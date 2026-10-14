@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "citrus"
+description = "Description to come"
+readme = "README.md"
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.11"
+dynamic = ["version"]
+authors = [
+    { name = "Citrus development team" },
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "torch",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+docs = ["sphinx", "sphinx_book_theme", "sphinx-copybutton", "sphinxext-opengraph"]
+
+[project.urls]
+Homepage = "https://github.com/cabouman/citrus"
+Documentation = "https://citrus.readthedocs.io"
+
+[tool.setuptools]
+packages = ["citrus"]
+
+[tool.setuptools.dynamic]
+version = { attr = "citrus.__version__" }
