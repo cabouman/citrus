@@ -37,10 +37,10 @@ iteration.
 detector pixel, from the computed views (`scatter_view_interp_order`: 3 = Catmull-Rom on the 4 nearest computed views,
 circular in angle, the default; 0 nearest, 1 linear, 2 quadratic), their primary comes from the solver's cheap primary
 projection, and the correction ratio is formed on every view (the ratio itself carries the moving shadow edges and is
-not interpolated). On the 180-view WLAB study (20 outer iterations), stride 2 costs +0.0014 relative RMSE for 51 % of
-the scatter time and stride 4 +0.008 for 26 %; cubic interpolation matches or beats linear at no extra cost. The
-penalty is mostly slower convergence of the coupled loop on the skipped views, not the interpolation error, so the
-saved time is best spent on more outer iterations. The default is stride 1 (every view).
+not interpolated). On the 180-view WLAB study (20 outer iterations, release defaults), the final relative RMSE is
+0.0429 at stride 1, 0.0427 at stride 2, 0.0429 at stride 4 and 0.0438 at stride 8, for scatter times of 56, 29, 15 and
+9 s per outer iteration (stride 8 computes scatter on 23 of the 180 views); cubic interpolation matches or beats
+linear at no extra cost. The default is stride 1 (every view).
 
 ## The scatter solver
 
