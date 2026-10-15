@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "citrus"
+dynamic = ["version"]
+description = "CITRUS: scatter-corrected cone-beam CT reconstruction with an LBTE source iteration scatter solver in the loop"
+readme = "README.md"
+license = { text = "BSD-3-Clause" }
+authors = [
+    { name = "Jordan Houri", email = "jhouri@purdue.edu" },
+    { name = "Charles A. Bouman" },
+]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "scipy",
+    "torch",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+docs = ["sphinx", "sphinx_book_theme", "sphinx-copybutton", "sphinxext-opengraph"]
+
+[project.urls]
+Homepage = "https://github.com/cabouman/citrus"
+Documentation = "https://citrus.readthedocs.io"
+
+[tool.setuptools.dynamic]
+version = { attr = "citrus.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["citrus*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

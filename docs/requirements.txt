@@ -1,0 +1,7 @@
+sphinx
+sphinx_book_theme
+sphinx-copybutton
+sphinxext-opengraph
+numpy
+scipy
+matplotlib

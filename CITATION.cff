@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "citrus"
+type: software
+authors:
+  - family-names: Houri
+    given-names: Jordan
+  - family-names: Bouman
+    given-names: Charles A.
+version: 0.0.1
+date-released: 2026-10-14
+url: "https://citrus.readthedocs.io"
+repository-code: "https://github.com/cabouman/citrus"
+license: BSD-3-Clause
