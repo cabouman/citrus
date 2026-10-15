@@ -1,6 +1,6 @@
 """Benchmark the LD sweep and one source iteration on WLAB-like coarse grids (CUDA, float32).
 
-Usage:  python dev_scripts/bench_transport_sweep.py [--grids 20x30x40,40x60x80] [--chunks 16,8] [--repeats 5]
+Usage:  python benchmarks/bench_transport_sweep.py [--grids 20x30x40,40x60x80] [--chunks 16,8] [--repeats 5]
                                                   [--variants torch,triton] [--mem-cap-mib 5000] [--no-si]
 
 For each grid (rows x cols x slices, 12.5 mm cells), each direction chunk (directions per octant swept

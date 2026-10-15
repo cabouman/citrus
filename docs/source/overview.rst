@@ -32,11 +32,13 @@ Package layout
     ========================== ===================================================================================
 
 ``citrus.recon``
-    ``mbir_bridge`` (MBIRTORCH ``ConeBeamModel`` matching the solver's geometry, FDK, the warm-started
-    single-iteration recipe) and ``synthetic`` (the synthetic WLAB dataset).
+    ``mbir_bridge``: the MBIRTORCH ``ConeBeamModel`` matching the solver's geometry, FDK, the warm-started
+    single-iteration recipe.
 
 ``citrus.utilities``
-    The WLAB phantom, grid and geometry, the attenuation <-> density model, a GPU memory cap and plotting helpers.
+    The WLAB phantom, grid and geometry, the attenuation <-> density model, synthetic cone-beam data with scatter
+    (``synthesize_cone_beam_data`` for any density volume, ``synthesize_wlab_dataset``), a GPU memory cap and plotting
+    helpers.
 
 Scope of the solver
 -------------------
@@ -57,5 +59,9 @@ Repository
     dense Galerkin assembly, Beer's law, brute-force point-to-point scatter integrals, and the identity "N CITRUS
     steps with fixed densities = N source iterations".
 ``dev_scripts/``
+    Shell scripts (bash; Linux, macOS, Git Bash on Windows): ``create_conda_test_environment.sh``,
+    ``clean_install_all.sh``, ``remove_build.sh``, ``deep_clean.sh``, ``run_tests.sh`` (``--slow`` for the slow tests),
+    ``build_docs.sh``, ``check_cuda.sh`` (PyTorch / CUDA / Triton availability and the kernel self-checks).
+``benchmarks/``
     Benchmarks of the sweep, the first-collision source kernel and the ray tracer, and a per-stage profile of the
     CITRUS step.

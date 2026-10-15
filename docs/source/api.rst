@@ -14,18 +14,13 @@ CITRUS
 
 .. automodule:: citrus.utilities
 
-Reconstruction
---------------
+MBIRTORCH bridge
+----------------
 
 ``citrus.recon.mbir_bridge``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. automodule:: citrus.recon.mbir_bridge
-
-``citrus.recon.synthetic``
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: citrus.recon.synthetic
 
 Scatter solver
 --------------

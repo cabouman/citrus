@@ -85,7 +85,7 @@ def tiny(real_lib):
     if not torch.cuda.is_available():
         pytest.skip("CUDA needed")
     from citrus.recon.mbir_bridge import make_cone_model
-    from citrus.recon.synthetic import synthesize_wlab_dataset, wlab_solver
+    from citrus.utilities import synthesize_wlab_dataset, wlab_solver
     from citrus.utilities import wlab_geometry, wlab_grid
 
     geom = replace(wlab_geometry(), num_det_rows=46, num_det_channels=38, delta_det_row=1.6, delta_det_channel=1.6)

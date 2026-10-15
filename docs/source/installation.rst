@@ -6,7 +6,7 @@ Requirements
 
 * Python >= 3.11, PyTorch (CUDA build for GPU use), NumPy, SciPy, Matplotlib.
 * `MBIRTORCH <https://github.com/cabouman/mbirtorch>`_ for the reconstruction side (``citrus_recon``,
-  ``mbir_recon``, the demos).
+  ``mbir_recon``, the demos; installed as a dependency, verified with mbirtorch 0.0.2).
 * `XrayPhysics <https://github.com/kylechampley/XrayPhysics>`_ to build the cross-section library (once; the library
   is cached on disk).
 * Optional: Triton (``triton`` on Linux, ``triton-windows`` on Windows) for the fused GPU kernels.
@@ -18,8 +18,15 @@ Install the package
 
    git clone https://github.com/cabouman/citrus.git
    cd citrus
-   pip install .            # or: pip install -e .   (development)
-   pip install .[test]      # with pytest
+   pip install .                  # or: pip install -e .   (development); installs MBIRTORCH too
+   pip install ".[test]"          # with pytest
+   pip install ".[physics,gpu]"   # XrayPhysics (needs a C++ toolchain and CMake) and Triton
+
+The ``physics`` extra builds XrayPhysics from its git repository; the ``gpu`` extra installs ``triton`` on Linux and
+``triton-windows`` on Windows. Without XrayPhysics the cross-section library cannot be built (a cached library still
+works); the test suite then uses the synthetic library and skips the tests that need the real one.
+``dev_scripts/create_conda_test_environment.sh`` creates a conda environment ``citrus`` (Python 3.11) with the test
+extras; ``dev_scripts/check_cuda.sh`` reports what is available.
 
 PyTorch is best installed first, with the CUDA version of your driver (see pytorch.org).
 

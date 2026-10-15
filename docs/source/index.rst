@@ -1,7 +1,7 @@
 citrus
 ======
 
-**CITRUS** reconstructs cone-beam CT volumes from scatter-contaminated projections by running a deterministic
+**CITRUS** (Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter) reconstructs cone-beam CT volumes from scatter-contaminated projections by running a deterministic
 scatter solver *inside* the iterative reconstruction. Every outer iteration performs one scatter step per view
 with the **LBTE source iteration solver** (a linear Boltzmann transport equation solver: multigroup in energy,
 discrete ordinates in angle, linear-discontinuous finite elements in space, source iteration over collision order,

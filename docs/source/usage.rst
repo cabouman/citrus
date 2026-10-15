@@ -23,7 +23,13 @@ fraction and central-row profiles. Options: ``--delta-voxel``, ``--supervoxel-fa
 from the solver's scatter-to-primary ratio, Poisson noise), runs CITRUS and the uncorrected MBIR loop with the same
 initialization, weights, partition sequence and frozen regularization, and plots central slices, central-row profiles,
 the relative RMSE per outer iteration and the estimated vs true scatter-to-primary ratio of one view. Options:
-``--views``, ``--delta-voxel``, ``--outer``, ``--I0``, ``--seed``, ``--no-noise``, ``--full``, ``--regenerate``.
+``--views``, ``--delta-voxel``, ``--outer``, ``--I0``, ``--seed``, ``--no-noise``, ``--full``, ``--regenerate``, ``--truth-sweep``, ``--truth-cone``.
+
+Ground truth of the CITRUS demo: the scatter of every view is computed by the scatter solver from the TRUE densities
+with a fully converged source iteration, stored as the scatter-to-primary ratio and applied to MBIRTORCH's primary
+counts, then Poisson noise is drawn. This is an intentional inverse crime for the scatter (the truth and the
+correction come from the same solver); ``--truth-sweep 16x32 --truth-cone 32x64`` generates the truth with finer
+angular discretizations than the loop (8x16, 16x32) to expose the solver's own discretization error.
 
 The scatter solver
 ------------------
@@ -54,7 +60,7 @@ CITRUS
 .. code-block:: python
 
    from citrus import CitrusConfig, citrus_recon, mbir_recon
-   from citrus.recon.synthetic import wlab_solver
+   from citrus.utilities import wlab_solver
 
    solver = wlab_solver(delta_voxel, geom=geom, device="cuda")          # or any ScatterSolver
    recon, info = citrus_recon(Y, I0, angles, grid, geom, solver, CitrusConfig(num_outer=10))
@@ -80,9 +86,11 @@ The per-view step is available on its own:
 Synthetic data
 --------------
 
-``citrus.recon.synthetic.synthesize_wlab_dataset(num_views, delta_voxel, I0, noise, seed, out_path, geom=...)``
-generates the WLAB dataset of the CITRUS demo: ``X_true`` (attenuation at the effective energy), ``rho_true``,
-line integrals, ``P``, ``S``, ``Y``, ``SPR``, the solver's primary and scatter images and metadata. The scatter is
-``S = SPR P`` with the solver's physical scatter-to-primary ratio, so the scatter-to-primary ratio of the data equals
-that of the solver exactly; the primary uses MBIRTORCH's own projector (the only model error the reconstruction sees is
-the scatter and the noise).
+``citrus.utilities.synthesize_cone_beam_data(rho, grid, geometry, angles, solver, I0, noise, seed)`` generates
+cone-beam counts with scatter for any water / bone density volume: ``X_true`` (attenuation at the effective energy),
+line integrals, ``P``, ``S``, ``Y``, ``SPR``, the solver's primary and scatter images and metadata. The primary uses
+MBIRTORCH's own projector, the scatter is ``S = SPR P`` with the scatter-to-primary ratio of one fully converged solve of
+``solver`` per view (so the scatter-to-primary ratio of the data equals that of the solver exactly). The truth solver
+may use a finer angular discretization than the solver of the reconstruction loop.
+``synthesize_wlab_dataset(num_views, delta_voxel, I0, noise, seed, out_path, config=..., geom=...)`` is the WLAB
+wrapper used by the CITRUS demo; ``save_dataset`` / ``load_dataset`` write and read ``.npz`` + ``.json``.

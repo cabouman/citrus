@@ -1,7 +1,7 @@
 """Benchmark of the fused first-collision source kernel (citrus/scatter_solver/kernels/uncollided_kernels.py).
 
 Usage:
-    python dev_scripts/bench_uncollided_kernel.py [--fine 1.0 0.5] [--cones 16x32 32x64]
+    python benchmarks/bench_uncollided_kernel.py [--fine 1.0 0.5] [--cones 16x32 32x64]
                                                   [--out _cache/runs/bench_uncollided_kernel] [--skip-image] [--reps 15]
 
 Setting: WLAB phantom (utilities.wlab_setup), angle 0, real XrayPhysics library (G = 6, 2001-point eta table),

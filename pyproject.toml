@@ -18,11 +18,19 @@ dependencies = [
     "scipy",
     "torch",
     "matplotlib",
+    "mbirtorch",
 ]
 
 [project.optional-dependencies]
 test = ["pytest"]
 docs = ["sphinx", "sphinx_book_theme", "sphinx-copybutton", "sphinxext-opengraph"]
+# XrayPhysics builds the cross-section library (C++ library: needs a C++ toolchain and CMake)
+physics = ["xrayphysics @ git+https://github.com/kylechampley/XrayPhysics"]
+# fused GPU kernels (optional: PyTorch paths are used without Triton)
+gpu = [
+    "triton; sys_platform == 'linux'",
+    "triton-windows; sys_platform == 'win32'",
+]
 
 [project.urls]
 Homepage = "https://github.com/cabouman/citrus"

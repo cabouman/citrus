@@ -1,6 +1,6 @@
 """Per-stage profile of one CITRUS step per view (citrus.citrus.citrus_step).
 
-    python dev_scripts/profile_citrus_step.py [--panel full|small] [--views 12] [--cone 16x32]
+    python benchmarks/profile_citrus_step.py [--panel full|small] [--views 12] [--cone 16x32]
 
 Synthesizes nothing: uses the WLAB phantom on the 0.5 cm grid (supervoxel factor 2), the full-field (150 x 184) or the
 small (100 x 75) panel, and `--views` of 180 equally spaced angles (every 180/views-th). Pass 1 builds every view's
@@ -27,7 +27,7 @@ import torch  # noqa: E402
 
 from citrus import citrus as citrus_hooks  # noqa: E402
 from citrus.citrus import CitrusState, StateStore, citrus_step  # noqa: E402
-from citrus.recon.synthetic import wlab_solver  # noqa: E402
+from citrus.utilities import wlab_solver  # noqa: E402
 from citrus.scatter_solver import scatter_image as step3  # noqa: E402
 from citrus.scatter_solver import scatter_solver as solver_mod  # noqa: E402
 from citrus.scatter_solver.config import SolverConfig  # noqa: E402

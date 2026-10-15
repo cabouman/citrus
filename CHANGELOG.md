@@ -14,7 +14,10 @@ First release.
   conservative first-collision source, collapsed-cone scatter image with sub-voxel points and a finite-cone footprint,
   detector and anti-scatter-grid responses; exact Siddon ray tracing. Fused Triton kernels on float32 CUDA with
   PyTorch reference paths for CPU / float64.
-- `citrus.recon`: MBIRTORCH bridge and the synthetic WLAB dataset; `citrus.utilities`: WLAB phantom and geometry,
-  attenuation <-> density model, plotting helpers.
-- Demos (`demo/demo_scatter_solver.py`, `demo/demo_citrus.py`), test suite, Sphinx documentation, benchmarks
-  (`dev_scripts/`).
+- `citrus.recon`: the MBIRTORCH bridge; `citrus.utilities`: WLAB phantom and geometry, attenuation <-> density
+  model, synthetic cone-beam data with scatter (`synthesize_cone_beam_data`, `synthesize_wlab_dataset`), plotting
+  helpers.
+- Demos (`demo/demo_scatter_solver.py`, `demo/demo_citrus.py` with a configurable ground-truth discretization), test
+  suite, Sphinx documentation, developer shell scripts (`dev_scripts/`) and benchmarks (`benchmarks/`).
+- Dependencies: numpy, scipy, torch, matplotlib, mbirtorch; extras `test`, `docs`, `physics` (XrayPhysics), `gpu`
+  (Triton).

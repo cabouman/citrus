@@ -1,7 +1,7 @@
 """Benchmark of the fused Triton Siddon ray tracer against the PyTorch Siddon reference.
 
 Usage:
-    python dev_scripts/bench_ray_tracing.py [--coarse 2.0 1.0 0.5] [--cones 16x32 32x64]
+    python benchmarks/bench_ray_tracing.py [--coarse 2.0 1.0 0.5] [--cones 16x32 32x64]
                                             [--out _cache/runs/bench_ray_tracing] [--parts equality,chunks,images,fine]
                                             [--torch-chunks 8] [--skip KEY,...] [--rerun]
 

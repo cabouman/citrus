@@ -1,13 +1,28 @@
 """Demo: CITRUS on the WLAB phantom (synthetic cone-beam data with scatter and Poisson noise).
 
-    python demo/demo_citrus.py                     # 36 views, 1 cm grid, 10 outer iterations (a few minutes)
+    python demo/demo_citrus.py                     # 36 views, 1 cm grid, 10 outer iterations (about 2 minutes)
     python demo/demo_citrus.py --full              # 180 views, 0.5 cm grid, 20 outer iterations (about 30 min)
     python demo/demo_citrus.py --views 60 --delta-voxel 0.5 --outer 15
+    python demo/demo_citrus.py --truth-sweep 16x32 --truth-cone 32x64   # truth finer than the loop's solver
 
-1. Data (cached in demo/input/): the WLAB phantom at E_eff (spectrum mean, 63 keV) on the reconstruction grid; the
-   primary P = I0 exp(-A X) from MBIRTORCH's projector, the scatter S = SPR P with the scatter-to-primary ratio of
-   the LBTE scatter solver (one converged solve per view on the true densities), Y = Poisson(P + S); full-field
-   panel (150 x 184 pixels of 0.4 cm).
+1. Data (citrus.utilities.synthesize_wlab_dataset, cached in demo/input/). The WLAB phantom (30 x 20 x 40 cm water
+   prism with lung, air and bone inserts) is rasterized on the reconstruction grid; full-field panel (150 x 184
+   pixels of 0.4 cm, the whole prism in the field at every view).
+   - Primary: P = I0 exp(-A X_true) with A the MBIRTORCH projector and X_true the attenuation of the true densities at
+     the effective energy (spectrum mean, 63 keV); I0 = flat-field counts per pixel.
+   - Ground-truth scatter: for every view, the LBTE scatter solver is run on the TRUE densities with a fully converged
+     source iteration (``ScatterSolver.solve_view``, tolerance 1e-3), giving the solver's scatter and primary planar
+     fluence images s, p (ideal photon-counting detector, no anti-scatter grid). The truth is stored as the per-pixel
+     scatter-to-primary ratio SPR = s / p and applied to the MBIRTORCH primary counts: S = SPR x P.
+   - Measured counts: Y = Poisson(P + S) (``--no-noise``: Y = P + S).
+   This is an intentional inverse crime for the scatter: the truth comes from the same solver (same physics, same
+   discretization by default) that CITRUS uses for its correction, so the study measures how well the coupled loop
+   converges, not the accuracy of the scatter model. (The primary is an inverse crime too: MBIRTORCH's own projector,
+   monoenergetic, on the reconstruction grid.) To expose the solver's angular discretization error, generate the
+   truth with finer direction sets than the loop: ``--truth-sweep`` (discrete-ordinates quadrature, polar x
+   azimuthal, loop default 8x16; recommended 16x32) and ``--truth-cone`` (collapsed-cone directions, loop default
+   16x32; recommended 32x64, or 48x96 as a reference). The defaults equal the loop's for speed; 16x32 / 32x64 make the
+   data synthesis about 4x slower.
 2. CITRUS (citrus.citrus_recon): FDK initialization, then per outer iteration one scatter step per view and one
    warm-started MBIR iteration on Y / (1 + SPR).
 3. The same MBIR loop without scatter correction (citrus.mbir_recon), for comparison.
@@ -20,6 +35,7 @@ estimated vs true scatter-to-primary ratio of view 0.
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 import os
 import time
@@ -34,10 +50,11 @@ import torch  # noqa: E402
 from citrus import CitrusConfig, citrus_recon, mbir_recon  # noqa: E402
 from citrus.citrus import estimate_regularization  # noqa: E402
 from citrus.recon.mbir_bridge import make_cone_model  # noqa: E402
-from citrus.recon.synthetic import load_dataset, synthesize_wlab_dataset, wlab_solver  # noqa: E402
+from citrus.scatter_solver.config import SolverConfig  # noqa: E402
 from citrus.scatter_solver.geometry import ConeGeometry  # noqa: E402
-from citrus.utilities import (full_field_wlab_geometry, plot_history, plot_profiles, plot_slices,  # noqa: E402
-                              set_memory_cap, wlab_grid)
+from citrus.utilities import (default_supervoxel_factor, full_field_wlab_geometry, load_dataset,  # noqa: E402
+                              plot_history, plot_profiles, plot_slices, set_memory_cap, synthesize_wlab_dataset,
+                              wlab_grid, wlab_solver)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -45,6 +62,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 def _box(grid, device, half) -> torch.Tensor:
     x, y, z = grid.axis_coordinates(device)
     return (x[None, :, None].abs() < half[0]) & (y[:, None, None].abs() < half[1]) & (z[None, None, :].abs() < half[2])
+
+
+def _counts(text: str, what: str) -> tuple[int, int]:
+    try:
+        p, a = (int(v) for v in text.lower().split("x"))
+    except ValueError:
+        raise SystemExit(f"{what} must be POLARxAZIMUTHAL, e.g. 16x32, got {text!r}")
+    return p, a
 
 
 def main() -> None:
@@ -57,6 +82,12 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0, help="Poisson noise seed")
     ap.add_argument("--no-noise", action="store_true", help="noise-free data (Y = P + S)")
     ap.add_argument("--regenerate", action="store_true", help="re-synthesize the data even if cached")
+    ap.add_argument("--truth-sweep", default=None,
+                    help="sweep quadrature of the ground-truth solver, POLARxAZIMUTHAL (default: the loop's, 8x16; "
+                         "recommended finer: 16x32; polar even, azimuthal divisible by 4)")
+    ap.add_argument("--truth-cone", default=None,
+                    help="collapsed-cone directions of the ground-truth solver, POLARxAZIMUTHAL (default: the loop's, "
+                         "16x32; recommended finer: 32x64)")
     ap.add_argument("--memory-cap-mib", type=float, default=4400.0, help="PyTorch CUDA memory cap (0: none)")
     ap.add_argument("--input", default=os.path.join(HERE, "input"))
     ap.add_argument("--out", default=os.path.join(HERE, "output"))
@@ -69,7 +100,18 @@ def main() -> None:
     set_memory_cap(args.memory_cap_mib)
     os.makedirs(args.input, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
+    loop_cfg = replace(SolverConfig(), supervoxel_factor=default_supervoxel_factor(args.delta_voxel))
+    tp, ta = _counts(args.truth_sweep, "--truth-sweep") if args.truth_sweep else (loop_cfg.num_polar,
+                                                                                 loop_cfg.num_azimuthal)
+    cp, ca = _counts(args.truth_cone, "--truth-cone") if args.truth_cone else (loop_cfg.cone_num_polar,
+                                                                              loop_cfg.cone_num_azimuthal)
+    if tp % 2 or ta % 4:
+        raise SystemExit("--truth-sweep: the polar count must be even and the azimuthal count divisible by 4")
+    truth_cfg = replace(loop_cfg, num_polar=tp, num_azimuthal=ta, cone_num_polar=cp, cone_num_azimuthal=ca)
+    truth_cfg.validate()
     tag = f"wlab_{args.views}v_{args.delta_voxel:g}cm".replace(".", "p") + ("_nonoise" if args.no_noise else "")
+    if truth_cfg != loop_cfg:
+        tag += f"_truth{tp}x{ta}_cone{cp}x{ca}"
     t_all = time.perf_counter()
 
     # ---- 1. data ------------------------------------------------------------------------------------------------
@@ -81,7 +123,7 @@ def main() -> None:
     else:
         t0 = time.perf_counter()
         data = synthesize_wlab_dataset(args.views, args.delta_voxel, args.I0, not args.no_noise, args.seed, path,
-                                       geom=geom, device=dev)
+                                       geom=geom, device=dev, config=truth_cfg)
         print(f"data: synthesized {args.views} views in {time.perf_counter() - t0:.1f} s -> {path}.npz")
     geom = ConeGeometry(**data["meta"]["geometry"])
     grid = wlab_grid(args.delta_voxel)
@@ -93,7 +135,9 @@ def main() -> None:
           f"{geom.num_det_channels}; SPR median {np.median(spr_true):.2f}, max {spr_true.max():.1f}")
 
     # ---- shared: solver, MBIRTORCH model, frozen regularization (scatter-free sinogram), metrics ---------------
-    solver = wlab_solver(args.delta_voxel, geom=geom, device=dev)
+    solver = wlab_solver(args.delta_voxel, config=loop_cfg, geom=geom, device=dev)
+    print(f"truth solver: sweep {tp}x{ta}, cone {cp}x{ca}; loop solver: sweep {loop_cfg.num_polar}x"
+          f"{loop_cfg.num_azimuthal}, cone {loop_cfg.cone_num_polar}x{loop_cfg.cone_num_azimuthal}")
     model = make_cone_model(grid, geom, angles, device=dev)
     Yt = torch.as_tensor(Y, device=dev)
     reg = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=dev) / I0), Yt / I0)
@@ -126,6 +170,7 @@ def main() -> None:
     rec = info_c["records"][1:]
     summary = {
         "views": len(angles), "delta_voxel_cm": args.delta_voxel, "grid": list(grid.shape), "outer": args.outer,
+        "truth_sweep": [tp, ta], "truth_cone": [cp, ca],
         "regularization": reg,
         "citrus": {"rmse_rel": hist_c[-1]["rmse_rel"], "rmse_rel_core": hist_c[-1]["rmse_rel_core"],
                    "seconds": t_citrus, "scatter_s_per_outer": float(np.mean([r["t_scatter"] for r in rec])),
