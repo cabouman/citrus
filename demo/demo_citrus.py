@@ -4,6 +4,7 @@
     python demo/demo_citrus.py --full              # 180 views, 0.5 cm grid, 20 outer iterations (about 30 min)
     python demo/demo_citrus.py --views 60 --delta-voxel 0.5 --outer 15
     python demo/demo_citrus.py --truth-sweep 16x32 --truth-cone 32x64   # truth finer than the loop's solver
+    python demo/demo_citrus.py --scatter-view-stride 2                  # scatter step on every 2nd view only
 
 1. Data (citrus.utilities.synthesize_wlab_dataset, cached in demo/input/). The WLAB phantom (30 x 20 x 40 cm water
    prism with lung, air and bone inserts) is rasterized on the reconstruction grid; full-field panel (150 x 184
@@ -24,7 +25,10 @@
    16x32; recommended 32x64, or 48x96 as a reference). The defaults equal the loop's for speed; 16x32 / 32x64 make the
    data synthesis about 4x slower.
 2. CITRUS (citrus.citrus_recon): FDK initialization, then per outer iteration one scatter step per view and one
-   warm-started MBIR iteration on Y / (1 + SPR).
+   warm-started MBIR iteration on Y / (1 + SPR). ``--scatter-view-stride n`` runs the scatter step on every n-th view
+   only and interpolates the other views' scatter signal in angle (``--scatter-view-interp-order``, default 3:
+   Catmull-Rom); the output files then carry a ``_stride<n>`` suffix (``_stride<n>_order<k>`` for orders other
+   than 3).
 3. The same MBIR loop without scatter correction (citrus.mbir_recon), for comparison.
 Both reconstructions use the same frozen regularization (MBIRTORCH's automatic estimate on the scatter-free
 sinogram), the same FDK initialization, weights and partition sequence, so they differ only by the scatter
@@ -88,12 +92,21 @@ def main() -> None:
     ap.add_argument("--truth-cone", default=None,
                     help="collapsed-cone directions of the ground-truth solver, POLARxAZIMUTHAL (default: the loop's, "
                          "16x32; recommended finer: 32x64)")
+    ap.add_argument("--scatter-view-stride", type=int, default=1,
+                    help="scatter step on every n-th view only (views 0, n, 2n, ...), the others interpolated in "
+                         "angle (default 1: every view)")
+    ap.add_argument("--scatter-view-interp-order", default="3", choices=["none", "0", "1", "2", "3"],
+                    help="angular interpolation of the skipped views (with --scatter-view-stride > 1): 0 nearest, "
+                         "1 linear, 2 quadratic, 3 cubic Catmull-Rom (default), none = not corrected (diagnostics)")
     ap.add_argument("--memory-cap-mib", type=float, default=4400.0, help="PyTorch CUDA memory cap (0: none)")
     ap.add_argument("--input", default=os.path.join(HERE, "input"))
     ap.add_argument("--out", default=os.path.join(HERE, "output"))
     args = ap.parse_args()
     if args.full:
         args.views, args.delta_voxel, args.outer = 180, 0.5, 20
+    interp_order = None if args.scatter_view_interp_order == "none" else int(args.scatter_view_interp_order)
+    if args.scatter_view_stride < 1:
+        raise SystemExit("--scatter-view-stride must be >= 1")
     if not torch.cuda.is_available():
         raise SystemExit("this demo needs a CUDA GPU (MBIRTORCH and the scatter solver run on the GPU)")
     dev = torch.device("cuda")
@@ -150,7 +163,13 @@ def main() -> None:
                           "rmse_rel_core": float(e[core].norm() / X_true[core].norm())})
         return cb
 
-    cfg = CitrusConfig(num_outer=args.outer, verbose=True)
+    cfg = CitrusConfig(num_outer=args.outer, verbose=True, scatter_view_stride=args.scatter_view_stride,
+                       scatter_view_interp_order=interp_order)
+    out_tag = tag
+    if args.scatter_view_stride > 1:
+        out_tag += f"_stride{args.scatter_view_stride}" + ("" if interp_order == 3 else f"_order{interp_order}")
+        print(f"sparse-view scatter: scatter step on {len(range(0, len(angles), args.scatter_view_stride))} of "
+              f"{len(angles)} views (stride {args.scatter_view_stride}), interpolation order {interp_order}")
 
     # ---- 2. CITRUS ------------------------------------------------------------------------------------------
     hist_c: list = []
@@ -171,6 +190,8 @@ def main() -> None:
     summary = {
         "views": len(angles), "delta_voxel_cm": args.delta_voxel, "grid": list(grid.shape), "outer": args.outer,
         "truth_sweep": [tp, ta], "truth_cone": [cp, ca],
+        "scatter_view_stride": args.scatter_view_stride, "scatter_view_interp_order": interp_order,
+        "computed_views": [int(v) for v in info_c["computed_views"]],
         "regularization": reg,
         "citrus": {"rmse_rel": hist_c[-1]["rmse_rel"], "rmse_rel_core": hist_c[-1]["rmse_rel_core"],
                    "seconds": t_citrus, "scatter_s_per_outer": float(np.mean([r["t_scatter"] for r in rec])),
@@ -180,7 +201,7 @@ def main() -> None:
         "fdk_rmse_rel": hist_c[0]["rmse_rel"],
         "history": {"citrus": hist_c, "no_correction": hist_n},
     }
-    with open(os.path.join(args.out, f"citrus_{tag}.json"), "w") as f:
+    with open(os.path.join(args.out, f"citrus_{out_tag}.json"), "w") as f:
         json.dump(summary, f, indent=1)
     print(f"\nrelative RMSE (whole prism / core): FDK {hist_c[0]['rmse_rel']:.4f} / {hist_c[0]['rmse_rel_core']:.4f}, "
           f"no correction {hist_n[-1]['rmse_rel']:.4f} / {hist_n[-1]['rmse_rel_core']:.4f}, "
@@ -212,7 +233,7 @@ def main() -> None:
     fig.tight_layout()
     figs["spr"] = fig
     for name, fig in figs.items():
-        p = os.path.join(args.out, f"citrus_{tag}_{name}.png")
+        p = os.path.join(args.out, f"citrus_{out_tag}_{name}.png")
         fig.savefig(p, dpi=120, bbox_inches="tight")
         plt.close(fig)
         print(f"figure: {p}")

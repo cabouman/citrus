@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.0.2 — 2026-10-15
+
+Sparse-view scatter with angular interpolation.
+
+- `CitrusConfig.scatter_view_stride` (default 1): the CITRUS scatter step runs on every n-th view only (views 0, n,
+  2n, ...; only those keep an accumulator, 1/n of the state memory); the other views' scatter signal is interpolated
+  in angle, per pixel, from the computed views, their primary comes from the solver's primary projection, and the
+  correction ratio is formed on every view.
+- `CitrusConfig.scatter_view_interp_order` (default 3), all circular in angle: 3 cubic Catmull-Rom on 4 neighbors, 2
+  quadratic (3-point Lagrange), 1 linear, 0 nearest computed view, None no interpolation (diagnostics: skipped views
+  uncorrected). Validated in `CitrusConfig.validate`.
+- `citrus.citrus`: `scatter_view_indices`, `angular_neighbors`, `interpolation_weights`, `interpolate_scatter`;
+  `citrus_recon`'s info gains `computed_views` and `view_interpolated`, the records `t_skipped`. `mbir_recon` is
+  unchanged.
+- Demo flags `--scatter-view-stride`, `--scatter-view-interp-order` (`demo/demo_citrus.py`; default stride 1).
+- Measured on the 180-view WLAB study (20 outer iterations): stride 2 +0.0014 relative RMSE for 51 % of the scatter
+  time, stride 4 +0.008 for 26 %.
+- Tests: `tests/test_sparse_views.py` (interpolators, configuration) and CUDA runs at strides 2 and 4 in
+  `tests/test_citrus_recon.py`.
+
 ## v0.0.1 — 2026-10-14
 
 First release.

@@ -12,6 +12,7 @@ Both demos write their figures to ``demo/output/`` (not tracked); the CITRUS dem
    python demo/demo_scatter_solver.py              # one view of the WLAB phantom (seconds)
    python demo/demo_citrus.py                      # 36 views, 1 cm grid, 10 outer iterations (about 2 minutes)
    python demo/demo_citrus.py --full               # 180 views, 0.5 cm grid, 20 outer iterations
+   python demo/demo_citrus.py --scatter-view-stride 2   # scatter step on every 2nd view only
 
 ``demo_scatter_solver.py`` builds the library, rasterizes the WLAB phantom (a 30 x 20 x 40 cm water prism with lung,
 air and bone inserts) and solves one view with the default configuration (6 groups, Legendre order 7, 8 x 16 sweep
@@ -23,7 +24,8 @@ fraction and central-row profiles. Options: ``--delta-voxel``, ``--supervoxel-fa
 from the solver's scatter-to-primary ratio, Poisson noise), runs CITRUS and the uncorrected MBIR loop with the same
 initialization, weights, partition sequence and frozen regularization, and plots central slices, central-row profiles,
 the relative RMSE per outer iteration and the estimated vs true scatter-to-primary ratio of one view. Options:
-``--views``, ``--delta-voxel``, ``--outer``, ``--I0``, ``--seed``, ``--no-noise``, ``--full``, ``--regenerate``, ``--truth-sweep``, ``--truth-cone``.
+``--views``, ``--delta-voxel``, ``--outer``, ``--I0``, ``--seed``, ``--no-noise``, ``--full``, ``--regenerate``, ``--truth-sweep``, ``--truth-cone``,
+``--scatter-view-stride`` (default 1), ``--scatter-view-interp-order`` (``0``-``3`` or ``none``, default ``3``).
 
 Ground truth of the CITRUS demo: the scatter of every view is computed by the scatter solver from the TRUE densities
 with a fully converged source iteration, stored as the scatter-to-primary ratio and applied to MBIRTORCH's primary
@@ -72,6 +74,23 @@ reconstruction grid and the scanner in MBIRTORCH conventions (:doc:`conventions`
 records (timings, accumulator change, scatter change), the final scatter-to-primary ratio and scatter-count estimate,
 and the frozen regularization. A ``callback(k, X_k, record)`` can track the iterates (the demo computes the RMSE
 against the truth with it).
+
+Sparse-view scatter: the scatter step can run on every n-th view only, with the other views' scatter interpolated
+in angle (:doc:`method`, "Sparse-view scatter"):
+
+.. code-block:: python
+
+   cfg = CitrusConfig(num_outer=10, scatter_view_stride=2)             # Catmull-Rom (order 3) by default
+   cfg = CitrusConfig(num_outer=10, scatter_view_stride=4, scatter_view_interp_order=1)   # linear
+   recon, info = citrus_recon(Y, I0, angles, grid, geom, solver, cfg)
+   info["computed_views"], info["view_interpolated"]                    # [Vc] indices, [V] bool
+
+``scatter_view_interp_order``: 3 cubic Catmull-Rom on 4 neighbors (default), 2 quadratic (3-point Lagrange), 1 linear,
+0 nearest computed view, all circular in angle; ``None`` leaves the skipped views uncorrected (diagnostics only). It
+is ignored at ``scatter_view_stride=1``. Measured on the 180-view WLAB study after 20 outer iterations: stride 2 costs
++0.0014 relative RMSE for 51 % of the scatter time, stride 4 +0.008 for 26 %. The functions
+``scatter_view_indices``, ``angular_neighbors``, ``interpolation_weights`` and ``interpolate_scatter`` of
+``citrus.citrus`` expose the view subset and the interpolation.
 
 The per-view step is available on its own:
 

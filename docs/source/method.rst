@@ -227,3 +227,41 @@ polychromatic primary and MBIR's monoenergetic model, and it only rescales the n
 :math:`W = Y/I_0` of the measured counts are the exact weights of :math:`y_c = -\log(Y_c/I_0)`. One warm-started MBIR
 (VCD) iteration at partition-schedule position :math:`k` on :math:`y_c` gives :math:`X_{k+1}`; the regularization is
 estimated once and frozen. The loop starts from the FDK reconstruction of the uncorrected data.
+
+Sparse-view scatter
+-------------------
+
+With ``scatter_view_stride`` :math:`n > 1` the step above runs only on the computed views :math:`\mathcal C = \{0, n,
+2n, \dots\}` (uniform over the angular range, starting at view 0), and only they keep an accumulator
+:math:`\Phi_v`. Every other view :math:`v` gets the scatter signal interpolated in angle, per detector pixel, from the
+computed views,
+
+.. math::
+
+   s_v = \max\Big(0,\ \sum_{j\in\mathcal C} w_{vj}\, s_j\Big), \qquad
+   \mathrm{SPR}_v = s_v / p_v,
+
+with :math:`p_v` the solver's primary image of view :math:`v` (a ray trace of the current densities, no transport, so
+cheap) and weights :math:`w_{vj}` that are circular in angle (period :math:`2\pi`). With :math:`t\in[0,1)` the
+fractional position of the view between its two bracketing computed views :math:`j_0, j_1`
+(``scatter_view_interp_order``):
+
+- 0: the nearest computed view;
+- 1: linear, :math:`(1-t)\,s_{j_0} + t\,s_{j_1}`;
+- 2: 3-point Lagrange at the actual angles of the nearest computed view and its two neighbours (exact for quadratics
+  of the angle);
+- 3 (default): Catmull-Rom on :math:`j_0-1, j_0, j_1, j_1+1`, weights
+  :math:`\tfrac12(-t^3+2t^2-t),\ \tfrac12(3t^3-5t^2+2),\ \tfrac12(-3t^3+4t^2+t),\ \tfrac12(t^3-t^2)`:
+  interpolating with a continuous first derivative, exact for quadratics of the angle on uniformly spaced computed
+  views (not for cubics: the central-difference tangents are second-order);
+- ``None`` (diagnostics): no interpolation, the skipped views keep their most recent computed scatter if any, else
+  zero (uncorrected).
+
+The scatter signal is interpolated rather than the ratio: the solver scatter is smooth on the panel and in angle (99 %
+of each pixel's variation energy lies in about 8-12 harmonics per rotation after a 1 cm low-pass), while the ratio
+carries the object's shadow edges, which move across the panel with the angle. On the 180-view WLAB study (20 outer
+iterations) stride 2 costs +0.0014 relative RMSE (0.0443 vs 0.0429) for 51 % of the scatter time and stride 4 +0.008
+(0.0509) for 26 %; Catmull-Rom matches or beats linear interpolation offline (skipped-view scatter error 1.05 / 1.94 %
+vs 1.12 / 2.11 % at strides 2 / 4) at no extra cost. Interpolating the TRUE scatter costs only about +0.0025 at stride
+4, so the in-loop penalty is mostly the slower convergence of the coupled loop on the skipped views, not the
+interpolation error.

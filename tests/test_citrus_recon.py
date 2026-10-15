@@ -3,6 +3,7 @@ on a tiny noise-free problem, the frozen regularization, and CITRUS with the tru
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 import numpy as np
@@ -163,3 +164,82 @@ def test_citrus_with_true_scatter_is_fixed_spr_mbir(tiny, monkeypatch):
     assert info["records"][3]["acc_change_mean"] == 0.25
     rel = float((X_c - X_o).norm() / X_o.norm())
     assert rel < 1e-4, rel  # MBIRTORCH's float32 atomics
+
+
+# ---- sparse-view scatter (scatter step on every n-th view, angular interpolation of the others) --------------
+
+@cuda
+def test_sparse_views_close_to_every_view(tiny):
+    """Strides 2 and 4 (Catmull-Rom, order 3) on the tiny problem, 3 outer iterations, final relative RMSE against
+    the stride-1 run. Measured (RTX 3070): stride 1 0.2094; stride 2 0.2068 (order 3) / 0.2071 (1) / 0.2082 (2) /
+    0.2112 (0); stride 4 0.2117 (3) / 0.2115 (1) / 0.2122 (2) / 0.2141 (0); order None (skipped views uncorrected)
+    0.2547 / 0.2982; no correction 0.3101. Bound: |stride n - stride 1| < 0.01 (vs differences < 0.003; the
+    uncorrected skipped views of order None fail it by 0.045 / 0.089)."""
+    data, grid, geom, solver, reg = tiny
+    e = {}
+    for stride in (1, 2, 4):
+        cfg = CitrusConfig(num_outer=3, scatter_view_stride=stride)
+        X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geom, solver, cfg, regularization=reg)
+        assert bool(torch.isfinite(X).all())
+        e[stride] = _rmse(X, data)
+        computed = np.arange(0, 16, stride)
+        np.testing.assert_array_equal(info["computed_views"], computed)
+        assert info["view_interpolated"].dtype == bool and info["view_interpolated"].shape == (16,)
+        assert list(np.flatnonzero(~info["view_interpolated"])) == list(computed)
+        assert info["state"]["num_views"] == len(computed)  # accumulators only for the computed views
+        assert float(info["spr"].min()) > 0  # every view is corrected
+        assert ("t_skipped" in info["records"][1]) == (stride > 1)
+        assert info["config"]["scatter_view_stride"] == stride
+    for stride in (2, 4):
+        assert abs(e[stride] - e[1]) < 0.01, e
+    # order None (diagnostics): the skipped views are not corrected and the error grows well past the bound
+    X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geom, solver,
+                           CitrusConfig(num_outer=3, scatter_view_stride=4, scatter_view_interp_order=None),
+                           regularization=reg)
+    skipped = np.setdiff1d(np.arange(16), np.arange(0, 16, 4))
+    assert not info["view_interpolated"].any()
+    assert float(info["spr"][torch.as_tensor(skipped)].abs().max()) == 0.0
+    assert _rmse(X, data) > e[1] + 0.03, (_rmse(X, data), e)
+
+
+@cuda
+def test_sparse_views_interpolate_the_scatter_signal(tiny, monkeypatch):
+    """The driver interpolates the scatter SIGNAL of the computed views and divides by the solver primary of every
+    view (not the ratio): with a fake step (s_v = 2 + cos(angle), p = 3 on computed views) and a fake primary (5 on
+    the skipped views), SPR_skipped = (M s_c) / 5 with M = interpolation_weights."""
+    data, grid, geom, solver, reg = tiny
+    angles = data["angles"]
+    view_of = {float(a): v for v, a in enumerate(angles)}
+    Rd, Cd = data["Y"].shape[1:]
+    sig = {v: 2.0 + math.cos(float(a)) for v, a in enumerate(angles)}
+    primary_calls = []
+
+    def fake_step(solver_, state, rho, grid_, angle, fields=None):
+        v = view_of[float(angle)]
+        new = CitrusState(angle=float(angle), Phi_gt1=None, num_steps=state.num_steps + 1,
+                          history=state.history + [1.0])
+        return (torch.full((Rd, Cd), sig[v], device=DEV), torch.full((Rd, Cd), 3.0, device=DEV), new)
+
+    class FakeStore(StateStore):
+        def put(self, i, Phi):
+            pass
+
+    def fake_primary(fields, angle):
+        primary_calls.append(view_of[float(angle)])
+        return {"signal": torch.full((Rd, Cd), 5.0, device=DEV)}
+
+    monkeypatch.setattr(citrus_mod, "citrus_step", fake_step)
+    monkeypatch.setattr(citrus_mod, "StateStore", FakeStore)
+    monkeypatch.setattr(solver, "primary", fake_primary)
+    for order in (1, 3):
+        primary_calls.clear()
+        cfg = CitrusConfig(num_outer=1, scatter_view_stride=4, scatter_view_interp_order=order)
+        _, info = citrus_recon(data["Y"], 1.0e5, angles, grid, geom, solver, cfg, regularization=reg)
+        computed = np.arange(0, 16, 4)
+        skipped = np.setdiff1d(np.arange(16), computed)
+        assert sorted(primary_calls) == list(skipped)  # the solver primary only on the skipped views
+        M = citrus_mod.interpolation_weights(angles, computed, order)
+        expect = M @ np.array([sig[int(v)] for v in computed])
+        spr = info["spr"][:, Rd // 2, Cd // 2].cpu().numpy()
+        np.testing.assert_allclose(spr[computed], expect[computed] / 3.0, rtol=1e-6)
+        np.testing.assert_allclose(spr[skipped], expect[skipped] / 5.0, rtol=1e-6)

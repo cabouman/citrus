@@ -32,6 +32,16 @@ higher orders. With fixed densities the recursion *is* source iteration and conv
 estimate, so the scatter and the reconstruction converge together for the cost of one sweep per view per MBIR
 iteration.
 
+**Sparse-view scatter.** `CitrusConfig(scatter_view_stride=n)` runs the scatter step on every n-th view only (views
+0, n, 2n, ...; only those keep an accumulator). For the other views the scatter *signal* is interpolated in angle, per
+detector pixel, from the computed views (`scatter_view_interp_order`: 3 = Catmull-Rom on the 4 nearest computed views,
+circular in angle, the default; 0 nearest, 1 linear, 2 quadratic), their primary comes from the solver's cheap primary
+projection, and the correction ratio is formed on every view (the ratio itself carries the moving shadow edges and is
+not interpolated). On the 180-view WLAB study (20 outer iterations), stride 2 costs +0.0014 relative RMSE for 51 % of
+the scatter time and stride 4 +0.008 for 26 %; cubic interpolation matches or beats linear at no extra cost. The
+penalty is mostly slower convergence of the coupled loop on the skipped views, not the interpolation error, so the
+saved time is best spent on more outer iterations. The default is stride 1 (every view).
+
 ## The scatter solver
 
 `citrus.scatter_solver` is a deterministic LBTE solver for kV photons: multigroup in energy (Compton and Rayleigh
@@ -82,6 +92,7 @@ step).
 python demo/demo_scatter_solver.py   # the scatter solver on one view of the WLAB phantom (seconds)
 python demo/demo_citrus.py           # CITRUS vs uncorrected MBIR: 36 views, 1 cm grid, 10 outer iterations (~2 min)
 python demo/demo_citrus.py --full    # 180 views, 0.5 cm grid, 20 outer iterations
+python demo/demo_citrus.py --scatter-view-stride 2   # scatter step on every 2nd view, the others interpolated
 ```
 
 Figures are written to `demo/output/`. In Python:
@@ -106,7 +117,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.0.1},
+  note = {Version 0.0.2},
   year = 2026
 }
 ```

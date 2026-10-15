@@ -28,6 +28,17 @@ densities, so the correction is the multiplicative Y_c = Y p / (p + s) = Y / (1 
 of any mismatch between the solver's polychromatic primary and MBIR's monoenergetic model, and it rescales the noise
 of Y (W = Y / I0 is the exact weight of y_c).
 
+Sparse-view scatter (CitrusConfig.scatter_view_stride n > 1): the scatter step runs only on the views 0, n, 2n, ...
+(uniform over the angular range, starting at view 0); only those views keep an accumulator. The scatter SIGNAL of every
+other view is interpolated in angle, per detector pixel, from the computed views' scatter signals (Catmull-Rom over
+the 4 nearest computed views, circular in angle, by default; orders 0-2 and None also exist;
+`interpolate_scatter`), its primary signal comes from the
+solver's primary projection (cheap: no transport), and the correction ratio s / p is formed on every view. The scatter
+signal is interpolated, not the ratio: the scatter is smooth on the panel and in angle, the ratio carries the object's
+shadow edges, which move across the panel with the angle. Measured on WLAB (180 views, 0.5 cm grid, 20 outer
+iterations): stride 2 costs +0.0014 relative RMSE for 51 % of the scatter time, stride 4 +0.008 for 26 %; the penalty
+is mostly the slower convergence of the coupled loop on the skipped views, not the interpolation error.
+
 Per-view state: one accumulator [G, (L+1)^2, 4, Rc, Cc, Sc] per view, stored compactly (`StateStore`): only the LD
 cell mean (the aged accumulator re-enters the next sweep with zero slopes) in float16 with a per-(group, moment)
 scale, 1/8 of float32 (17.6 MiB per view on a 0.5 cm WLAB grid with 1 cm transport cells). The reconstruction differs
@@ -38,6 +49,7 @@ Public API
     citrus_recon(...)     the CITRUS reconstruction (returns the reconstruction and a dict of diagnostics)
     mbir_recon(...)       the same MBIR loop without the solver: no correction, or a fixed SPR correction
     citrus_step(...)      one scatter step of one view over an explicit CitrusState
+    scatter_view_indices, angular_neighbors, interpolation_weights, interpolate_scatter   sparse-view scatter
     G1, G1to2, G_gt2, G_step, project_scatter   the per-view operators of the step
     DensityModel, StateStore, CitrusConfig, estimate_regularization, apply_regularization
 """
@@ -46,7 +58,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass, field, replace
-from typing import Callable, Optional, Sequence, Union
+from typing import Callable, Literal, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -70,6 +82,11 @@ __all__ = [
     "DensityModel",
     "StateStore",
     "CitrusConfig",
+    "SCATTER_VIEW_INTERP_ORDERS",
+    "scatter_view_indices",
+    "angular_neighbors",
+    "interpolation_weights",
+    "interpolate_scatter",
     "estimate_regularization",
     "apply_regularization",
     "citrus_recon",
@@ -344,6 +361,23 @@ class CitrusConfig:
                      (pinned) host memory (`StateStore`)
     pin_limit_gib  : largest pinned host allocation for the accumulators
     verbose        : print one line per outer iteration
+    scatter_view_stride : n >= 1. 1 (default): the scatter step runs on every view. n > 1: only on every n-th view
+                     (views 0, n, 2n, ...: uniform over the angular range, starting at view 0; `scatter_view_indices`);
+                     the other views' scatter signal is interpolated in angle (scatter_view_interp_order) and
+                     divided by their solver primary. Only the computed views keep an accumulator (1/n of the state
+                     memory).
+    scatter_view_interp_order : the per-pixel interpolation in angle of the skipped views' scatter signal from the
+                     computed views, circular in angle (ignored at stride 1; `angular_neighbors`):
+                       3 (default)  cubic Catmull-Rom on the 4 nearest computed views: interpolating, continuous first
+                                    derivative, exact for polynomials of angle up to degree 2 on uniformly spaced
+                                    computed views (no local 4-point C1 scheme is exact for cubics)
+                       2            quadratic: 3-point Lagrange centered on the nearest computed view (exact for
+                                    quadratics of angle on any spacing; jumps where the nearest view changes)
+                       1            linear between the 2 bracketing computed views
+                       0            nearest computed view (zero-order hold)
+                       None         diagnostics only: no interpolation; the skipped views keep their most recent
+                                    computed scatter if any, else zero, i.e. with the fixed view subset they are NOT
+                                    scatter-corrected
     """
 
     num_outer: int = 10
@@ -353,12 +387,163 @@ class CitrusConfig:
     gpu_state_budget_mib: float = 2600.0
     pin_limit_gib: float = 8.0
     verbose: bool = False
+    scatter_view_stride: int = 1
+    scatter_view_interp_order: Literal[0, 1, 2, 3] | None = 3
 
     def validate(self) -> None:
         if self.num_outer < 1:
             raise ValueError("num_outer must be >= 1")
         if self.min_counts <= 0:
             raise ValueError("min_counts must be > 0")
+        stride = self.scatter_view_stride
+        if isinstance(stride, bool) or not isinstance(stride, (int, np.integer)) or stride < 1:
+            raise ValueError(f"scatter_view_stride must be an integer >= 1, got {stride!r}")
+        _check_interp_order(self.scatter_view_interp_order)
+
+
+# =====================================================================================================
+# sparse-view scatter: angular interpolation of the skipped views
+# =====================================================================================================
+
+SCATTER_VIEW_INTERP_ORDERS = (None, 0, 1, 2, 3)
+_TWO_PI = 2.0 * np.pi
+
+
+def _check_interp_order(order, allow_none: bool = True) -> None:
+    ok = (order is None and allow_none) or (
+        not isinstance(order, bool) and isinstance(order, (int, np.integer)) and int(order) in (0, 1, 2, 3))
+    if not ok:
+        allowed = SCATTER_VIEW_INTERP_ORDERS if allow_none else SCATTER_VIEW_INTERP_ORDERS[1:]
+        raise ValueError(f"scatter_view_interp_order must be one of {allowed}, got {order!r}")
+
+
+def scatter_view_indices(num_views: int, stride: int) -> np.ndarray:
+    """The views that get a scatter step at `stride`: 0, stride, 2 stride, ... < num_views (uniform over the angular
+    range of a uniformly sampled scan, starting at view 0). Stride 1 gives every view."""
+    if int(stride) < 1 or int(num_views) < 1:
+        raise ValueError(f"need num_views >= 1 and stride >= 1, got {num_views}, {stride}")
+    return np.arange(0, int(num_views), int(stride))
+
+
+def angular_neighbors(computed_angles: Union[Sequence[float], np.ndarray], angle: float,
+                      order: Literal[0, 1, 2, 3] = 3) -> list[tuple[int, float]]:
+    """Interpolation neighbors and weights of a view at `angle` (rad) from views at `computed_angles` (rad, any order,
+    any 2 pi offset), circular in angle (period 2 pi). Returns [(index into computed_angles, weight), ...], weights
+    summing to 1. With j0, j1 the computed views bracketing the angle (wrapping from the last computed angle to the
+    first + 2 pi) and t in [0, 1) its fractional position between them:
+
+      0 : nearest computed view (zero-order hold; t = 1/2 goes to j0)
+      1 : linear, weights 1 - t, t on j0, j1
+      2 : quadratic, 3-point Lagrange on the nearest computed view and its two neighbors, at their actual angles:
+          exact for quadratics of angle on any spacing; discontinuous where the nearest view changes
+      3 : cubic Catmull-Rom on j0 - 1, j0, j1, j1 + 1 with parameter t: interpolating, continuous first derivative
+          (tangent (f[j1] - f[j0 - 1]) / 2 per interval at j0), exact for polynomials of angle up to degree 2 on
+          uniformly spaced computed views and for linear ones on any spacing; NOT exact for cubics (no local 4-point
+          C1 interpolant is); its outer weights are negative
+
+    With fewer computed views than the order needs (order + 1), the order is lowered to (number of computed views) - 1;
+    one computed view gets weight 1."""
+    _check_interp_order(order, allow_none=False)
+    order = int(order)
+    ca = np.mod(np.asarray(computed_angles, dtype=np.float64).reshape(-1), _TWO_PI)
+    Vc = ca.size
+    if Vc == 0:
+        raise ValueError("need at least one computed view")
+    if Vc == 1:
+        return [(0, 1.0)]
+    order = min(order, Vc - 1)
+    perm = np.argsort(ca, kind="stable")
+    cs = ca[perm]
+
+    def at(i: int) -> float:  # unwrapped angle of the i-th sorted computed view (i may leave [0, Vc))
+        return float(cs[i % Vc]) + _TWO_PI * (i // Vc)
+
+    a = float(np.mod(float(angle), _TWO_PI))
+    j0 = int(np.searchsorted(cs, a, side="right")) - 1  # previous computed view; -1: before the first (wraps)
+    j1 = j0 + 1
+    a0, a1 = at(j0), at(j1)
+    t = (a - a0) / (a1 - a0) if a1 - a0 > 1e-15 else 0.0
+    if order == 0:
+        pairs = [(j0 if t <= 0.5 else j1, 1.0)]
+    elif order == 1:
+        pairs = [(j0, 1.0 - t), (j1, t)]
+    elif order == 2:
+        m = j0 if t <= 0.5 else j1
+        nodes = (m - 1, m, m + 1)
+        x = [at(i) for i in nodes]
+        pairs = []
+        for i, xi in zip(nodes, x):
+            w = 1.0
+            for xk in x:
+                if xk != xi:
+                    w *= (a - xk) / (xi - xk)
+            pairs.append((i, w))
+    else:
+        t2, t3 = t * t, t * t * t
+        pairs = [(j0 - 1, 0.5 * (-t3 + 2.0 * t2 - t)), (j0, 0.5 * (3.0 * t3 - 5.0 * t2 + 2.0)),
+                 (j1, 0.5 * (-3.0 * t3 + 4.0 * t2 + t)), (j1 + 1, 0.5 * (t3 - t2))]
+    merged: dict[int, float] = {}
+    for i, w in pairs:
+        k = int(perm[i % Vc])
+        merged[k] = merged.get(k, 0.0) + float(w)
+    return list(merged.items())
+
+
+def interpolation_weights(angles: Union[Sequence[float], np.ndarray], computed: Union[Sequence[int], np.ndarray],
+                          order: Literal[0, 1, 2, 3] | None = 3) -> np.ndarray:
+    """The [V, Vc] matrix M with s_all = M s_c: row v holds the `angular_neighbors` weights of view v over the
+    computed views (indices `computed` into angles); the computed views' own rows are one-hot (they keep their value);
+    order None gives zero rows for the skipped views."""
+    ang = np.asarray(angles, dtype=np.float64).reshape(-1)
+    comp = np.asarray(computed, dtype=np.int64).reshape(-1)
+    if comp.size == 0 or comp.min() < 0 or comp.max() >= ang.size or np.unique(comp).size != comp.size:
+        raise ValueError("computed must be distinct view indices into angles")
+    _check_interp_order(order)
+    M = np.zeros((ang.size, comp.size), dtype=np.float64)
+    M[comp, np.arange(comp.size)] = 1.0
+    if order is not None:
+        is_computed = np.zeros(ang.size, dtype=bool)
+        is_computed[comp] = True
+        ca = ang[comp]
+        for v in np.flatnonzero(~is_computed):
+            for j, w in angular_neighbors(ca, float(ang[v]), order):
+                M[v, j] += w
+    return M
+
+
+def interpolate_scatter(s_c: Tensor, angles: Union[Sequence[float], np.ndarray],
+                        computed: Union[Sequence[int], np.ndarray],
+                        order: Literal[0, 1, 2, 3] | None = 3,
+                        previous: Optional[Tensor] = None, weights: Optional[Tensor] = None) -> Tensor:
+    """Every view's scatter [V, ...] from the computed views' scatter s_c [Vc, ...] (any per-view image, any units):
+    the computed views keep s_c exactly; a skipped view v gets sum_j w_vj s_c[j] (`angular_neighbors`, per pixel),
+    clamped at 0 (the order 2 and 3 weights can be negative). order None: no interpolation, the skipped views keep their
+    value in `previous` [V, ...] (their most recent estimate) if given, else zero. weights: a precomputed
+    `interpolation_weights(angles, computed, order)` as a tensor (saves rebuilding it every outer iteration)."""
+    ang = np.asarray(angles, dtype=np.float64).reshape(-1)
+    comp = np.asarray(computed, dtype=np.int64).reshape(-1)
+    V, Vc = ang.size, comp.size
+    if s_c.shape[0] != Vc:
+        raise ValueError(f"s_c must have one image per computed view ({Vc}), got {tuple(s_c.shape)}")
+    comp_t = torch.as_tensor(comp, device=s_c.device)
+    _check_interp_order(order)
+    if order is None:
+        if previous is not None:
+            if previous.shape[0] != V or previous.shape[1:] != s_c.shape[1:]:
+                raise ValueError(f"previous must be [{V}, *{tuple(s_c.shape[1:])}], got {tuple(previous.shape)}")
+            out = previous.to(s_c.device, s_c.dtype).clone()
+        else:
+            out = torch.zeros((V,) + tuple(s_c.shape[1:]), device=s_c.device, dtype=s_c.dtype)
+        out[comp_t] = s_c
+        return out
+    if weights is None:
+        weights = torch.as_tensor(interpolation_weights(ang, comp, order), device=s_c.device, dtype=s_c.dtype)
+    if tuple(weights.shape) != (V, Vc):
+        raise ValueError(f"weights must be [{V}, {Vc}], got {tuple(weights.shape)}")
+    out = (weights.to(s_c.device, s_c.dtype) @ s_c.reshape(Vc, -1)).reshape((V,) + tuple(s_c.shape[1:]))
+    out.clamp_min_(0.0)
+    out[comp_t] = s_c  # exact (and unclamped) on the computed views
+    return out
 
 
 def estimate_regularization(model, sinogram: Tensor, weights: Optional[Tensor] = None) -> dict:
@@ -483,42 +668,75 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
     Returns (recon [R, C, S] float32 on the solver device, info) with info:
       records          per outer iteration (records[0] = the initial volume): k, t_scatter, t_transfer, t_mbir,
                        t_total, negative_fraction (voxels clamped by the density model), acc_change_mean / max
-                       (relative accumulator change over the views), scatter_change_rel (mean |S_k - S_k-1| /
+                       (relative accumulator change over the computed views), scatter_change_rel (mean |S_k - S_k-1| /
                        mean |S_k| of the scatter-count estimate), gpu_peak_mib
       spr              [V, Rd, Cd] the last scatter-to-primary ratio estimate
       scatter_counts   [V, Rd, Cd] the last scatter-count estimate Y - Y_c
-      regularization   the frozen sigmas;  state: the accumulator storage;  init_recon, model, seconds, fdk_seconds
+      regularization   the frozen sigmas;  state: the accumulator storage (one slot per computed view);  init_recon,
+                       model, seconds, fdk_seconds
+      computed_views   [Vc] int array: the views with a scatter step (`scatter_view_indices`; every view at stride 1)
+      view_interpolated [V] bool array: True where the scatter is interpolated in angle (the skipped views at
+                       config.scatter_view_stride > 1 with an interpolation order), False where the scatter step
+                       computed it (and for the uncorrected skipped views of order None)
+    With config.scatter_view_stride > 1 the records also hold t_skipped (seconds per outer iteration spent on the
+    angular interpolation and the skipped views' primaries, included in t_scatter).
     """
     config = CitrusConfig() if config is None else config
+    config.validate()
     device = solver.device
     Y, ang = _counts_and_angles(sinogram_counts, angles, device)
+    V = len(ang)
     density = DensityModel.from_library(solver.lib, config.energy_kev)
     coarse = grid.coarsen(int(solver.config.supervoxel_factor))
     full_shape = (solver.num_groups, (solver.L + 1) ** 2, 4) + tuple(coarse.shape)
-    store = StateStore(len(ang), full_shape, device, gpu_budget_mib=config.gpu_state_budget_mib,
+    computed = scatter_view_indices(V, config.scatter_view_stride)
+    sparse = len(computed) < V
+    order = config.scatter_view_interp_order if sparse else None
+    skipped = np.setdiff1d(np.arange(V), computed)
+    weights = None
+    view_interpolated = np.zeros(V, dtype=bool)
+    if sparse and order is not None:
+        weights = torch.as_tensor(interpolation_weights(ang, computed, order), device=device, dtype=torch.float32)
+        view_interpolated[skipped] = True
+    store = StateStore(len(computed), full_shape, device, gpu_budget_mib=config.gpu_state_budget_mib,
                        pin_limit_gib=config.pin_limit_gib)
-    shells = [CitrusState() for _ in range(len(ang))]
+    shells = [CitrusState() for _ in computed]  # one per computed view (the age-ordered recursion)
     Rd, Cd = int(Y.shape[1]), int(Y.shape[2])
     tiny = torch.finfo(torch.float32).tiny
+    s_last: list[Optional[Tensor]] = [None]  # every view's last scatter estimate (order None keeps it on skipped views)
 
     def scatter_stage(k: int, X: Tensor, rec: dict) -> Tensor:
         transfer0 = store.transfer_seconds
         rho = density(X)
         rec["negative_fraction"] = density.last_negative_fraction
         fields = solver.material_fields(rho, grid)  # shared by every view of this outer iteration
-        s = torch.empty((len(ang), Rd, Cd), device=device, dtype=torch.float32)
-        p = torch.empty_like(s)
+        s_c = torch.empty((len(computed), Rd, Cd), device=device, dtype=torch.float32)
+        p = torch.empty((V, Rd, Cd), device=device, dtype=torch.float32)
         hist = []
-        for v, a in enumerate(ang):
-            st = replace(shells[v], Phi_gt1=store.get(v))
-            s[v], p[v], new = citrus_step(solver, st, rho, grid, float(a), fields=fields)
-            store.put(v, new.Phi_gt1)
-            shells[v] = replace(new, Phi_gt1=None)
+        for j, v in enumerate(computed):
+            st = replace(shells[j], Phi_gt1=store.get(j))
+            s_c[j], p[v], new = citrus_step(solver, st, rho, grid, float(ang[v]), fields=fields)
+            store.put(j, new.Phi_gt1)
+            shells[j] = replace(new, Phi_gt1=None)
             hist.append(new.history[-1])
             del st, new
         rec["acc_change_mean"] = float(np.mean(hist))
         rec["acc_change_max"] = float(np.max(hist))
         rec["t_transfer"] = store.transfer_seconds - transfer0
+        if not sparse:
+            s = s_c
+        else:
+            _sync(device)
+            t0 = time.perf_counter()
+            # the scatter SIGNAL is interpolated in angle; the primary of every view comes from the solver (cheap)
+            s = interpolate_scatter(s_c, ang, computed, order, previous=s_last[0], weights=weights)
+            for v in skipped:
+                p[int(v)] = solver.primary(fields, float(ang[v]))["signal"]
+            _sync(device)
+            rec["t_skipped"] = time.perf_counter() - t0
+        if sparse and order is None:
+            s_last[0] = s
+        del fields, rho
         return s / p.clamp_min(tiny)
 
     try:
@@ -526,6 +744,8 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
                               regularization=regularization, init_recon=init_recon, model=model, callback=callback,
                               label="citrus")
         info["state"] = store.describe()
+        info["computed_views"] = computed.copy()
+        info["view_interpolated"] = view_interpolated
     finally:
         store.close()
     return X, info
