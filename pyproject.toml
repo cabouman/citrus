@@ -18,7 +18,7 @@ dependencies = [
     "scipy",
     "torch",
     "matplotlib",
-    "mbirtorch",
+    "mbirtorch>=0.0.2,<0.2",  # verified on 0.0.2 and 0.1.2 (recon first_iteration / init_recon semantics)
 ]
 
 [project.optional-dependencies]

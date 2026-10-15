@@ -2,4 +2,4 @@ numpy
 scipy
 torch
 matplotlib
-mbirtorch
+mbirtorch>=0.0.2,<0.2
