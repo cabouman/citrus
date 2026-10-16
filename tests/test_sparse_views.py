@@ -221,3 +221,10 @@ def test_config_defaults_and_validation():
             CitrusConfig(scatter_view_stride=2, scatter_view_interp_order=order).validate()
         with pytest.raises(ValueError, match="scatter_view_interp_order"):  # validated at stride 1 too
             CitrusConfig(scatter_view_interp_order=order).validate()
+    # scatter step every n outer iterations
+    assert cfg.scatter_every == 1
+    for every in (1, 2, 7, np.int64(4)):
+        CitrusConfig(scatter_every=every).validate()
+    for every in (0, -1, 1.5, 2.0, True, "2", None):
+        with pytest.raises(ValueError, match="scatter_every"):
+            CitrusConfig(scatter_every=every).validate()

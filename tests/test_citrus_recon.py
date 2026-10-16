@@ -166,6 +166,34 @@ def test_citrus_with_true_scatter_is_fixed_spr_mbir(tiny, monkeypatch):
     assert rel < 1e-4, rel  # MBIRTORCH's float32 atomics
 
 
+# ---- scatter step every n outer iterations ------------------------------------------------------------------
+
+@cuda
+def test_scatter_every_reuses_the_correction(tiny):
+    """scatter_every=2 over 4 outer iterations: the scatter stage runs at k = 0 and 2 only (records 1 and 3), the
+    other records reuse the ratio (no accumulator entries, t_scatter ~ 0), the accumulators advance twice, and the
+    result is finite and corrected on every view. The scatter_every=2 run with 4 iterations must lie between the
+    2-iteration and the 4-iteration every-iteration runs in final error (it has the scatter steps of the former and
+    the MBIR iterations of the latter)."""
+    data, grid, geom, solver, reg = tiny
+    cfg = CitrusConfig(num_outer=4, scatter_every=2)
+    X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geom, solver, cfg, regularization=reg)
+    assert bool(torch.isfinite(X).all())
+    recs = info["records"][1:]
+    assert [r["scatter_refreshed"] for r in recs] == [True, False, True, False]
+    assert all("acc_change_mean" in r for r in recs[::2]) and not any("acc_change_mean" in r for r in recs[1::2])
+    assert all(r["t_scatter"] < 0.5 * min(x["t_scatter"] for x in recs[::2]) for r in recs[1::2])
+    assert float(info["spr"].min()) > 0
+    assert info["config"]["scatter_every"] == 2
+    e_every2 = _rmse(X, data)
+    X2, _ = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geom, solver, CitrusConfig(num_outer=2),
+                         regularization=reg)
+    X4, _ = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geom, solver, CitrusConfig(num_outer=4),
+                         regularization=reg)
+    e2, e4 = _rmse(X2, data), _rmse(X4, data)
+    assert e4 < e_every2 < e2 + 1e-3, (e4, e_every2, e2)
+
+
 # ---- sparse-view scatter (scatter step on every n-th view, angular interpolation of the others) --------------
 
 @cuda

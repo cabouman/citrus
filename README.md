@@ -42,6 +42,15 @@ not interpolated). On the 180-view WLAB study (20 outer iterations, release defa
 9 s per outer iteration (stride 8 computes scatter on 23 of the 180 views); cubic interpolation matches or beats
 linear at no extra cost. The default is stride 1 (every view).
 
+**Scatter step every n outer iterations.** `CitrusConfig(scatter_every=n)` runs the scatter stage at the outer
+iterations 0, n, 2n, ... only and reuses the previous scatter-to-primary ratio in between, so n MBIR iterations run
+per scatter step (the accumulators keep their age). An MBIR iteration costs about 1 % of a scatter stage, so for a
+given number of scatter steps the extra MBIR iterations are nearly free, and they help: on the 180-view WLAB study
+the same 20 scatter steps give a relative RMSE of 0.0429 at 20 outer iterations (n = 1), 0.0310 at 40 (n = 2) and
+0.0286 at 80 (n = 4) in the same wall time, while at 40 iterations n = 2 is within 0.0008 of n = 1 (0.0302) at half
+the scatter cost. At a fixed number of outer iterations, skipping scatter stages costs accuracy (20 iterations:
+0.0513 at n = 2, 0.0700 at n = 4). The default is 1.
+
 ## The scatter solver
 
 `citrus.scatter_solver` is a deterministic LBTE solver for kV photons: multigroup in energy (Compton and Rayleigh
@@ -117,7 +126,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.0.2},
+  note = {Version 0.0.3},
   year = 2026
 }
 ```

@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.0.3 — 2026-10-16
+
+Scatter step every n outer iterations.
+
+- `CitrusConfig.scatter_every` (default 1): the scatter stage runs at the outer iterations 0, n, 2n, ... only and
+  the previous scatter-to-primary ratio is reused in between, so n MBIR iterations run per scatter step (the
+  accumulators keep their age). Validated in `CitrusConfig.validate`; every record of `citrus_recon` now carries
+  `scatter_refreshed`.
+- Demo flag `--scatter-every` (`demo/demo_citrus.py`); the summary reports `scatter_steps`.
+- Measured on the 180-view WLAB study: the same 20 scatter steps give a relative RMSE of 0.0429 at 20 outer
+  iterations (n = 1), 0.0310 at 40 (n = 2) and 0.0286 at 80 (n = 4) in the same wall time; at 40 iterations n = 2 is
+  within 0.0008 of n = 1 (0.0302) at half the scatter cost. At a fixed 20 outer iterations skipping stages costs
+  accuracy (0.0513 at n = 2, 0.0700 at n = 4). At equal scatter cost CITRUS at every iteration (0.0429) beats a
+  converged scatter solve at every 2nd iteration (0.0501).
+- Tests: configuration checks in `tests/test_sparse_views.py`, a CUDA run with `scatter_every=2` in
+  `tests/test_citrus_recon.py`.
+
 ## v0.0.2 — 2026-10-15
 
 Sparse-view scatter with angular interpolation.

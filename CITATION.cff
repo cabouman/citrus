@@ -7,8 +7,8 @@ authors:
     given-names: Jordan
   - family-names: Bouman
     given-names: Charles A.
-version: 0.0.2
-date-released: 2026-10-15
+version: 0.0.3
+date-released: 2026-10-16
 url: "https://citrus.readthedocs.io"
 repository-code: "https://github.com/cabouman/citrus"
 license: BSD-3-Clause

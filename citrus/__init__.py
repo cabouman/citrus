@@ -6,7 +6,7 @@
     citrus.utilities        WLAB phantom and geometry, attenuation <-> density model, plotting helpers
 """
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 from .citrus import (CitrusConfig, CitrusState, citrus_recon, citrus_step, mbir_recon)  # noqa: E402
 

@@ -92,6 +92,22 @@ is ignored at ``scatter_view_stride=1``. Measured on the 180-view WLAB study aft
 ``scatter_view_indices``, ``angular_neighbors``, ``interpolation_weights`` and ``interpolate_scatter`` of
 ``citrus.citrus`` expose the view subset and the interpolation.
 
+Scatter step every n outer iterations: ``scatter_every=n`` runs the scatter stage at the outer iterations 0, n, 2n,
+... only and reuses the previous scatter-to-primary ratio in between (:doc:`method`, "Scatter step every n outer
+iterations"):
+
+.. code-block:: python
+
+   cfg = CitrusConfig(num_outer=40, scatter_every=2)   # 20 scatter steps, 40 MBIR iterations
+   recon, info = citrus_recon(Y, I0, angles, grid, geom, solver, cfg)
+   [r["scatter_refreshed"] for r in info["records"][1:]]   # True at the iterations with a scatter stage
+
+For a given number of scatter steps the extra MBIR iterations are nearly free (one costs about 1 % of a scatter
+stage) and improve the result: on the 180-view WLAB study 20 scatter steps give a relative RMSE of 0.0429 at 20
+outer iterations, 0.0310 at 40 (``scatter_every=2``) and 0.0286 at 80 (``scatter_every=4``) in the same wall time.
+At a fixed number of outer iterations, skipping scatter stages costs accuracy (20 iterations: 0.0513 at n = 2,
+0.0700 at n = 4), so choose ``num_outer`` as n times the number of scatter steps you can afford.
+
 The per-view step is available on its own:
 
 .. code-block:: python

@@ -265,3 +265,23 @@ iterations) stride 2 costs +0.0014 relative RMSE (0.0443 vs 0.0429) for 51 % of 
 vs 1.12 / 2.11 % at strides 2 / 4) at no extra cost. Interpolating the TRUE scatter costs only about +0.0025 at stride
 4, so the in-loop penalty is mostly the slower convergence of the coupled loop on the skipped views, not the
 interpolation error.
+
+Scatter step every n outer iterations
+-------------------------------------
+
+With ``scatter_every`` :math:`n > 1` the scatter stage runs at the outer iterations :math:`k = 0, n, 2n, \dots` only;
+at the other outer iterations the previous ratio :math:`\mathrm{SPR}` is reused and only the MBIR iteration runs, so
+:math:`n` MBIR iterations run per scatter step and the accumulators :math:`\Phi_v` keep their age across the skipped
+iterations (the recursion is unchanged, it is simply advanced less often). An MBIR iteration costs about 1 % of a
+scatter stage on the WLAB study (0.75 s against 56 s for 180 views), so for a given number of scatter steps the
+additional MBIR iterations are nearly free.
+
+Measured on the 180-view WLAB study (0.5 cm grid, release defaults, relative RMSE over the prism): at a fixed 20
+outer iterations the scatter step at every 2nd / 4th iteration (10 / 5 steps) raises the final error from 0.0429 to
+0.0513 / 0.0700, because between refreshes the MBIR iterations converge towards the solution of a stale correction.
+The same 20 scatter steps spread over 40 (:math:`n = 2`) / 80 (:math:`n = 4`) outer iterations lower it to 0.0310 /
+0.0286 in the same wall time, and at 40 iterations :math:`n = 2` is within 0.0008 of a scatter step at every
+iteration (0.0302) at half the scatter cost. The scatter budget sets the cost; choose ``num_outer`` as :math:`n`
+times the number of scatter steps you can afford. At equal scatter cost, one CITRUS sweep per iteration (0.0429)
+beats a converged scatter solve at every 2nd iteration (0.0501): a fresh partial update is worth more than a
+converged but stale one.

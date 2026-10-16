@@ -39,6 +39,16 @@ shadow edges, which move across the panel with the angle. Measured on WLAB (180 
 iterations): stride 2 costs +0.0014 relative RMSE for 51 % of the scatter time, stride 4 +0.008 for 26 %; the penalty
 is mostly the slower convergence of the coupled loop on the skipped views, not the interpolation error.
 
+Scatter step every n outer iterations (CitrusConfig.scatter_every n > 1): the scatter stage runs at the outer
+iterations 0, n, 2n, ... only; in between, the previous scatter-to-primary ratio is reused and only the MBIR iteration
+runs, so n MBIR iterations run per scatter step and the accumulators keep their age across the skipped iterations. An
+MBIR iteration is cheap next to a scatter stage (0.75 s against 56 s on the 180-view WLAB study), so for a given
+number of scatter steps more MBIR iterations are nearly free. Measured on WLAB (180 views, 0.5 cm grid): at a fixed 20
+outer iterations the scatter step at every 2nd / 4th iteration raises the final relative RMSE from 0.0429 to 0.0513 /
+0.0700 (the MBIR iterations converge towards a stale correction between refreshes); the same 20 scatter steps spread
+over 40 (n = 2) / 80 (n = 4) outer iterations lower it to 0.0310 / 0.0286 in the same wall time, and at 40 iterations
+n = 2 is within 0.0008 of a scatter step at every iteration (0.0302) at half the scatter cost. The default is 1.
+
 Per-view state: one accumulator [G, (L+1)^2, 4, Rc, Cc, Sc] per view, stored compactly (`StateStore`): only the LD
 cell mean (the aged accumulator re-enters the next sweep with zero slopes) in float16 with a per-(group, moment)
 scale, 1/8 of float32 (17.6 MiB per view on a 0.5 cm WLAB grid with 1 cm transport cells). The reconstruction differs
@@ -378,6 +388,11 @@ class CitrusConfig:
                        None         diagnostics only: no interpolation; the skipped views keep their most recent
                                     computed scatter if any, else zero, i.e. with the fixed view subset they are NOT
                                     scatter-corrected
+    scatter_every  : n >= 1. 1 (default): a scatter step at every outer iteration. n > 1: the scatter stage runs at
+                     the outer iterations 0, n, 2n, ... only and the previous scatter-to-primary ratio is reused in
+                     between (n MBIR iterations per scatter step; the accumulators keep their age). For a fixed number
+                     of scatter steps, spreading them over n times more outer iterations costs almost nothing (an MBIR
+                     iteration is ~1 % of a scatter stage) and improves the reconstruction (module docstring).
     """
 
     num_outer: int = 10
@@ -389,6 +404,7 @@ class CitrusConfig:
     verbose: bool = False
     scatter_view_stride: int = 1
     scatter_view_interp_order: Literal[0, 1, 2, 3] | None = 3
+    scatter_every: int = 1
 
     def validate(self) -> None:
         if self.num_outer < 1:
@@ -399,6 +415,9 @@ class CitrusConfig:
         if isinstance(stride, bool) or not isinstance(stride, (int, np.integer)) or stride < 1:
             raise ValueError(f"scatter_view_stride must be an integer >= 1, got {stride!r}")
         _check_interp_order(self.scatter_view_interp_order)
+        every = self.scatter_every
+        if isinstance(every, bool) or not isinstance(every, (int, np.integer)) or every < 1:
+            raise ValueError(f"scatter_every must be an integer >= 1, got {every!r}")
 
 
 # =====================================================================================================
@@ -607,7 +626,12 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
         _sync(device)
         t0 = time.perf_counter()
         if scatter_stage is not None:
-            spr = scatter_stage(k, X, rec)
+            # scatter stage at the outer iterations 0, n, 2n, ... (n = config.scatter_every); the previous
+            # scatter-to-primary ratio is reused in between
+            refresh = (k % int(config.scatter_every) == 0) or spr is None
+            rec["scatter_refreshed"] = refresh
+            if refresh:
+                spr = scatter_stage(k, X, rec)
         Yc = Y if spr is None else Y / (1.0 + spr)
         y_c = -torch.log(Yc.clamp_min(config.min_counts) / float(I0))
         if reg is None:  # estimated once on the first sinogram MBIR inverts, then frozen
@@ -679,7 +703,9 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
                        config.scatter_view_stride > 1 with an interpolation order), False where the scatter step
                        computed it (and for the uncorrected skipped views of order None)
     With config.scatter_view_stride > 1 the records also hold t_skipped (seconds per outer iteration spent on the
-    angular interpolation and the skipped views' primaries, included in t_scatter).
+    angular interpolation and the skipped views' primaries, included in t_scatter). Every record holds
+    scatter_refreshed: True at the outer iterations with a scatter stage (all of them at config.scatter_every = 1),
+    False where the previous ratio was reused (then t_scatter ~ 0 and the accumulator entries are absent).
     """
     config = CitrusConfig() if config is None else config
     config.validate()

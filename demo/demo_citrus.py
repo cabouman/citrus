@@ -98,6 +98,9 @@ def main() -> None:
     ap.add_argument("--scatter-view-interp-order", default="3", choices=["none", "0", "1", "2", "3"],
                     help="angular interpolation of the skipped views (with --scatter-view-stride > 1): 0 nearest, "
                          "1 linear, 2 quadratic, 3 cubic Catmull-Rom (default), none = not corrected (diagnostics)")
+    ap.add_argument("--scatter-every", type=int, default=1,
+                    help="scatter step at every n-th outer iteration only; the previous correction is reused in "
+                         "between (default 1: every iteration)")
     ap.add_argument("--memory-cap-mib", type=float, default=4400.0, help="PyTorch CUDA memory cap (0: none)")
     ap.add_argument("--input", default=os.path.join(HERE, "input"))
     ap.add_argument("--out", default=os.path.join(HERE, "output"))
@@ -107,6 +110,8 @@ def main() -> None:
     interp_order = None if args.scatter_view_interp_order == "none" else int(args.scatter_view_interp_order)
     if args.scatter_view_stride < 1:
         raise SystemExit("--scatter-view-stride must be >= 1")
+    if args.scatter_every < 1:
+        raise SystemExit("--scatter-every must be >= 1")
     if not torch.cuda.is_available():
         raise SystemExit("this demo needs a CUDA GPU (MBIRTORCH and the scatter solver run on the GPU)")
     dev = torch.device("cuda")
@@ -164,12 +169,16 @@ def main() -> None:
         return cb
 
     cfg = CitrusConfig(num_outer=args.outer, verbose=True, scatter_view_stride=args.scatter_view_stride,
-                       scatter_view_interp_order=interp_order)
+                       scatter_view_interp_order=interp_order, scatter_every=args.scatter_every)
     out_tag = tag
     if args.scatter_view_stride > 1:
         out_tag += f"_stride{args.scatter_view_stride}" + ("" if interp_order == 3 else f"_order{interp_order}")
         print(f"sparse-view scatter: scatter step on {len(range(0, len(angles), args.scatter_view_stride))} of "
               f"{len(angles)} views (stride {args.scatter_view_stride}), interpolation order {interp_order}")
+    if args.scatter_every > 1:
+        out_tag += f"_every{args.scatter_every}"
+        print(f"scatter step at every {args.scatter_every}-th outer iteration "
+              f"({len(range(0, args.outer, args.scatter_every))} scatter steps in {args.outer} outer iterations)")
 
     # ---- 2. CITRUS ------------------------------------------------------------------------------------------
     hist_c: list = []
@@ -191,6 +200,8 @@ def main() -> None:
         "views": len(angles), "delta_voxel_cm": args.delta_voxel, "grid": list(grid.shape), "outer": args.outer,
         "truth_sweep": [tp, ta], "truth_cone": [cp, ca],
         "scatter_view_stride": args.scatter_view_stride, "scatter_view_interp_order": interp_order,
+        "scatter_every": args.scatter_every,
+        "scatter_steps": int(sum(1 for r in rec if r.get("scatter_refreshed", True))),
         "computed_views": [int(v) for v in info_c["computed_views"]],
         "regularization": reg,
         "citrus": {"rmse_rel": hist_c[-1]["rmse_rel"], "rmse_rel_core": hist_c[-1]["rmse_rel_core"],
