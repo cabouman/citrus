@@ -25,7 +25,7 @@ from citrus.scatter_solver.uncollided import fc_source_at_directions
 from citrus.scatter_solver import scatter_image as _si
 from citrus.scatter_solver.scatter_image import (coarsen_mu_t, covering_polar_angle, panel_direction_set,
                                                  primary_image, scatter_fraction, supervoxel_subpoint_emission)
-from citrus.scatter_solver.cross_sections import mu_t_volume, synthetic_library
+from citrus.scatter_solver.cross_sections import material_pairs, mu_t_volume, synthetic_library
 
 # single rays per pixel (no finite-cone footprint) in every oracle comparison of this module
 combined_scatter_image = functools.partial(_si.combined_scatter_image, footprint=False)
@@ -168,7 +168,7 @@ def test_single_voxel_bookkeeping(device, angle):
 def test_wlab_first_order_and_mc_cuda():
     dev = torch.device("cuda")
     grid, geom, rho = wlab_setup(2.0, device=dev, dtype=torch.float32)
-    lib = synthetic_library(num_groups=3, legendre_order=2).to(dev, torch.float32)
+    lib = synthetic_library(num_groups=3, legendre_order=2, num_materials=7).to(dev, torch.float32)
     angle = 0.3
     src = SourceModel()
     phi_uc = uncollided_fluence(lib, rho, grid, geom, angle, src, PROJ)
@@ -465,7 +465,7 @@ def test_first_order_wlab_cuda():
     geom = wlab_setup(2.0, device=dev, dtype=torch.float32)[1]
     grid = Grid((10, 16, 20), 2.0)  # padded along x to be divisible by 2
     rho = wlab_phantom(grid, device=dev, dtype=torch.float32)
-    lib = synthetic_library(num_groups=3, legendre_order=2).to(dev, torch.float32)
+    lib = synthetic_library(num_groups=3, legendre_order=2, num_materials=7).to(dev, torch.float32)
     angle = 0.3
     phi_uc = uncollided_fluence(lib, rho, grid, geom, angle, SourceModel(), PROJ)
     q = panel_direction_set(geom, angle, (8, 16), max_polar_angle=grid, device=dev, dtype=torch.float32)
@@ -595,7 +595,7 @@ def test_direction_context_chunk_loop_no_sync():
     geom = wlab_setup(2.0, device=dev, dtype=torch.float32)[1]
     grid = Grid((10, 16, 20), 2.0)  # padded along x to be divisible by 2
     rho = wlab_phantom(grid, device=dev, dtype=torch.float32)
-    lib = synthetic_library(num_groups=3, legendre_order=2).to(dev, torch.float32)
+    lib = synthetic_library(num_groups=3, legendre_order=2, num_materials=7).to(dev, torch.float32)
     angle = 0.3
     phi_uc = uncollided_fluence(lib, rho, grid, geom, angle, SourceModel(), PROJ)
     q = panel_direction_set(geom, angle, (4, 8), max_polar_angle=grid, device=dev, dtype=torch.float32)
@@ -608,9 +608,11 @@ def test_direction_context_chunk_loop_no_sync():
     T = torch.rand(3, num_sh(L), *coarse.shape, device=dev) * 0.01
     S = torch.rand(1, 3, *coarse.shape, device=dev)
     ctx = make_direction_context(q, geom, angle, det, grd, lib, dev, torch.float32, chunk=8)
+    pairs = material_pairs(rho)  # built once per density field (ScatterSolver.material_fields): one host sync
 
     def images():
-        return (combined_scatter_image(lib, rho, phi_uc, grid, 2, T, L, geom, angle, q, mu_c, P, det, grd, ctx),
+        return (combined_scatter_image(lib, rho, phi_uc, grid, 2, T, L, geom, angle, q, mu_c, P, det, grd, ctx,
+                                       pairs=pairs),
                 scatter_image_from_source(lambda om: S.expand(om.shape[0], -1, -1, -1, -1), coarse, geom, angle, q,
                                           mu_c, P, det, grd, lib, context=ctx))
 
@@ -727,7 +729,7 @@ def test_combined_scatter_image_wlab_cuda():
     geom = wlab_setup(2.0, device=dev, dtype=torch.float32)[1]
     grid = Grid((10, 16, 20), 2.0)  # padded along x to be divisible by 2
     rho = wlab_phantom(grid, device=dev, dtype=torch.float32)
-    lib = synthetic_library(num_groups=3, legendre_order=2).to(dev, torch.float32)
+    lib = synthetic_library(num_groups=3, legendre_order=2, num_materials=7).to(dev, torch.float32)
     angle = 0.3
     phi_uc = uncollided_fluence(lib, rho, grid, geom, angle, SourceModel(), PROJ)
     q = panel_direction_set(geom, angle, (8, 16), max_polar_angle=grid, device=dev, dtype=torch.float32)
@@ -768,7 +770,7 @@ def test_combined_scatter_image_no_sync():
     geom = wlab_setup(2.0, device=dev, dtype=torch.float32)[1]
     grid = Grid((10, 16, 20), 2.0)  # padded along x to be divisible by 2
     rho = wlab_phantom(grid, device=dev, dtype=torch.float32)
-    lib = synthetic_library(num_groups=3, legendre_order=2).to(dev, torch.float32)
+    lib = synthetic_library(num_groups=3, legendre_order=2, num_materials=7).to(dev, torch.float32)
     angle = 0.3
     phi_uc = uncollided_fluence(lib, rho, grid, geom, angle, SourceModel(), PROJ)
     q = panel_direction_set(geom, angle, (4, 8), max_polar_angle=grid, device=dev, dtype=torch.float32)
@@ -779,12 +781,13 @@ def test_combined_scatter_image_no_sync():
     L = 2
     T = torch.rand(3, num_sh(L), *coarse.shape, device=dev) * 0.01
     ctx = make_direction_context(q, geom, angle, det, grd, lib, dev, torch.float32, chunk=8)
+    pairs = material_pairs(rho)  # built once per density field (ScatterSolver.material_fields): one host sync
 
     def images():
         out = []
         for fp in (False, True):
             out.append(_si.combined_scatter_image(lib, rho, phi_uc, grid, 2, T, L, geom, angle, q, mu_c, P, det, grd,
-                                                  ctx, footprint=fp))
+                                                  ctx, footprint=fp, pairs=pairs))
         return out
 
     ref = images()  # compiles; the direction storage of the context is read to the host once here

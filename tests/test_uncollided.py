@@ -406,7 +406,7 @@ def test_fc_moment_source_triton_synthetic(monkeypatch):
     """End to end through solver.fc_moment_source (restricted LD moments; the sampling correction is computed from
     the same backend): Triton == PyTorch to 1e-5 on the 2 cm WLAB problem, synthetic library."""
     _fc_kernel_or_skip()
-    tri, ref = _fc_moment_sources(synthetic_library(4, 5), monkeypatch)
+    tri, ref = _fc_moment_sources(synthetic_library(4, 5, num_materials=7), monkeypatch)
     assert tri.shape == ref.shape
     _assert_rel(tri, ref, 1e-5)
 

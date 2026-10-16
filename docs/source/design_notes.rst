@@ -20,8 +20,12 @@ filter on a 1 keV grid (``default_spectrum_125kvp``); any two-column spectrum ca
 [10, 125] keV have edges 125, 85.0, 69.2, 59.6, 51.7, 42.4, 10 keV and spectrum-weighted group energies 98.0, 76.7,
 64.4, 56.1, 47.1, 36.0 keV.
 
-**Materials.** Water (H 0.1119, O 0.8881 by mass) and ICRP cortical bone (XrayPhysics ``bone_cortical``,
-1.85 g/cm^3). Narrow-group mass attenuation of water agrees with NIST XCOM to 0.1 % at 40-100 keV; the ICRP bone is
+**Materials.** Seven materials (air, lung, adipose, water, muscle, soft tissue, cortical bone; the table of
+:doc:`method`, "CITRUS coupling"), among them water (H 0.1119, O 0.8881 by mass) and ICRP cortical bone (XrayPhysics
+``bone_cortical``, 1.85 g/cm^3). The seven-material library builds in about 16 s and is cached under a key that
+includes the material table; its water and bone rows equal those of a two-material library to 1e-13 (summation
+order only), and on the WLAB phantom (water and bone only) the seven-material solve equals the two-material solve
+bit for bit in float32. Narrow-group mass attenuation of water agrees with NIST XCOM to 0.1 % at 40-100 keV; the ICRP bone is
 1.45 % below ICRU-44 bone at 60 keV (different composition).
 
 **Energy quadrature.** Each group is cut into bins of at most 0.5 keV; quantities are evaluated at bin midpoints and
@@ -152,7 +156,13 @@ Hessian diagonal are recomputed from ``init_recon`` at every call; the regulariz
 (``auto_regularize_flag=False``) after one automatic estimate. A restarted run (one call per iteration) converges like
 a continuous run.
 
-**FDK.** ``recon_fdk``: cosine pre-weight, ramp filter along channels, the adjoint of the forward projector; full scan.
+**FDK.** ``recon_fdk``: cosine pre-weight, ramp filter along channels, the adjoint of the forward projector, every
+view scaled by pi / V; it assumes a full rotation (MBIRTORCH applies no short-scan weighting). For a short scan
+(range Lambda < 2 pi) ``mbir_bridge.fdk(..., geom=, angles=)`` multiplies the line integrals by
+(Lambda / pi) w(beta, gamma), the Parker weights in the overscan form of Wesarg et al.; the sign of the fan angle
+gamma = -atan(u / SDD) was fixed by measurement (with it an off-center test object reconstructs from a 202.6 degree
+scan as accurately as from a full rotation, 3.3 % against 3.2 %; the unweighted FDK is off by 11-14 %, the opposite
+sign by 13 %).
 
 CITRUS cost and memory
 ----------------------
@@ -163,6 +173,11 @@ sweep is rebuilt every step because the densities change: sampling correction 21
 16 ms, restriction to LD moments 34 ms) and the scatter image 0.15-0.17 s (first-collision source at the cone
 directions 51 ms, sub-point emission 78 ms, downstream attenuation 18 ms, projection 22 ms, accumulation 9 ms).
 A converged solve of the same view costs about 0.55 s. At 1 cm (factor 1) a CITRUS step costs about 0.13 s.
+These are two-material (version 0.0.3) timings. The seven-material basis adds about 6 % (``benchmarks/
+profile_citrus_step.py`` in one session with the desktop sharing the GPU: 317 ms per view before, 335 ms after): the
+pair mode of the first-collision kernel (larger table, per-voxel row offsets; 0.76 vs 0.60 ms per chunk of 8
+directions) and one ray trace per material present (four instead of two for the WLAB reconstructions, whose lung and
+air inserts become lung / adipose and air / lung mixtures) in the uncollided fluence and the primary.
 
 The per-view accumulator is :math:`G (L+1)^2 \cdot 4` values per cell: 141 MiB in float32 on the 0.5 cm WLAB grid
 with 1 cm cells (24.7 GiB for 180 views). It is stored compactly (LD cell mean, scaled float16: 17.6 MiB per view,

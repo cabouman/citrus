@@ -10,8 +10,8 @@ import numpy as np
 import pytest
 import torch
 
-from citrus.citrus import (SCATTER_VIEW_INTERP_ORDERS, CitrusConfig, angular_neighbors, interpolate_scatter,
-                           interpolation_weights, scatter_view_indices)
+from citrus.citrus import (SCATTER_VIEW_INTERP_ORDERS, CitrusConfig, angular_neighbors, full_rotation,
+                           interpolate_scatter, interpolation_weights, scatter_view_indices)
 
 TWO_PI = 2.0 * math.pi
 
@@ -201,6 +201,42 @@ def test_interpolation_argument_errors():
             interpolation_weights(angles, [0, 4], bad)
     with pytest.raises(ValueError):
         angular_neighbors(angles[:4], 0.1, None)
+
+
+# ---- short scans: interpolation along the arc ----------------------------------------------------------------------
+
+def test_full_rotation_detection():
+    assert full_rotation(_uniform(36)) and full_rotation(_uniform(36) + 5.0) and full_rotation(_uniform(2))
+    fan = math.radians(22.6)
+    short = (math.pi + fan) * np.arange(36) / 36
+    assert not full_rotation(short) and not full_rotation(short + 5.5)  # also across the 2 pi wrap
+    assert not full_rotation(np.array([0.0, 0.1]))
+
+
+@pytest.mark.parametrize("start", [0.0, 5.5])
+@pytest.mark.parametrize("order,degree", [(1, 1), (2, 2), (3, 1)])
+def test_short_scan_interpolation_along_the_arc(start, order, degree):
+    """A short scan (pi + fan angle) is interpolated along its arc, never across the missing arc: polynomials of the arc
+    angle are reproduced (order 3 with clamped end nodes: linear exactly), the views beyond the last computed view hold
+    its value, and no weight goes to a view on the other end of the arc."""
+    V, stride = 36, 4
+    lam = math.pi + math.radians(22.6)
+    arc = lam * np.arange(V) / V
+    angles = np.mod(start + arc, TWO_PI)  # as stored (any 2 pi offset)
+    computed = scatter_view_indices(V, stride)
+    f = _poly(arc, degree)
+    out = _interp(f, angles, computed, order)
+    inside = np.arange(V) <= computed[-1]
+    np.testing.assert_allclose(out[inside], f[inside], rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(out[~inside], f[computed[-1]], rtol=1e-12)  # held beyond the last computed view
+    M = interpolation_weights(angles, computed, order)
+    first_half = np.arange(V) < V // 2
+    assert np.abs(M[np.ix_(first_half, [len(computed) - 1])]).max() == 0.0
+    assert np.abs(M[np.ix_(~first_half, [0])]).max() == 0.0
+    # forced circular interpolation would wrap across the missing arc
+    Mc = interpolation_weights(angles, computed, 1, circular=True)
+    assert Mc[V - 1, 0] > 0
+    assert angular_neighbors(arc[computed], arc[-1], 3, circular=False) == [(len(computed) - 1, 1.0)]
 
 
 # ---- configuration ----------------------------------------------------------------------------------------------

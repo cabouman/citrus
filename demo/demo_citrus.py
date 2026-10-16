@@ -1,14 +1,21 @@
 """Demo: CITRUS on the WLAB phantom (synthetic cone-beam data with scatter and Poisson noise).
 
-    python demo/demo_citrus.py                     # 36 views, 1 cm grid, 10 outer iterations (about 2 minutes)
-    python demo/demo_citrus.py --full              # 180 views, 0.5 cm grid, 20 outer iterations (about 30 min)
+    python demo/demo_citrus.py                     # 36 views over a short scan, 1 cm grid, 10 outer iterations
+                                                   # (about 2 minutes)
+    python demo/demo_citrus.py --full              # the report study: 180 views over a FULL rotation, 0.5 cm grid,
+                                                   # 20 outer iterations (about 30 min)
+    python demo/demo_citrus.py --end-view-angle 360                     # 36 views over a full rotation
     python demo/demo_citrus.py --views 60 --delta-voxel 0.5 --outer 15
     python demo/demo_citrus.py --truth-sweep 16x32 --truth-cone 32x64   # truth finer than the loop's solver
     python demo/demo_citrus.py --scatter-view-stride 2                  # scatter step on every 2nd view only
 
 1. Data (citrus.utilities.synthesize_wlab_dataset, cached in demo/input/). The WLAB phantom (30 x 20 x 40 cm water
    prism with lung, air and bone inserts) is rasterized on the reconstruction grid; full-field panel (150 x 184
-   pixels of 0.4 cm, the whole prism in the field at every view).
+   pixels of 0.4 cm, the whole prism in the field at every view). Views: evenly spaced over [start, end) (endpoint
+   excluded; ``--start-view-angle`` / ``--end-view-angle`` in degrees, MBIRTORCH's angle convention); the default end
+   is the short scan start + 180 degrees + the in-plane fan angle of the panel, 2 atan(0.5 x 150 x 0.4 cm / 150 cm) =
+   22.6 degrees, i.e. 202.6 degrees; ``--end-view-angle 360`` (with start 0) is a full rotation. ``--full`` keeps the
+   report's full rotation (end = start + 360 degrees, set explicitly).
    - Primary: P = I0 exp(-A X_true) with A the MBIRTORCH projector and X_true the attenuation of the true densities at
      the effective energy (spectrum mean, 63 keV); I0 = flat-field counts per pixel.
    - Ground-truth scatter: for every view, the LBTE scatter solver is run on the TRUE densities with a fully converged
@@ -24,7 +31,8 @@
    azimuthal, loop default 8x16; recommended 16x32) and ``--truth-cone`` (collapsed-cone directions, loop default
    16x32; recommended 32x64, or 48x96 as a reference). The defaults equal the loop's for speed; 16x32 / 32x64 make the
    data synthesis about 4x slower.
-2. CITRUS (citrus.citrus_recon): FDK initialization, then per outer iteration one scatter step per view and one
+2. CITRUS (citrus.citrus_recon): FDK initialization (Parker-weighted for a short scan: MBIRTORCH's FDK has no
+   short-scan weighting, recon.mbir_bridge.short_scan_weights), then per outer iteration one scatter step per view and one
    warm-started MBIR iteration on Y / (1 + SPR). ``--scatter-view-stride n`` runs the scatter step on every n-th view
    only and interpolates the other views' scatter signal in angle (``--scatter-view-interp-order``, default 3:
    Catmull-Rom); the output files then carry a ``_stride<n>`` suffix (``_stride<n>_order<k>`` for orders other
@@ -41,6 +49,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 import json
+import math
 import os
 import time
 
@@ -53,7 +62,7 @@ import torch  # noqa: E402
 
 from citrus import CitrusConfig, citrus_recon, mbir_recon  # noqa: E402
 from citrus.citrus import estimate_regularization  # noqa: E402
-from citrus.recon.mbir_bridge import make_cone_model  # noqa: E402
+from citrus.recon.mbir_bridge import is_short_scan, make_cone_model, scan_range  # noqa: E402
 from citrus.scatter_solver.config import SolverConfig  # noqa: E402
 from citrus.scatter_solver.geometry import ConeGeometry  # noqa: E402
 from citrus.utilities import (default_supervoxel_factor, full_field_wlab_geometry, load_dataset,  # noqa: E402
@@ -81,7 +90,15 @@ def main() -> None:
     ap.add_argument("--views", type=int, default=36, help="number of views over 360 degrees (default 36)")
     ap.add_argument("--delta-voxel", type=float, default=1.0, help="voxel pitch in cm (default 1.0; 0.5 for full)")
     ap.add_argument("--outer", type=int, default=10, help="outer iterations (default 10)")
-    ap.add_argument("--full", action="store_true", help="full size: 180 views, 0.5 cm grid, 20 outer iterations")
+    ap.add_argument("--full", action="store_true",
+                    help="the report study: 180 views over a FULL rotation (end view angle = start + 360 degrees, set "
+                         "explicitly; --end-view-angle is ignored), 0.5 cm grid, 20 outer iterations")
+    ap.add_argument("--start-view-angle", type=float, default=0.0,
+                    help="first view angle in degrees (default 0; MBIRTORCH's angle convention)")
+    ap.add_argument("--end-view-angle", type=float, default=None,
+                    help="end of the angular range in degrees, excluded (views evenly spaced over [start, end)); "
+                         "default: the short scan start + 180 + fan angle of the panel (22.6 degrees); "
+                         "start + 360 for a full rotation")
     ap.add_argument("--I0", type=float, default=1.0e5, help="flat-field counts per pixel (default 1e5)")
     ap.add_argument("--seed", type=int, default=0, help="Poisson noise seed")
     ap.add_argument("--no-noise", action="store_true", help="noise-free data (Y = P + S)")
@@ -107,6 +124,7 @@ def main() -> None:
     args = ap.parse_args()
     if args.full:
         args.views, args.delta_voxel, args.outer = 180, 0.5, 20
+        args.end_view_angle = args.start_view_angle + 360.0  # the report's full rotation
     interp_order = None if args.scatter_view_interp_order == "none" else int(args.scatter_view_interp_order)
     if args.scatter_view_stride < 1:
         raise SystemExit("--scatter-view-stride must be >= 1")
@@ -127,7 +145,19 @@ def main() -> None:
         raise SystemExit("--truth-sweep: the polar count must be even and the azimuthal count divisible by 4")
     truth_cfg = replace(loop_cfg, num_polar=tp, num_azimuthal=ta, cone_num_polar=cp, cone_num_azimuthal=ca)
     truth_cfg.validate()
-    tag = f"wlab_{args.views}v_{args.delta_voxel:g}cm".replace(".", "p") + ("_nonoise" if args.no_noise else "")
+    start = math.radians(args.start_view_angle)
+    end = None if args.end_view_angle is None else math.radians(args.end_view_angle)
+    if end is not None and not end > start:
+        raise SystemExit("--end-view-angle must be larger than --start-view-angle")
+    full_rotation = end is not None and abs(end - start - 2 * math.pi) < 1e-9
+    if full_rotation and args.start_view_angle == 0.0:
+        arc = ""  # the full rotation from 0 keeps the tag of earlier versions
+    elif end is None:
+        arc = "_short" if args.start_view_angle == 0.0 else f"_short{args.start_view_angle:g}deg"
+    else:
+        arc = f"_{args.start_view_angle:g}to{args.end_view_angle:g}deg"
+    tag = (f"wlab_{args.views}v_{args.delta_voxel:g}cm".replace(".", "p") + arc.replace(".", "p")
+           + ("_nonoise" if args.no_noise else ""))
     if truth_cfg != loop_cfg:
         tag += f"_truth{tp}x{ta}_cone{cp}x{ca}"
     t_all = time.perf_counter()
@@ -141,7 +171,8 @@ def main() -> None:
     else:
         t0 = time.perf_counter()
         data = synthesize_wlab_dataset(args.views, args.delta_voxel, args.I0, not args.no_noise, args.seed, path,
-                                       geom=geom, device=dev, config=truth_cfg)
+                                       geom=geom, device=dev, config=truth_cfg, start_view_angle=start,
+                                       end_view_angle=end)
         print(f"data: synthesized {args.views} views in {time.perf_counter() - t0:.1f} s -> {path}.npz")
     geom = ConeGeometry(**data["meta"]["geometry"])
     grid = wlab_grid(args.delta_voxel)
@@ -149,6 +180,9 @@ def main() -> None:
     Y, angles = data["Y"], data["angles"]
     X_true = torch.as_tensor(data["X_true"], device=dev)
     spr_true = data["SPR"]
+    span = math.degrees(scan_range(angles))
+    print(f"views over {math.degrees(float(angles[0])):.1f} + {span:.1f} degrees "
+          f"({'short scan' if is_short_scan(angles) else 'full rotation'})")
     print(f"grid {grid.shape} at {grid.delta_voxel} cm, {len(angles)} views, panel {geom.num_det_rows} x "
           f"{geom.num_det_channels}; SPR median {np.median(spr_true):.2f}, max {spr_true.max():.1f}")
 
@@ -197,7 +231,8 @@ def main() -> None:
     # ---- summary ---------------------------------------------------------------------------------------------
     rec = info_c["records"][1:]
     summary = {
-        "views": len(angles), "delta_voxel_cm": args.delta_voxel, "grid": list(grid.shape), "outer": args.outer,
+        "views": len(angles), "start_view_angle_deg": math.degrees(float(angles[0])), "scan_range_deg": span,
+        "short_scan": bool(is_short_scan(angles)), "delta_voxel_cm": args.delta_voxel, "grid": list(grid.shape), "outer": args.outer,
         "truth_sweep": [tp, ta], "truth_cone": [cp, ca],
         "scatter_view_stride": args.scatter_view_stride, "scatter_view_interp_order": interp_order,
         "scatter_every": args.scatter_every,

@@ -5,9 +5,10 @@ The algorithm
 Measured counts Y [V, Rd, Cd] (flat field I0) contain primary and scatter, Y ~ Poisson(P + S). CITRUS alternates, per
 outer iteration k, ONE scatter step per view and ONE warm-started MBIR iteration:
 
-    X_0      = FDK(-log(Y / I0))                                    (the uncorrected data)
+    X_0      = FDK(-log(Y / I0))                                    (the uncorrected data; Parker-weighted for a
+                                                                     short scan)
     for k = 0 .. N-1:
-        rho_k            = densities(X_k)                            two-material split at E_eff
+        rho_k            = densities(X_k)                            seven-material interpolating model at E_eff
         for every view v:
             phi1          = G1(rho_k)                                uncollided fluence (fine grid)
             Phi_v         = G_step(rho_k, phi1, Phi_v)               ONE sweep of FC source + aged accumulator
@@ -31,7 +32,8 @@ of Y (W = Y / I0 is the exact weight of y_c).
 Sparse-view scatter (CitrusConfig.scatter_view_stride n > 1): the scatter step runs only on the views 0, n, 2n, ...
 (uniform over the angular range, starting at view 0); only those views keep an accumulator. The scatter SIGNAL of every
 other view is interpolated in angle, per detector pixel, from the computed views' scatter signals (Catmull-Rom over
-the 4 nearest computed views, circular in angle, by default; orders 0-2 and None also exist;
+the 4 nearest computed views by default, circular in angle for a full rotation, along the arc with the end views held
+for a short scan; orders 0-2 and None also exist;
 `interpolate_scatter`), its primary signal comes from the
 solver's primary projection (cheap: no transport), and the correction ratio s / p is formed on every view. The scatter
 signal is interpolated, not the ratio: the scatter is smooth on the panel and in angle, the ratio carries the object's
@@ -59,7 +61,8 @@ Public API
     citrus_recon(...)     the CITRUS reconstruction (returns the reconstruction and a dict of diagnostics)
     mbir_recon(...)       the same MBIR loop without the solver: no correction, or a fixed SPR correction
     citrus_step(...)      one scatter step of one view over an explicit CitrusState
-    scatter_view_indices, angular_neighbors, interpolation_weights, interpolate_scatter   sparse-view scatter
+    scatter_view_indices, angular_neighbors, full_rotation, interpolation_weights, interpolate_scatter
+                          sparse-view scatter
     G1, G1to2, G_gt2, G_step, project_scatter   the per-view operators of the step
     DensityModel, StateStore, CitrusConfig, estimate_regularization, apply_regularization
 """
@@ -95,6 +98,7 @@ __all__ = [
     "SCATTER_VIEW_INTERP_ORDERS",
     "scatter_view_indices",
     "angular_neighbors",
+    "full_rotation",
     "interpolation_weights",
     "interpolate_scatter",
     "estimate_regularization",
@@ -136,7 +140,7 @@ def _fields(solver: ScatterSolver, rho: Tensor, grid: Grid, fields: Optional[Mat
 
 def G1(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float,
        fields: Optional[MaterialFields] = None) -> Tensor:
-    """Uncollided fluence phi_uc [G, R, C, S] on the fine grid. rho [2, R, C, S]."""
+    """Uncollided fluence phi_uc [G, R, C, S] on the fine grid. rho [M, R, C, S] (M = 7 basis materials)."""
     return solver.uncollided(_fields(solver, rho, grid, fields), angle)
 
 
@@ -212,7 +216,7 @@ def citrus_step(solver: ScatterSolver, state: CitrusState, rho: Tensor, grid: Gr
 
     With the densities held fixed, N steps give Phi_gt1^(N) = sum_{n=1}^{N} K^{n-1} phi2, K = sweep o scatter, i.e.
     exactly the source iteration after N iterations, so the recursion converges to `ScatterSolver.solve_view`.
-    rho [2, R, C, S] on grid; angle must match state.angle once set. Returns (scatter_signal [Rd, Cd],
+    rho [M, R, C, S] on grid (M = 7 basis materials, `utilities.attenuation_to_densities`); angle must match state.angle once set. Returns (scatter_signal [Rd, Cd],
     primary_signal [Rd, Cd], new state). The input state is not modified; the returned state holds the new
     accumulator. fields: precomputed `solver.material_fields(rho, grid)` (the densities are shared by every view of
     an outer iteration, so the caller may build them once); None builds them here.
@@ -243,9 +247,11 @@ def citrus_step(solver: ScatterSolver, state: CitrusState, rho: Tensor, grid: Gr
 
 @dataclass
 class DensityModel:
-    """X (1/cm, MBIR's monoenergetic attenuation at E_eff) -> rho [2, ...] (water, bone; g/cm^3) for the solver:
-    `utilities.attenuation_to_densities` (two-material split at E_eff) after clamping X at 0 (FDK undershoot,
-    noise). `last_negative_fraction` = fraction of voxels clamped in the last call."""
+    """X (1/cm, MBIR's monoenergetic attenuation at E_eff) -> rho [7, ...] (g/cm^3, the library's basis materials:
+    air, lung, adipose, water, muscle, soft tissue, cortical bone) for the solver: `utilities.attenuation_to_densities`
+    (the interpolating seven-material model at E_eff: the two materials whose nominal attenuations bracket X, at most
+    two per voxel, a pure-bone voxel stays pure bone) after clamping X at 0 (FDK undershoot, noise).
+    `last_negative_fraction` = fraction of voxels clamped in the last call."""
 
     lib: MultigroupLibrary
     energy_kev: float
@@ -377,7 +383,8 @@ class CitrusConfig:
                      divided by their solver primary. Only the computed views keep an accumulator (1/n of the state
                      memory).
     scatter_view_interp_order : the per-pixel interpolation in angle of the skipped views' scatter signal from the
-                     computed views, circular in angle (ignored at stride 1; `angular_neighbors`):
+                     computed views, circular in angle for a full rotation and along the arc for a short scan (the
+                     views beyond the last computed view hold its value; ignored at stride 1; `angular_neighbors`):
                        3 (default)  cubic Catmull-Rom on the 4 nearest computed views: interpolating, continuous first
                                     derivative, exact for polynomials of angle up to degree 2 on uniformly spaced
                                     computed views (no local 4-point C1 scheme is exact for cubics)
@@ -445,9 +452,13 @@ def scatter_view_indices(num_views: int, stride: int) -> np.ndarray:
 
 
 def angular_neighbors(computed_angles: Union[Sequence[float], np.ndarray], angle: float,
-                      order: Literal[0, 1, 2, 3] = 3) -> list[tuple[int, float]]:
+                      order: Literal[0, 1, 2, 3] = 3, circular: bool = True) -> list[tuple[int, float]]:
     """Interpolation neighbors and weights of a view at `angle` (rad) from views at `computed_angles` (rad, any order,
-    any 2 pi offset), circular in angle (period 2 pi). Returns [(index into computed_angles, weight), ...], weights
+    any 2 pi offset), circular in angle (period 2 pi). circular=False (a scan over less than a full rotation): the
+    angles are taken as given (unwrapped along the arc), the neighbors stay among the computed views (the
+    cubic's ghost nodes beyond the end views are linear extrapolations, so it stays exact for linear functions of
+    the angle; the quadratic stencil shifts inside) and an angle outside [min, max] of the computed angles gets the
+    nearest end view with weight 1. Returns [(index into computed_angles, weight), ...], weights
     summing to 1. With j0, j1 the computed views bracketing the angle (wrapping from the last computed angle to the
     first + 2 pi) and t in [0, 1) its fractional position between them:
 
@@ -464,7 +475,9 @@ def angular_neighbors(computed_angles: Union[Sequence[float], np.ndarray], angle
     one computed view gets weight 1."""
     _check_interp_order(order, allow_none=False)
     order = int(order)
-    ca = np.mod(np.asarray(computed_angles, dtype=np.float64).reshape(-1), _TWO_PI)
+    ca = np.asarray(computed_angles, dtype=np.float64).reshape(-1)
+    if circular:
+        ca = np.mod(ca, _TWO_PI)
     Vc = ca.size
     if Vc == 0:
         raise ValueError("need at least one computed view")
@@ -473,11 +486,18 @@ def angular_neighbors(computed_angles: Union[Sequence[float], np.ndarray], angle
     order = min(order, Vc - 1)
     perm = np.argsort(ca, kind="stable")
     cs = ca[perm]
+    if not circular:
+        a = float(angle)
+        if a <= cs[0] or a >= cs[-1]:
+            return [(int(perm[0 if a <= cs[0] else Vc - 1]), 1.0)]
 
-    def at(i: int) -> float:  # unwrapped angle of the i-th sorted computed view (i may leave [0, Vc))
-        return float(cs[i % Vc]) + _TWO_PI * (i // Vc)
+        def at(i: int) -> float:  # angle of the i-th sorted computed view (clamped to the arc)
+            return float(cs[min(max(i, 0), Vc - 1)])
+    else:
+        def at(i: int) -> float:  # unwrapped angle of the i-th sorted computed view (i may leave [0, Vc))
+            return float(cs[i % Vc]) + _TWO_PI * (i // Vc)
 
-    a = float(np.mod(float(angle), _TWO_PI))
+        a = float(np.mod(float(angle), _TWO_PI))
     j0 = int(np.searchsorted(cs, a, side="right")) - 1  # previous computed view; -1: before the first (wraps)
     j1 = j0 + 1
     a0, a1 = at(j0), at(j1)
@@ -488,6 +508,8 @@ def angular_neighbors(computed_angles: Union[Sequence[float], np.ndarray], angle
         pairs = [(j0, 1.0 - t), (j1, t)]
     elif order == 2:
         m = j0 if t <= 0.5 else j1
+        if not circular:
+            m = min(max(m, 1), Vc - 2)
         nodes = (m - 1, m, m + 1)
         x = [at(i) for i in nodes]
         pairs = []
@@ -501,6 +523,16 @@ def angular_neighbors(computed_angles: Union[Sequence[float], np.ndarray], angle
         t2, t3 = t * t, t * t * t
         pairs = [(j0 - 1, 0.5 * (-t3 + 2.0 * t2 - t)), (j0, 0.5 * (3.0 * t3 - 5.0 * t2 + 2.0)),
                  (j1, 0.5 * (-3.0 * t3 + 4.0 * t2 + t)), (j1 + 1, 0.5 * (t3 - t2))]
+    if not circular:  # Catmull-Rom ghost nodes beyond the ends: linear extrapolation (exact for linear functions)
+        ext = []
+        for i, w in pairs:
+            if i < 0:
+                ext += [(0, 2.0 * w), (1, -w)]
+            elif i > Vc - 1:
+                ext += [(Vc - 1, 2.0 * w), (Vc - 2, -w)]
+            else:
+                ext.append((i, w))
+        pairs = ext
     merged: dict[int, float] = {}
     for i, w in pairs:
         k = int(perm[i % Vc])
@@ -508,11 +540,32 @@ def angular_neighbors(computed_angles: Union[Sequence[float], np.ndarray], angle
     return list(merged.items())
 
 
+def full_rotation(angles: Union[Sequence[float], np.ndarray]) -> bool:
+    """True when the views cover the circle without a large gap: the largest angular gap between consecutive views
+    (circularly, mod 2 pi) is at most 1.5 times the median gap. False for a short scan (the missing arc is the gap)."""
+    a = np.sort(np.mod(np.asarray(angles, dtype=np.float64).reshape(-1), _TWO_PI))
+    if a.size < 3:
+        return a.size == 2 and abs(float(a[1] - a[0]) - np.pi) < 1e-9
+    gaps = np.diff(np.concatenate([a, a[:1] + _TWO_PI]))
+    return bool(gaps.max() <= 1.5 * np.median(gaps) + 1e-12)
+
+
+def _unwrap_arc(angles: np.ndarray) -> np.ndarray:
+    """Angles of a short scan unwrapped along its arc: the arc starts after the largest circular gap."""
+    a = np.mod(angles, _TWO_PI)
+    srt = np.sort(a)
+    gaps = np.diff(np.concatenate([srt, srt[:1] + _TWO_PI]))
+    origin = float(srt[(int(np.argmax(gaps)) + 1) % srt.size])
+    return origin + np.mod(a - origin, _TWO_PI)
+
+
 def interpolation_weights(angles: Union[Sequence[float], np.ndarray], computed: Union[Sequence[int], np.ndarray],
-                          order: Literal[0, 1, 2, 3] | None = 3) -> np.ndarray:
+                          order: Literal[0, 1, 2, 3] | None = 3, circular: Optional[bool] = None) -> np.ndarray:
     """The [V, Vc] matrix M with s_all = M s_c: row v holds the `angular_neighbors` weights of view v over the
     computed views (indices `computed` into angles); the computed views' own rows are one-hot (they keep their value);
-    order None gives zero rows for the skipped views."""
+    order None gives zero rows for the skipped views. circular: None (default) = `full_rotation(angles)`; False
+    interpolates along the arc of a short scan (angles unwrapped from the end of the missing arc), holding the end
+    computed views beyond them."""
     ang = np.asarray(angles, dtype=np.float64).reshape(-1)
     comp = np.asarray(computed, dtype=np.int64).reshape(-1)
     if comp.size == 0 or comp.min() < 0 or comp.max() >= ang.size or np.unique(comp).size != comp.size:
@@ -523,9 +576,11 @@ def interpolation_weights(angles: Union[Sequence[float], np.ndarray], computed: 
     if order is not None:
         is_computed = np.zeros(ang.size, dtype=bool)
         is_computed[comp] = True
-        ca = ang[comp]
+        circ = full_rotation(ang) if circular is None else bool(circular)
+        arc = ang if circ else _unwrap_arc(ang)
+        ca = arc[comp]
         for v in np.flatnonzero(~is_computed):
-            for j, w in angular_neighbors(ca, float(ang[v]), order):
+            for j, w in angular_neighbors(ca, float(arc[v]), order, circular=circ):
                 M[v, j] += w
     return M
 
@@ -604,7 +659,7 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
         model = make_cone_model(grid, geometry, angles, device=device)
     t0 = time.perf_counter()
     if init_recon is None:
-        X = fdk(model, y_meas)
+        X = fdk(model, y_meas, geom=geometry, angles=angles)  # Parker-weighted for a short scan
     else:
         X = torch.as_tensor(init_recon, dtype=torch.float32, device=device).clone()
     _sync(device)

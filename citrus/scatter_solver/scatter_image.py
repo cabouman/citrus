@@ -60,7 +60,8 @@ tests; the solver always applies it.
 
 Primary
 -------
-`primary_image` is exact in energy: it projects the two density maps (g/cm^2) and sums the transmission over the
+`primary_image` is exact in energy: it projects the density maps of the materials present (g/cm^2) and sums the
+transmission over the
 library's fine-energy table within each group (`cross_sections.group_transmission`), per sub-ray before the pixel
 average, instead of exp(-int mu_t,g dl) with group-averaged mu_t (within-group beam hardening, -1.4 % at WLAB).
 """
@@ -83,7 +84,7 @@ from .geometry import ConeGeometry, Grid
 from .kernels import triton_utils as _tu
 from .ray_tracing import Projectors
 from .source import SourceModel
-from .uncollided import fc_source_at_directions
+from .uncollided import fc_source_at_directions, present_materials, resolve_pairs
 
 __all__ = [
     "covering_polar_angle",
@@ -714,7 +715,8 @@ def combined_scatter_image(lib: MultigroupLibrary, rho_fine: Tensor, phi_uc_fine
                            factor: int, T_mean: Tensor, L: int, geom: ConeGeometry, angle: float, quad: Quadrature,
                            mu_t_coarse: Optional[Tensor], projectors: Projectors, detector: DetectorResponse,
                            grid_response: GridResponse, context: Optional[DirectionSetContext] = None,
-                           chunk: int = 8, *, fc_chunk: int = 4, footprint: bool = True) -> dict[str, Tensor]:
+                           chunk: int = 8, *, fc_chunk: int = 4, footprint: bool = True,
+                           pairs=None) -> dict[str, Tensor]:
     """Total scatter image (first-order + multiple-collision) in ONE collapsed-cone pass: the first- and
     multiple-collision sources are summed and ray-traced to the detector together, on the supervoxel grid with
     sub-voxel quadrature points.
@@ -725,7 +727,9 @@ def combined_scatter_image(lib: MultigroupLibrary, rho_fine: Tensor, phi_uc_fine
     the transfer moments, `ScatterSolver.mc_source_moments`), or the 6-D [G, (L+1)^2, 4, Rc, Cc, Sc] tensor whose LD
     mean is used; mu_t_coarse [G, Rc, Cc, Sc] on C (None -> coarsen_mu_t(mu_t_volume(lib, rho_fine))). context: the
     view's `make_direction_context` (built here when None; its chunking replaces `chunk`). fc_chunk: directions per
-    inner batch of the FC source (PyTorch path).
+    inner batch of the FC source (PyTorch path). pairs: the `cross_sections.MaterialPairs` of rho_fine for M > 2 basis
+    materials (built once here when None; the FC source of every chunk gathers the two table rows of each voxel by
+    material index); ignored for M <= 2.
 
     Per direction chunk (Omega_k, k of them):
       tau    = downstream_cumulative(mu_t_coarse, C, Omega_k)   [k, G, Rc, Cc, Sc]
@@ -743,6 +747,7 @@ def combined_scatter_image(lib: MultigroupLibrary, rho_fine: Tensor, phi_uc_fine
     """
     dev, dt = phi_uc_fine.device, phi_uc_fine.dtype
     rho = rho_fine.to(device=dev, dtype=dt)
+    pairs = resolve_pairs(rho, pairs)
     f = int(factor)
     coarse = grid_fine.coarsen(f)
     mu_c = coarsen_mu_t(mu_t_volume(lib, rho), f) if mu_t_coarse is None else mu_t_coarse.to(device=dev, dtype=dt)
@@ -767,7 +772,7 @@ def combined_scatter_image(lib: MultigroupLibrary, rho_fine: Tensor, phi_uc_fine
     acc = ctx.new_accumulator()
     for i, om in enumerate(ctx.omega_chunks):
         k = int(om.shape[0])
-        src = fc_source_at_directions(lib, rho, phi_uc_fine, grid_fine, geom, angle, om, chunk=fc_chunk)
+        src = fc_source_at_directions(lib, rho, phi_uc_fine, grid_fine, geom, angle, om, chunk=fc_chunk, pairs=pairs)
         if tuple(src.shape) != (k, G, *fine_shape):
             raise ValueError(f"FC source {tuple(src.shape)} != {(k, G, *fine_shape)}")
         tau = projectors.downstream_cumulative(mu_c, coarse, geom, angle, om)  # [k, G, Rc, Cc, Sc]
@@ -796,12 +801,12 @@ def primary_image(lib: MultigroupLibrary, rho: Tensor, grid: Grid, geom: ConeGeo
     """Primary image, per group at the pixels, exact in energy:
 
         fluence_g(u)        = b(Omega_p) / |r_D - r_0|^2 T_g(u)                                photons/cm^2
-        T_g(u)              = < sum_{E in g} w_E exp(-(P_w m_w(E) + P_b m_b(E))) >_pixel
+        T_g(u)              = < sum_{E in g} w_E exp(-sum_m P_m m_m(E)) >_pixel
         planar_fluence_g(u) = cos(theta0(u)) fluence_g(u)                                     photons/cm^2
         signal_g(u)         = planar_fluence_g(u) G_g(theta1, theta2) D_g(theta0)            keV/cm^2
 
-    P_m = int_{r_0}^{r_D} rho_m dl: line integrals of the two density maps (g/cm^2; two projections,
-    `projectors.primary_project(rho)`), w_E / m_m(E) the library's fine-energy table (lib.fine_weight,
+    P_m = int_{r_0}^{r_D} rho_m dl: line integrals of the density maps (g/cm^2; one projection per material PRESENT,
+    `projectors.primary_project(rho[present])`, `uncollided.present_materials`), w_E / m_m(E) the library's fine-energy table (lib.fine_weight,
     lib.fine_mu_t; `cross_sections.group_transmission`). fluence_g is the fine-energy sum within group g, so the
     per-group detector and grid responses (at lib.group_energy) apply, and fluence.sum(0) /
     planar_fluence.sum(0) is the exact polychromatic primary (up to the fine quadrature; the group-averaged
@@ -827,11 +832,15 @@ def primary_image(lib: MultigroupLibrary, rho: Tensor, grid: Grid, geom: ConeGeo
                                            delta_det_row=geom.delta_det_row / n,
                                            delta_det_channel=geom.delta_det_channel / n)
     # sub-pixel (i, j) of pixel (r, c) is pixel (r n + i, c n + j) of geom_sub: same panel, same offsets
+    if int(rho.shape[0]) != lib.num_materials:
+        raise ValueError(f"rho has {int(rho.shape[0])} materials, the library {lib.num_materials}")
+    present = present_materials(rho)
+    src = rho if present is None else rho[present]
     if getattr(projectors, "n_sub", None) is not None:  # disable the projector's own sub-sampling
-        path = projectors.primary_project(rho, grid, geom_sub, angle, n_sub=1)  # [M, Rd n, Cd n] g/cm^2
+        path = projectors.primary_project(src, grid, geom_sub, angle, n_sub=1)  # [M', Rd n, Cd n] g/cm^2
     else:
-        path = projectors.primary_project(rho, grid, geom_sub, angle)
-    trans = group_transmission(lib, path)  # [G, Rd n, Cd n]
+        path = projectors.primary_project(src, grid, geom_sub, angle)
+    trans = group_transmission(lib, path, materials=present)  # [G, Rd n, Cd n]
     if n > 1:
         trans = trans.reshape(-1, Rd, n, Cd, n).mean(dim=(2, 4))
     pix = geom.pixel_centers(angle, dev, dt)

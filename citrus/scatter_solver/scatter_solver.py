@@ -3,11 +3,12 @@ image and primary image for one view.
 
 Pipeline of `ScatterSolver.solve_view(rho_fine, grid_fine, angle)` (docs/source/method.rst has the derivation):
 
-    rho_fine [2, R, C, S]  (fine grid F)            rho_coarse = supervoxel average of rho_fine  (grid C)
+    rho_fine [M, R, C, S]  (fine grid F; M = 7     rho_coarse = supervoxel average of rho_fine  (grid C)
+                           basis materials)         pairs_fine = material_pairs(rho_fine) (at most 2 per voxel)
     mu_t_fine      = mu_t_volume(lib, rho_fine)                       group attenuation (diagnostics)
     mu_t_coarse, mu_s_l_coarse from rho_coarse                        linear in rho: = averaged mu
-    phi_uc         = uncollided_fluence(lib, rho_fine)                exact in energy: line integrals of the two
-                     density maps + the fine-energy table (sum_{E in g} w_E exp(-sum_m m_m(E) P_m))
+    phi_uc         = uncollided_fluence(lib, rho_fine)                exact in energy: line integrals of the density
+                     maps of the materials present + the fine-energy table (sum_{E in g} w_E exp(-sum_m m_m(E) P_m))
     S_FC(Omega_m)  = restrict_fc_to_ld_moments(corrected fc_source_at_directions(lib, ..., Omega_m))   exact eta
                      table, l = 0 and l = 1 conservative sampling correction (uncollided.fc_sampling_correction)
     SI             = source_iteration(ctx, mu_t_coarse, mu_s_l_coarse, S_FC)                   LD sweeps on C
@@ -48,7 +49,7 @@ from torch import Tensor
 
 from .angular_quadrature import Quadrature, product_quadrature, scatter_source_moments
 from .config import SolverConfig
-from .cross_sections import MultigroupLibrary, mu_t_volume, transfer_moments_volume
+from .cross_sections import MaterialPairs, MultigroupLibrary, material_pairs, mu_t_volume, transfer_moments_volume
 from .detector import DetectorResponse, GridResponse
 from .geometry import ConeGeometry, Grid
 from .ray_tracing import Projectors, SiddonProjectors
@@ -76,13 +77,15 @@ DeviceLike = Union[torch.device, str, None]
 # libraries
 # =====================================================================================================
 
-def build_solver_library(config: SolverConfig, spectrum=None, cache_dir: Optional[str] = "default") -> MultigroupLibrary:
-    """`cross_section_library.build_library(config, spectrum, cache_dir)` (spectrum None -> the default 125 kVp
-    spectrum; cache_dir "default" -> `cross_section_library.default_cache_dir()`, None -> no cache). Needs
-    XrayPhysics unless the library is cached. float64 CPU tensors."""
+def build_solver_library(config: SolverConfig, spectrum=None, cache_dir: Optional[str] = "default",
+                         materials=None) -> MultigroupLibrary:
+    """`cross_section_library.build_library(config, spectrum, cache_dir, materials=materials)` (spectrum None -> the
+    default 125 kVp spectrum; cache_dir "default" -> `cross_section_library.default_cache_dir()`, None -> no cache;
+    materials None -> the seven-material table, `cross_sections.MATERIAL_TABLE`). Needs XrayPhysics unless the
+    library is cached (about 16 s to build). float64 CPU tensors."""
     from .cross_section_library import build_library  # lazy: XrayPhysics only needed here
 
-    return build_library(config, spectrum, cache_dir)
+    return build_library(config, spectrum, cache_dir, materials=materials)
 
 
 def truncated_library(lib: MultigroupLibrary, L: int) -> MultigroupLibrary:
@@ -113,13 +116,15 @@ class MaterialFields:
     """Everything that depends on the densities only (not on the view). Built by `ScatterSolver.material_fields`.
 
     grid_fine, grid_coarse : fine grid F and supervoxel grid C = grid_fine.coarsen(factor)
-    rho_fine      [M, R, C, S]        g/cm^3
+    rho_fine      [M, R, C, S]        g/cm^3 (M = the library's basis materials)
     rho_coarse    [M, Rc, Cc, Sc]     supervoxel averages
     mu_t_fine     [G, R, C, S]        group total attenuation (1/cm); diagnostics only: the uncollided fluence and
                                       the primary use the density line integrals and the fine-energy table
     mu_t_coarse   [G, Rc, Cc, Sc]     group total attenuation on C: sweep and the downstream attenuation of the
                                       scatter image
     mu_s_l_coarse [G, G, L+1, Rc, Cc, Sc]  Legendre transfer moments on C (1/cm), truncated at the solver's order L
+    pairs_fine    `cross_sections.MaterialPairs` of rho_fine (index / density [2, R, C, S]) when M > 2 (the
+                  first-collision source gathers the two table rows of each voxel by index), None for M <= 2
     """
 
     grid_fine: Grid
@@ -130,6 +135,7 @@ class MaterialFields:
     mu_t_fine: Tensor
     mu_t_coarse: Tensor
     mu_s_l_coarse: Tensor
+    pairs_fine: Optional[MaterialPairs] = None
 
 
 # =====================================================================================================
@@ -317,9 +323,14 @@ class ScatterSolver:
 
     # ---- stages ----------------------------------------------------------------------------------
     def material_fields(self, rho_fine: Tensor, grid_fine: Grid) -> MaterialFields:
-        """Attenuation and transfer fields of `rho_fine` [M, R, C, S] on grid_fine and its supervoxel grid."""
+        """Attenuation and transfer fields of `rho_fine` [M, R, C, S] on grid_fine and its supervoxel grid (M = the
+        library's number of materials; for M > 2 at most two nonzero materials per voxel, whose pair representation
+        `cross_sections.material_pairs` is derived here once)."""
         if tuple(rho_fine.shape[1:]) != tuple(grid_fine.shape):
             raise ValueError(f"rho spatial shape {tuple(rho_fine.shape[1:])} != grid shape {grid_fine.shape}")
+        if int(rho_fine.shape[0]) != self.lib.num_materials:
+            raise ValueError(f"rho has {int(rho_fine.shape[0])} materials, the library {self.lib.num_materials} "
+                             f"{tuple(self.lib.materials)}")
         f = int(self.config.supervoxel_factor)
         rho = rho_fine.to(device=self.device, dtype=self.dtype)
         coarse = grid_fine.coarsen(f)
@@ -329,6 +340,7 @@ class ScatterSolver:
             mu_t_fine=mu_t_volume(self.lib, rho),
             mu_t_coarse=mu_t_volume(self.lib_transport, rho_c),
             mu_s_l_coarse=transfer_moments_volume(self.lib_transport, rho_c),
+            pairs_fine=material_pairs(rho) if int(rho.shape[0]) > 2 else None,
         )
 
     def uncollided(self, fields: MaterialFields, angle: float) -> Tensor:
@@ -354,7 +366,7 @@ class ScatterSolver:
         def fc_ld(idx: Tensor) -> Tensor:
             om = omega.index_select(0, idx.to(omega.device))
             fc = fc_source_at_directions(self.lib, fields.rho_fine, phi_uc, fields.grid_fine, self.geom, angle, om,
-                                         chunk=self.fc_chunk)
+                                         chunk=self.fc_chunk, pairs=fields.pairs_fine)
             fc = corr.apply(fc, om)
             return restrict_fc_to_ld_moments(fc, fields.grid_fine, fields.factor)
 
@@ -380,7 +392,7 @@ class ScatterSolver:
         ctx = self.sweep_context(fields.grid_coarse) if ctx is None else ctx
         return fc_sampling_correction(self.lib, fields.rho_fine, phi_uc, fields.grid_fine, self.geom, angle,
                                       ctx.quad.omega, ctx.quad.weight, chunk=self.fc_chunk,
-                                      batch=self.config.direction_chunk)
+                                      batch=self.config.direction_chunk, pairs=fields.pairs_fine)
 
     def scatter_moment_source(self, fields: MaterialFields, phi: Tensor,
                               ctx: Optional[SweepContext] = None) -> SourceFn:
@@ -420,7 +432,7 @@ class ScatterSolver:
         return combined_scatter_image(
             self.lib, fields.rho_fine, phi_uc, fields.grid_fine, fields.factor, T_mean, self.L, self.geom, angle, quad,
             fields.mu_t_coarse, self.projectors, self.detector, self.grid_response, context,
-            chunk=self.config.direction_chunk, fc_chunk=self.fc_chunk)
+            chunk=self.config.direction_chunk, fc_chunk=self.fc_chunk, pairs=fields.pairs_fine)
 
     def primary(self, fields: MaterialFields, angle: float) -> dict[str, Tensor]:
         """Primary image (exact in energy)."""
@@ -445,8 +457,8 @@ class ScatterSolver:
     def solve_view(self, rho_fine: Tensor, grid_fine: Grid, angle: float, keep_phi_total: bool = False) -> ViewResult:
         """Full solve for one view (module docstring).
 
-        rho_fine: [2, R, C, S] water/bone densities (g/cm^3) on grid_fine (shape divisible by the supervoxel
-        factor). angle: view angle (rad). keep_phi_total: also return the collided moments
+        rho_fine: [M, R, C, S] basis-material densities (g/cm^3; M = 7 for the package's library, at most two nonzero
+        per voxel) on grid_fine (shape divisible by the supervoxel factor). angle: view angle (rad). keep_phi_total: also return the collided moments
         [G, (L+1)^2, 4, Rc, Cc, Sc]. Returns ViewResult. On CUDA the per-stage peak memory is measured by
         resetting the device's peak-memory statistics at the start of every stage.
         """

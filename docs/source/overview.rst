@@ -32,20 +32,22 @@ Package layout
     ========================== ===================================================================================
 
 ``citrus.recon``
-    ``mbir_bridge``: the MBIRTORCH ``ConeBeamModel`` matching the solver's geometry, FDK, the warm-started
-    single-iteration recipe.
+    ``mbir_bridge``: the MBIRTORCH ``ConeBeamModel`` matching the solver's geometry, FDK (with Parker weights for a
+    short scan), the warm-started single-iteration recipe.
 
 ``citrus.utilities``
-    The WLAB phantom, grid and geometry, the attenuation <-> density model, synthetic cone-beam data with scatter
-    (``synthesize_cone_beam_data`` for any density volume, ``synthesize_wlab_dataset``), a GPU memory cap and plotting
-    helpers.
+    The WLAB phantom, grid and geometry, the seven-material attenuation <-> density model, the view angles (short
+    scan by default), synthetic cone-beam data with scatter (``synthesize_cone_beam_data`` for any density volume,
+    ``synthesize_wlab_dataset``), a GPU memory cap and plotting helpers.
 
 Scope of the solver
 -------------------
 
 * Photon energies of kV imaging (default 10-125 keV, 6 equal-fluence groups); Compton scattering (no Doppler
   broadening) and Rayleigh scattering from EPDL97 via XrayPhysics; photoelectric absorption as local deposition.
-* Two basis materials (water and ICRP cortical bone); every voxel is a mixture given by two density maps.
+* Seven basis materials (air, lung, adipose, water, skeletal muscle, soft tissue, ICRP cortical bone); every voxel
+  is a mixture of at most two of them, the two whose nominal attenuations bracket its attenuation (the library, the
+  solver and the kernels are general in the number of materials).
 * A point source collimated to the flat panel; detector and anti-scatter-grid responses as lookup tables.
 * Float32 on CUDA (production; fused Triton kernels) and float64 / CPU (reference and tests).
 

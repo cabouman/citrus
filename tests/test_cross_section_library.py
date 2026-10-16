@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from citrus.scatter_solver.config import SolverConfig
-from citrus.scatter_solver.cross_sections import MultigroupLibrary
+from citrus.scatter_solver.cross_sections import BONE, MATERIALS, NOMINAL_DENSITIES, WATER, MultigroupLibrary
 from citrus.scatter_solver import cross_section_library as xb
 
 try:
@@ -130,9 +130,9 @@ def _rel_l2(lib: MultigroupLibrary, m: int, gi: int, go: int, Lr: int) -> float:
 )
 def test_legendre_reconstruction_water(built, gi, go):
     lib, _ = built
-    if float(lib.mu_s_l[0, gi, go, 0]) <= 0.0:
+    if float(lib.mu_s_l[WATER, gi, go, 0]) <= 0.0:
         pytest.skip("no transfer for this pair")
-    err = _rel_l2(lib, 0, gi, go, lib.legendre_order)
+    err = _rel_l2(lib, WATER, gi, go, lib.legendre_order)
     assert err < 0.05, f"water {gi}->{go}: relative L2 error {err:.4f} at L={lib.legendre_order}"
 
 
@@ -171,8 +171,10 @@ def test_groups_and_spectrum(built):
             assert t.dtype == torch.float64 and t.device.type == "cpu"
     lib, _ = built  # equal fluence
     np.testing.assert_allclose(lib.spectrum_fraction.numpy(), np.full(G, 1.0 / G), atol=1e-4)
-    assert lib.mu_s_l.shape == (2, G, G, L + 1)
-    assert lib.mu_s_eta.shape == (2, G, G, 1001)
+    assert lib.mu_s_l.shape == (7, G, G, L + 1)
+    assert lib.mu_s_eta.shape == (7, G, G, 1001)
+    assert lib.materials == MATERIALS and lib.num_materials == 7
+    assert lib.nominal_density.tolist() == list(NOMINAL_DENSITIES)
     assert float(lib.eta_grid[0]) == -1.0 and float(lib.eta_grid[-1]) == 1.0
 
 
@@ -248,7 +250,7 @@ def test_cache_roundtrip(tmp_path, monkeypatch):
 def test_fine_table_consistent_with_groups(built):
     for (lib, info), spectrum_weight in ((built, True),):
         E, fg, w, m = lib.fine_energy.numpy(), lib.fine_group.numpy(), lib.fine_weight.numpy(), lib.fine_mu_t.numpy()
-        assert lib.fine_group.dtype == torch.int64 and lib.fine_mu_t.shape == (2, E.size)
+        assert lib.fine_group.dtype == torch.int64 and lib.fine_mu_t.shape == (7, E.size)
         assert abs(w.sum() - 1.0) < 1e-12 and np.all(w > 0)
         assert E.min() > 10.0 and E.max() < 125.0
         edges = lib.group_edges.numpy()
@@ -285,11 +287,15 @@ def test_fine_table_polychromatic_transmission(built):
     mu = np.stack([sum(f * BACKEND.sigma("total", Z, Em) for Z, f in info.composition[mat].items())
                    for mat in lib.materials])
     for water, bone in ((20.0, 0.0), (15.0, 3.0), (0.0, 0.0)):
-        ref = float(np.sum(p * np.exp(-(mu[0] * water + mu[1] * bone))))
-        T = group_transmission(lib, torch.tensor([water, bone], dtype=torch.float64))
+        ref = float(np.sum(p * np.exp(-(mu[WATER] * water + mu[BONE] * bone))))
+        path = torch.zeros(7, dtype=torch.float64)
+        path[WATER], path[BONE] = water, bone
+        T = group_transmission(lib, path)
+        T2 = group_transmission(lib, path[[WATER, BONE]], materials=[WATER, BONE])  # only the materials present
+        assert torch.allclose(T2, T, rtol=1e-15, atol=0)
         assert T.shape == (G,)
         assert float(T.sum()) == pytest.approx(ref, rel=2e-5)
-        old = float((lib.spectrum_fraction * torch.exp(-(lib.mu_t[0] * water + lib.mu_t[1] * bone))).sum())
+        old = float((lib.spectrum_fraction * torch.exp(-(lib.mu_t[WATER] * water + lib.mu_t[BONE] * bone))).sum())
         if water == 20.0 and bone == 0.0:
             assert -0.016 < old / ref - 1 < -0.012
 
@@ -300,12 +306,12 @@ def test_fine_table_polychromatic_transmission(built):
 def test_full_resolution_default_config():
     cfg = SolverConfig()  # G=6, L=7, 2001-point eta table
     lib, info = xb.compute_library(cfg, None, BACKEND)
-    assert lib.mu_s_eta.shape == (2, 6, 6, 2001)
+    assert lib.mu_s_eta.shape == (7, 6, 6, 2001)
     for mi, mat in enumerate(lib.materials):
         ref = _group_avg(info, "cs", mat) + _group_avg(info, "rs", mat)
         rows = lib.mu_s_l[mi, :, :, 0].sum(dim=1).numpy() + info.compton_below_cutoff[mi]
         np.testing.assert_allclose(rows, ref, rtol=1e-4)
     for gi in range(6):
         for go in range(gi + 1, 6):
-            if float(lib.mu_s_l[0, gi, go, 0]) > 0:
-                assert _rel_l2(lib, 0, gi, go, 7) < 0.05
+            if float(lib.mu_s_l[WATER, gi, go, 0]) > 0:
+                assert _rel_l2(lib, WATER, gi, go, 7) < 0.05

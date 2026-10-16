@@ -3,8 +3,9 @@
     python demo/demo_scatter_solver.py [--delta-voxel 1.0] [--supervoxel-factor 1] [--angle-deg 0]
                                        [--panel small|full] [--grid] [--device cuda] [--memory-cap-mib 4400]
 
-Builds the multigroup library from XrayPhysics (cached in $CITRUS_CACHE_DIR or ~/.cache/citrus), rasterizes the WLAB
-phantom (30 x 20 x 40 cm water prism with lung, air and bone inserts), solves one view with the default solver
+Builds the seven-material multigroup library from XrayPhysics (cached in $CITRUS_CACHE_DIR or ~/.cache/citrus; about
+16 s on the first run), rasterizes the WLAB phantom (30 x 20 x 40 cm water prism with lung, air and bone inserts, in
+the seven-material basis: its water and bone rows), solves one view with the default solver
 configuration (6 groups, P7, 8 x 16 sweep directions, 16 x 32 collapsed-cone directions), and plots the primary and
 scatter detector signals, the scatter fraction and central-row profiles to demo/output/scatter_solver_view.png.
 """
@@ -53,7 +54,8 @@ def main() -> None:
                      dtype="float32" if dev.type == "cuda" else "float64")
     t0 = time.perf_counter()
     lib = build_solver_library(config)
-    print(f"library: {lib.num_groups} groups, Legendre order {lib.legendre_order}, "
+    print(f"library: {lib.num_materials} materials {', '.join(lib.materials)}; {lib.num_groups} groups, "
+          f"Legendre order {lib.legendre_order}, "
           f"edges {np.round(lib.group_edges.numpy(), 1).tolist()} keV ({time.perf_counter() - t0:.1f} s)")
 
     grid = wlab_grid(args.delta_voxel)

@@ -61,9 +61,15 @@ Linear-discontinuous (LD) cell moments
 Materials
 ---------
 
-* Two basis materials: index 0 = water, index 1 = cortical bone (ICRP composition, 1.85 g/cm^3 reference).
-  Density maps ``rho: [2, rows, cols, slices]`` in g/cm^3. All coefficients are linear in rho:
-  ``mu_x[g] = rho[0] * lib.mu_x[0, g] + rho[1] * lib.mu_x[1, g]`` with per-unit-density (mass) coefficients.
+* Seven basis materials (``cross_sections.MATERIAL_TABLE``), in order of increasing attenuation at their nominal
+  densities: 0 air (0.0012 g/cm^3), 1 lung (0.26), 2 adipose (0.95), 3 water (1.0), 4 skeletal muscle (1.05),
+  5 soft tissue (1.06), 6 cortical bone (ICRP composition, 1.85); ``WATER = 3``, ``BONE = 6``.
+  Density maps ``rho: [7, rows, cols, slices]`` in g/cm^3. All coefficients are linear in rho:
+  ``mu_x[g] = sum_m rho[m] * lib.mu_x[m, g]`` with per-unit-density (mass) coefficients; the library carries
+  ``materials`` (names) and ``nominal_density [M]``.
+* At most two nonzero materials per voxel (the density model's output); the first-collision source uses the compact
+  pair representation ``MaterialPairs`` (``index [2, ...]`` int32, ``density [2, ...]``) derived once per density
+  field (``ScatterSolver.material_fields`` -> ``MaterialFields.pairs_fine``).
 
 Device and dtype
 ----------------

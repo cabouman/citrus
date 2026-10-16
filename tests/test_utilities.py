@@ -1,18 +1,22 @@
-"""Utilities (citrus/utilities.py): the WLAB phantom and grid, the attenuation <-> density model, and synthetic
-cone-beam data with scatter (generic and WLAB)."""
+"""Utilities (citrus/utilities.py): the WLAB phantom and grid, the attenuation <-> density model (the interpolating
+seven-material model), the view angles (short scan by default) and synthetic cone-beam data with scatter (generic and
+WLAB)."""
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 import pytest
 import torch
 
 from citrus.scatter_solver.config import SolverConfig
-from citrus.scatter_solver.cross_sections import synthetic_library
+from citrus.scatter_solver.cross_sections import BONE, MATERIALS, WATER, synthetic_library
 from citrus.scatter_solver.geometry import ConeGeometry, Grid
 from citrus.utilities import (RHO_AIR, RHO_BONE, RHO_LUNG, attenuation_to_densities, densities_to_attenuation,
-                              effective_energy, load_dataset, mass_attenuation_at, synthesize_cone_beam_data,
-                              synthesize_wlab_dataset, wlab_geometry, wlab_grid, wlab_phantom, wlab_setup)
+                              effective_energy, fan_angle, full_field_wlab_geometry, load_dataset, mass_attenuation_at,
+                              nominal_attenuation, synthesize_cone_beam_data, synthesize_wlab_dataset, view_angles,
+                              wlab_geometry, wlab_grid, wlab_phantom, wlab_setup)
 
 
 # ---- WLAB phantom ----------------------------------------------------------------------------------------
@@ -30,9 +34,12 @@ def test_wlab_phantom_volumes_and_materials(delta):
     assert grid.shape == (round(20 / delta), round(30 / delta), round(40 / delta))
     assert grid.extent == pytest.approx((30.0, 20.0, 40.0))
     rho = wlab_phantom(grid, dtype=torch.float64)
-    assert rho.shape == (2, *grid.shape) and rho.dtype == torch.float64
+    assert rho.shape == (7, *grid.shape) and rho.dtype == torch.float64
+    assert (WATER, BONE) == (3, 6) and MATERIALS[WATER] == "water" and MATERIALS[BONE] == "bone"
     v = grid.voxel_volume
-    w, b = rho[0], rho[1]
+    w, b = rho[WATER], rho[BONE]
+    others = [m for m in range(7) if m not in (WATER, BONE)]
+    assert float(rho[others].abs().max()) == 0.0  # only the water and bone rows are used
     lung, air, bone = _mask(grid, -5, 0, 6, 6), _mask(grid, 3, 0, 2, 2), _mask(grid, 7, 0, 2, 2)
     # insert volumes (cm^3) and densities
     assert (w == RHO_LUNG).sum().item() * v == pytest.approx(6 * 6 * 40)
@@ -51,11 +58,11 @@ def test_wlab_phantom_on_larger_grid_and_options():
     grid = Grid(shape=(24, 34, 44), delta_voxel=1.0, recon_slice_offset=1.0)  # 2 cm margin, slice offset 1 cm
     rho = wlab_phantom(grid, lung_center=(5.0, 2.0), air_center=(-4.0, -3.0), bone_center=(-10.0, 4.0))
     assert rho.dtype == torch.float32
-    assert (rho[0] > 0).sum().item() == (30 * 20 - 4) * 40  # all prism voxels except bone are water-based
-    assert (rho[1] > 0).sum().item() == 4 * 40
+    assert (rho[WATER] > 0).sum().item() == (30 * 20 - 4) * 40  # all prism voxels except bone are water-based
+    assert (rho[BONE] > 0).sum().item() == 4 * 40
     x, y, z = grid.axis_coordinates()
     assert rho[:, :, :, (z.abs() > 20)].abs().sum() == 0
-    assert rho[0, 12, 19, 22].item() == pytest.approx(RHO_LUNG)  # (x, y, z) = (2.5, 0.5, 1.5) is in the lung
+    assert rho[WATER, 12, 19, 22].item() == pytest.approx(RHO_LUNG)  # (x, y, z) = (2.5, 0.5, 1.5) is in the lung
     with pytest.raises(ValueError):
         wlab_phantom(Grid(shape=(20, 30, 38), delta_voxel=1.0))  # too short in z
     with pytest.raises(ValueError):
@@ -68,14 +75,14 @@ def test_wlab_setup():
     grid, geom, rho = wlab_setup()
     assert grid.shape == (20, 30, 40) and grid.delta_voxel == 1.0
     assert geom.source_iso_dist == 100.0 and geom.image_shape == (75, 100)
-    assert rho.shape == (2, 20, 30, 40)
+    assert rho.shape == (7, 20, 30, 40)
 
 
 def test_wlab_primary_beer_law_central_channels(device):
     from citrus.scatter_solver.ray_tracing import SiddonProjectors
     from citrus.scatter_solver.cross_sections import mu_t_volume, synthetic_library
 
-    lib = synthetic_library(6)
+    lib = synthetic_library(6, num_materials=7)
     grid, geom, rho = wlab_setup(1.0, device=device, dtype=torch.float64)
     mu = mu_t_volume(lib, rho)
     tau = SiddonProjectors().primary_project(mu, grid, geom, 0.0)  # [G, 75, 100]
@@ -83,7 +90,7 @@ def test_wlab_primary_beer_law_central_channels(device):
     src = torch.tensor(geom.source_position(0.0), device=device, dtype=torch.float64)
     d = pix - src
     path = 20.0 * torch.linalg.norm(d, dim=-1) / d[..., 1].abs()  # full 20 cm of water along y
-    ref = lib.mu_t[0].to(device)[:, None, None] * path[None]
+    ref = lib.mu_t[WATER].to(device)[:, None, None] * path[None]
     torch.testing.assert_close(tau[:, :, 48:52], ref, rtol=0, atol=1e-10)
 
 
@@ -105,7 +112,8 @@ def test_effective_energy_and_interpolation(real_lib):
     E = effective_energy(real_lib)
     assert 62.5 < E < 63.5  # spectrum mean of the default 125 kVp spectrum
     m = mass_attenuation_at(real_lib, E)
-    assert 0.19 < float(m[0]) < 0.21 and 0.28 < float(m[1]) < 0.30  # water, cortical bone at ~63 keV (cm^2/g)
+    assert m.shape == (7,)
+    assert 0.19 < float(m[WATER]) < 0.21 and 0.28 < float(m[BONE]) < 0.30  # water, cortical bone at ~63 keV (cm^2/g)
     j = 57  # at a table node the interpolation returns the table value
     e = float(real_lib.fine_energy[j])
     assert torch.allclose(mass_attenuation_at(real_lib, e), real_lib.fine_mu_t[:, j].double(), rtol=1e-12)
@@ -115,30 +123,74 @@ def test_effective_energy_and_interpolation(real_lib):
 
 @pytest.mark.parametrize("lib_kind", ["synthetic", "real"])
 def test_density_round_trip(lib_kind, request, device):
-    lib = synthetic_library() if lib_kind == "synthetic" else request.getfixturevalue("real_lib")
+    """The interpolating seven-material model on the WLAB phantom: exact in attenuation; water and bone voxels come
+    back as themselves (pure water 1.0, pure bone 1.85 g/cm^3: the two-material split of citrus < 0.1.0 returned unit
+    water plus 1.156 g/cm^3 bone for the bone insert); the lung (water at 0.26) and air (water at 0.0012) inserts map to
+    the lung / adipose and air / lung mixtures of the same attenuation."""
+    lib = synthetic_library(num_materials=7) if lib_kind == "synthetic" else request.getfixturevalue("real_lib")
     E = 63.0 if lib_kind == "real" else float(lib.fine_energy.mean())
     m = mass_attenuation_at(lib, E)
-    mw, mb = float(m[0]), float(m[1])
+    mw, mb = float(m[WATER]), float(m[BONE])
     grid = wlab_grid(1.0)
     rho = wlab_phantom(grid, device=device, dtype=torch.float64)
     X = densities_to_attenuation(lib, rho, E)
     assert X.shape == grid.shape and X.device.type == device.type and X.dtype == torch.float64
-    assert torch.allclose(X, rho[0] * mw + rho[1] * mb)
+    assert torch.allclose(X, rho[WATER] * mw + rho[BONE] * mb)
     rho2 = attenuation_to_densities(lib, X, E)
-    assert rho2.shape == rho.shape
-    # the attenuation round trip is exact
+    assert rho2.shape == rho.shape == (7, *grid.shape)
+    # the attenuation round trip is exact; at most two materials per voxel
     assert torch.allclose(densities_to_attenuation(lib, rho2, E), X, rtol=1e-12, atol=1e-14)
-    bone = rho[1] > 0
-    # water / lung / air / vacuum come back exactly
-    assert torch.allclose(rho2[:, ~bone], rho[:, ~bone], rtol=1e-12, atol=1e-14)
-    # cortical bone (1.85 g/cm^3 bone) -> unit water + (1.85 - m_w/m_b) bone
-    assert torch.allclose(rho2[0][bone], torch.ones_like(rho2[0][bone]))
-    assert torch.allclose(rho2[1][bone], torch.full_like(rho2[1][bone], RHO_BONE - mw / mb), rtol=1e-12)
-    # negatives clamp to zero, the boundary X = mu_w is pure unit water
-    Xn = torch.tensor([-0.1, 0.0, mw, 0.5 * mw, mw + mb], dtype=torch.float64, device=device)
+    assert int((rho2 != 0).sum(0).max()) <= 2 and bool((rho2 >= 0).all())
+    bone = rho[BONE] > 0
+    water = rho[WATER] == 1.0
+    # cortical bone stays pure bone at 1.85 g/cm^3, water pure unit water, vacuum zero
+    assert torch.allclose(rho2[:, bone], rho[:, bone], rtol=1e-12, atol=1e-12)
+    assert torch.allclose(rho2[:, water], rho[:, water], rtol=1e-12, atol=1e-12)
+    assert bool((rho2[:, X == 0] == 0).all())
+    # the lung and air inserts: two bracketing materials
+    lung = (rho[WATER] == RHO_LUNG)
+    air = (rho[WATER] == RHO_AIR)
+    names = lambda mask: {MATERIALS[k] for k in range(7) if bool((rho2[k][mask] != 0).any())}  # noqa: E731
+    if lib_kind == "real":
+        assert names(lung) == {"lung", "adipose"} and names(air) == {"air", "lung"}
+    # negatives clamp to zero; X = mu_w is pure unit water; mu_w + 0.5 (mu_b - mu_soft) mixes soft tissue and bone
+    mu = nominal_attenuation(lib, E)
+    Xn = torch.tensor([-0.1, 0.0, mw, 0.5 * (mu[5] + mu[6]), 2.0 * mb * 1.85], dtype=torch.float64, device=device)
     r = attenuation_to_densities(lib, Xn, E)
-    expect = torch.tensor([[0.0, 0.0, 1.0, 0.5, 1.0], [0.0, 0.0, 0.0, 0.0, 1.0]], dtype=torch.float64, device=device)
+    expect = torch.zeros(7, 5, dtype=torch.float64, device=device)
+    expect[WATER, 2] = 1.0
+    expect[5, 3], expect[BONE, 3] = 0.5 * 1.06, 0.5 * 1.85
+    expect[BONE, 4] = 2.0 * 1.85
     assert torch.allclose(r, expect, rtol=1e-12, atol=1e-14)
+
+
+# ---- view angles ------------------------------------------------------------------------------------------
+
+def test_fan_angle_and_view_angles():
+    geom = full_field_wlab_geometry()
+    fan = fan_angle(geom)
+    assert fan == pytest.approx(2 * math.atan(0.5 * 150 * 0.4 / 150.0), rel=1e-15)
+    assert math.degrees(fan) == pytest.approx(22.62, abs=0.01)
+    assert math.degrees(fan_angle(wlab_geometry())) == pytest.approx(15.19, abs=0.01)
+    # default: short scan [start, start + pi + fan), endpoint excluded, evenly spaced
+    a = view_angles(36, geom)
+    assert a.shape == (36,) and a.dtype == np.float64 and a[0] == 0.0
+    step = (math.pi + fan) / 36
+    assert np.allclose(np.diff(a), step, rtol=0, atol=1e-14)
+    assert a[-1] + step == pytest.approx(math.pi + fan, rel=1e-14)
+    b = view_angles(10, geom, start_view_angle=0.5)
+    assert b[0] == 0.5 and b[-1] + (math.pi + fan) / 10 == pytest.approx(0.5 + math.pi + fan, rel=1e-14)
+    # explicit start / end; a full rotation
+    c = view_angles(8, geom, start_view_angle=-0.2, end_view_angle=1.4)
+    assert np.allclose(c, -0.2 + 1.6 * np.arange(8) / 8, atol=1e-15)
+    full = view_angles(180, None, 0.0, 2 * math.pi)
+    assert np.allclose(full, 2 * math.pi * np.arange(180) / 180, atol=1e-14)
+    with pytest.raises(ValueError):
+        view_angles(10, None)  # the short-scan default needs the geometry
+    with pytest.raises(ValueError):
+        view_angles(10, geom, 1.0, 1.0)
+    with pytest.raises(ValueError):
+        view_angles(0, geom)
 
 
 # ---- synthetic dataset ---------------------------------------------------------------------------------
@@ -155,12 +207,14 @@ def test_smoke_dataset_2cm(real_lib, tmp_path):
     pytest.importorskip("mbirtorch")
     V = 4
     out = synthesize_wlab_dataset(V, 2.0, I0=1.0e5, noise=False, seed=0, out_path=tmp_path / "smoke", lib=real_lib,
-                                  geom=wlab_geometry())
+                                  geom=wlab_geometry(), end_view_angle=2 * np.pi)
     R, C, S = wlab_grid(2.0).shape
     for k in ("P", "S", "Y", "Y_mean", "SPR", "line_integrals", "solver_primary", "solver_scatter"):
         assert out[k].shape == (V, 75, 100) and out[k].dtype == np.float32, k
-    assert out["X_true"].shape == (R, C, S) and out["rho_true"].shape == (2, R, C, S)
+    assert out["X_true"].shape == (R, C, S) and out["rho_true"].shape == (7, R, C, S)
     assert out["angles"].shape == (V,) and np.allclose(out["angles"], 2 * np.pi * np.arange(V) / V)
+    assert out["meta"]["materials"] == list(MATERIALS) and out["mass_attenuation"].shape == (7,)
+    assert out["meta"]["short_scan"] is False and out["meta"]["end_view_angle"] == pytest.approx(2 * np.pi)
     assert out["phi_air"].shape == (75, 100)
     # noise-free: Y = P + S, P = I0 exp(-A X), S = SPR P
     assert np.array_equal(out["Y"], out["Y_mean"])
@@ -178,6 +232,8 @@ def test_smoke_dataset_2cm(real_lib, tmp_path):
     # Poisson noise: reproducible per seed, unbiased
     n1 = synthesize_wlab_dataset(2, 2.0, I0=1.0e5, noise=True, seed=3, lib=real_lib, geom=wlab_geometry())
     n2 = synthesize_wlab_dataset(2, 2.0, I0=1.0e5, noise=True, seed=3, lib=real_lib, geom=wlab_geometry())
+    # the default angular range is the short scan [0, pi + fan angle)
+    assert np.allclose(n1["angles"], view_angles(2, wlab_geometry())) and n1["meta"]["short_scan"] is True
     # the rates themselves differ between runs at the float32 ulp level (atomic accumulation in MBIRTORCH's and the
     # solver's CUDA kernels), which flips a handful of Poisson draws; the rest is bitwise reproducible
     assert np.mean(n1["Y"] != n2["Y"]) < 1e-3 and not np.array_equal(n1["Y"], n1["Y_mean"])
@@ -196,13 +252,13 @@ def test_synthesize_cone_beam_data_generic():
     dev = torch.device("cuda")
     grid = Grid((8, 8, 8), 2.0)
     geom = ConeGeometry(100.0, 150.0, 24, 24, 1.6, 1.6)
-    rho = torch.zeros(2, *grid.shape, device=dev)
-    rho[0, 1:7, 1:7, 1:7] = 1.0
-    rho[0, 3:5, 3:5] = 0.0
-    rho[1, 3:5, 3:5] = 1.5
+    rho = torch.zeros(7, *grid.shape, device=dev)
+    rho[WATER, 1:7, 1:7, 1:7] = 1.0
+    rho[WATER, 3:5, 3:5] = 0.0
+    rho[BONE, 3:5, 3:5] = 1.5
     cfg = SolverConfig(num_groups=3, legendre_order=1, num_polar=2, num_azimuthal=4, cone_num_polar=4,
                        cone_num_azimuthal=8, supervoxel_factor=2, si_tol=1e-3)
-    solver = ScatterSolver(synthetic_library(3, 2), cfg, geom, detector=ideal_counting_response(),
+    solver = ScatterSolver(synthetic_library(3, 2, num_materials=7), cfg, geom, detector=ideal_counting_response(),
                            grid_response=no_grid(), device=dev, dtype=torch.float32)
     angles = [0.0, 1.0, 2.5]
     out = synthesize_cone_beam_data(rho, grid, geom, angles, solver, I0=1.0e4, noise=False)

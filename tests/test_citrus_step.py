@@ -24,7 +24,7 @@ ANGLE = 0.4
 
 
 def _solver(cfg: SolverConfig = CFG) -> ScatterSolver:
-    return ScatterSolver(synthetic_library(cfg.num_groups, 5), cfg, wlab_geometry(), SiddonProjectors(),
+    return ScatterSolver(synthetic_library(cfg.num_groups, 5, num_materials=7), cfg, wlab_geometry(), SiddonProjectors(),
                          csi_response(), no_grid(), device=DEV, dtype=torch.float32)
 
 

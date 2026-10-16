@@ -8,7 +8,10 @@ directions before contracting it with phi_uc. This module computes the result di
     eta_k(v)   = Omega_UC(v) . omega_k,   Omega_UC(v) = (r_v - r0) / |r_v - r0|
 
 Kernel `_fc_kernel`, per program (block of BLOCK flattened voxels, block of KB directions):
-  - loads rho [2, BLOCK] once (two basis materials, docs/source/conventions.rst) and evaluates the voxel centers from the
+  - loads the two material densities [2, BLOCK] once (dense mode, PAIR = False: the two basis materials of an M = 2
+    library, slots 0 and 1 = materials 0 and 1; pair mode, PAIR = True: the compact pair representation
+    `cross_sections.MaterialPairs` of an M-material volume, densities [2, V] and material indices [2, V] int32, at most
+    two nonzero materials per voxel, the package's seven-material case) and evaluates the voxel centers from the
     1-D axis coordinates of the grid (x[cols], y[rows], z[slices]) and Omega_UC with IEEE sqrt / division (no
     [V, 3] Omega_UC tensor is formed);
   - for each of its directions: eta, the fractional index on the uniform eta grid (exactly the arithmetic of
@@ -18,8 +21,11 @@ Kernel `_fc_kernel`, per program (block of BLOCK flattened voxels, block of KB d
   - writes acc to out[k, :G, v] (coalesced along v).
 The table is re-laid out once per (library tensor, device) as tab [N, G_in, M, GP] float32 (GP = next power of
 two >= G) with zeros where g_out < g_in (the no-upscatter mask) or g_out >= G (padding), so for a given voxel all
-entries it needs lie in two contiguous 2 G M GP-float rows. At G = 6, N = 2001 the table is 0.8 MB and stays
-L2 resident; neighboring voxels hit neighboring eta rows.
+entries it needs lie in two contiguous G M GP-float rows (one per eta node). At G = 6, N = 2001 the table is 0.8 MB
+for M = 2 and 2.7 MB for the seven-material table, and stays L2 resident; neighboring voxels hit neighboring eta rows.
+In pair mode the material slot offset (index x GP) is per voxel instead of the constants 0 and GP; the gathers per
+(voxel, direction, g_in) are the same four, so the cost is close to that of the two-material case for any M (0.76 vs
+0.60 ms per chunk of 8 directions on the 0.5 cm WLAB problem: the larger table and the per-voxel offsets).
 
 Memory: the kernel reads rho, phi_uc (and the tiny axis/direction/table inputs) and writes the [K, G, V] output;
 no temporaries. The `chunk` argument of the PyTorch path is irrelevant here (all K directions in one launch).
@@ -104,10 +110,11 @@ def use_kernel(t: Tensor, backend: str) -> bool:
 
 def _self_check(device: torch.device) -> tuple[bool, str]:
     """Kernel vs the PyTorch path on a 5 x 7 x 6 grid, G = 4 (synthetic library), 6 directions including the
-    directions parallel and antiparallel to Omega_UC of one voxel (eta = +-1 exactly), rho = 0 in some voxels."""
-    from ..cross_sections import synthetic_library
+    directions parallel and antiparallel to Omega_UC of one voxel (eta = +-1 exactly), rho = 0 in some voxels; dense
+    mode (2 materials) and pair mode (7 materials, random pairs)."""
+    from ..cross_sections import material_pairs, synthetic_library
     from ..geometry import ConeGeometry, Grid
-    from ..uncollided import _fc_source_torch, primary_directions_to_voxels
+    from ..uncollided import _fc_source_torch, _fc_source_torch_pairs, primary_directions_to_voxels
 
     lib = synthetic_library(4, legendre_order=1, num_eta=201)
     grid = Grid(shape=(5, 7, 6), delta_voxel=1.0, voxel_slice_aspect=0.8)
@@ -124,13 +131,24 @@ def _self_check(device: torch.device) -> tuple[bool, str]:
     rho, phi, om = rho.to(device), phi.to(device), om.to(device)
     ref = _fc_source_torch(lib, rho, phi, grid, geom, angle, om, chunk=4)
     out = fc_source(lib, rho, phi, grid, geom, angle, om)
+    # pair mode: 7 materials, at most two nonzero per voxel, against the PyTorch pair path
+    lib7 = synthetic_library(4, legendre_order=1, num_eta=201, num_materials=7)
+    rho7 = torch.zeros(7, *grid.shape)
+    sel = torch.randint(0, 7, (2,) + tuple(grid.shape), generator=gen)
+    rho7.scatter_(0, sel, torch.rand((2,) + tuple(grid.shape), generator=gen) + 0.1)
+    rho7 = rho7.to(device)
+    pairs7 = material_pairs(rho7)
+    ref7 = _fc_source_torch_pairs(lib7, pairs7, phi, grid, geom, angle, om, chunk=4)
+    out7 = fc_source(lib7, rho7, phi, grid, geom, angle, om, pairs=pairs7)
     torch.cuda.synchronize(device)
-    if out.shape != ref.shape or not bool(torch.isfinite(out).all()):
-        return False, "self-check: wrong shape or non-finite output"
-    worst = float((out - ref).abs().max()) / max(float(ref.abs().max()), 1e-30)
+    worst = 0.0
+    for o, r in ((out, ref), (out7, ref7)):
+        if o.shape != r.shape or not bool(torch.isfinite(o).all()):
+            return False, "self-check: wrong shape or non-finite output"
+        worst = max(worst, float((o - r).abs().max()) / max(float(r.abs().max()), 1e-30))
     if worst > SELF_CHECK_REL_TOL:
         return False, f"self-check: kernel deviates from the PyTorch path by {worst:.2e} (rel)"
-    return True, f"kernel matches the PyTorch path (max rel dev {worst:.1e})"
+    return True, f"kernel matches the PyTorch path, dense and pair modes (max rel dev {worst:.1e})"
 
 
 # ================================================================================================
@@ -140,10 +158,13 @@ def _self_check(device: torch.device) -> tuple[bool, str]:
 if triton is not None:
 
     @triton.jit
-    def _fc_kernel(rho_ptr, phi_ptr, xax_ptr, yax_ptr, zax_ptr, om_ptr, tab_ptr, out_ptr,
+    def _fc_kernel(rho_ptr, idx_ptr, phi_ptr, xax_ptr, yax_ptr, zax_ptr, om_ptr, tab_ptr, out_ptr,
                    V, C, S, K, N, r0x, r0y, r0z, eta_lo, eta_hi,
-                   G: tl.constexpr, GP: tl.constexpr, KB: tl.constexpr, BLOCK: tl.constexpr):
-        """Two basis materials (M = 2, docs/source/conventions.rst); table row layout [G_in, M, GP]."""
+                   G: tl.constexpr, GP: tl.constexpr, KB: tl.constexpr, BLOCK: tl.constexpr,
+                   MT: tl.constexpr, PAIR: tl.constexpr):
+        """Table row layout [G_in, MT, GP] (MT = materials of the table). Dense mode (PAIR False, MT = 2): rho_ptr holds
+        the densities of materials 0 and 1. Pair mode: rho_ptr the two slot densities, idx_ptr the two slot material
+        indices (int32 [2, V]); the slot offsets ia GP, ib GP replace the constants 0, GP."""
         pid_v = tl.program_id(0)
         pid_k = tl.program_id(1)
         v = pid_v * BLOCK + tl.arange(0, BLOCK)
@@ -168,7 +189,10 @@ if triton is not None:
         smask = gm[:, None] & vm[None, :]
         nm1 = (N - 1).to(tl.float32)
         span = eta_hi - eta_lo
-        ROW: tl.constexpr = G * 2 * GP  # floats per eta row of the table
+        ROW: tl.constexpr = G * MT * GP  # floats per eta row of the table
+        if PAIR:
+            sa = (tl.load(idx_ptr + v, mask=vm, other=0) * GP)[None, :]
+            sb = (tl.load(idx_ptr + V + v, mask=vm, other=0) * GP)[None, :]
         for kb in range(KB):
             k = pid_k * KB + kb
             if k < K:
@@ -185,11 +209,17 @@ if triton is not None:
                 acc = tl.zeros((GP, BLOCK), dtype=tl.float32)
                 for gi in tl.static_range(G):
                     ph = tl.load(phi_ptr + gi * V + v, mask=vm, other=0.0)
-                    off = rowoff + gi * (2 * GP)
-                    a0 = tl.load(tab_ptr + off, mask=smask, other=0.0)
-                    a1 = tl.load(tab_ptr + off + ROW, mask=smask, other=0.0)
-                    b0 = tl.load(tab_ptr + off + GP, mask=smask, other=0.0)
-                    b1 = tl.load(tab_ptr + off + (ROW + GP), mask=smask, other=0.0)
+                    off = rowoff + gi * (MT * GP)
+                    if PAIR:
+                        offa = off + sa
+                        offb = off + sb
+                    else:
+                        offa = off
+                        offb = off + GP
+                    a0 = tl.load(tab_ptr + offa, mask=smask, other=0.0)
+                    a1 = tl.load(tab_ptr + offa + ROW, mask=smask, other=0.0)
+                    b0 = tl.load(tab_ptr + offb, mask=smask, other=0.0)
+                    b1 = tl.load(tab_ptr + offb + ROW, mask=smask, other=0.0)
                     T = rh0 * (a0 + (a1 - a0) * w) + rh1 * (b0 + (b1 - b0) * w)
                     acc += T * ph[None, :]
                 obase = (k.to(tl.int64) * G + go[:, None].to(tl.int64)) * V + v[None, :]
@@ -210,7 +240,7 @@ def _next_pow2(n: int) -> int:
 def prepared_table(lib, device: torch.device) -> tuple[Tensor, float, float]:
     """Kernel layout of the eta table of `lib` and the ends of its (uniform) eta grid.
 
-    lib.mu_s_eta [M = 2, G_in, G_out, N] (any device/dtype) -> tab [N, G_in, M, GP] float32 contiguous on `device`,
+    lib.mu_s_eta [M, G_in, G_out, N] (any device/dtype) -> tab [N, G_in, M, GP] float32 contiguous on `device`,
     GP = next power of two >= G, zero where g_out < g_in (no upscatter) or g_out >= G (padding); plus
     (eta_lo, eta_hi) = (lib.eta_grid[0], lib.eta_grid[-1]) as Python floats. Cached per (source tensor, device,
     tensor versions), so the host reads the grid ends once per library and device.
@@ -221,8 +251,8 @@ def prepared_table(lib, device: torch.device) -> tuple[Tensor, float, float]:
     if hit is not None and hit[0]() is table and key in hit[1]:
         return hit[1][key]
     M, G, G2, N = table.shape
-    if G != G2 or M != 2:
-        raise ValueError(f"transfer table must be [2, G, G, N], got {tuple(table.shape)}")
+    if G != G2:
+        raise ValueError(f"transfer table must be [M, G, G, N], got {tuple(table.shape)}")
     GP = _next_pow2(G)
     t = table.to(device=device, dtype=torch.float32)
     t = t * torch.triu(torch.ones(G, G, device=device, dtype=torch.float32))[None, :, :, None]
@@ -250,31 +280,45 @@ def _directions_per_program(K: int, num_vblocks: int, device: torch.device) -> i
     return kb
 
 
-def kernel_supports(lib, rho: Tensor, phi_uc: Tensor) -> bool:
-    """Shape preconditions of the kernel: two basis materials and a [2, G, G, N] table matching phi_uc's G."""
+def kernel_supports(lib, rho: Tensor, phi_uc: Tensor, pairs=None) -> bool:
+    """Shape preconditions of the kernel: a [M, G, G, N] table matching phi_uc's G and either two dense basis
+    materials (M = 2, pairs None) or the pair representation of an M-material volume."""
     G = phi_uc.shape[0]
-    return rho.shape[0] == 2 and tuple(lib.mu_s_eta.shape[:3]) == (2, G, G) and lib.mu_s_eta.shape[3] >= 2
+    t = lib.mu_s_eta
+    if tuple(t.shape[1:3]) != (G, G) or t.shape[3] < 2:
+        return False
+    if pairs is not None:
+        return int(pairs.num_materials) == int(t.shape[0]) and int(rho.shape[0]) == int(t.shape[0])
+    return rho.shape[0] == 2 and t.shape[0] == 2
 
 
-def fc_source(lib, rho: Tensor, phi_uc: Tensor, grid, geom, angle: float, omegas: Tensor) -> Tensor:
+def fc_source(lib, rho: Tensor, phi_uc: Tensor, grid, geom, angle: float, omegas: Tensor, pairs=None) -> Tensor:
     """Fused evaluation of `uncollided.fc_source_at_directions` (float32 CUDA only; no availability check here).
 
-    lib: MultigroupLibrary (uses eta_grid [N], ascending and uniform, and mu_s_eta [2, G, G, N]);
-    rho: [2, rows, cols, slices]; phi_uc: [G, rows, cols, slices] float32 CUDA; omegas: [K, 3] unit vectors
-    (recon frame). Returns [K, G, rows, cols, slices] float32 on phi_uc's device.
+    lib: MultigroupLibrary (uses eta_grid [N], ascending and uniform, and mu_s_eta [M, G, G, N]);
+    rho: [M, rows, cols, slices] (M = 2 without pairs); pairs: the `cross_sections.MaterialPairs` of rho (required
+    when M > 2: the kernel then gathers the two table rows of each voxel by index); phi_uc: [G, rows, cols, slices]
+    float32 CUDA; omegas: [K, 3] unit vectors (recon frame). Returns [K, G, rows, cols, slices] float32 on phi_uc's
+    device.
     """
     dev, dt = phi_uc.device, phi_uc.dtype
     if dev.type != "cuda" or dt != torch.float32:
         raise ValueError("the fused FC-source kernel needs float32 CUDA tensors")
-    if not kernel_supports(lib, rho, phi_uc):
-        raise ValueError("the fused FC-source kernel needs two basis materials and a [2, G, G, N] table")
+    if not kernel_supports(lib, rho, phi_uc, pairs):
+        raise ValueError("the fused FC-source kernel needs two dense basis materials and a [2, G, G, N] table, or the "
+                         "pair representation of the volume with a matching [M, G, G, N] table")
     G = phi_uc.shape[0]
     shape = tuple(phi_uc.shape[1:])
     if tuple(grid.shape) != shape:
         raise ValueError(f"phi_uc spatial shape {shape} != grid shape {tuple(grid.shape)}")
     R, C, S = shape
     V = R * C * S
-    rho_f = rho.to(device=dev, dtype=dt).reshape(2, V).contiguous()
+    if pairs is None:
+        rho_f = rho.to(device=dev, dtype=dt).reshape(2, V).contiguous()
+        idx_f = rho_f  # unused by the dense variant
+    else:
+        rho_f = pairs.density.to(device=dev, dtype=dt).reshape(2, V).contiguous()
+        idx_f = pairs.index.to(device=dev, dtype=torch.int32).reshape(2, V).contiguous()
     phi_f = phi_uc.reshape(G, V).contiguous()
     om = omegas.to(device=dev, dtype=dt).reshape(-1, 3).contiguous()
     K = om.shape[0]
@@ -287,16 +331,17 @@ def fc_source(lib, rho: Tensor, phi_uc: Tensor, grid, geom, angle: float, omegas
     nvb = -(-V // BLOCK_V)
     kb = _directions_per_program(K, nvb, dev)
     _fc_kernel[(nvb, -(-K // kb))](
-        rho_f, phi_f, x, y, z, om, tab, out, V, C, S, K, int(tab.shape[0]),
+        rho_f, idx_f, phi_f, x, y, z, om, tab, out, V, C, S, K, int(tab.shape[0]),
         float(r0[0]), float(r0[1]), float(r0[2]), eta_lo, eta_hi,
-        G=G, GP=_next_pow2(G), KB=kb, BLOCK=BLOCK_V, num_warps=NUM_WARPS)
+        G=G, GP=_next_pow2(G), KB=kb, BLOCK=BLOCK_V, MT=int(tab.shape[2]), PAIR=pairs is not None,
+        num_warps=NUM_WARPS)
     return out
 
 
 def fc_source_or_none(lib, rho: Tensor, phi_uc: Tensor, grid, geom, angle: float, omegas: Tensor,
-                      backend: str) -> Optional[Tensor]:
+                      backend: str, pairs=None) -> Optional[Tensor]:
     """`fc_source(...)` when the kernel applies (`use_kernel(phi_uc, backend)` and `kernel_supports`), else None
     (the caller then runs the PyTorch path)."""
-    if not use_kernel(phi_uc, backend) or not kernel_supports(lib, rho, phi_uc):
+    if not use_kernel(phi_uc, backend) or not kernel_supports(lib, rho, phi_uc, pairs):
         return None
-    return fc_source(lib, rho, phi_uc, grid, geom, angle, omegas)
+    return fc_source(lib, rho, phi_uc, grid, geom, angle, omegas, pairs=pairs)

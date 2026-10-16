@@ -37,6 +37,9 @@ __all__ = [
     "forward_project",
     "back_project",
     "fdk",
+    "scan_range",
+    "is_short_scan",
+    "short_scan_weights",
     "mbir_iterations",
     "freeze_regularization",
     "mbirtorch_version",
@@ -106,10 +109,86 @@ def back_project(model, sinogram: Tensor) -> Tensor:
     return model.back_project(sinogram, output_sharded=True)
 
 
-def fdk(model, sinogram: Tensor, filter_name: str = "ramp") -> Tensor:
+def scan_range(angles) -> float:
+    """Angular range (rad) covered by views evenly spaced over [start, end) with the endpoint excluded:
+    (a[-1] - a[0]) V / (V - 1) (2 pi for a full rotation of V views; 0 for a single view)."""
+    a = _angles_array(angles)
+    if a.size < 2:
+        return 0.0
+    return float(abs(a[-1] - a[0]) * a.size / (a.size - 1))
+
+
+def is_short_scan(angles, tol: float = 1e-6) -> bool:
+    """True when the evenly spaced views cover less than a full rotation (`scan_range` < 2 pi)."""
+    return scan_range(angles) < 2.0 * np.pi - tol
+
+
+def short_scan_weights(geom: ConeGeometry, angles, device: DeviceLike = None) -> Optional[Tensor]:
+    """FDK redundancy weights [V, 1, Cd] (float32) for views evenly spaced over a range Lambda < 2 pi, or None for a
+    full rotation (MBIRTORCH's FDK is then exact as is).
+
+    MBIRTORCH's `recon_fdk` applies no short-scan weighting: it scales every view by pi / V, the full-scan weight
+    (1/2) (2 pi / V). For a short scan this method multiplies the line integrals before the FDK by
+    Lambda / pi * w(beta, gamma) with the Parker weights in the generalized form of Wesarg et al. (Med. Phys. 29, 2002;
+    an overscan delta = (Lambda - pi) / 2 >= gamma_m allowed), beta = (i + 1/2) Lambda / V the view position in the
+    arc and gamma = -atan(u / SDD) the in-plane fan angle of channel u (the sign of MBIRTORCH's frame, tested):
+
+        w = sin^2(pi/4 beta / (delta - gamma))              0 <= beta < 2 (delta - gamma)
+            1                                               2 (delta - gamma) <= beta < pi - 2 gamma
+            sin^2(pi/4 (pi + 2 delta - beta) / (delta + gamma))     pi - 2 gamma <= beta <= pi + 2 delta
+
+    so that the weights of the two measurements of every in-plane line sum to 1. The weights need delta >= gamma_m,
+    i.e. Lambda >= pi + fan angle; for a shorter range a RuntimeWarning is issued and None returned (plain MBIRTORCH
+    FDK: incomplete data, shading). The weights act per channel (the in-plane Parker weighting of the cone-beam FDK,
+    approximate off the central plane like FDK itself)."""
+    a = _angles_array(angles)
+    V = a.size
+    lam = scan_range(a)
+    if V < 2 or lam >= 2.0 * np.pi - 1e-6:
+        return None
+    sdd = float(geom.source_detector_dist)
+    u = (np.arange(geom.num_det_channels) - (geom.num_det_channels - 1) / 2.0) * float(geom.delta_det_channel) \
+        - float(geom.det_channel_offset)
+    gamma = _PARKER_SIGN * np.arctan(u / sdd)  # [Cd]
+    gm = float(np.abs(gamma).max())
+    delta = 0.5 * (lam - np.pi)
+    if delta < gm - 1e-9:
+        import warnings
+
+        warnings.warn(f"scan range {np.degrees(lam):.1f} deg is shorter than a short scan (180 deg + fan angle "
+                      f"{np.degrees(2 * gm):.1f} deg): no redundancy weighting, the FDK is incomplete", RuntimeWarning)
+        return None
+    beta = (np.arange(V) + 0.5) * lam / V
+    if a[-1] < a[0]:
+        beta = beta[::-1].copy()
+    B, Gm = beta[:, None], gamma[None, :]
+    w = np.ones((V, gamma.size))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r1 = B < 2.0 * (delta - Gm)
+        w = np.where(r1, np.sin(np.pi / 4.0 * B / np.where(r1, delta - Gm, 1.0)) ** 2, w)
+        r3 = B >= np.pi - 2.0 * Gm
+        w = np.where(r3, np.sin(np.pi / 4.0 * np.clip(np.pi + 2.0 * delta - B, 0.0, None)
+                                / np.where(r3, delta + Gm, 1.0)) ** 2, w)
+    w = w * (lam / np.pi)
+    dev = torch.device(device) if device is not None else None
+    return torch.as_tensor(w[:, None, :].astype(np.float32), device=dev)
+
+
+_PARKER_SIGN = -1.0  # gamma = -atan(u / SDD): orientation relative to the rotation in MBIRTORCH's frame (measured:
+# the other sign leaves a 13 % error on an off-center test object, this one the full-rotation FDK error; tests)
+
+
+def fdk(model, sinogram: Tensor, filter_name: str = "ramp", *, geom: Optional[ConeGeometry] = None,
+        angles=None) -> Tensor:
     """FDK reconstruction (`ConeBeamModel.recon_fdk` = `recon_direct`: ramp filter with the FDK cosine pre-weight,
-    then the adjoint of the forward projector; full-scan, no short-scan weighting) of line integrals
-    [views, rows, channels] -> volume [R, C, S] (1/cm) on the model device."""
+    then the adjoint of the forward projector) of line integrals [views, rows, channels] -> volume [R, C, S] (1/cm)
+    on the model device. MBIRTORCH's FDK assumes a full rotation (no short-scan weighting); given the scan `geom` and
+    `angles` of a short scan (`is_short_scan`), the line integrals are first multiplied by the Parker weights of
+    `short_scan_weights` (without them a half-rotation FDK carries the usual short-scan shading and a wrong scale)."""
+    if geom is not None and angles is not None:
+        w = short_scan_weights(geom, angles, device=sinogram.device if isinstance(sinogram, Tensor) else None)
+        if w is not None:
+            sinogram = torch.as_tensor(sinogram, dtype=torch.float32, device=w.device) * w
     return model.recon_fdk(sinogram, filter_name=filter_name, output_sharded=True)
 
 

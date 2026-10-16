@@ -10,22 +10,51 @@ the first-collision (FC) source are
 in the recon frame, on the fine grid, and are device- and dtype-preserving (the dtype of `rho` / `phi_uc` decides
 the computation dtype).
 
-The uncollided fluence is exact in energy within each group: two upstream ray traces of the density maps and the
-library's fine-energy attenuation table (`cross_sections.group_transmission`), not the group-averaged mu_t.
+The uncollided fluence is exact in energy within each group: upstream ray traces of the density maps (one per basis
+material present in the volume, `present_materials`) and the library's fine-energy attenuation table
+(`cross_sections.group_transmission`), not the group-averaged mu_t.
+
+Materials: rho is [M, R, C, S] for any number of basis materials M (7 for the package's table). With M > 2 the
+first-collision source uses the compact pair representation (`cross_sections.MaterialPairs`: at most two nonzero
+materials per voxel, the two table rows gathered by material index), so its cost is that of a two-material basis;
+M <= 2 takes the dense path.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 from torch import Tensor
 
-from .cross_sections import MultigroupLibrary, group_transmission, transfer_eta_at
+from .cross_sections import (MaterialPairs, MultigroupLibrary, group_transmission, material_pairs, transfer_eta_at,
+                             transfer_eta_at_pairs)
 from .geometry import ConeGeometry, Grid
 from .kernels import uncollided_kernels as _fc_tri
 from .ray_tracing import Projectors
 from .source import SourceModel
+
+
+def present_materials(rho: Tensor) -> Optional[list[int]]:
+    """Library indices of the materials with any nonzero density in rho [M, ...] when M > 2 and some material is
+    absent (one host synchronization), else None (= all materials). An absent material has zero line integrals, so
+    tracing only the present ones gives the same transmission (`cross_sections.group_transmission(materials=...)`)."""
+    M = int(rho.shape[0])
+    if M <= 2:
+        return None
+    present = [int(i) for i in torch.nonzero(rho.reshape(M, -1).ne(0).any(1)).flatten().tolist()]
+    if len(present) == M:
+        return None
+    return present if present else [0]
+
+
+def resolve_pairs(rho: Tensor, pairs: Optional[MaterialPairs]) -> Optional[MaterialPairs]:
+    """The pair representation used by the FC source: None for M <= 2 (the dense path), else `pairs` (built from rho
+    when not given, `cross_sections.material_pairs`)."""
+    if int(rho.shape[0]) <= 2:
+        return None
+    return pairs if pairs is not None else material_pairs(rho)
 
 
 def primary_directions_to_voxels(grid: Grid, geom: ConeGeometry, angle: float, device=None,
@@ -44,10 +73,11 @@ def uncollided_fluence(lib: MultigroupLibrary, rho: Tensor, grid: Grid, geom: Co
                        source: SourceModel, projectors: Projectors) -> Tensor:
     """Uncollided scalar fluence at every fine voxel center, exact in energy within each group.
 
-        phi_UC,g(r) = b(Omega_UC(r)) / |r - r0|^2 * sum_{E in g} w_E exp(-(P_w(r) m_w(E) + P_b(r) m_b(E)))
+        phi_UC,g(r) = b(Omega_UC(r)) / |r - r0|^2 * sum_{E in g} w_E exp(-sum_m P_m(r) m_m(E))
 
-    with P_m(r) = int_{r0}^{r} rho_m dl the upstream line integrals of the two density maps (g/cm^2, TWO ray
-    traces, `projectors.upstream_cumulative(rho)`), and the library's fine-energy table: w_E = lib.fine_weight
+    with P_m(r) = int_{r0}^{r} rho_m dl the upstream line integrals of the density maps (g/cm^2, one ray trace per
+    material PRESENT in the volume, `projectors.upstream_cumulative(rho[present])`, `present_materials`: an absent
+    material adds nothing), and the library's fine-energy table: w_E = lib.fine_weight
     (source photons/sr per fine bin; their sum over group g is f_g = source.per_group_strength), m_m(E) =
     lib.fine_mu_t (`cross_sections.group_transmission`). Since mu_t is linear in the densities this is the exact
     group-integrated polychromatic Beer's law (up to the fine quadrature); the group-averaged attenuation
@@ -57,8 +87,12 @@ def uncollided_fluence(lib: MultigroupLibrary, rho: Tensor, grid: Grid, geom: Co
     per source photon/sr (point values at voxel centers).
     """
     dev, dt = rho.device, rho.dtype
-    path = projectors.upstream_cumulative(rho, grid, geom, angle)  # [M, R, C, S] g/cm^2
-    trans = group_transmission(lib, path)  # [G, R, C, S]
+    if int(rho.shape[0]) != lib.num_materials:
+        raise ValueError(f"rho has {int(rho.shape[0])} materials, the library {lib.num_materials}")
+    present = present_materials(rho)
+    src = rho if present is None else rho[present]
+    path = projectors.upstream_cumulative(src, grid, geom, angle)  # [M', R, C, S] g/cm^2
+    trans = group_transmission(lib, path, materials=present)  # [G, R, C, S]
     r = grid.center_coordinates(dev, dt)
     r0 = torch.tensor(geom.source_position(angle), device=dev, dtype=dt)
     d = r - r0
@@ -69,7 +103,7 @@ def uncollided_fluence(lib: MultigroupLibrary, rho: Tensor, grid: Grid, geom: Co
 
 def fc_source_at_directions(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor, grid: Grid,
                             geom: ConeGeometry, angle: float, omegas: Tensor, chunk: int = 4,
-                            backend: str = "auto") -> Tensor:
+                            backend: str = "auto", pairs: Optional[MaterialPairs] = None) -> Tensor:
     """First-collision source at every fine voxel center for each direction.
 
         S_FC,g(r, omega_k) = sum_{g' <= g} mu_s^{g'->g}(r; Omega_UC(r) . omega_k) phi_UC,g'(r)
@@ -85,10 +119,17 @@ def fc_source_at_directions(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor,
     the PyTorch path (the reference). The two paths agree to float32 rounding (~1e-6 relative).
     chunk: directions per batch of the PyTorch path (peak memory ~ 3 M G^2 chunk |F| scalars); the kernel
     evaluates all K directions in one launch without temporaries, so it ignores `chunk`.
+    pairs: for M > 2 basis materials, the compact pair representation of rho (`cross_sections.material_pairs(rho)`, at
+    most two nonzero materials per voxel; built here when None, so pass it when calling repeatedly with the same
+    densities): both paths gather the two table rows of each voxel by material index (cost and memory of a
+    two-material basis). Ignored for M <= 2 (the dense path).
     """
-    fused = _fc_tri.fc_source_or_none(lib, rho, phi_uc, grid, geom, angle, omegas, backend)
+    pairs = resolve_pairs(rho, pairs)
+    fused = _fc_tri.fc_source_or_none(lib, rho, phi_uc, grid, geom, angle, omegas, backend, pairs=pairs)
     if fused is not None:
         return fused
+    if pairs is not None:
+        return _fc_source_torch_pairs(lib, pairs, phi_uc, grid, geom, angle, omegas, chunk)
     return _fc_source_torch(lib, rho, phi_uc, grid, geom, angle, omegas, chunk)
 
 
@@ -111,6 +152,27 @@ def _fc_source_torch(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor, grid: 
         eta = torch.einsum("rcsx,kx->krcs", om_uc, om)  # [k, R, C, S]
         rho_k = rho[:, None].expand(M, k, *rho.shape[1:])
         T = transfer_eta_at(lib, rho_k, eta)  # [G_in, G_out, k, R, C, S]
+        out[s:s + k] = torch.einsum("abk...,ab,a...->kb...", T, down, phi_uc)
+    return out
+
+
+def _fc_source_torch_pairs(lib: MultigroupLibrary, pairs: MaterialPairs, phi_uc: Tensor, grid: Grid,
+                           geom: ConeGeometry, angle: float, omegas: Tensor, chunk: int = 4) -> Tensor:
+    """PyTorch path of `fc_source_at_directions` for the pair representation (any device / dtype): per `chunk`
+    directions the two table rows of every voxel are gathered by material index (`cross_sections.transfer_eta_at_pairs`)."""
+    dev, dt = phi_uc.device, phi_uc.dtype
+    pairs = pairs.to(device=dev, dtype=dt)
+    omegas = omegas.to(device=dev, dtype=dt).reshape(-1, 3)
+    K = omegas.shape[0]
+    G = phi_uc.shape[0]
+    om_uc = primary_directions_to_voxels(grid, geom, angle, dev, dt)  # [R, C, S, 3]
+    down = torch.triu(torch.ones(G, G, device=dev, dtype=dt))
+    out = torch.empty(K, G, *phi_uc.shape[1:], device=dev, dtype=dt)
+    for s in range(0, K, max(1, int(chunk))):
+        om = omegas[s:s + chunk]
+        k = om.shape[0]
+        eta = torch.einsum("rcsx,kx->krcs", om_uc, om)  # [k, R, C, S]
+        T = transfer_eta_at_pairs(lib, pairs, eta)  # [G_in, G_out, k, R, C, S]
         out[s:s + k] = torch.einsum("abk...,ab,a...->kb...", T, down, phi_uc)
     return out
 
@@ -201,7 +263,7 @@ class FCSamplingCorrection:
 
 def fc_sampling_correction(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor, grid: Grid, geom: ConeGeometry,
                            angle: float, omegas: Tensor, weights: Tensor, chunk: int = 4,
-                           batch: int = 8) -> FCSamplingCorrection:
+                           batch: int = 8, pairs: Optional[MaterialPairs] = None) -> FCSamplingCorrection:
     """Correction factors that make the quadrature (omegas [K, 3], weights [K]) integrate the sampled FC source
     exactly in angle, l = 0 and l = 1 about Omega_UC (one extra pass of `fc_source_at_directions` over all K
     directions, `batch` at a time).
@@ -214,7 +276,7 @@ def fc_sampling_correction(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor, 
     (the clamp keeps 1 + beta mu >= 0, i.e. a non-negative source).
     Precision (`fc_quadrature_sums`): the sums are formed by matmuls in the input dtype (float32 on GPU) over blocks of
     at most `_FC_SUM_MAX_DIRECTIONS` directions and accumulated across blocks in float64; the factors are computed in
-    float64. Returns an FCSamplingCorrection in the dtype of phi_uc.
+    float64. Returns an FCSamplingCorrection in the dtype of phi_uc. pairs: as in `fc_source_at_directions`.
     """
     dev, dt = phi_uc.device, phi_uc.dtype
     omegas = omegas.to(device=dev, dtype=dt).reshape(-1, 3)
@@ -222,7 +284,8 @@ def fc_sampling_correction(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor, 
     if w.shape[0] != omegas.shape[0]:
         raise ValueError("weights and omegas disagree in length")
     om_uc = primary_directions_to_voxels(grid, geom, angle, dev, dt)
-    I = fc_quadrature_sums(lib, rho, phi_uc, grid, geom, angle, omegas, w, om_uc=om_uc, chunk=chunk, batch=batch)
+    I = fc_quadrature_sums(lib, rho, phi_uc, grid, geom, angle, omegas, w, om_uc=om_uc, chunk=chunk, batch=batch,
+                           pairs=resolve_pairs(rho, pairs))
     E = fc_exact_moments(lib, rho, phi_uc.double(), l_max=1)
     scale, beta = fc_correction_factors(I, E)
     return FCSamplingCorrection(scale=scale.to(dt), beta=beta.to(dt), om_uc=om_uc)
@@ -244,7 +307,7 @@ def _moment_weight_rows(omegas: Tensor, weights: Tensor) -> Tensor:
 
 def fc_quadrature_sums(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor, grid: Grid, geom: ConeGeometry,
                        angle: float, omegas: Tensor, weights: Tensor, om_uc: Tensor | None = None, chunk: int = 4,
-                       batch: int = 8) -> Tensor:
+                       batch: int = 8, pairs: Optional[MaterialPairs] = None) -> Tensor:
     """Quadrature sums of the point-sampled FC source per voxel and group (see `fc_sampling_correction`):
 
         I0 = sum_m w_m S_m,  I1 = sum_m w_m mu_m S_m,  I2 = sum_m w_m mu_m^2 S_m,   mu_m = omega_m . Omega_UC(r)
@@ -257,8 +320,9 @@ def fc_quadrature_sums(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor, grid
     contracted with the per-voxel monomials of Omega_UC (1 + 3 + 6 rows -> I0, I1, I2) and added to the float64
     accumulators, so a float32 sum runs over at most `_FC_SUM_MAX_DIRECTIONS` directions and the sum across those
     blocks keeps float64. float64 inputs are summed in float64 throughout. (The float32 matmul assumes TF32 is off,
-    `torch.backends.cuda.matmul.allow_tf32 = False`, the PyTorch default.)
+    `torch.backends.cuda.matmul.allow_tf32 = False`, the PyTorch default.) pairs: as in `fc_source_at_directions`.
     """
+    pairs = resolve_pairs(rho, pairs)
     dev, dt = phi_uc.device, phi_uc.dtype
     omegas = omegas.to(device=dev, dtype=dt).reshape(-1, 3)
     weights = weights.to(device=dev, dtype=dt).reshape(-1)
@@ -289,7 +353,7 @@ def fc_quadrature_sums(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor, grid
         if in_block + k > _FC_SUM_MAX_DIRECTIONS:
             flush()
             in_block = 0
-        fc = fc_source_at_directions(lib, rho, phi_uc, grid, geom, angle, om, chunk=chunk)  # [k, G, R, C, S]
+        fc = fc_source_at_directions(lib, rho, phi_uc, grid, geom, angle, om, chunk=chunk, pairs=pairs)
         part.addmm_(rows[:, s:s + k], fc.reshape(k, G * V))
         in_block += k
         del fc

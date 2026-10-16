@@ -29,16 +29,17 @@ CFG = SolverConfig(num_groups=4, legendre_order=3, num_polar=4, num_azimuthal=8,
 IMAGE_KEYS = ("fluence", "planar_fluence", "signal_per_group", "signal")
 
 
-def peaked_library(num_groups: int = 4, legendre_order: int = 4, g_hg: float = 0.7) -> MultigroupLibrary:
+def peaked_library(num_groups: int = 4, legendre_order: int = 4, g_hg: float = 0.7,
+                   num_materials: int = 7) -> MultigroupLibrary:
     """synthetic_library with Henyey-Greenstein (forward-peaked) WITHIN-group kernels, so that all Legendre
     moments are non-zero (mu_s_l[g, g, l] = a g_hg^l)."""
-    lib = synthetic_library(num_groups=num_groups, legendre_order=legendre_order)
+    lib = synthetic_library(num_groups=num_groups, legendre_order=legendre_order, num_materials=num_materials)
     eta = lib.eta_grid
     mu_s_l = lib.mu_s_l.clone()
     mu_s_eta = lib.mu_s_eta.clone()
     l = torch.arange(legendre_order + 1, dtype=torch.float64)
     hg = (1 - g_hg ** 2) / (4 * math.pi * (1 + g_hg ** 2 - 2 * g_hg * eta) ** 1.5)
-    for m in range(2):
+    for m in range(lib.num_materials):
         for g in range(num_groups):
             a = float(mu_s_l[m, g, g, 0])
             mu_s_l[m, g, g] = a * g_hg ** l
@@ -48,7 +49,7 @@ def peaked_library(num_groups: int = 4, legendre_order: int = 4, g_hg: float = 0
 
 def make_solver(cfg: SolverConfig = CFG, lib: MultigroupLibrary | None = None, grid_response=None,
                 **kw) -> ScatterSolver:
-    lib = synthetic_library(cfg.num_groups, 5) if lib is None else lib
+    lib = synthetic_library(cfg.num_groups, 5, num_materials=7) if lib is None else lib
     return ScatterSolver(lib, cfg, wlab_geometry(), SiddonProjectors(), csi_response(),
                          no_grid() if grid_response is None else grid_response, device=DEV, dtype=torch.float32, **kw)
 
@@ -132,7 +133,7 @@ def test_truncated_library():
 # ---- linearity in the source strength --------------------------------------------------------------------
 
 def test_linearity_in_source_strength(rho, base_result):
-    lib = synthetic_library(CFG.num_groups, 5)
+    lib = synthetic_library(CFG.num_groups, 5, num_materials=7)
     lib2 = replace(lib, spectrum_fraction=2.5 * lib.spectrum_fraction, fine_weight=2.5 * lib.fine_weight)
     r2 = make_solver(lib=lib2).solve_view(rho, GRID, 0.0)
     r = base_result

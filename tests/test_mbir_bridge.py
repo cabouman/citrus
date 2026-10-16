@@ -14,6 +14,7 @@ pytest.importorskip("mbirtorch")
 
 from citrus.utilities import wlab_geometry  # noqa: E402
 from citrus.utilities import wlab_grid, wlab_phantom  # noqa: E402
+from citrus.scatter_solver.cross_sections import BONE, WATER  # noqa: E402
 from citrus.scatter_solver.ray_tracing import SiddonProjectors  # noqa: E402
 from citrus.recon.mbir_bridge import (fdk, forward_project, freeze_regularization,  # noqa: E402
                                                make_cone_model, mbir_iterations)
@@ -66,7 +67,7 @@ def test_wlab_projection_matches_siddon(setup):
     to ~1 % RMS (measured: <= 1.4 % at 1 cm, <= 0.25 % at 0.5 cm voxels), on the same pixels."""
     grid, model = setup
     rho = wlab_phantom(grid, device=DEV)
-    X = 0.201 * rho[0] + 0.289 * rho[1]
+    X = 0.201 * rho[WATER] + 0.289 * rho[BONE]
     sino = forward_project(model, X)
     assert sino.shape == (len(ANGLES), 75, 100) and sino.device.type == "cuda"
     tol = 0.02 if grid.delta_voxel >= 1.0 else 0.005
@@ -135,3 +136,53 @@ def test_fdk_and_single_iteration_recipe():
     sig = freeze_regularization(model)
     xk, _ = mbir_iterations(model, 2.0 * sino, xk, first_iteration=4)  # a different sinogram: sigmas stay frozen
     assert model.get_params("sigma_y") == sig["sigma_y"] and model.get_params("sigma_x") == sig["sigma_x"]
+
+
+def test_scan_range_and_short_scan_detection():
+    from citrus.recon.mbir_bridge import is_short_scan, scan_range
+    from citrus.utilities import fan_angle, full_field_wlab_geometry, view_angles
+
+    geom = full_field_wlab_geometry()
+    full = view_angles(36, geom, 0.3, 0.3 + 2 * np.pi)
+    short = view_angles(36, geom, 0.3)
+    assert scan_range(full) == pytest.approx(2 * np.pi, rel=1e-12) and not is_short_scan(full)
+    assert scan_range(short) == pytest.approx(np.pi + fan_angle(geom), rel=1e-12) and is_short_scan(short)
+    assert scan_range([0.5]) == 0.0
+
+
+def test_short_scan_fdk_parker_weights():
+    """MBIRTORCH's FDK has no short-scan weighting; `fdk(..., geom=, angles=)` applies Parker weights to a short scan
+    (pi + fan angle): an off-center object is reconstructed as accurately as from a full rotation, whereas the plain
+    FDK of the short scan is 11-14 % off; the weights of conjugate rays sum to 1 (times Lambda / pi); a full rotation
+    is left unweighted."""
+    from citrus.recon.mbir_bridge import short_scan_weights
+    from citrus.utilities import full_field_wlab_geometry, view_angles
+
+    geom = full_field_wlab_geometry()
+    grid = wlab_grid(1.0)
+    x, y, z = grid.axis_coordinates(DEV)
+    obj = (((x[None, :, None] - 6) ** 2 + (y[:, None, None] + 2) ** 2 < 16) & (z[None, None, :].abs() < 8)).float() * 0.2
+    obj += ((x[None, :, None].abs() < 14) & (y[:, None, None].abs() < 9) & (z[None, None, :].abs() < 8)).float() * 0.1
+    inner = (x[None, :, None].abs() < 12) & (y[:, None, None].abs() < 7) & (z[None, None, :].abs() < 4)
+
+    def err(r):
+        return float((r - obj)[inner].norm() / obj[inner].norm())
+
+    full = view_angles(90, geom, 0.0, 2 * np.pi)
+    assert short_scan_weights(geom, full) is None
+    m_full = make_cone_model(grid, geom, full, device=DEV)
+    e_full = err(fdk(m_full, forward_project(m_full, obj), geom=geom, angles=full))
+    for start in (0.0, 1.0):
+        ang = view_angles(90, geom, start)
+        model = make_cone_model(grid, geom, ang, device=DEV)
+        sino = forward_project(model, obj)
+        e_plain, e_parker = err(fdk(model, sino)), err(fdk(model, sino, geom=geom, angles=ang))
+        assert e_plain > 0.08 and e_parker < e_full + 0.01, (e_plain, e_parker, e_full)
+    # redundancy: on a fine short scan the weights of the two measurements of a central-plane line sum to Lambda / pi
+    ang = view_angles(2000, geom, 0.0)
+    w = short_scan_weights(geom, ang)[:, 0].double().numpy()  # [V, Cd]
+    lam = 2000 * (ang[1] - ang[0])
+    assert w.min() >= 0 and w.max() == pytest.approx(lam / np.pi, rel=1e-6)
+    assert w.sum(0).mean() * (ang[1] - ang[0]) == pytest.approx(lam, rel=1e-2)  # sum_beta w dbeta = pi (Lambda / pi)
+    with pytest.warns(RuntimeWarning, match="shorter than a short scan"):
+        assert short_scan_weights(geom, np.linspace(0, np.pi, 50, endpoint=False)) is None

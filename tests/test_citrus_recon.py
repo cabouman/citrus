@@ -80,8 +80,9 @@ def real_lib():
 
 @pytest.fixture(scope="module")
 def tiny(real_lib):
-    """16 views, 2 cm grid (10 x 15 x 20), a full-field panel of 1.6 cm pixels (46 x 38), noise-free (Y = P + S),
-    the real library, the regularization estimated on the true primary (frozen for every reconstruction)."""
+    """16 views over the default short scan (180 degrees + the fan angle of the panel), 2 cm grid (10 x 15 x 20), a
+    full-field panel of 1.6 cm pixels (46 x 38), noise-free (Y = P + S), the real library, the regularization estimated
+    on the true primary (frozen for every reconstruction)."""
     pytest.importorskip("mbirtorch")
     if not torch.cuda.is_available():
         pytest.skip("CUDA needed")
@@ -271,3 +272,28 @@ def test_sparse_views_interpolate_the_scatter_signal(tiny, monkeypatch):
         spr = info["spr"][:, Rd // 2, Cd // 2].cpu().numpy()
         np.testing.assert_allclose(spr[computed], expect[computed] / 3.0, rtol=1e-6)
         np.testing.assert_allclose(spr[skipped], expect[skipped] / 5.0, rtol=1e-6)
+
+
+@cuda
+def test_citrus_recon_on_short_scan(tiny):
+    """The tiny data set is a short scan (the release default): citrus_recon initializes with the Parker-weighted FDK
+    (MBIRTORCH's own FDK has no short-scan weighting and leaves the half-rotation data with a shading / scale error),
+    and the loop runs and improves on that initialization."""
+    from citrus.recon.mbir_bridge import fdk, is_short_scan
+    from citrus.utilities import fan_angle, view_angles
+
+    data, grid, geom, solver, reg = tiny
+    assert is_short_scan(data["angles"]) and data["meta"]["short_scan"] is True
+    np.testing.assert_allclose(data["angles"], view_angles(16, geom), atol=1e-15)
+    assert data["meta"]["end_view_angle"] == pytest.approx(math.pi + fan_angle(geom))
+    seen = []
+    X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geom, solver, CitrusConfig(num_outer=2),
+                           regularization=reg, callback=lambda k, X, rec: seen.append(_rmse(X, data)))
+    y_free = -torch.log(torch.as_tensor(data["P"], device=DEV) / 1.0e5)  # scatter-free: isolates the FDK weighting
+    model = info["model"]
+    e_parker = _rmse(fdk(model, y_free, geom=geom, angles=data["angles"]), data)
+    e_plain = _rmse(fdk(model, y_free), data)
+    # 16 views of 2 cm voxels: the FDK error is mostly view aliasing here (0.157 vs 0.176 unweighted); the weighting
+    # itself is checked on a finer problem in tests/test_mbir_bridge.py
+    assert e_parker < 0.95 * e_plain, (e_parker, e_plain)
+    assert seen[-1] < seen[0] and bool(torch.isfinite(X).all())

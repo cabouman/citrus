@@ -21,9 +21,12 @@ with vacuum boundaries and a point source at the focal spot :math:`\mathbf r_0`,
 :math:`q = s(E)\,b(\boldsymbol\Omega)\,\delta(\mathbf r - \mathbf r_0)`, where :math:`s(E)` is the normalized spectrum
 and :math:`b` the collimation (1 for directions that hit the panel, else 0). Interactions: photoelectric absorption
 (local deposition), Compton scattering (Klein-Nishina kinematics with the incoherent scattering function, no Doppler
-broadening) and Rayleigh scattering (form factors), from EPDL97 via XrayPhysics. Every voxel is a mixture of two basis
-materials (water, cortical bone) with densities :math:`\rho_w, \rho_b`, so every coefficient is linear in the
-densities: :math:`\mu_x(\mathbf r, E) = \rho_w(\mathbf r)\, m_{x,w}(E) + \rho_b(\mathbf r)\, m_{x,b}(E)`.
+broadening) and Rayleigh scattering (form factors), from EPDL97 via XrayPhysics. Every voxel is a mixture of the
+seven basis materials of the table below with densities :math:`\rho_m`, so every coefficient is linear in the
+densities: :math:`\mu_x(\mathbf r, E) = \sum_m \rho_m(\mathbf r)\, m_{x,m}(E)` with the mass coefficients
+:math:`m_{x,m}` of the cross-section library. The density model of the CITRUS coupling gives every voxel at most two
+nonzero materials; the first-collision source then gathers only the two table rows of each voxel (the pair
+representation, ``cross_sections.material_pairs``), so its cost is that of a two-material basis.
 
 Uncollided and collided fluence
 -------------------------------
@@ -35,10 +38,10 @@ The fluence splits into the uncollided part, known in closed form, and the colli
 .. math::
 
    \phi_{UC,g}(\mathbf r) = \frac{b(\boldsymbol\Omega_{UC})}{|\mathbf r - \mathbf r_0|^2}
-   \sum_{E\in g} w_E \exp\!\big(-P_w(\mathbf r)\, m_w(E) - P_b(\mathbf r)\, m_b(E)\big),
+   \sum_{E\in g} w_E \exp\!\Big(-\sum_m P_m(\mathbf r)\, m_m(E)\Big),
    \qquad P_m(\mathbf r) = \int_{\mathbf r_0}^{\mathbf r} \rho_m\, dl,
 
-i.e. two ray traces of the density maps and a fine-energy table (0.5 keV bins, weights :math:`w_E` of the spectrum):
+i.e. one ray trace per material present in the volume (an absent material adds nothing) and a fine-energy table (0.5 keV bins, weights :math:`w_E` of the spectrum):
 exact in energy, without the within-group beam-hardening error of group-averaged attenuation. The collided fluence
 satisfies the same LBTE with the **first-collision source** in place of :math:`q`,
 
@@ -191,21 +194,76 @@ The detector and grid responses are per incident photon: the signal of group :ma
 
 with :math:`\theta_0` the angle to the panel normal, :math:`D` the detector response (keV deposited per photon) and
 :math:`G` the anti-scatter-grid transmission at the grid angles. The primary image uses the same rule with the
-per-pixel direction from the focal spot and the exact-in-energy transmission of the two density line integrals,
+per-pixel direction from the focal spot and the exact-in-energy transmission of the density line integrals,
 averaged over sub-pixel rays after the energy sum. The scatter fraction is :math:`S/(P+S)`.
 
 CITRUS coupling
 ---------------
 
 MBIR reconstructs a monoenergetic attenuation map :math:`X` at an effective energy :math:`E_{eff}` (the spectrum mean,
-63 keV for the default 125 kVp spectrum). The solver needs densities: the two-material split
+63.03 keV for the default 125 kVp spectrum). The solver needs the densities of its seven basis materials, each with a
+nominal density :math:`\rho_m^{nom}` (its density in the body) and a nominal attenuation
+:math:`\mu_m = \rho_m^{nom}\, m_m(E_{eff})`, :math:`m_m` the total mass attenuation coefficient:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 34 16 16
+
+   * - material
+     - composition
+     - :math:`\rho^{nom}` (g/cm³)
+     - :math:`\mu` at 63 keV (1/cm)
+   * - air
+     - XrayPhysics ``air``
+     - 0.0012
+     - 0.00022
+   * - lung
+     - XrayPhysics ``lung``
+     - 0.26
+     - 0.0520
+   * - adipose
+     - XrayPhysics ``adipose_tissue``
+     - 0.95
+     - 0.1846
+   * - water
+     - H₂O
+     - 1.0
+     - 0.2013
+   * - muscle
+     - ICRU-44 skeletal muscle
+     - 1.05
+     - 0.2102
+   * - soft tissue
+     - ICRU-44 soft tissue
+     - 1.06
+     - 0.2122
+   * - cortical bone
+     - XrayPhysics ``bone_cortical`` (ICRP)
+     - 1.85
+     - 0.5366
+
+The materials are listed in their fixed order of increasing nominal attenuation, which holds at every energy of the
+library (10-125 keV; the library builder asserts it; muscle lies below soft tissue at every energy, attenuation ratio
+0.986-0.991). The interpolating density model assigns each voxel the two consecutive materials whose nominal
+attenuations bracket :math:`X`:
 
 .. math::
 
-   X \le \mu_w:\ \rho_w = X/m_w,\ \rho_b = 0; \qquad X > \mu_w:\ \rho_w = 1,\ \rho_b = (X - m_w)/m_b,
+   \mu_a \le X < \mu_b:\quad f = \frac{X - \mu_a}{\mu_b - \mu_a},\qquad
+   \rho_a = (1 - f)\,\rho_a^{nom},\quad \rho_b = f\,\rho_b^{nom},
 
-with :math:`m_{w,b} = m_{w,b}(E_{eff})` and :math:`\mu_w` the attenuation of unit-density water (negative values are
-clamped to vacuum) is exact in attenuation at :math:`E_{eff}`.
+below the first material (air) the first material alone with :math:`\rho = X / m_{air}`, above the last (cortical
+bone) the last alone with :math:`\rho = X / m_{bone}` (bone denser than 1.85 g/cm³); negative values are clamped to
+vacuum. Since :math:`\rho_a m_a + \rho_b m_b = (1 - f)\mu_a + f \mu_b = X`, the model is exact in attenuation at
+:math:`E_{eff}`; it returns the pure material at its own nominal attenuation (a water voxel is water, a cortical-bone
+voxel bone at 1.85 g/cm³) and at most two materials per voxel. Composition matters beyond :math:`E_{eff}`: the
+solver's primary and scatter are polychromatic, and two voxels of equal :math:`X` but different composition attenuate
+the harder and softer parts of the spectrum differently. The two-material split of versions up to 0.0.3 (water of
+density :math:`X/m_w` below unit water, unit water *plus* bone above it) turned the WLAB cortical-bone insert into
+water 1.0 + bone 1.156 g/cm³; behind the bone the polychromatic primary was then 3 % low and the SPR 3 % high, and the
+coupled loop overshot the bone by 6 %. With the seven-material model the 20-iteration WLAB reconstruction has the bone
+within 0.6 % and the water within 0.6 % (relative RMSE 0.0389 instead of 0.0429), and the solver SPR at the true
+attenuation reproduces the SPR of the true densities to 3·10⁻⁴.
 
 Per view :math:`v`, CITRUS keeps the accumulated collided moments :math:`\Phi_v = \sum_{n\ge1}\phi_v^{(n)}` and performs
 in every outer iteration :math:`k` the step
@@ -228,6 +286,15 @@ polychromatic primary and MBIR's monoenergetic model, and it only rescales the n
 (VCD) iteration at partition-schedule position :math:`k` on :math:`y_c` gives :math:`X_{k+1}`; the regularization is
 estimated once and frozen. The loop starts from the FDK reconstruction of the uncorrected data.
 
+Short scans. The views are evenly spaced over :math:`[\beta_s, \beta_e)`; the default range of the synthetic data is a
+short scan, :math:`\beta_e = \beta_s + \pi + 2\gamma_m` with :math:`2\gamma_m = 2\arctan(N_c \Delta_c / (2\,
+\mathrm{SDD}))` the in-plane fan angle of the panel (22.6° for the WLAB full-field panel). MBIRTORCH's FDK assumes a
+full rotation, so before it the line integrals of a short scan of range :math:`\Lambda` are weighted with
+:math:`(\Lambda/\pi)\, w(\beta, \gamma)`, the Parker weights in the overscan form of Wesarg et al. (:math:`\delta =
+(\Lambda - \pi)/2 \ge \gamma_m`, :math:`\gamma = -\arctan(u/\mathrm{SDD})` in MBIRTORCH's frame), which make the two
+measurements of every in-plane line sum to one. MBIR itself needs no weighting. The sparse-view interpolation below
+runs along the arc of a short scan instead of circularly.
+
 Sparse-view scatter
 -------------------
 
@@ -242,7 +309,9 @@ computed views,
    \mathrm{SPR}_v = s_v / p_v,
 
 with :math:`p_v` the solver's primary image of view :math:`v` (a ray trace of the current densities, no transport, so
-cheap) and weights :math:`w_{vj}` that are circular in angle (period :math:`2\pi`). With :math:`t\in[0,1)` the
+cheap) and weights :math:`w_{vj}` that are circular in angle (period :math:`2\pi`) for a full rotation; for a short
+scan they run along the arc (the views beyond the last computed view keep its value; the cubic's ghost nodes at the
+ends are linear extrapolations). With :math:`t\in[0,1)` the
 fractional position of the view between its two bracketing computed views :math:`j_0, j_1`
 (``scatter_view_interp_order``):
 
@@ -260,7 +329,7 @@ fractional position of the view between its two bracketing computed views :math:
 The scatter signal is interpolated rather than the ratio: the solver scatter is smooth on the panel and in angle (99 %
 of each pixel's variation energy lies in about 8-12 harmonics per rotation after a 1 cm low-pass), while the ratio
 carries the object's shadow edges, which move across the panel with the angle. On the 180-view WLAB study (20 outer
-iterations) stride 2 costs +0.0014 relative RMSE (0.0443 vs 0.0429) for 51 % of the scatter time and stride 4 +0.008
+iterations, two-material density model of version 0.0.2) stride 2 costs +0.0014 relative RMSE (0.0443 vs 0.0429) for 51 % of the scatter time and stride 4 +0.008
 (0.0509) for 26 %; Catmull-Rom matches or beats linear interpolation offline (skipped-view scatter error 1.05 / 1.94 %
 vs 1.12 / 2.11 % at strides 2 / 4) at no extra cost. Interpolating the TRUE scatter costs only about +0.0025 at stride
 4, so the in-loop penalty is mostly the slower convergence of the coupled loop on the skipped views, not the
@@ -276,7 +345,8 @@ iterations (the recursion is unchanged, it is simply advanced less often). An MB
 scatter stage on the WLAB study (0.75 s against 56 s for 180 views), so for a given number of scatter steps the
 additional MBIR iterations are nearly free.
 
-Measured on the 180-view WLAB study (0.5 cm grid, release defaults, relative RMSE over the prism): at a fixed 20
+Measured on the 180-view WLAB study (0.5 cm grid, the defaults of version 0.0.3 with the two-material density
+model, relative RMSE over the prism): at a fixed 20
 outer iterations the scatter step at every 2nd / 4th iteration (10 / 5 steps) raises the final error from 0.0429 to
 0.0513 / 0.0700, because between refreshes the MBIR iterations converge towards the solution of a stale correction.
 The same 20 scatter steps spread over 40 (:math:`n = 2`) / 80 (:math:`n = 4`) outer iterations lower it to 0.0310 /
