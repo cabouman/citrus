@@ -33,24 +33,25 @@ fluence from one outer iteration to the next. Per view :math:`v` it keeps the ac
 
 .. math::
 
-   \phi_{UC} = G_1(\rho_k), \qquad \Phi_v \leftarrow \phi^{(1)}(\rho_k) + K(\rho_k)\,\Phi_v
+   \phi_{UC} = \text{uncollided fluence of } \rho_k, \qquad
+   \Phi_v^{(k)} = G_k\,\phi_1^{(k)} + G_k\,\Phi_v^{(k-1)}
    \quad(\text{one sweep of the summed sources}), \qquad
-   s_v = \text{scatter image of } (\phi_{UC}, \Phi_v),
+   s_v = \text{scatter image of } (\phi_1^{(k)}, \Phi_v^{(k)}),
 
-with :math:`G_1` the uncollided operator, :math:`\phi^{(1)}` the once-collided fluence of the first-collision source and
-:math:`K` the collided transport of one collision order (scattering source, then a sweep). Writing :math:`K_k` and
-:math:`\phi^{(1)}_k` for these operators at the densities of reconstruction :math:`k`, the accumulator expands as
+with :math:`\phi_1^{(k)}` the first-collision source of the densities :math:`\rho_k` and :math:`G_k` one transport
+sweep at those densities: applied to :math:`\phi_1^{(k)}` it gives the once-collided fluence, applied to
+:math:`\Phi_v^{(k-1)}` it transports the scattering source of the previous accumulator by one collision order. The
+two sources are summed and swept together, so the step costs one sweep. The accumulator expands as
 
 .. math::
 
-   \Phi_v^{(k)} = \phi^{(1)}_k + K_k\,\Phi_v^{(k-1)}
-                = \phi^{(1)}_k + K_k\,\phi^{(1)}_{k-1} + K_k K_{k-1}\,\phi^{(1)}_{k-2} + \dots
+   \Phi_v^{(k)} = G_k\,\phi_1^{(k)} + G_k G_{k-1}\,\phi_1^{(k-1)} + G_k G_{k-1} G_{k-2}\,\phi_1^{(k-2)} + \dots
 
 The :math:`n`-th collision order of the current estimate started from the first-collision source of :math:`n-1` outer
 iterations earlier: the dominant low orders always come from the newest reconstructions, while stale information is
 pushed into the weak, smooth high orders.
 
-With the densities held fixed, :math:`N` steps give :math:`\Phi^{(N)} = \sum_{n=1}^{N} K^{n-1}\phi^{(1)}`, exactly the
+With the densities held fixed, :math:`N` steps give :math:`\Phi^{(N)} = \sum_{n=1}^{N} G^{n}\phi_1`, exactly the
 source iteration truncated after :math:`N` sweeps (a tested identity, ``citrus_step``). The recursion *is* source
 iteration, so the scatter estimate converges together with the reconstruction, for the cost of one sweep per view per
 outer iteration.
