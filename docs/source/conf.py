@@ -57,7 +57,7 @@ try:
 except ImportError:
     html_theme = "alabaster"
 html_title = "citrus"
-ogp_site_url = "https://citrus.readthedocs.io/"
+ogp_site_url = "https://purduecitrus.readthedocs.io/"
 
 
 def _literal_docstrings(app, what, name, obj, options, lines):

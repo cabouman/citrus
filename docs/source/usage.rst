@@ -10,12 +10,14 @@ Both demos write their figures to ``demo/output/`` (not tracked); the CITRUS dem
 .. code-block:: bash
 
    python demo/demo_scatter_solver.py              # one view of the WLAB phantom (seconds)
-   python demo/demo_citrus.py                      # 36 views over a short scan, 1 cm grid, 10 outer iterations
-                                                   # (about 2 minutes)
+   python demo/demo_citrus.py                      # 180 views over a short scan, 0.5 cm grid, 80 outer iterations,
+                                                   # scatter step on every 8th view and at every 8th outer iteration
+                                                   # (about 4 minutes)
    python demo/demo_citrus.py --end-view-angle 360 # the same over a full rotation
    python demo/demo_citrus.py --full               # the report study: 180 views over a full rotation, 0.5 cm grid,
-                                                   # 20 outer iterations
-   python demo/demo_citrus.py --scatter-view-stride 2   # scatter step on every 2nd view only
+                                                   # 20 outer iterations, scatter step on every view at every iteration
+   python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer 10 --scatter-view-stride 1 --scatter-every 1
+                                                   # a quick run (about 2 minutes)
 
 ``demo_scatter_solver.py`` builds the seven-material library (about 16 s, then cached), rasterizes the WLAB phantom (a
 30 x 20 x 40 cm water prism with lung, air and bone inserts) and solves one view with the default configuration (6 groups, Legendre order 7, 8 x 16 sweep
@@ -27,9 +29,11 @@ fraction and central-row profiles. Options: ``--delta-voxel``, ``--supervoxel-fa
 from the solver's scatter-to-primary ratio, Poisson noise), runs CITRUS and the uncorrected MBIR loop with the same
 initialization, weights, partition sequence and frozen regularization, and plots central slices, central-row profiles,
 the relative RMSE per outer iteration and the estimated vs true scatter-to-primary ratio of one view. Options:
-``--views``, ``--delta-voxel``, ``--outer``, ``--I0``, ``--seed``, ``--no-noise``, ``--full``, ``--regenerate``,
+``--views`` (default 180), ``--delta-voxel`` (default 0.5), ``--supervoxel-factor`` (fine voxels per transport cell,
+default ~1 cm cells), ``--outer`` (default 80), ``--I0``, ``--seed``, ``--no-noise``, ``--full``, ``--regenerate``,
 ``--truth-sweep``, ``--truth-cone``, ``--start-view-angle`` / ``--end-view-angle`` (degrees),
-``--scatter-view-stride`` (default 1), ``--scatter-view-interp-order`` (``0``-``3`` or ``none``, default ``3``).
+``--scatter-view-stride`` (default 8), ``--scatter-view-interp-order`` (``0``-``3`` or ``none``, default ``3``),
+``--scatter-every`` (default 8).
 
 Angular range: the views are evenly spaced over ``[start, end)`` (endpoint excluded, MBIRTORCH's angle convention).
 The default end is a short scan, start + 180 degrees + the in-plane fan angle of the panel,
@@ -37,9 +41,9 @@ The default end is a short scan, start + 180 degrees + the in-plane fan angle of
 degrees); ``--end-view-angle 360`` (with the default start 0) is a full rotation. ``--full`` reproduces the report
 study and sets the full rotation explicitly. MBIRTORCH's FDK, which initializes the loop, assumes a full rotation; for
 a short scan ``citrus_recon`` / ``mbir_recon`` apply Parker weights before it (``recon.mbir_bridge.fdk(...,
-geom=, angles=)``, ``short_scan_weights``), and the sparse-view interpolation runs along the arc. Measured with the
-demo defaults (36 views, 1 cm grid, 10 outer iterations): relative RMSE of CITRUS 0.064 over the short scan
-(uncorrected MBIR 0.29, FDK 0.31) and 0.075 over a full rotation.
+geom=, angles=)``, ``short_scan_weights``), and the sparse-view interpolation runs along the arc. Measured with
+36 views, a 1 cm grid, 10 outer iterations and the scatter step on every view at every iteration: relative RMSE of
+CITRUS 0.064 over the short scan (uncorrected MBIR 0.29, FDK 0.31) and 0.075 over a full rotation.
 
 Ground truth of the CITRUS demo: the scatter of every view is computed by the scatter solver from the TRUE densities
 with a fully converged source iteration, stored as the scatter-to-primary ratio and applied to MBIRTORCH's primary

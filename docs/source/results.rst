@@ -42,9 +42,14 @@ Findings:
    relative RMSE of 0.0389 over the prism and 0.0451 in the core (two-material: 0.0429 / 0.0505), for 8 % more
    scatter time (62.6 s instead of 57.9 s per outer iteration in the same session).
 
-The default demo (``demo/demo_citrus.py``: 36 views over a short scan of 202.6 degrees, 1 cm grid, 10 outer
-iterations) shows the same ordering in about two minutes: relative RMSE 0.31 (FDK, Parker-weighted), 0.29 (no
-correction), 0.064 (CITRUS); over a full rotation (``--end-view-angle 360``) 0.32, 0.29 and 0.075.
+The quick demo setting (``demo/demo_citrus.py --views 36 --delta-voxel 1 --outer 10 --scatter-view-stride 1
+--scatter-every 1``: 36 views over a short scan of 202.6 degrees, 1 cm grid, 10 outer iterations) shows the same
+ordering in about two minutes: relative RMSE 0.31 (FDK, Parker-weighted), 0.29 (no correction), 0.064 (CITRUS); over
+a full rotation (``--end-view-angle 360``) 0.32, 0.29 and 0.075.
+The demo's defaults (180 views over the short scan, 0.5 cm grid, 80 outer iterations with the scatter step on every
+8th view and at every 8th outer iteration, i.e. 10 scatter steps on 23 views each) reach a relative RMSE of 0.024 over
+the prism and 0.029 in the core (FDK 0.32, no correction 0.29) in 226 s on the RTX 3070 (8.4 s per scatter stage,
+0.8 s per MBIR iteration).
 
 Accuracy of the scatter model itself (inverse crime): the synthetic data and the reconstruction loop use the same
 solver, so the remaining discretization error of the solver (per-pixel ray effects of a finite collapsed-cone set,

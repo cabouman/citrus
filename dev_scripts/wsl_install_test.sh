@@ -43,8 +43,8 @@ step "demo/demo_scatter_solver.py"
 python demo/demo_scatter_solver.py 2>&1 | tail -15
 echo "demo_scatter_solver exit: ${PIPESTATUS[0]}"
 
-step "demo/demo_citrus.py (default short scan, 36 views, 1 cm, 10 outer iterations)"
-python demo/demo_citrus.py 2>&1 | tail -20
+step "demo/demo_citrus.py (quick setting: short scan, 36 views, 1 cm, 10 outer iterations)"
+python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer 10 --scatter-view-stride 1 --scatter-every 1 2>&1 | tail -20
 echo "demo_citrus exit: ${PIPESTATUS[0]}"
 ls demo/output 2>/dev/null
 step "done"

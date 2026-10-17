@@ -8,7 +8,7 @@ solver. This replaces the usual sequential pipeline (FDK, one scatter estimate f
 reconstruction that never revisits the scatter), whose scatter estimate inherits the errors of the scatter-corrupted
 initial volume.
 
-Full documentation: [citrus.readthedocs.io](https://citrus.readthedocs.io).
+Full documentation: [purduecitrus.readthedocs.io](https://purduecitrus.readthedocs.io).
 
 ## How CITRUS works
 
@@ -31,9 +31,6 @@ refreshed from the freshest reconstruction, while stale information is relegated
 higher orders. With fixed densities the recursion *is* source iteration and converges to the fully converged scatter
 estimate, so the scatter and the reconstruction converge together for the cost of one sweep per view per MBIR
 iteration.
-
-The density model, the sparse-view option (`scatter_view_stride`), the option to run the scatter step every n outer
-iterations (`scatter_every`) and the results of the synthetic studies are described in the documentation.
 
 ## The scatter solver
 
@@ -75,11 +72,14 @@ step).
 
 ```bash
 python demo/demo_scatter_solver.py   # the scatter solver on one view of the WLAB phantom (seconds)
-python demo/demo_citrus.py           # CITRUS vs uncorrected MBIR: 36 views over a short scan, 1 cm grid,
-                                     # 10 outer iterations (~2 min)
+python demo/demo_citrus.py           # CITRUS vs uncorrected MBIR: 180 views over a short scan, 0.5 cm grid,
+                                     # 80 outer iterations, scatter step on every 8th view at every 8th iteration
+                                     # (~4 min)
 python demo/demo_citrus.py --end-view-angle 360      # the same over a full rotation
-python demo/demo_citrus.py --full    # the report study: 180 views over a full rotation, 0.5 cm grid, 20 iterations
-python demo/demo_citrus.py --scatter-view-stride 2   # scatter step on every 2nd view, the others interpolated
+python demo/demo_citrus.py --full    # the report study: 180 views over a full rotation, 0.5 cm grid, 20 iterations,
+                                     # scatter step on every view at every iteration
+python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer 10 --scatter-view-stride 1 --scatter-every 1
+                                     # a quick run (~2 min)
 ```
 
 The views are evenly spaced over `[start, end)` (`--start-view-angle`, `--end-view-angle` in degrees); the default

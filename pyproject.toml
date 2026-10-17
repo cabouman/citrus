@@ -34,7 +34,7 @@ gpu = [
 
 [project.urls]
 Homepage = "https://github.com/cabouman/citrus"
-Documentation = "https://citrus.readthedocs.io"
+Documentation = "https://purduecitrus.readthedocs.io"
 
 [tool.setuptools.dynamic]
 version = { attr = "citrus.__version__" }

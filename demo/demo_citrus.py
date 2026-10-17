@@ -1,13 +1,16 @@
 """Demo: CITRUS on the WLAB phantom (synthetic cone-beam data with scatter and Poisson noise).
 
-    python demo/demo_citrus.py                     # 36 views over a short scan, 1 cm grid, 10 outer iterations
-                                                   # (about 2 minutes)
+    python demo/demo_citrus.py                     # 180 views over a short scan, 0.5 cm grid, 80 outer iterations
+                                                   # with the scatter step on every 8th view and at every 8th outer
+                                                   # iteration (10 scatter steps)
     python demo/demo_citrus.py --full              # the report study: 180 views over a FULL rotation, 0.5 cm grid,
-                                                   # 20 outer iterations (about 30 min)
-    python demo/demo_citrus.py --end-view-angle 360                     # 36 views over a full rotation
-    python demo/demo_citrus.py --views 60 --delta-voxel 0.5 --outer 15
+                                                   # 20 outer iterations, scatter step on every view and at every
+                                                   # outer iteration (about 30 min)
+    python demo/demo_citrus.py --end-view-angle 360                     # the default over a full rotation
+    python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer 10 --scatter-view-stride 1 --scatter-every 1
+                                                   # a quick run (about 2 minutes)
+    python demo/demo_citrus.py --supervoxel-factor 1                    # 0.5 cm transport cells (default: ~1 cm)
     python demo/demo_citrus.py --truth-sweep 16x32 --truth-cone 32x64   # truth finer than the loop's solver
-    python demo/demo_citrus.py --scatter-view-stride 2                  # scatter step on every 2nd view only
 
 1. Data (citrus.utilities.synthesize_wlab_dataset, cached in demo/input/). The WLAB phantom (30 x 20 x 40 cm water
    prism with lung, air and bone inserts) is rasterized on the reconstruction grid; full-field panel (150 x 184
@@ -15,7 +18,8 @@
    excluded; ``--start-view-angle`` / ``--end-view-angle`` in degrees, MBIRTORCH's angle convention); the default end
    is the short scan start + 180 degrees + the in-plane fan angle of the panel, 2 atan(0.5 x 150 x 0.4 cm / 150 cm) =
    22.6 degrees, i.e. 202.6 degrees; ``--end-view-angle 360`` (with start 0) is a full rotation. ``--full`` keeps the
-   report's full rotation (end = start + 360 degrees, set explicitly).
+   report's full rotation (end = start + 360 degrees, set explicitly) and its scatter step on every view at every
+   outer iteration.
    - Primary: P = I0 exp(-A X_true) with A the MBIRTORCH projector and X_true the attenuation of the true densities at
      the effective energy (spectrum mean, 63 keV); I0 = flat-field counts per pixel.
    - Ground-truth scatter: for every view, the LBTE scatter solver is run on the TRUE densities with a fully converged
@@ -30,13 +34,16 @@
    truth with finer direction sets than the loop: ``--truth-sweep`` (discrete-ordinates quadrature, polar x
    azimuthal, loop default 8x16; recommended 16x32) and ``--truth-cone`` (collapsed-cone directions, loop default
    16x32; recommended 32x64, or 48x96 as a reference). The defaults equal the loop's for speed; 16x32 / 32x64 make the
-   data synthesis about 4x slower.
+   data synthesis about 4x slower. ``--supervoxel-factor`` sets the transport cell size of both solvers (fine voxels
+   per cell along each axis; default round(1 cm / delta_voxel), i.e. ~1 cm cells); the data set's cache name records
+   it when it differs from the default.
 2. CITRUS (citrus.citrus_recon): FDK initialization (Parker-weighted for a short scan: MBIRTORCH's FDK has no
    short-scan weighting, recon.mbir_bridge.short_scan_weights), then per outer iteration one scatter step per view and one
    warm-started MBIR iteration on Y / (1 + SPR). ``--scatter-view-stride n`` runs the scatter step on every n-th view
    only and interpolates the other views' scatter signal in angle (``--scatter-view-interp-order``, default 3:
-   Catmull-Rom); the output files then carry a ``_stride<n>`` suffix (``_stride<n>_order<k>`` for orders other
-   than 3).
+   Catmull-Rom; default stride 8); ``--scatter-every n`` runs the scatter step at every n-th outer iteration only and
+   reuses the scatter-to-primary ratio in between (default 8). The output files carry ``_stride<n>`` and
+   ``_every<n>`` suffixes for values other than 1 (``_stride<n>_order<k>`` for interpolation orders other than 3).
 3. The same MBIR loop without scatter correction (citrus.mbir_recon), for comparison.
 Both reconstructions use the same frozen regularization (MBIRTORCH's automatic estimate on the scatter-free
 sinogram), the same FDK initialization, weights and partition sequence, so they differ only by the scatter
@@ -87,12 +94,17 @@ def _counts(text: str, what: str) -> tuple[int, int]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--views", type=int, default=36, help="number of views over 360 degrees (default 36)")
-    ap.add_argument("--delta-voxel", type=float, default=1.0, help="voxel pitch in cm (default 1.0; 0.5 for full)")
-    ap.add_argument("--outer", type=int, default=10, help="outer iterations (default 10)")
+    ap.add_argument("--views", type=int, default=180, help="number of views over the angular range (default 180)")
+    ap.add_argument("--delta-voxel", type=float, default=0.5, help="voxel pitch in cm (default 0.5)")
+    ap.add_argument("--supervoxel-factor", type=int, default=None,
+                    help="fine voxels per transport cell along each axis, for the loop's and the truth's solver "
+                         "(default: round(1 cm / delta_voxel), ~1 cm cells)")
+    ap.add_argument("--outer", type=int, default=80, help="outer iterations (default 80)")
     ap.add_argument("--full", action="store_true",
                     help="the report study: 180 views over a FULL rotation (end view angle = start + 360 degrees, set "
-                         "explicitly; --end-view-angle is ignored), 0.5 cm grid, 20 outer iterations")
+                         "explicitly; --end-view-angle is ignored), 0.5 cm grid, 20 outer iterations, scatter step on "
+                         "every view at every outer iteration (--views, --delta-voxel, --outer, --scatter-view-stride "
+                         "and --scatter-every are overridden)")
     ap.add_argument("--start-view-angle", type=float, default=0.0,
                     help="first view angle in degrees (default 0; MBIRTORCH's angle convention)")
     ap.add_argument("--end-view-angle", type=float, default=None,
@@ -109,22 +121,28 @@ def main() -> None:
     ap.add_argument("--truth-cone", default=None,
                     help="collapsed-cone directions of the ground-truth solver, POLARxAZIMUTHAL (default: the loop's, "
                          "16x32; recommended finer: 32x64)")
-    ap.add_argument("--scatter-view-stride", type=int, default=1,
+    ap.add_argument("--scatter-view-stride", type=int, default=8,
                     help="scatter step on every n-th view only (views 0, n, 2n, ...), the others interpolated in "
-                         "angle (default 1: every view)")
+                         "angle (default 8)")
     ap.add_argument("--scatter-view-interp-order", default="3", choices=["none", "0", "1", "2", "3"],
                     help="angular interpolation of the skipped views (with --scatter-view-stride > 1): 0 nearest, "
                          "1 linear, 2 quadratic, 3 cubic Catmull-Rom (default), none = not corrected (diagnostics)")
-    ap.add_argument("--scatter-every", type=int, default=1,
+    ap.add_argument("--scatter-every", type=int, default=8,
                     help="scatter step at every n-th outer iteration only; the previous correction is reused in "
-                         "between (default 1: every iteration)")
+                         "between (default 8)")
     ap.add_argument("--memory-cap-mib", type=float, default=4400.0, help="PyTorch CUDA memory cap (0: none)")
     ap.add_argument("--input", default=os.path.join(HERE, "input"))
     ap.add_argument("--out", default=os.path.join(HERE, "output"))
     args = ap.parse_args()
     if args.full:
         args.views, args.delta_voxel, args.outer = 180, 0.5, 20
+        args.scatter_view_stride, args.scatter_every = 1, 1
         args.end_view_angle = args.start_view_angle + 360.0  # the report's full rotation
+    default_factor = default_supervoxel_factor(args.delta_voxel)
+    if args.supervoxel_factor is None:
+        args.supervoxel_factor = default_factor
+    elif args.supervoxel_factor < 1:
+        raise SystemExit("--supervoxel-factor must be >= 1")
     interp_order = None if args.scatter_view_interp_order == "none" else int(args.scatter_view_interp_order)
     if args.scatter_view_stride < 1:
         raise SystemExit("--scatter-view-stride must be >= 1")
@@ -136,7 +154,7 @@ def main() -> None:
     set_memory_cap(args.memory_cap_mib)
     os.makedirs(args.input, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
-    loop_cfg = replace(SolverConfig(), supervoxel_factor=default_supervoxel_factor(args.delta_voxel))
+    loop_cfg = replace(SolverConfig(), supervoxel_factor=args.supervoxel_factor)
     tp, ta = _counts(args.truth_sweep, "--truth-sweep") if args.truth_sweep else (loop_cfg.num_polar,
                                                                                  loop_cfg.num_azimuthal)
     cp, ca = _counts(args.truth_cone, "--truth-cone") if args.truth_cone else (loop_cfg.cone_num_polar,
@@ -158,6 +176,8 @@ def main() -> None:
         arc = f"_{args.start_view_angle:g}to{args.end_view_angle:g}deg"
     tag = (f"wlab_{args.views}v_{args.delta_voxel:g}cm".replace(".", "p") + arc.replace(".", "p")
            + ("_nonoise" if args.no_noise else ""))
+    if args.supervoxel_factor != default_factor:
+        tag += f"_sv{args.supervoxel_factor}"
     if truth_cfg != loop_cfg:
         tag += f"_truth{tp}x{ta}_cone{cp}x{ca}"
     t_all = time.perf_counter()
@@ -183,7 +203,8 @@ def main() -> None:
     span = math.degrees(scan_range(angles))
     print(f"views over {math.degrees(float(angles[0])):.1f} + {span:.1f} degrees "
           f"({'short scan' if is_short_scan(angles) else 'full rotation'})")
-    print(f"grid {grid.shape} at {grid.delta_voxel} cm, {len(angles)} views, panel {geom.num_det_rows} x "
+    print(f"grid {grid.shape} at {grid.delta_voxel} cm, transport grid {grid.coarsen(args.supervoxel_factor).shape} "
+          f"(factor {args.supervoxel_factor}), {len(angles)} views, panel {geom.num_det_rows} x "
           f"{geom.num_det_channels}; SPR median {np.median(spr_true):.2f}, max {spr_true.max():.1f}")
 
     # ---- shared: solver, MBIRTORCH model, frozen regularization (scatter-free sinogram), metrics ---------------
@@ -232,7 +253,8 @@ def main() -> None:
     rec = info_c["records"][1:]
     summary = {
         "views": len(angles), "start_view_angle_deg": math.degrees(float(angles[0])), "scan_range_deg": span,
-        "short_scan": bool(is_short_scan(angles)), "delta_voxel_cm": args.delta_voxel, "grid": list(grid.shape), "outer": args.outer,
+        "short_scan": bool(is_short_scan(angles)), "delta_voxel_cm": args.delta_voxel, "grid": list(grid.shape),
+        "supervoxel_factor": args.supervoxel_factor, "outer": args.outer,
         "truth_sweep": [tp, ta], "truth_cone": [cp, ca],
         "scatter_view_stride": args.scatter_view_stride, "scatter_view_interp_order": interp_order,
         "scatter_every": args.scatter_every,
