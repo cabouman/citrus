@@ -105,7 +105,6 @@ __all__ = [
     "material_order",
     "densities_to_attenuation",
     "attenuation_to_densities",
-    "default_supervoxel_factor",
     "wlab_solver",
     "fan_angle",
     "view_angles",
@@ -329,21 +328,15 @@ def attenuation_to_densities(lib: MultigroupLibrary, X: Tensor, energy_kev: Opti
 # synthetic cone-beam data
 # =====================================================================================================
 
-def default_supervoxel_factor(delta_voxel: float) -> int:
-    """Supervoxel factor giving ~1 cm transport cells: round(1 / delta_voxel), at least 1 (0.5 cm -> 2, 1 cm -> 1,
-    2 cm -> 1)."""
-    return max(1, int(round(1.0 / float(delta_voxel))))
-
-
 def wlab_solver(delta_voxel: float, *, config: Optional[SolverConfig] = None, lib: Optional[MultigroupLibrary] = None,
                 geom: Optional[ConeGeometry] = None, device=None,
                 cache_dir: Optional[str] = "default") -> ScatterSolver:
-    """ScatterSolver for the WLAB data: the given config (default SolverConfig() with the supervoxel factor of
-    `default_supervoxel_factor`), the real library (build_solver_library, cached in `cache_dir`; "default" is
+    """ScatterSolver for the WLAB data: the given config (default SolverConfig(): 1 cm transport cells,
+    `SolverConfig.transport_cell_cm`, whatever the fine voxel size `delta_voxel`, which only names the grid the solver
+    will be used with), the real library (build_solver_library, cached in `cache_dir`; "default" is
     $CITRUS_CACHE_DIR or ~/.cache/citrus; needs XrayPhysics unless cached), the full-field WLAB geometry (default), an
     ideal counting detector and no grid, float32."""
-    cfg = config if config is not None else replace(SolverConfig(),
-                                                    supervoxel_factor=default_supervoxel_factor(delta_voxel))
+    cfg = config if config is not None else SolverConfig()
     lib = lib if lib is not None else build_solver_library(cfg, cache_dir=cache_dir)
     dev = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return ScatterSolver(lib, cfg, geom if geom is not None else full_field_wlab_geometry(),
@@ -386,8 +379,8 @@ def synthesize_cone_beam_data(rho: Tensor, grid: Grid, geometry: ConeGeometry, a
                               progress: Optional[Callable[[int, float], None]] = None) -> dict:
     """Cone-beam counts with scatter for any density volume (module docstring, "Synthetic cone-beam data").
 
-    rho [M, R, C, S] densities (g/cm^3) of the solver library's M = 7 basis materials on `grid` (the reconstruction grid; shape divisible by the
-    solver's supervoxel factor); geometry: the scan (used by MBIRTORCH and must be the solver's geometry); angles [V]
+    rho [M, R, C, S] densities (g/cm^3) of the solver library's M = 7 basis materials on `grid` (the reconstruction
+    grid, the solver's fine grid); geometry: the scan (used by MBIRTORCH and must be the solver's geometry); angles [V]
     (rad); solver: the ScatterSolver that defines the scatter truth (one fully converged solve_view per view);
     I0: flat-field counts per pixel; noise: Poisson(Y_mean) with torch.Generator(seed), else Y = Y_mean;
     energy_kev: E_eff (None: the spectrum mean of the solver's library). progress(view_index, seconds) is called after
@@ -500,7 +493,7 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
     num_views angles evenly spaced over [start_view_angle, end_view_angle) (`view_angles`; default end: the short scan
     start + pi + fan angle of the panel, 202.6 degrees for the full-field panel; end = start + 2 pi for a full
     rotation), the solver `wlab_solver(delta_voxel, config=config, lib=lib, geom=geom)` (default: SolverConfig() with
-    ~1 cm transport cells, the full-field geometry `full_field_wlab_geometry()`, ideal counting detector, no grid).
+    1 cm transport cells, the full-field geometry `full_field_wlab_geometry()`, ideal counting detector, no grid).
     meta also records delta_voxel, start_view_angle and end_view_angle. out_path: if given, the data are written with
     `save_dataset` (<out_path>.npz and <out_path>.json)."""
     dev = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")

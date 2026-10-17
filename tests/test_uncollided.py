@@ -383,7 +383,7 @@ def _fc_moment_sources(lib, monkeypatch) -> tuple[torch.Tensor, torch.Tensor]:
     dev = torch.device("cuda")
     grid = Grid((10, 16, 20), 2.0)
     cfg = SolverConfig(num_groups=lib.num_groups, legendre_order=3, num_polar=4, num_azimuthal=8, cone_num_polar=8,
-                       cone_num_azimuthal=16, supervoxel_factor=2, direction_chunk=8)
+                       cone_num_azimuthal=16, transport_cell_cm=4.0, direction_chunk=8)
     sol = ScatterSolver(lib, cfg, wlab_geometry(), SiddonProjectors(),
                        csi_response(), no_grid(), device=dev, dtype=torch.float32)
     rho = wlab_phantom(grid, device=dev, dtype=torch.float32)

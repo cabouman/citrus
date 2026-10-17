@@ -7,29 +7,32 @@ the first-collision (FC) source are
     S_FC,g(r, Omega)  = sum_{g' <= g} mu_s^{g' -> g}(r; Omega_UC(r) . Omega) phi_UC,g'(r)
 
 (per-steradian transfer mu_s(eta) tabulated in eta = cos(scattering angle)). All functions work for one view angle
-in the recon frame, on the fine grid, and are device- and dtype-preserving (the dtype of `rho` / `phi_uc` decides
-the computation dtype).
+in the recon frame and are device- and dtype-preserving (the dtype of `rho` / `phi_uc` decides the computation
+dtype). The evaluation points are the voxel centers of the `grid` argument: in the solver the quadrature grid Q (q^3
+points per transport cell, docs/source/conventions.rst, "Grids"), with the densities resampled onto Q.
 
 The uncollided fluence is exact in energy within each group: upstream ray traces of the density maps (one per basis
 material present in the volume, `present_materials`) and the library's fine-energy attenuation table
-(`cross_sections.group_transmission`), not the group-averaged mu_t.
+(`cross_sections.group_transmission`), not the group-averaged mu_t. The trace runs through any grid to the points of
+any other (`uncollided_fluence(..., points=)`): the solver traces through the transport grid C to the Q points.
 
-Materials: rho is [M, R, C, S] for any number of basis materials M (7 for the package's table). With M > 2 the
-first-collision source uses the compact pair representation (`cross_sections.MaterialPairs`: at most two nonzero
-materials per voxel, the two table rows gathered by material index), so its cost is that of a two-material basis;
-M <= 2 takes the dense path.
+Materials: rho is [M, R, C, S] for any number of basis materials M (7 for the package's table). Where every point has
+at most two nonzero materials, the first-collision source uses the compact pair representation
+(`cross_sections.MaterialPairs`: the two table rows gathered by material index; the cost of a two-material basis);
+otherwise (resampled densities can mix more materials per point) and for M <= 2 it evaluates all M materials densely
+(`pairs` argument: a MaterialPairs, `DENSE`, or None to decide from rho, `resolve_pairs`).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from torch import Tensor
 
-from .cross_sections import (MaterialPairs, MultigroupLibrary, group_transmission, material_pairs, transfer_eta_at,
-                             transfer_eta_at_pairs)
+from .cross_sections import (MaterialPairs, MultigroupLibrary, group_transmission, material_pairs_if_compact,
+                             transfer_eta_at, transfer_eta_at_pairs)
 from .geometry import ConeGeometry, Grid
 from .kernels import uncollided_kernels as _fc_tri
 from .ray_tracing import Projectors
@@ -49,12 +52,24 @@ def present_materials(rho: Tensor) -> Optional[list[int]]:
     return present if present else [0]
 
 
-def resolve_pairs(rho: Tensor, pairs: Optional[MaterialPairs]) -> Optional[MaterialPairs]:
-    """The pair representation used by the FC source: None for M <= 2 (the dense path), else `pairs` (built from rho
-    when not given, `cross_sections.material_pairs`)."""
-    if int(rho.shape[0]) <= 2:
-        return None
-    return pairs if pairs is not None else material_pairs(rho)
+# `pairs` value selecting the dense evaluation over all M materials
+DENSE = "dense"
+PairsArg = Union[MaterialPairs, str, None]
+
+
+def resolve_pairs(rho: Tensor, pairs: PairsArg) -> Union[MaterialPairs, str]:
+    """The material representation of the FC source: `pairs` itself when it is a MaterialPairs or `DENSE`; for None,
+    `cross_sections.material_pairs_if_compact(rho)` (the pair representation when M > 2 and every point has at most
+    two nonzero materials; one host synchronization) or DENSE. Resolve once and pass the result when calling
+    repeatedly with the same densities."""
+    if isinstance(pairs, MaterialPairs):
+        return pairs
+    if pairs is None:
+        compact = material_pairs_if_compact(rho)
+        return DENSE if compact is None else compact
+    if pairs != DENSE:
+        raise ValueError(f"pairs must be a MaterialPairs, {DENSE!r} or None, got {pairs!r}")
+    return DENSE
 
 
 def primary_directions_to_voxels(grid: Grid, geom: ConeGeometry, angle: float, device=None,
@@ -70,30 +85,38 @@ def primary_directions_to_voxels(grid: Grid, geom: ConeGeometry, angle: float, d
 
 
 def uncollided_fluence(lib: MultigroupLibrary, rho: Tensor, grid: Grid, geom: ConeGeometry, angle: float,
-                       source: SourceModel, projectors: Projectors) -> Tensor:
-    """Uncollided scalar fluence at every fine voxel center, exact in energy within each group.
+                       source: SourceModel, projectors: Projectors, points: Optional[Grid] = None) -> Tensor:
+    """Uncollided scalar fluence at the voxel centers of `points` (default: of `grid`), exact in energy within each
+    group, traced through the densities rho on `grid`.
 
         phi_UC,g(r) = b(Omega_UC(r)) / |r - r0|^2 * sum_{E in g} w_E exp(-sum_m P_m(r) m_m(E))
 
-    with P_m(r) = int_{r0}^{r} rho_m dl the upstream line integrals of the density maps (g/cm^2, one ray trace per
-    material PRESENT in the volume, `projectors.upstream_cumulative(rho[present])`, `present_materials`: an absent
-    material adds nothing), and the library's fine-energy table: w_E = lib.fine_weight
+    with P_m(r) = int_{r0}^{r} rho_m dl the upstream line integrals of the density maps on `grid` (g/cm^2, zero outside
+    its box; one ray trace per material PRESENT in the volume, `present_materials`: an absent material adds nothing):
+    `projectors.upstream_cumulative(rho[present], grid)` when the points are the centers of `grid` itself, else
+    `projectors.upstream_to_points(rho[present], grid, ..., points centers)` (one ray per point: the number of rays is
+    the number of points, the path cost that of `grid`; a point outside the box gets the integral of the part of its
+    ray inside the box). The library's fine-energy table: w_E = lib.fine_weight
     (source photons/sr per fine bin; their sum over group g is f_g = source.per_group_strength), m_m(E) =
     lib.fine_mu_t (`cross_sections.group_transmission`). Since mu_t is linear in the densities this is the exact
     group-integrated polychromatic Beer's law (up to the fine quadrature); the group-averaged attenuation
     f_g exp(-int mu_t,g dl) ignores beam hardening within a group (-1.4% after 20 cm of water with 6 groups).
 
-    rho: [M, rows, cols, slices] g/cm^3. Returns phi_uc [G, rows, cols, slices] in photons/cm^2
-    per source photon/sr (point values at voxel centers).
+    rho: [M, rows, cols, slices] g/cm^3 on grid. Returns phi_uc [G, *points.shape] in photons/cm^2 per source
+    photon/sr (point values at the voxel centers of `points`).
     """
     dev, dt = rho.device, rho.dtype
     if int(rho.shape[0]) != lib.num_materials:
         raise ValueError(f"rho has {int(rho.shape[0])} materials, the library {lib.num_materials}")
+    pts = grid if points is None else points
     present = present_materials(rho)
     src = rho if present is None else rho[present]
-    path = projectors.upstream_cumulative(src, grid, geom, angle)  # [M', R, C, S] g/cm^2
+    r = pts.center_coordinates(dev, dt)
+    if pts == grid:
+        path = projectors.upstream_cumulative(src, grid, geom, angle)  # [M', R, C, S] g/cm^2
+    else:
+        path = projectors.upstream_to_points(src, grid, geom, angle, r.reshape(-1, 3)).reshape(-1, *pts.shape)
     trans = group_transmission(lib, path, materials=present)  # [G, R, C, S]
-    r = grid.center_coordinates(dev, dt)
     r0 = torch.tensor(geom.source_position(angle), device=dev, dtype=dt)
     d = r - r0
     dist2 = (d * d).sum(-1)  # [R, C, S]
@@ -103,8 +126,9 @@ def uncollided_fluence(lib: MultigroupLibrary, rho: Tensor, grid: Grid, geom: Co
 
 def fc_source_at_directions(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor, grid: Grid,
                             geom: ConeGeometry, angle: float, omegas: Tensor, chunk: int = 4,
-                            backend: str = "auto", pairs: Optional[MaterialPairs] = None) -> Tensor:
-    """First-collision source at every fine voxel center for each direction.
+                            backend: str = "auto", pairs: PairsArg = None) -> Tensor:
+    """First-collision source at every voxel center of `grid` (in the solver the quadrature grid Q) for each
+    direction.
 
         S_FC,g(r, omega_k) = sum_{g' <= g} mu_s^{g'->g}(r; Omega_UC(r) . omega_k) phi_UC,g'(r)
 
@@ -119,17 +143,19 @@ def fc_source_at_directions(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor,
     the PyTorch path (the reference). The two paths agree to float32 rounding (~1e-6 relative).
     chunk: directions per batch of the PyTorch path (peak memory ~ 3 M G^2 chunk |F| scalars); the kernel
     evaluates all K directions in one launch without temporaries, so it ignores `chunk`.
-    pairs: for M > 2 basis materials, the compact pair representation of rho (`cross_sections.material_pairs(rho)`, at
-    most two nonzero materials per voxel; built here when None, so pass it when calling repeatedly with the same
-    densities): both paths gather the two table rows of each voxel by material index (cost and memory of a
-    two-material basis). Ignored for M <= 2 (the dense path).
+    pairs: the material representation (`resolve_pairs`): a `cross_sections.MaterialPairs` of rho (at most two
+    nonzero materials per point; both paths gather the two table rows of each point by material index: cost and
+    memory of a two-material basis), `DENSE` (all M materials per point: the PyTorch path forms the M-material mix, the
+    kernel's dense mode costs about M / 2 times its pair mode), or None (decided from rho here, one host
+    synchronization: pass the resolved value when calling repeatedly with the same densities).
     """
     pairs = resolve_pairs(rho, pairs)
-    fused = _fc_tri.fc_source_or_none(lib, rho, phi_uc, grid, geom, angle, omegas, backend, pairs=pairs)
+    mp = pairs if isinstance(pairs, MaterialPairs) else None
+    fused = _fc_tri.fc_source_or_none(lib, rho, phi_uc, grid, geom, angle, omegas, backend, pairs=mp)
     if fused is not None:
         return fused
-    if pairs is not None:
-        return _fc_source_torch_pairs(lib, pairs, phi_uc, grid, geom, angle, omegas, chunk)
+    if mp is not None:
+        return _fc_source_torch_pairs(lib, mp, phi_uc, grid, geom, angle, omegas, chunk)
     return _fc_source_torch(lib, rho, phi_uc, grid, geom, angle, omegas, chunk)
 
 
@@ -178,20 +204,21 @@ def _fc_source_torch_pairs(lib: MultigroupLibrary, pairs: MaterialPairs, phi_uc:
 
 
 def restrict_fc_to_ld_moments(fc: Tensor, grid: Grid, factor: int) -> Tensor:
-    """Restrict a fine-grid field to LD moments on the supervoxel grid.
+    """Restrict a field on a refined grid (the quadrature grid Q = C.refine(factor)) to LD moments on the grid it
+    refines (the transport grid C).
 
     fc: [..., rows, cols, slices] on `grid` (typically [K, G, rows, cols, slices]).
-    Returns [..., 4, rows/f, cols/f, slices/f] with moments ordered [0, x, y, z] (x <-> cols,
-    y <-> rows, z <-> slices), using the f^3 fine sub-voxel centers as equal-weight quadrature points
+    Returns [..., 4, rows/f, cols/f, slices/f] (f = factor) with moments ordered [0, x, y, z] (x <-> cols,
+    y <-> rows, z <-> slices), using the f^3 sub-cell centers as equal-weight quadrature points
     with local coordinates u_j = (2j + 1)/f - 1 (grid.local_coordinates_of_fine_in_coarse):
 
       moment 0 = mean_j S_j
       moment a = mean_j(S_j u_a,j) / mean_j(u_a,j^2)
 
     The midpoint quadrature gives mean_j(u_j^2) = (1 - 1/f^2)/3, not 1/3, so the continuous Galerkin
-    formula (3 mean(S u)) would return s (1 - 1/f^2) for a field c + s u sampled at the sub-voxel centers.
+    formula (3 mean(S u)) would return s (1 - 1/f^2) for a field c + s u sampled at the sub-cell centers.
     Dividing by the discrete second moment instead reproduces a field that is linear within each
-    supervoxel exactly (slope s, mean c). For f = 1 the slopes are 0.
+    cell exactly (slope s, mean c). For f = 1 the slopes are 0.
     """
     f = int(factor)
     coarse = grid.coarsen(f)  # validates divisibility
@@ -241,7 +268,8 @@ def fc_exact_moments(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor, l_max:
 
 @dataclass(frozen=True, eq=False)
 class FCSamplingCorrection:
-    """Per-voxel, per-group correction of the pointwise-sampled FC source (fine grid):
+    """Per-point, per-group correction of the pointwise-sampled FC source (on the grid of its points, in the solver
+    the quadrature grid Q):
 
         S_m <- scale * S_m * (1 + beta * Omega_m . Omega_UC)
 
@@ -263,7 +291,7 @@ class FCSamplingCorrection:
 
 def fc_sampling_correction(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor, grid: Grid, geom: ConeGeometry,
                            angle: float, omegas: Tensor, weights: Tensor, chunk: int = 4,
-                           batch: int = 8, pairs: Optional[MaterialPairs] = None) -> FCSamplingCorrection:
+                           batch: int = 8, pairs: PairsArg = None) -> FCSamplingCorrection:
     """Correction factors that make the quadrature (omegas [K, 3], weights [K]) integrate the sampled FC source
     exactly in angle, l = 0 and l = 1 about Omega_UC (one extra pass of `fc_source_at_directions` over all K
     directions, `batch` at a time).
@@ -307,7 +335,7 @@ def _moment_weight_rows(omegas: Tensor, weights: Tensor) -> Tensor:
 
 def fc_quadrature_sums(lib: MultigroupLibrary, rho: Tensor, phi_uc: Tensor, grid: Grid, geom: ConeGeometry,
                        angle: float, omegas: Tensor, weights: Tensor, om_uc: Tensor | None = None, chunk: int = 4,
-                       batch: int = 8, pairs: Optional[MaterialPairs] = None) -> Tensor:
+                       batch: int = 8, pairs: PairsArg = None) -> Tensor:
     """Quadrature sums of the point-sampled FC source per voxel and group (see `fc_sampling_correction`):
 
         I0 = sum_m w_m S_m,  I1 = sum_m w_m mu_m S_m,  I2 = sum_m w_m mu_m^2 S_m,   mu_m = omega_m . Omega_UC(r)

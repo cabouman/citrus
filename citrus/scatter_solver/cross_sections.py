@@ -25,8 +25,10 @@ attenuation at the nominal density at every energy of the library (10-125 keV; a
 (compositions in `cross_section_library.MATERIAL_FORMULAS`). Density maps are rho [M, rows, cols, slices] with M = 7
 in this order; every coefficient is linear in rho. The density model (`citrus.utilities.attenuation_to_densities`)
 gives every voxel at most two nonzero materials, the two whose nominal attenuations bracket the voxel's attenuation;
-the first-collision source works on that compact pair representation (`MaterialPairs`, `material_pairs`). The
-library, the solver and the kernels are general in M; `synthetic_library` builds test libraries of any M.
+the first-collision source works on that compact pair representation (`MaterialPairs`, `material_pairs`) wherever its
+evaluation points have at most two nonzero materials (`material_pairs_if_compact`; block means of such a field can mix
+more, and are then evaluated densely over all M materials). The library, the solver and the kernels are general in M;
+`synthetic_library` builds test libraries of any M.
 """
 
 from __future__ import annotations
@@ -222,6 +224,25 @@ def material_pairs(rho: Tensor) -> MaterialPairs:
     idx = torch.where(used, idx, torch.zeros_like(idx))
     dens = torch.gather(rho, 0, idx) * used.to(rho.dtype)
     return MaterialPairs(index=idx.to(torch.int32).contiguous(), density=dens.contiguous(), num_materials=M)
+
+
+def max_materials_per_point(rho: Tensor) -> int:
+    """Largest number of nonzero materials at any point of rho [M, ...] (one host synchronization; 0 for an empty or
+    all-zero volume)."""
+    if rho.numel() == 0:
+        return 0
+    return int((rho != 0).sum(0).max())
+
+
+def material_pairs_if_compact(rho: Tensor) -> Optional[MaterialPairs]:
+    """`material_pairs(rho)` when rho [M, ...] has M > 2 materials and at most two nonzero ones at every point, else
+    None (M <= 2, or some point mixes three or more materials: the first-collision source then evaluates all M
+    materials densely). One host synchronization when M > 2. Block means of a density field that obeys the
+    two-material convention (`citrus.utilities.attenuation_to_densities`) can mix more materials, so the solver
+    decides per quadrature grid (`scatter_solver.MaterialFields.pairs_quad`)."""
+    if int(rho.shape[0]) <= 2 or max_materials_per_point(rho) > 2:
+        return None
+    return material_pairs(rho)
 
 
 # ---- per-voxel coefficients from density maps ----------------------------------------------------

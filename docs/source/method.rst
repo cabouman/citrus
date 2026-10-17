@@ -25,8 +25,10 @@ broadening) and Rayleigh scattering (form factors), from EPDL97 via XrayPhysics.
 seven basis materials of the table below with densities :math:`\rho_m`, so every coefficient is linear in the
 densities: :math:`\mu_x(\mathbf r, E) = \sum_m \rho_m(\mathbf r)\, m_{x,m}(E)` with the mass coefficients
 :math:`m_{x,m}` of the cross-section library. The density model of the CITRUS coupling gives every voxel at most two
-nonzero materials; the first-collision source then gathers only the two table rows of each voxel (the pair
-representation, ``cross_sections.material_pairs``), so its cost is that of a two-material basis.
+nonzero materials. The first-collision source is evaluated on the quadrature grid (below) from resampled densities;
+where every quadrature point has at most two nonzero materials it gathers only their two table rows (the pair
+representation, ``cross_sections.material_pairs``: the cost of a two-material basis), otherwise all seven (about 3.5
+times the work per point, on far fewer points than the fine grid has).
 
 Uncollided and collided fluence
 -------------------------------
@@ -52,6 +54,18 @@ satisfies the same LBTE with the **first-collision source** in place of :math:`q
 
 evaluated from the tabulated per-steradian transfer :math:`\mu_s^{g'\to g}(\eta)`, :math:`\eta = \cos\theta` on a
 2001-point grid (no Legendre truncation: the first-collision source keeps the Rayleigh forward peak).
+
+Grids. Following Acuros CTS (Maslowski et al. 2018, Med. Phys. 45:1899, Section 2.B), one computational grid carries
+every step of the scatter solve: the transport grid C of cubic cells of edge ``transport_cell_cm`` (default 1 cm)
+covering the reconstruction box, whatever the reconstruction voxel size (:doc:`conventions`, "Grids"). The
+first-collision source is integrated over each cell with :math:`q^3` equal-weight points on the midpoint lattice
+(the quadrature grid Q = C refined :math:`q` times; :math:`q` = ``fc_points_per_axis``, default 2, bounded by the
+data resolution: at most round(cell / fine voxel), so 1 cm voxels in 1 cm cells use :math:`q = 1`), with the densities
+of each point the exact average of the fine densities over its :math:`(\Delta_C/q)^3` sub-cell (conservative overlap
+resampling, mass conserving for any ratio of voxel to cell size). :math:`\phi_{UC}` is evaluated at the Q points by
+tracing the resampled density maps from the focal spot through Q (``fc_trace_grid = "quadrature"``, default; "coarse"
+traces through C, which smears a material boundary inside a cell, "fine" through the reconstruction grid). The cost of every first-order step is :math:`q^3` points per cell,
+independent of the fine grid; only the primary image is computed on the fine grid.
 
 Multigroup and spherical-harmonic discretization
 ------------------------------------------------
@@ -86,7 +100,7 @@ integrates products :math:`Y_n Y_{n'}` up to degree :math:`L` exactly when ``num
 Linear-discontinuous cells
 --------------------------
 
-Space is discretized on the supervoxel grid (``supervoxel_factor`` fine voxels per cell along each axis). In each
+Space is discretized on the transport grid C (cubic cells of edge ``transport_cell_cm``). In each
 cuboid cell the angular fluence of one direction is linear, with moments :math:`(\psi_0, \psi_x, \psi_y, \psi_z)` in
 the local coordinates :math:`u_a = 2(x_a - x_{a,c})/\Delta_a \in [-1, 1]`
 (:math:`f_0 = \frac1V\int f\,dV`, :math:`f_a = \frac3V\int f\,u_a\,dV`). The Galerkin projection of the transport
@@ -136,9 +150,10 @@ where :math:`\mathcal L^{-1}` is one transport sweep and :math:`\mathcal S` the 
 iteration stops when :math:`\|\phi^{(n)}\| / \|\phi_C\| <` ``si_tol`` (default :math:`10^{-3}`, scalar-flux cell means;
 about 16 sweeps for WLAB).
 
-The first-collision source enters the sweep as LD moments on the supervoxels, restricted from samples at the fine voxel
-centers (the :math:`f^3` sub-voxel points of each supervoxel). Because :math:`S_{FC}` is forward peaked, point samples
-at the sweep directions under-integrate it; each view therefore rescales the samples per voxel and group,
+The first-collision source enters the sweep as LD moments on the transport cells, restricted from samples at the
+:math:`q^3` quadrature points of each cell (mean and the three slopes of the midpoint quadrature, exact for a source
+linear within the cell). Because :math:`S_{FC}` is forward peaked, point samples at the sweep directions
+under-integrate it; each view therefore rescales the samples per quadrature point and group,
 :math:`S_m \leftarrow a\,S_m\,(1 + \beta\,\boldsymbol\Omega_m\cdot\boldsymbol\Omega_{UC})`, so that the quadrature
 reproduces the exact :math:`l = 0` and :math:`l = 1` moments of the first-collision source about
 :math:`\boldsymbol\Omega_{UC}` (with :math:`\beta\in[-1,1]` keeping the source non-negative).
@@ -170,11 +185,11 @@ the angular integral is the quadrature sum:
 No :math:`1/r^2` factor appears: in the point-to-point form :math:`\int dV\,E\,e^{-\tau}/|\mathbf r_D - \mathbf r|^2`
 the volume element about :math:`\mathbf r_D` is :math:`l^2\,dl\,d\Omega`, which cancels it.
 
-Grids. :math:`\tau_\downarrow` is traced on the supervoxel grid; at every sub-voxel point :math:`\mathbf r_j` it is
+Grids. :math:`\tau_\downarrow` is traced on the transport grid; at every quadrature point :math:`\mathbf r_j` it is
 corrected to first order inside the cell, :math:`\tau_j = \max(0, \tau_c - \mu_{t,c}\,\boldsymbol\Omega\cdot(\mathbf
-r_j - \mathbf r_c))`, and the emission :math:`(S_{FC}(\mathbf r_j) + S_{MC,c})\,e^{-\tau_j}` is projected on the fine
-grid (each sub-point traced to the panel). Both sources share one attenuation field and one projection per chunk of
-directions.
+r_j - \mathbf r_c))`, and the emission :math:`(S_{FC}(\mathbf r_j) + S_{MC,c})\,e^{-\tau_j}` is projected on the
+quadrature grid (each point traced to the panel). Both sources share one attenuation field and one projection per
+chunk of directions; nothing of the scatter image touches the fine grid.
 
 Finite-cone footprint. Each direction stands for a solid-angle cell of gnomonic widths :math:`(W_\alpha, W_\beta)`;
 photons emitted at height :math:`h` above the panel within that cell land on an :math:`hW_\alpha \times hW_\beta`

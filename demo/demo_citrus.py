@@ -9,7 +9,7 @@
     python demo/demo_citrus.py --end-view-angle 360                     # the default over a full rotation
     python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer 10 --scatter-view-stride 1 --scatter-every 1
                                                    # a quick run (about 2 minutes)
-    python demo/demo_citrus.py --supervoxel-factor 1                    # 0.5 cm transport cells (default: ~1 cm)
+    python demo/demo_citrus.py --transport-cell-cm 0.5                  # 0.5 cm transport cells (default: 1 cm)
     python demo/demo_citrus.py --truth-sweep 16x32 --truth-cone 32x64   # truth finer than the loop's solver
 
 1. Data (citrus.utilities.synthesize_wlab_dataset, cached in demo/input/). The WLAB phantom (30 x 20 x 40 cm water
@@ -34,9 +34,8 @@
    truth with finer direction sets than the loop: ``--truth-sweep`` (discrete-ordinates quadrature, polar x
    azimuthal, loop default 8x16; recommended 16x32) and ``--truth-cone`` (collapsed-cone directions, loop default
    16x32; recommended 32x64, or 48x96 as a reference). The defaults equal the loop's for speed; 16x32 / 32x64 make the
-   data synthesis about 4x slower. ``--supervoxel-factor`` sets the transport cell size of both solvers (fine voxels
-   per cell along each axis; default round(1 cm / delta_voxel), i.e. ~1 cm cells); the data set's cache name records
-   it when it differs from the default.
+   data synthesis about 4x slower. ``--transport-cell-cm`` sets the transport cell size of both solvers (cm, any
+   ratio to the voxel pitch; default 1 cm); the data set's cache name records it when it differs from 1 cm.
 2. CITRUS (citrus.citrus_recon): FDK initialization (Parker-weighted for a short scan: MBIRTORCH's FDK has no
    short-scan weighting, recon.mbir_bridge.short_scan_weights), then per outer iteration one scatter step per view and one
    warm-started MBIR iteration on Y / (1 + SPR). ``--scatter-view-stride n`` runs the scatter step on every n-th view
@@ -71,8 +70,8 @@ from citrus import CitrusConfig, citrus_recon, mbir_recon  # noqa: E402
 from citrus.citrus import estimate_regularization  # noqa: E402
 from citrus.recon.mbir_bridge import is_short_scan, make_cone_model, scan_range  # noqa: E402
 from citrus.scatter_solver.config import SolverConfig  # noqa: E402
-from citrus.scatter_solver.geometry import ConeGeometry  # noqa: E402
-from citrus.utilities import (default_supervoxel_factor, full_field_wlab_geometry, load_dataset,  # noqa: E402
+from citrus.scatter_solver.geometry import ConeGeometry, Grid  # noqa: E402
+from citrus.utilities import (full_field_wlab_geometry, load_dataset,  # noqa: E402
                               plot_history, plot_profiles, plot_slices, set_memory_cap, synthesize_wlab_dataset,
                               wlab_grid, wlab_solver)
 
@@ -96,9 +95,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--views", type=int, default=180, help="number of views over the angular range (default 180)")
     ap.add_argument("--delta-voxel", type=float, default=0.5, help="voxel pitch in cm (default 0.5)")
-    ap.add_argument("--supervoxel-factor", type=int, default=None,
-                    help="fine voxels per transport cell along each axis, for the loop's and the truth's solver "
-                         "(default: round(1 cm / delta_voxel), ~1 cm cells)")
+    ap.add_argument("--transport-cell-cm", type=float, default=1.0,
+                    help="transport cell edge length in cm, for the loop's and the truth's solver (default 1; any "
+                         "ratio to --delta-voxel)")
     ap.add_argument("--outer", type=int, default=80, help="outer iterations (default 80)")
     ap.add_argument("--full", action="store_true",
                     help="the report study: 180 views over a FULL rotation (end view angle = start + 360 degrees, set "
@@ -138,11 +137,8 @@ def main() -> None:
         args.views, args.delta_voxel, args.outer = 180, 0.5, 20
         args.scatter_view_stride, args.scatter_every = 1, 1
         args.end_view_angle = args.start_view_angle + 360.0  # the report's full rotation
-    default_factor = default_supervoxel_factor(args.delta_voxel)
-    if args.supervoxel_factor is None:
-        args.supervoxel_factor = default_factor
-    elif args.supervoxel_factor < 1:
-        raise SystemExit("--supervoxel-factor must be >= 1")
+    if not args.transport_cell_cm > 0:
+        raise SystemExit("--transport-cell-cm must be > 0")
     interp_order = None if args.scatter_view_interp_order == "none" else int(args.scatter_view_interp_order)
     if args.scatter_view_stride < 1:
         raise SystemExit("--scatter-view-stride must be >= 1")
@@ -154,7 +150,7 @@ def main() -> None:
     set_memory_cap(args.memory_cap_mib)
     os.makedirs(args.input, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
-    loop_cfg = replace(SolverConfig(), supervoxel_factor=args.supervoxel_factor)
+    loop_cfg = replace(SolverConfig(), transport_cell_cm=args.transport_cell_cm)
     tp, ta = _counts(args.truth_sweep, "--truth-sweep") if args.truth_sweep else (loop_cfg.num_polar,
                                                                                  loop_cfg.num_azimuthal)
     cp, ca = _counts(args.truth_cone, "--truth-cone") if args.truth_cone else (loop_cfg.cone_num_polar,
@@ -176,8 +172,8 @@ def main() -> None:
         arc = f"_{args.start_view_angle:g}to{args.end_view_angle:g}deg"
     tag = (f"wlab_{args.views}v_{args.delta_voxel:g}cm".replace(".", "p") + arc.replace(".", "p")
            + ("_nonoise" if args.no_noise else ""))
-    if args.supervoxel_factor != default_factor:
-        tag += f"_sv{args.supervoxel_factor}"
+    if args.transport_cell_cm != 1.0:
+        tag += f"_cell{args.transport_cell_cm:g}".replace(".", "p")
     if truth_cfg != loop_cfg:
         tag += f"_truth{tp}x{ta}_cone{cp}x{ca}"
     t_all = time.perf_counter()
@@ -203,9 +199,12 @@ def main() -> None:
     span = math.degrees(scan_range(angles))
     print(f"views over {math.degrees(float(angles[0])):.1f} + {span:.1f} degrees "
           f"({'short scan' if is_short_scan(angles) else 'full rotation'})")
-    print(f"grid {grid.shape} at {grid.delta_voxel} cm, transport grid {grid.coarsen(args.supervoxel_factor).shape} "
-          f"(factor {args.supervoxel_factor}), {len(angles)} views, panel {geom.num_det_rows} x "
-          f"{geom.num_det_channels}; SPR median {np.median(spr_true):.2f}, max {spr_true.max():.1f}")
+    print(f"grid {grid.shape} at {grid.delta_voxel} cm, transport grid "
+          f"{Grid.covering(grid, args.transport_cell_cm).shape} "
+          f"({args.transport_cell_cm:g} cm cells, {loop_cfg.quadrature_points(max(grid.deltas))} first-collision "
+          f"points per axis), "
+          f"{len(angles)} views, panel {geom.num_det_rows} x {geom.num_det_channels}; SPR median "
+          f"{np.median(spr_true):.2f}, max {spr_true.max():.1f}")
 
     # ---- shared: solver, MBIRTORCH model, frozen regularization (scatter-free sinogram), metrics ---------------
     solver = wlab_solver(args.delta_voxel, config=loop_cfg, geom=geom, device=dev)
@@ -254,7 +253,9 @@ def main() -> None:
     summary = {
         "views": len(angles), "start_view_angle_deg": math.degrees(float(angles[0])), "scan_range_deg": span,
         "short_scan": bool(is_short_scan(angles)), "delta_voxel_cm": args.delta_voxel, "grid": list(grid.shape),
-        "supervoxel_factor": args.supervoxel_factor, "outer": args.outer,
+        "transport_cell_cm": args.transport_cell_cm,
+        "fc_points_per_axis": loop_cfg.quadrature_points(max(grid.deltas)),
+        "outer": args.outer,
         "truth_sweep": [tp, ta], "truth_cone": [cp, ca],
         "scatter_view_stride": args.scatter_view_stride, "scatter_view_interp_order": interp_order,
         "scatter_every": args.scatter_every,

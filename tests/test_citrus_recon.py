@@ -91,9 +91,10 @@ def tiny(real_lib):
     from citrus.utilities import wlab_geometry, wlab_grid
 
     geom = replace(wlab_geometry(), num_det_rows=46, num_det_channels=38, delta_det_row=1.6, delta_det_channel=1.6)
-    data = synthesize_wlab_dataset(16, 2.0, noise=False, seed=0, lib=real_lib, geom=geom)
+    cfg = SolverConfig(transport_cell_cm=2.0)  # 2 cm transport cells on the 2 cm grid
+    data = synthesize_wlab_dataset(16, 2.0, noise=False, seed=0, lib=real_lib, geom=geom, config=cfg)
     grid = wlab_grid(2.0)
-    solver = wlab_solver(2.0, lib=real_lib, geom=geom, device=DEV)
+    solver = wlab_solver(2.0, config=cfg, lib=real_lib, geom=geom, device=DEV)
     model = make_cone_model(grid, geom, data["angles"], device=DEV)
     Y = torch.as_tensor(data["Y"], device=DEV)
     P = torch.as_tensor(data["P"], device=DEV)
@@ -144,7 +145,7 @@ def test_citrus_with_true_scatter_is_fixed_spr_mbir(tiny, monkeypatch):
     angles = data["angles"]
     view_of = {float(a): v for v, a in enumerate(angles)}
     spr_true = torch.as_tensor(data["SPR"], device=DEV)
-    coarse = grid.coarsen(solver.config.supervoxel_factor)
+    coarse = solver.transport_grid(grid)
     shape = (solver.num_groups, (solver.L + 1) ** 2, 4) + tuple(coarse.shape)
 
     def fake_step(solver_, state, rho, grid_, angle, fields=None):

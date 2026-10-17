@@ -234,7 +234,7 @@ def test_fc_source_pair_kernel_matches_torch(G, K):
 
 GRID = Grid((10, 16, 20), 2.0)  # the WLAB problem of tests/test_scatter_solver.py
 CFG = SolverConfig(num_groups=4, legendre_order=3, num_polar=4, num_azimuthal=8, cone_num_polar=8,
-                   cone_num_azimuthal=16, supervoxel_factor=2, si_tol=1e-4, si_max_iterations=40, direction_chunk=8)
+                   cone_num_azimuthal=16, transport_cell_cm=4.0, si_tol=1e-4, si_max_iterations=40, direction_chunk=8)
 
 
 def _solver(lib, cfg=CFG, dtype=torch.float32):
@@ -261,7 +261,7 @@ def test_solver_seven_materials_equals_two_materials_synthetic(dtype):
     rho7 = wlab_phantom(GRID, device=DEV, dtype=dtype)
     s7 = _solver(lib7, dtype=dtype)
     f = s7.material_fields(rho7, GRID)
-    assert f.pairs_fine is not None and torch.equal(f.pairs_fine.dense(), rho7)
+    assert f.pairs_quad is not None and torch.equal(f.pairs_quad.dense(), f.rho_quad)
     a = s7.solve_view(rho7, GRID, 0.3)
     b = _solver(lib2, dtype=dtype).solve_view(rho7[[WATER, BONE]], GRID, 0.3)
     _compare_views(a, b, 2e-5 if dtype == torch.float32 else 1e-12)

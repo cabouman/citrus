@@ -1,9 +1,11 @@
 """Exact ray-box line integrals (Siddon / Amanatides-Woo parametric traversal) and the `Projectors` interface.
 
-`Projectors` is the protocol of the four field-level ray-tracing operations the scatter solver needs (all batched
+`Projectors` is the protocol of the five field-level ray-tracing operations the scatter solver needs (all batched
 over a leading group axis G, for one view angle, in the recon frame, the volume being zero outside the grid box):
 
     upstream_cumulative    line integral from the focal spot to every voxel center          (uncollided fluence)
+    upstream_to_points     line integral from the focal spot to arbitrary points           (uncollided fluence at the
+                                                                                            quadrature-grid points)
     primary_project        line integral from the focal spot to every pixel center          (primary image)
     downstream_cumulative  line integral from every voxel center to the panel along Omega_k  (scatter attenuation)
     oblique_project        line integral of a field along Omega_k through every pixel center (scatter projection)
@@ -45,6 +47,14 @@ class Projectors(Protocol):
         """Line integral of mu from the focal spot to every voxel center.
 
         mu: [G, rows, cols, slices] (1/cm). Returns tau_up: [G, rows, cols, slices] (dimensionless).
+        """
+        ...
+
+    def upstream_to_points(self, mu: Tensor, grid: Grid, geom: ConeGeometry, angle: float, points: Tensor) -> Tensor:
+        """Line integral of mu (on `grid`, zero outside its box) from the focal spot to arbitrary points.
+
+        mu: [G, rows, cols, slices]; points: [N, 3] (recon frame, cm; inside or outside the box).
+        Returns [G, N]. Used for the uncollided fluence at the quadrature-grid points traced through another grid.
         """
         ...
 
@@ -291,6 +301,17 @@ class SiddonProjectors:
         src = torch.tensor(geom.source_position(angle), device=mu.device, dtype=mu.dtype)
         tau = self.line_integrals(mu, src.expand_as(centers), centers, grid)
         return tau.reshape(mu.shape)
+
+    def upstream_to_points(self, mu: Tensor, grid: Grid, geom: ConeGeometry, angle: float, points: Tensor) -> Tensor:
+        """Line integral of mu from the focal spot to each of points [N, 3] (recon frame; the segment is clipped to the
+        box of `grid`, so a point outside the box gets the integral of the part of its ray inside it).
+
+        mu: [G, rows, cols, slices] on grid. Returns [G, N]. One ray per point (`line_integrals`; the fused kernel on
+        float32 CUDA): the cost follows the number of points and the traversal of `grid`.
+        """
+        pts = points.to(device=mu.device, dtype=mu.dtype).reshape(-1, 3)
+        src = torch.tensor(geom.source_position(angle), device=mu.device, dtype=mu.dtype)
+        return self.line_integrals(mu, src.expand_as(pts), pts, grid)
 
     # ---- (b) ----------------------------------------------------------------------------------
     def primary_project(self, mu: Tensor, grid: Grid, geom: ConeGeometry, angle: float,

@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.2.0 — 2026-10-17
+
+First-order quantities on a quadrature grid of the transport cells (Acuros CTS, Maslowski et al. 2018, Med Phys
+45:1899, Section 2.B); transport cells of any size. **Breaking changes.**
+
+- **Transport grid by cell size.** `SolverConfig.supervoxel_factor` is removed; `SolverConfig.transport_cell_cm`
+  (default 1.0) sets the edge of the cubic transport cells. The transport grid C = `Grid.covering(fine_grid, cell)`
+  covers the fine box, centred on it (ceil(extent / cell) cells per axis, symmetric empty padding): any ratio of voxel
+  to cell size. `ScatterSolver.transport_grid`, `quadrature_grid`; `utilities.default_supervoxel_factor` is removed
+  (`wlab_solver` / `synthesize_wlab_dataset` default to 1 cm cells, unchanged on the 1 and 0.5 cm WLAB grids). Demo
+  flags `--supervoxel-factor` -> `--transport-cell-cm` (cache-name suffix `_cell<cm>`, run JSON `transport_cell_cm`).
+- **Conservative resampling.** `geometry.resample_conservative` / `overlap_matrix` / `resampling_matrices`: exact
+  cell averages of the voxel-wise constant fine field (separable per-axis overlap matrices, cached), mass conserving for
+  any ratio; equal to the block mean for integer ratios. `scatter_solver.coarsen_density(rho, grid_fine, grid_coarse)`
+  and `scatter_image.coarsen_mu_t(mu, grid_fine, grid_coarse)` use it (new signatures).
+- **Quadrature grid Q = C.refine(q)**, `Grid.refine`. `SolverConfig.fc_points_per_axis` (default 2) is an upper
+  bound: q = min(fc_points_per_axis, max(1, round(transport_cell_cm / largest fine voxel edge))) (Python's round;
+  `SolverConfig.quadrature_points`, `ScatterSolver.quadrature_points`), so 1 cm voxels in 1 cm cells keep q = 1 and the
+  cost of version 0.1.0 (CITRUS step about 0.12 s per view), 0.5 cm and smaller voxels get q = 2. The uncollided
+  fluence, the first-collision source at the sweep and cone directions, its sampling correction and restriction, and the
+  first-order emission, footprint and projection of the scatter image all live on Q; only the primary image and the
+  resampling touch the fine grid. `MaterialFields`: `grid_quad`, `q`, `rho_quad`, `pairs_quad` (None -> dense),
+  `fc_pairs`; `factor`, `mu_t_fine` and `pairs_fine` are removed. `ScatterSolver.uncollided` returns phi_uc on Q.
+- **Uncollided trace.** `SolverConfig.fc_trace_grid`: "quadrature" (default, through Q), "coarse" (through C: smears
+  a boundary inside a cell, up to 4 % of the lateral scatter when the cells are offset half a cell from the object) or
+  "fine" (through the reconstruction grid), all at about the same cost; `uncollided_fluence(..., points=)`, `Projectors.upstream_to_points`. With
+  q = cell / voxel and the fine trace the solver reproduces version 0.1.0 to float rounding
+  (`tests/data/pre_quadrature_reference.json`: 8 x 8 block means of the signals; `tests/test_quadrature_grid.py`).
+- **Dense first-collision kernel for any M.** Resampled densities can mix more than two materials per point: the Triton
+  kernel's dense mode now takes all M materials (compile-time M; 2.7x the pair-mode time per point at M = 7);
+  `cross_sections.material_pairs_if_compact`, `max_materials_per_point`; `pairs=` accepts a `MaterialPairs`,
+  `uncollided.DENSE` or None (decide from rho).
+- `combined_scatter_image(lib, rho_quad, phi_uc_quad, grid_quad, q, ..., grid_coarse=None)`,
+  `supervoxel_subpoint_emission(src_quad, ..., grid_quad, q)`, `DirectionSetContext.subcell_offsets(grid_quad, q)`.
+- Cost: a CITRUS step is about 0.31 s per view at 0.5, 0.25 and 0.125 cm voxels with 1 cm cells (version 0.1.0:
+  0.32 s, 1.76 s, out of memory). `benchmarks/profile_citrus_step.py --voxel --cell --fc-points --fc-trace`.
+
 ## v0.1.0 — 2026-10-16
 
 Seven-material density model; short-scan data by default. **Breaking changes; results change.**

@@ -14,7 +14,7 @@ Parts:
     --reps calls x 4 different chunks (CUDA synchronized), peak MiB above the resident inputs
     (max_memory_allocated - memory_allocated before the call) and the max deviation between the backends
     (relative to the field maximum) and of each backend vs a float64 evaluation.
- 2. first-order image on the fine grid (`scatter_image.combined_scatter_image` with supervoxel factor 1 and a zero
+ 2. first-order image on the fine grid (`scatter_image.combined_scatter_image` with q = 1 on that grid and a zero
     multiple-collision source, chunk=8, fc_chunk=4) with the default fused Siddon projectors (`SiddonProjectors()`)
     on the cone sets --cones, FC source on each backend (the backend is selected by patching the name that
     scatter_image resolves); wall seconds after a warm-up, peak MiB (max_memory_allocated, absolute), and the rel RMS of
@@ -99,7 +99,7 @@ class Bench:
         return step3.panel_direction_set(geom, 0.0, cone, max_polar_angle=grid, device=self.dev, dtype=torch.float32)
 
     def first_order(self, fine: float, quad) -> dict:
-        """First-order image on the fine grid: the combined pass at supervoxel factor 1 with a zero MC source."""
+        """First-order image on the fine grid: the combined pass at q = 1 with a zero MC source."""
         grid, geom, rho, mu, phi_uc = self.setup(fine)
         T0 = torch.zeros(self.lib.num_groups, 1, *grid.shape, device=self.dev)
         return step3.combined_scatter_image(self.lib, rho, phi_uc, grid, 1, T0, 0, geom, 0.0, quad, mu,

@@ -1,37 +1,44 @@
 """The assembled LBTE source iteration scatter solver: uncollided fluence, source iteration, collapsed-cone scatter
 image and primary image for one view.
 
-Pipeline of `ScatterSolver.solve_view(rho_fine, grid_fine, angle)` (docs/source/method.rst has the derivation):
+Pipeline of `ScatterSolver.solve_view(rho_fine, grid_fine, angle)` (docs/source/method.rst has the derivation; grids
+in docs/source/conventions.rst, "Grids"):
 
-    rho_fine [M, R, C, S]  (fine grid F; M = 7     rho_coarse = supervoxel average of rho_fine  (grid C)
-                           basis materials)         pairs_fine = material_pairs(rho_fine) (at most 2 per voxel)
-    mu_t_fine      = mu_t_volume(lib, rho_fine)                       group attenuation (diagnostics)
+    rho_fine [M, R, C, S]  fine (reconstruction) grid F; M = 7 basis materials
+    grid_coarse = Grid.covering(grid_fine, transport_cell_cm)          transport grid C (cubic cells, covers F)
+    grid_quad   = grid_coarse.refine(q)                                quadrature grid Q, q = fc_points_per_axis
+                                                                       bounded by the data resolution
+    rho_coarse, rho_quad = conservative overlap resampling of rho_fine onto C and Q (`geometry.resample_conservative`)
+    pairs_quad  = material_pairs_if_compact(rho_quad)                  pair or dense first-collision evaluation
     mu_t_coarse, mu_s_l_coarse from rho_coarse                        linear in rho: = averaged mu
-    phi_uc         = uncollided_fluence(lib, rho_fine)                exact in energy: line integrals of the density
-                     maps of the materials present + the fine-energy table (sum_{E in g} w_E exp(-sum_m m_m(E) P_m))
-    S_FC(Omega_m)  = restrict_fc_to_ld_moments(corrected fc_source_at_directions(lib, ..., Omega_m))   exact eta
-                     table, l = 0 and l = 1 conservative sampling correction (uncollided.fc_sampling_correction)
+    phi_uc         = uncollided_fluence at the Q points, traced through rho_quad on Q (fc_trace_grid "quadrature",
+                     the default), rho_coarse on C ("coarse") or rho_fine on F ("fine"); exact in energy: line integrals of the density maps of the materials
+                     present + the fine-energy table (sum_{E in g} w_E exp(-sum_m m_m(E) P_m))
+    S_FC(Omega_m)  = restrict_fc_to_ld_moments(corrected fc_source_at_directions(lib, rho_quad, ..., Omega_m), q)
+                     exact eta table on Q, l = 0 and l = 1 conservative sampling correction
+                     (uncollided.fc_sampling_correction)
     SI             = source_iteration(ctx, mu_t_coarse, mu_s_l_coarse, S_FC)                   LD sweeps on C
     T_MC           = scatter_source_moments(mu_s_l_coarse, phi_total[:, :, 0])                  cell-mean MC source
     scatter        = scatter_image.combined_scatter_image(..., T_MC, mu_t_coarse)               ONE collapsed-cone
-                     pass: per direction chunk tau_down once on C, S_FC at the fine sub-voxel points + S_MC per
-                     supervoxel, attenuated per sub-point, one projection on F, finite-cone footprint
-    primary        = scatter_image.primary_image(lib, rho_fine)       exact in energy (as phi_uc)
+                     pass: per direction chunk tau_down once on C, S_FC at the Q points + S_MC per cell, attenuated
+                     per point, one projection on Q, finite-cone footprint
+    primary        = scatter_image.primary_image(lib, rho_fine)       exact in energy (as phi_uc), on F
     SF             = S / (P + S)
 
 The collided transport uses the library truncated to Legendre order L (`truncated_library`); the uncollided fluence,
 the primary and the first-collision source use the full library (true mu_t, exact eta table).
 
-No state is kept between calls apart from caches of grid/quadrature-dependent objects (sweep contexts,
+No state is kept between calls apart from caches of grid/quadrature-dependent objects (transport grids, sweep contexts,
 collapsed-cone direction sets, and the scatter-image direction contexts `scatter_image.make_direction_context` per
 (view angle, direction set, grids), an LRU of `direction_context_cache` entries shared by the scatter images of a view
 and by repeated calls such as the CITRUS step's). `clear_caches()` drops them all. All tensors live on
 `solver.device` with `solver.dtype`.
 
-Grids: every scatter order, including the first-order term, is transported on the supervoxel grid C. The fine grid F
-is used only for the primary image and for the uncollided fluence and first-collision source at the sub-voxel
-quadrature points (the f^3 fine voxel centers of each supervoxel), which feed both the LD source moments of the sweep
-and the scatter-image emission; the scatter image is projected on F (each sub-point traced to the panel).
+Grids: every scatter order is transported on C. The first-order quantities (uncollided fluence, first-collision source
+at the sweep and cone directions, its sampling correction and restriction, the first-order emission and its
+projection) live on Q: q^3 points per transport cell whatever the fine voxel size (Acuros CTS, Maslowski et al. 2018,
+Med Phys 45:1899, Section 2.B). Only the primary image (one projection per material present) and the resampling of
+the densities touch the fine grid F.
 """
 
 from __future__ import annotations
@@ -44,21 +51,21 @@ from typing import Iterator, Optional, Sequence, Union
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from .angular_quadrature import Quadrature, product_quadrature, scatter_source_moments
 from .config import SolverConfig
-from .cross_sections import MaterialPairs, MultigroupLibrary, material_pairs, mu_t_volume, transfer_moments_volume
+from .cross_sections import (MaterialPairs, MultigroupLibrary, material_pairs_if_compact, mu_t_volume,
+                             transfer_moments_volume)
 from .detector import DetectorResponse, GridResponse
-from .geometry import ConeGeometry, Grid
+from .geometry import ConeGeometry, Grid, resample_conservative
 from .ray_tracing import Projectors, SiddonProjectors
 from .scatter_image import (DirectionSetContext, combined_scatter_image, make_direction_context, panel_direction_set,
                             primary_image, scatter_fraction)
 from .source import SourceModel
 from .source_iteration import SIResult, scatter_moments, scatter_source_fn, source_iteration
 from .transport_sweep import SourceFn, SweepContext, make_sweep_context, sweep
-from .uncollided import (FCSamplingCorrection, fc_sampling_correction, fc_source_at_directions,
+from .uncollided import (DENSE, FCSamplingCorrection, fc_sampling_correction, fc_source_at_directions,
                          restrict_fc_to_ld_moments, uncollided_fluence)
 
 __all__ = [
@@ -98,13 +105,12 @@ def truncated_library(lib: MultigroupLibrary, L: int) -> MultigroupLibrary:
     return replace(lib, mu_s_l=lib.mu_s_l[..., :L + 1].clone())
 
 
-def coarsen_density(rho_fine: Tensor, factor: int) -> Tensor:
-    """Supervoxel average of densities [M, R, C, S] -> [M, R/f, C/f, S/f] (every coefficient is linear in rho, so
-    this equals averaging mu)."""
-    f = int(factor)
-    if f == 1:
-        return rho_fine
-    return F.avg_pool3d(rho_fine.unsqueeze(0), kernel_size=f, stride=f).squeeze(0)
+def coarsen_density(rho_fine: Tensor, grid_fine: Grid, grid_coarse: Grid) -> Tensor:
+    """Cell averages of densities [M, R, C, S] on grid_fine over the cells of grid_coarse -> [M, Rc, Cc, Sc]
+    (conservative overlap resampling, `geometry.resample_conservative`: exact for voxel-wise constant densities, zero
+    outside the fine box; any ratio of the voxel sizes). Every coefficient is linear in rho, so this equals averaging
+    mu. Used for the transport grid C and the quadrature grid Q."""
+    return resample_conservative(rho_fine, grid_fine, grid_coarse)
 
 
 # =====================================================================================================
@@ -115,27 +121,40 @@ def coarsen_density(rho_fine: Tensor, factor: int) -> Tensor:
 class MaterialFields:
     """Everything that depends on the densities only (not on the view). Built by `ScatterSolver.material_fields`.
 
-    grid_fine, grid_coarse : fine grid F and supervoxel grid C = grid_fine.coarsen(factor)
-    rho_fine      [M, R, C, S]        g/cm^3 (M = the library's basis materials)
-    rho_coarse    [M, Rc, Cc, Sc]     supervoxel averages
-    mu_t_fine     [G, R, C, S]        group total attenuation (1/cm); diagnostics only: the uncollided fluence and
-                                      the primary use the density line integrals and the fine-energy table
+    grid_fine     fine (reconstruction) grid F
+    grid_coarse   transport grid C = Grid.covering(grid_fine, config.transport_cell_cm) (cubic cells, centred on F)
+    grid_quad     quadrature grid Q = grid_coarse.refine(q)
+    q             effective quadrature points per axis per transport cell (`ScatterSolver.quadrature_points`:
+                  config.fc_points_per_axis bounded by round(transport_cell_cm / largest fine voxel edge))
+    rho_fine      [M, R, C, S]        g/cm^3 (M = the library's basis materials); used by the primary (and the
+                                      "fine" uncollided trace) only
+    rho_coarse    [M, Rc, Cc, Sc]     cell averages on C (conservative overlap resampling, `coarsen_density`)
+    rho_quad      [M, Rq, Cq, Sq]     averages over the Q cells (the density each quadrature point represents)
     mu_t_coarse   [G, Rc, Cc, Sc]     group total attenuation on C: sweep and the downstream attenuation of the
                                       scatter image
     mu_s_l_coarse [G, G, L+1, Rc, Cc, Sc]  Legendre transfer moments on C (1/cm), truncated at the solver's order L
-    pairs_fine    `cross_sections.MaterialPairs` of rho_fine (index / density [2, R, C, S]) when M > 2 (the
-                  first-collision source gathers the two table rows of each voxel by index), None for M <= 2
+    pairs_quad    `cross_sections.MaterialPairs` of rho_quad (index / density [2, Rq, Cq, Sq]) when M > 2 and every
+                  quadrature point has at most two nonzero materials (always when Q equals a fine grid obeying the
+                  density model's convention); None otherwise: the first-collision source then evaluates all M
+                  materials (`fc_pairs`)
+    No [G, ...] field lives on the fine grid.
     """
 
     grid_fine: Grid
     grid_coarse: Grid
-    factor: int
+    grid_quad: Grid
+    q: int
     rho_fine: Tensor
     rho_coarse: Tensor
-    mu_t_fine: Tensor
+    rho_quad: Tensor
     mu_t_coarse: Tensor
     mu_s_l_coarse: Tensor
-    pairs_fine: Optional[MaterialPairs] = None
+    pairs_quad: Optional[MaterialPairs] = None
+
+    @property
+    def fc_pairs(self):
+        """The `pairs` argument of the first-collision functions: pairs_quad, or `uncollided.DENSE` when it is None."""
+        return DENSE if self.pairs_quad is None else self.pairs_quad
 
 
 # =====================================================================================================
@@ -221,7 +240,8 @@ class ScatterSolver:
 
     lib            : MultigroupLibrary with legendre_order >= config.legendre_order (`build_solver_library(config)`).
     config         : SolverConfig (validated here). Used fields: legendre_order, num_polar, num_azimuthal,
-                     supervoxel_factor, si_tol, si_max_iterations, cone_num_polar, cone_num_azimuthal,
+                     transport_cell_cm, fc_points_per_axis, fc_trace_grid, si_tol, si_max_iterations, cone_num_polar,
+                     cone_num_azimuthal,
                      direction_chunk (directions per batch in the scatter image AND directions per octant per sweep
                      chunk), dtype (when `dtype` is None).
     geom, projectors, detector, grid_response, source : system model; projectors is injected (any
@@ -260,6 +280,7 @@ class ScatterSolver:
         self.fc_chunk = int(fc_chunk)
         self.primary_n_sub = primary_n_sub
         self._ctx_cache: dict[Grid, SweepContext] = {}
+        self._grid_cache: dict[Grid, Grid] = {}
         self._cone_cache: dict[tuple[Grid, float], Quadrature] = {}
         self.direction_context_cache = max(0, int(direction_context_cache))
         self._dir_ctx_cache: OrderedDict[tuple, DirectionSetContext] = OrderedDict()
@@ -268,6 +289,22 @@ class ScatterSolver:
     @property
     def num_groups(self) -> int:
         return self.lib.num_groups
+
+    def quadrature_points(self, grid_fine: Grid) -> int:
+        """Effective quadrature points per axis per transport cell for this fine grid,
+        `config.quadrature_points(max(grid_fine.deltas))` (fc_points_per_axis bounded by the data resolution)."""
+        return self.config.quadrature_points(max(grid_fine.deltas))
+
+    def transport_grid(self, grid_fine: Grid) -> Grid:
+        """Transport grid C of a fine grid: `Grid.covering(grid_fine, config.transport_cell_cm)` (cached)."""
+        g = self._grid_cache.get(grid_fine)
+        if g is None:
+            g = self._grid_cache[grid_fine] = Grid.covering(grid_fine, self.config.transport_cell_cm)
+        return g
+
+    def quadrature_grid(self, grid_fine: Grid) -> Grid:
+        """Quadrature grid Q = transport_grid(grid_fine).refine(quadrature_points(grid_fine))."""
+        return self.transport_grid(grid_fine).refine(self.quadrature_points(grid_fine))
 
     def sweep_quadrature(self) -> Quadrature:
         """The product sweep quadrature of the config (float64 CPU; the sweep context reorders it by octant)."""
@@ -283,13 +320,13 @@ class ScatterSolver:
 
     def cone_quadrature(self, grid: Grid, angle: float) -> Quadrature:
         """Cached collapsed-cone direction set (`scatter_image.panel_direction_set` with the config's cone counts, cell
-        widths filled) limited to `covering_polar_angle(grid, geom, angle)`; omega [K, 3], weight [K] on the solver
-        device."""
+        widths filled) limited to `covering_polar_angle` of the box of `transport_grid(grid)` (which contains the box of
+        the fine grid and every emitting point); omega [K, 3], weight [K] on the solver device. grid: the fine grid."""
         key = (grid, float(angle))
         q = self._cone_cache.get(key)
         if q is None:
-            q = panel_direction_set(self.geom, angle, self.config, max_polar_angle=grid, device=self.device,
-                                    dtype=self.dtype)
+            q = panel_direction_set(self.geom, angle, self.config, max_polar_angle=self.transport_grid(grid),
+                                    device=self.device, dtype=self.dtype)
             self._cone_cache[key] = q
         return q
 
@@ -301,7 +338,7 @@ class ScatterSolver:
         stays valid while the entry lives. Used by `scatter_image` and reused by repeated calls with the same view."""
         quad = self.cone_quadrature(fields.grid_fine, angle) if quad is None else quad
         key = (float(angle), id(quad), tuple(fields.grid_fine.shape), tuple(fields.grid_coarse.shape),
-               int(self.config.direction_chunk))
+               tuple(fields.grid_quad.shape), int(self.config.direction_chunk))
         ctx = self._dir_ctx_cache.get(key)
         if ctx is not None and ctx.quad is quad:
             self._dir_ctx_cache.move_to_end(key)
@@ -318,57 +355,72 @@ class ScatterSolver:
         """Drop every cached object: sweep contexts, collapsed-cone direction sets and direction contexts (they are
         rebuilt on demand)."""
         self._ctx_cache.clear()
+        self._grid_cache.clear()
         self._cone_cache.clear()
         self._dir_ctx_cache.clear()
 
     # ---- stages ----------------------------------------------------------------------------------
     def material_fields(self, rho_fine: Tensor, grid_fine: Grid) -> MaterialFields:
-        """Attenuation and transfer fields of `rho_fine` [M, R, C, S] on grid_fine and its supervoxel grid (M = the
-        library's number of materials; for M > 2 at most two nonzero materials per voxel, whose pair representation
-        `cross_sections.material_pairs` is derived here once)."""
+        """Density-only fields of `rho_fine` [M, R, C, S] on grid_fine (M = the library's number of materials): the
+        transport grid C and quadrature grid Q, the densities resampled onto both (`coarsen_density`), the attenuation
+        and transfer fields on C, and the material representation of rho_quad (`cross_sections.
+        material_pairs_if_compact`, one host synchronization). Nothing of size [G, R, C, S] is formed on the fine
+        grid."""
         if tuple(rho_fine.shape[1:]) != tuple(grid_fine.shape):
             raise ValueError(f"rho spatial shape {tuple(rho_fine.shape[1:])} != grid shape {grid_fine.shape}")
         if int(rho_fine.shape[0]) != self.lib.num_materials:
             raise ValueError(f"rho has {int(rho_fine.shape[0])} materials, the library {self.lib.num_materials} "
                              f"{tuple(self.lib.materials)}")
-        f = int(self.config.supervoxel_factor)
         rho = rho_fine.to(device=self.device, dtype=self.dtype)
-        coarse = grid_fine.coarsen(f)
-        rho_c = coarsen_density(rho, f)
+        coarse = self.transport_grid(grid_fine)
+        q = self.quadrature_points(grid_fine)
+        quad = coarse.refine(q)
+        rho_c = coarsen_density(rho, grid_fine, coarse)
+        rho_q = rho_c if quad == coarse else coarsen_density(rho, grid_fine, quad)
         return MaterialFields(
-            grid_fine=grid_fine, grid_coarse=coarse, factor=f, rho_fine=rho, rho_coarse=rho_c,
-            mu_t_fine=mu_t_volume(self.lib, rho),
-            mu_t_coarse=mu_t_volume(self.lib_transport, rho_c),
+            grid_fine=grid_fine, grid_coarse=coarse, grid_quad=quad, q=q, rho_fine=rho, rho_coarse=rho_c,
+            rho_quad=rho_q, mu_t_coarse=mu_t_volume(self.lib_transport, rho_c),
             mu_s_l_coarse=transfer_moments_volume(self.lib_transport, rho_c),
-            pairs_fine=material_pairs(rho) if int(rho.shape[0]) > 2 else None,
+            pairs_quad=material_pairs_if_compact(rho_q),
         )
 
     def uncollided(self, fields: MaterialFields, angle: float) -> Tensor:
-        """Uncollided fluence phi_uc [G, R, C, S] on the fine grid."""
-        return uncollided_fluence(self.lib, fields.rho_fine, fields.grid_fine, self.geom, angle, self.source,
-                                  self.projectors)
+        """Uncollided fluence phi_uc [G, Rq, Cq, Sq] at the quadrature points (the voxel centers of fields.grid_quad),
+        ray traced from the focal spot (one ray per point) through Q itself (rho_quad; config.fc_trace_grid
+        "quadrature", the default: material boundaries resolved at the Q spacing), through the transport grid C
+        (rho_coarse, "coarse": a boundary inside a cell is smeared over it) or through the fine grid F (rho_fine,
+        "fine"). The cost of all three is dominated by the fine-energy transmission, about the same."""
+        if self.config.fc_trace_grid == "fine":
+            rho, grid = fields.rho_fine, fields.grid_fine
+        elif self.config.fc_trace_grid == "quadrature":
+            rho, grid = fields.rho_quad, fields.grid_quad
+        else:
+            rho, grid = fields.rho_coarse, fields.grid_coarse
+        return uncollided_fluence(self.lib, rho, grid, self.geom, angle, self.source, self.projectors,
+                                  points=fields.grid_quad)
 
     def fc_moment_source(self, fields: MaterialFields, angle: float, phi_uc: Tensor,
                          ctx: Optional[SweepContext] = None) -> SourceFn:
         """Sweep source function of the first-collision source: reordered direction indices [Dsel] ->
-        LD moments [Dsel, G, 4, Rc, Cc, Sc] = restrict_fc_to_ld_moments(fc_source_at_directions(lib, ...,
-        ctx.quad.omega[idx])) (exact eta table, fine grid, restricted to the supervoxels). The fine-grid samples are
-        first multiplied by the per-voxel factors of `fc_sampling_correction` (computed here, once, by a pass over
-        all sweep directions), so that the sweep quadrature integrates the FC source exactly in its l = 0 and l = 1
-        moments about the primary direction."""
+        LD moments [Dsel, G, 4, Rc, Cc, Sc] = restrict_fc_to_ld_moments(fc_source_at_directions(lib, rho_quad,
+        phi_uc, grid_quad, ..., ctx.quad.omega[idx]), q) (exact eta table at the quadrature points, restricted to the
+        transport cells). phi_uc: [G, Rq, Cq, Sq] (`uncollided`). The point samples are first multiplied by the
+        per-point factors of `fc_sampling_correction` (computed here, once, by a pass over all sweep directions), so
+        that the sweep quadrature integrates the FC source exactly in its l = 0 and l = 1 moments about the primary
+        direction."""
         ctx = self.sweep_context(fields.grid_coarse) if ctx is None else ctx
         omega = ctx.quad.omega.to(device=self.device, dtype=self.dtype)
         corr = self.fc_sampling_correction(fields, angle, phi_uc, ctx)
-        # the sweep calls the source once per chunk with 8 x direction_chunk directions; evaluate the fine-grid FC
-        # source in batches of at most direction_chunk directions so that its fine-grid temporaries stay bounded
+        # the sweep calls the source once per chunk with 8 x direction_chunk directions; evaluate the FC source in
+        # batches of at most direction_chunk directions so that its quadrature-grid temporaries stay bounded
         batch = max(1, min(int(self.config.direction_chunk), ctx.directions_per_octant))
 
         def fc_ld(idx: Tensor) -> Tensor:
             om = omega.index_select(0, idx.to(omega.device))
-            fc = fc_source_at_directions(self.lib, fields.rho_fine, phi_uc, fields.grid_fine, self.geom, angle, om,
-                                         chunk=self.fc_chunk, pairs=fields.pairs_fine)
+            fc = fc_source_at_directions(self.lib, fields.rho_quad, phi_uc, fields.grid_quad, self.geom, angle, om,
+                                         chunk=self.fc_chunk, pairs=fields.fc_pairs)
             fc = corr.apply(fc, om)
-            return restrict_fc_to_ld_moments(fc, fields.grid_fine, fields.factor)
+            return restrict_fc_to_ld_moments(fc, fields.grid_quad, fields.q)
 
         def fn(idx: Tensor, out: Optional[Tensor] = None) -> Tensor:
             n = int(idx.numel())
@@ -386,13 +438,14 @@ class ScatterSolver:
 
     def fc_sampling_correction(self, fields: MaterialFields, angle: float, phi_uc: Tensor,
                                ctx: Optional[SweepContext] = None) -> FCSamplingCorrection:
-        """The per-voxel factors (fine grid) that make the sweep quadrature integrate the FC source exactly in angle
+        """The per-point factors (quadrature grid) that make the sweep quadrature integrate the FC source exactly in
+        angle
         (l = 0 and l = 1 about Omega_UC): one extra pass of fc_source_at_directions over all sweep directions
         (uncollided.fc_sampling_correction). Computed once per call of `fc_moment_source`, i.e. once per view."""
         ctx = self.sweep_context(fields.grid_coarse) if ctx is None else ctx
-        return fc_sampling_correction(self.lib, fields.rho_fine, phi_uc, fields.grid_fine, self.geom, angle,
+        return fc_sampling_correction(self.lib, fields.rho_quad, phi_uc, fields.grid_quad, self.geom, angle,
                                       ctx.quad.omega, ctx.quad.weight, chunk=self.fc_chunk,
-                                      batch=self.config.direction_chunk, pairs=fields.pairs_fine)
+                                      batch=self.config.direction_chunk, pairs=fields.fc_pairs)
 
     def scatter_moment_source(self, fields: MaterialFields, phi: Tensor,
                               ctx: Optional[SweepContext] = None) -> SourceFn:
@@ -422,20 +475,21 @@ class ScatterSolver:
                       quad: Optional[Quadrature] = None,
                       context: Optional[DirectionSetContext] = None) -> dict[str, Tensor]:
         """Total scatter image of a view in ONE collapsed-cone pass (scatter_image.combined_scatter_image): the FC
-        source at the fine sub-voxel points (from phi_uc [G, R, C, S]) and the MC source of the cell-mean moments
-        T_mean [G, (L+1)^2, Rc, Cc, Sc] share tau_down (mu_t_coarse), the per-sub-point attenuation, one projection
+        source at the quadrature points (from phi_uc [G, Rq, Cq, Sq]) and the MC source of the cell-mean moments
+        T_mean [G, (L+1)^2, Rc, Cc, Sc] share tau_down (mu_t_coarse), the per-point attenuation, one projection on Q
         per direction chunk and the finite-cone footprint. context: the view's direction context (default:
         `direction_context(fields, angle, quad)`, cached). Returns the image dict (fluence, planar_fluence,
         signal_per_group [G, Rd, Cd], signal [Rd, Cd])."""
         quad = self.cone_quadrature(fields.grid_fine, angle) if quad is None else quad
         context = self.direction_context(fields, angle, quad) if context is None else context
         return combined_scatter_image(
-            self.lib, fields.rho_fine, phi_uc, fields.grid_fine, fields.factor, T_mean, self.L, self.geom, angle, quad,
+            self.lib, fields.rho_quad, phi_uc, fields.grid_quad, fields.q, T_mean, self.L, self.geom, angle, quad,
             fields.mu_t_coarse, self.projectors, self.detector, self.grid_response, context,
-            chunk=self.config.direction_chunk, fc_chunk=self.fc_chunk, pairs=fields.pairs_fine)
+            chunk=self.config.direction_chunk, fc_chunk=self.fc_chunk, pairs=fields.fc_pairs,
+            grid_coarse=fields.grid_coarse)
 
     def primary(self, fields: MaterialFields, angle: float) -> dict[str, Tensor]:
-        """Primary image (exact in energy)."""
+        """Primary image (exact in energy, on the fine grid)."""
         return primary_image(self.lib, fields.rho_fine, fields.grid_fine, self.geom, angle, self.source,
                              self.projectors, self.detector, self.grid_response, n_sub=self.primary_n_sub)
 
@@ -457,9 +511,10 @@ class ScatterSolver:
     def solve_view(self, rho_fine: Tensor, grid_fine: Grid, angle: float, keep_phi_total: bool = False) -> ViewResult:
         """Full solve for one view (module docstring).
 
-        rho_fine: [M, R, C, S] basis-material densities (g/cm^3; M = 7 for the package's library, at most two nonzero
-        per voxel) on grid_fine (shape divisible by the supervoxel factor). angle: view angle (rad). keep_phi_total: also return the collided moments
-        [G, (L+1)^2, 4, Rc, Cc, Sc]. Returns ViewResult. On CUDA the per-stage peak memory is measured by
+        rho_fine: [M, R, C, S] basis-material densities (g/cm^3; M = 7 for the package's library) on grid_fine (any
+        voxel size: the transport grid covers it, `transport_grid`). angle: view angle (rad). keep_phi_total: also
+        return the collided moments [G, (L+1)^2, 4, Rc, Cc, Sc]. Returns ViewResult. On CUDA the per-stage peak memory
+        is measured by
         resetting the device's peak-memory statistics at the start of every stage.
         """
         timings: dict[str, float] = {}

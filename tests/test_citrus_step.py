@@ -19,7 +19,7 @@ from citrus.utilities import wlab_geometry, wlab_phantom
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 GRID = Grid((10, 16, 20), 2.0)
 CFG = SolverConfig(num_groups=4, legendre_order=3, num_polar=4, num_azimuthal=8, cone_num_polar=8,
-                   cone_num_azimuthal=16, supervoxel_factor=2, si_tol=1e-4, si_max_iterations=40)
+                   cone_num_azimuthal=16, transport_cell_cm=4.0, si_tol=1e-4, si_max_iterations=40)
 ANGLE = 0.4
 
 

@@ -10,7 +10,7 @@ outer iteration k, ONE scatter step per view and ONE warm-started MBIR iteration
     for k = 0 .. N-1:
         rho_k            = densities(X_k)                            seven-material interpolating model at E_eff
         for every view v:
-            phi1          = G1(rho_k)                                uncollided fluence (fine grid)
+            phi1          = G1(rho_k)                                uncollided fluence (quadrature grid Q)
             Phi_v         = G_step(rho_k, phi1, Phi_v)               ONE sweep of FC source + aged accumulator
             s_v, p_v      = project_scatter(phi1, Phi_v), primary    scatter and primary signals of the view
         SPR_k            = s / p
@@ -140,14 +140,17 @@ def _fields(solver: ScatterSolver, rho: Tensor, grid: Grid, fields: Optional[Mat
 
 def G1(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float,
        fields: Optional[MaterialFields] = None) -> Tensor:
-    """Uncollided fluence phi_uc [G, R, C, S] on the fine grid. rho [M, R, C, S] (M = 7 basis materials)."""
+    """Uncollided fluence phi_uc [G, Rq, Cq, Sq] at the quadrature points (the voxel centers of the solver's
+    quadrature grid Q = transport grid refined fc_points_per_axis times, `ScatterSolver.uncollided`). rho [M, R, C, S]
+    on the fine grid (M = 7 basis materials)."""
     return solver.uncollided(_fields(solver, rho, grid, fields), angle)
 
 
 def G1to2(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float, phi_uc: Tensor,
           fields: Optional[MaterialFields] = None) -> Tensor:
-    """Once-collided fluence moments phi2 [G, (L+1)^2, 4, Rc, Cc, Sc]: restrict the first-collision source to
-    LD moments on the supervoxel grid and do ONE sweep (= source iteration n = 1)."""
+    """Once-collided fluence moments phi2 [G, (L+1)^2, 4, Rc, Cc, Sc] from phi_uc [G, Rq, Cq, Sq] (`G1`): restrict the
+    first-collision source at the quadrature points to LD moments on the transport grid and do ONE sweep (= source
+    iteration n = 1)."""
     f = _fields(solver, rho, grid, fields)
     return solver.transport_sweep(f, solver.fc_moment_source(f, angle, phi_uc))
 
@@ -177,7 +180,8 @@ def G_step(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float, phi_uc:
            Phi_gt1: Optional[Tensor], fields: Optional[MaterialFields] = None) -> Tensor:
     """G1to2(phi_uc) + G_gt2(Phi_gt1) in ONE sweep: the sweep is linear in its source, so the first-collision
     source and the scattering source of the previous accumulator are summed per direction chunk and transported
-    together (half the transport cost of the two separate operators). Returns the new accumulator
+    together (half the transport cost of the two separate operators). phi_uc: [G, Rq, Cq, Sq] (`G1`). Returns the new
+    accumulator
     Phi_gt1' = phi2 + K Phi_gt1 [G, (L+1)^2, 4, Rc, Cc, Sc] (K = sweep o scatter); Phi_gt1 None gives phi2 alone."""
     f = _fields(solver, rho, grid, fields)
     ctx = solver.sweep_context(f.grid_coarse)
@@ -199,7 +203,7 @@ def project_scatter(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float
                     fields: Optional[MaterialFields] = None,
                     quad: Optional[Quadrature] = None) -> dict[str, Tensor]:
     """Total scatter image (first order + multiple collision) in ONE collapsed-cone pass, exactly
-    `ScatterSolver.scatter_image`: the FC source of phi_uc [G, R, C, S] (fine grid, sub-voxel points) and the MC source
+    `ScatterSolver.scatter_image`: the FC source of phi_uc [G, Rq, Cq, Sq] (the quadrature points) and the MC source
     of the collided moments Phi_gt1 [G, (L+1)^2, 4, Rc, Cc, Sc] (cell mean) share tau_down and one projection per
     direction chunk. Returns the image dict: fluence, planar_fluence, signal_per_group [G, Rd, Cd], signal [Rd, Cd]."""
     f = _fields(solver, rho, grid, fields)
@@ -734,10 +738,10 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
     """CITRUS reconstruction (module docstring) of measured counts.
 
     sinogram_counts [V, Rd, Cd]: measured counts Y (primary + scatter, flat-field I0 per pixel); angles [V] (rad);
-    grid / geometry: reconstruction grid and cone-beam geometry (MBIRTORCH conventions; also the solver's grid: its
-    shape must be divisible by solver.config.supervoxel_factor); solver: the ScatterSolver (its geometry, detector and
-    grid response describe the scanner; its device is used for everything); config: CitrusConfig (default
-    CitrusConfig()).
+    grid / geometry: reconstruction grid and cone-beam geometry (MBIRTORCH conventions; also the solver's fine grid,
+    covered by its transport grid of solver.config.transport_cell_cm cells); solver: the ScatterSolver (its geometry,
+    detector and grid response describe the scanner; its device is used for everything); config: CitrusConfig
+    (default CitrusConfig()).
     regularization: frozen {"sigma_y", "sigma_x", "sigma_prox"}; None estimates them once (MBIRTORCH's automatic
     estimate) on the first scatter-corrected sinogram and freezes them. init_recon: initial volume [R, C, S]
     (default: FDK of the uncorrected data). model: a prebuilt MBIRTORCH ConeBeamModel (`recon.mbir_bridge.
@@ -768,7 +772,7 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
     Y, ang = _counts_and_angles(sinogram_counts, angles, device)
     V = len(ang)
     density = DensityModel.from_library(solver.lib, config.energy_kev)
-    coarse = grid.coarsen(int(solver.config.supervoxel_factor))
+    coarse = solver.transport_grid(grid)
     full_shape = (solver.num_groups, (solver.L + 1) ** 2, 4) + tuple(coarse.shape)
     computed = scatter_view_indices(V, config.scatter_view_stride)
     sparse = len(computed) < V

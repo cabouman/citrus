@@ -147,7 +147,7 @@ def test_footprint_consistent_on_every_path(device):
     for f in (1, 2):
         T = (torch.rand(3, num_sh(2), *grid.coarsen(f).shape, dtype=F64,
                         generator=torch.Generator().manual_seed(f)) * 0.01).to(device)
-        mu_c = coarsen_mu_t(0.9 * mu, f)
+        mu_c = coarsen_mu_t(0.9 * mu, grid, grid.coarsen(f))
         args = (lib, rho, phi_uc, grid, f, T, 2, geom, angle, q, mu_c, PROJ, det, grd)
         tot = combined_scatter_image(*args, chunk=5)
         _close(combined_scatter_image(*args, ctx), tot, rtol=1e-12, msg=f"f={f} cached context")

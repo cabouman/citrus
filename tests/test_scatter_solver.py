@@ -1,5 +1,5 @@
-"""End-to-end tests of the assembled solver (citrus/scatter_solver/scatter_solver.py), WLAB at 2 cm, supervoxel
-factor 2."""
+"""End-to-end tests of the assembled solver (citrus/scatter_solver/scatter_solver.py), WLAB at 2 cm, 4 cm transport
+cells, q = 2 quadrature points per axis (the quadrature grid is the 2 cm grid itself)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from citrus.scatter_solver.config import SolverConfig
-from citrus.scatter_solver.cross_sections import MultigroupLibrary, synthetic_library
+from citrus.scatter_solver.cross_sections import MultigroupLibrary, mu_t_volume, synthetic_library
 from citrus.scatter_solver.detector import csi_response, focused_1d_grid, no_grid
 from citrus.scatter_solver.geometry import Grid
 from citrus.scatter_solver.ray_tracing import SiddonProjectors
@@ -22,10 +22,10 @@ from citrus.scatter_solver.uncollided import (fc_exact_moments, fc_source_at_dir
 from citrus.utilities import wlab_geometry, wlab_phantom
 
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# 2 cm WLAB grid padded to 32 cm along x so that every axis is divisible by the supervoxel factor 2
+# 2 cm WLAB grid padded to 32 cm along x so that the 4 cm transport cells tile it
 GRID = Grid((10, 16, 20), 2.0)
 CFG = SolverConfig(num_groups=4, legendre_order=3, num_polar=4, num_azimuthal=8, cone_num_polar=8,
-                   cone_num_azimuthal=16, supervoxel_factor=2, si_tol=1e-4, si_max_iterations=40, direction_chunk=8)
+                   cone_num_azimuthal=16, transport_cell_cm=4.0, si_tol=1e-4, si_max_iterations=40, direction_chunk=8)
 IMAGE_KEYS = ("fluence", "planar_fluence", "signal_per_group", "signal")
 
 
@@ -111,11 +111,14 @@ def test_coarse_fields_are_averages(rho):
     s = make_solver()
     f = s.material_fields(rho, GRID)
     assert f.grid_coarse.shape == (5, 8, 10) and f.grid_coarse.delta_voxel == 4.0
-    # linear in rho: the coarse mu_t is the supervoxel average of the fine one
-    mu_avg = coarsen_density(f.mu_t_fine, 2)
+    assert f.q == 2 and f.grid_quad == GRID and f.rho_quad is f.rho_fine  # 2 points per 4 cm cell = the 2 cm grid
+    # linear in rho: the coarse mu_t is the cell average of the fine one
+    mu_avg = coarsen_density(mu_t_volume(s.lib_transport, rho), GRID, f.grid_coarse)
     assert torch.allclose(f.mu_t_coarse, mu_avg, rtol=1e-5, atol=1e-7)
     assert torch.allclose(f.rho_coarse.sum(), rho.sum() / 8, rtol=1e-5)
     assert f.mu_s_l_coarse.shape == (4, 4, CFG.legendre_order + 1, 5, 8, 10)
+    assert not any(t.shape[0] == CFG.num_groups and tuple(t.shape[1:]) == GRID.shape
+                   for t in vars(f).values() if isinstance(t, torch.Tensor))  # no [G, ...] fine-grid field
 
 
 def test_truncated_library():
@@ -169,7 +172,8 @@ def test_grid_lowers_scatter_fraction(rho, base_result):
 
 def test_config_validation():
     SolverConfig().validate()
-    for bad in (dict(num_polar=7), dict(num_azimuthal=14), dict(supervoxel_factor=0), dict(si_tol=0.0),
+    for bad in (dict(num_polar=7), dict(num_azimuthal=14), dict(transport_cell_cm=0.0), dict(fc_points_per_axis=0),
+                dict(fc_trace_grid="medium"), dict(si_tol=0.0),
                 dict(direction_chunk=0), dict(dtype="float16"), dict(group_edges_kev=(100.0, 10.0))):
         with pytest.raises(ValueError):
             replace(SolverConfig(), **bad).validate()
@@ -190,13 +194,14 @@ def test_fc_sampling_conservative(rho):
     idx = torch.arange(ctx.num_directions, device=DEV)
     w = ctx.quad.weight.to(DEV, torch.float64)
     om = ctx.quad.omega.to(DEV, torch.float64)
-    fc_point = fc_source_at_directions(sol.lib, f.rho_fine, phi_uc, GRID, geom, 0.0, om)  # uncorrected samples
+    Q = f.grid_quad
+    fc_point = fc_source_at_directions(sol.lib, f.rho_quad, phi_uc, Q, geom, 0.0, om)  # uncorrected samples
 
-    E = fc_exact_moments(sol.lib, f.rho_fine, phi_uc, l_max=1)  # [2, G, R, C, S]
-    exact = restrict_fc_to_ld_moments(E[0], GRID, CFG.supervoxel_factor)
+    E = fc_exact_moments(sol.lib, f.rho_quad, phi_uc, l_max=1)  # [2, G, Rq, Cq, Sq]
+    exact = restrict_fc_to_ld_moments(E[0], Q, f.q)
     scale = float(exact[:, 0].abs().max())
     got = torch.einsum("d,dg...->g...", w, sol.fc_moment_source(f, 0.0, phi_uc, ctx)(idx))  # [G, 4, Rc, Cc, Sc]
-    pt = torch.einsum("d,dg...->g...", w, restrict_fc_to_ld_moments(fc_point, GRID, CFG.supervoxel_factor))
+    pt = torch.einsum("d,dg...->g...", w, restrict_fc_to_ld_moments(fc_point, Q, f.q))
     assert float((got - exact).abs().max()) < 1e-6 * scale
     assert float((got[:, 0].sum() - exact[:, 0].sum()).abs()) < 1e-6 * float(exact[:, 0].sum())
     assert float((pt[:, 0] - exact[:, 0]).abs().max()) > 1e-3 * scale
@@ -204,7 +209,7 @@ def test_fc_sampling_conservative(rho):
     corr = sol.fc_sampling_correction(f, 0.0, phi_uc, ctx)
     fc = corr.apply(fc_point, om)
     assert float(fc.min()) >= 0.0
-    mu = torch.einsum("rcsx,kx->krcs", primary_directions_to_voxels(GRID, geom, 0.0, DEV, torch.float64), om)
+    mu = torch.einsum("rcsx,kx->krcs", primary_directions_to_voxels(Q, geom, 0.0, DEV, torch.float64), om)
     J = torch.einsum("k,krcs,kgrcs->grcs", w, mu, fc)
     free = corr.beta.abs() < 1
     assert float(free.double().mean()) > 0.5
@@ -232,16 +237,17 @@ def test_fc_sampling_float32_accumulation(rho, monkeypatch):
     w64 = ctx.quad.weight.to(DEV, torch.float64)
     corr = sol.fc_sampling_correction(f, 0.0, phi_uc, ctx)
     assert corr.scale.dtype == torch.float32 and corr.beta.dtype == torch.float32
-    E = fc_exact_moments(sol.lib, f.rho_fine.double(), phi_uc.double(), l_max=1)
+    E = fc_exact_moments(sol.lib, f.rho_quad.double(), phi_uc.double(), l_max=1)
+    Q = f.grid_quad
 
     # (a) the same float32 FC source, all sums in float64
-    fc = fc_source_at_directions(sol.lib, f.rho_fine, phi_uc, GRID, geom, 0.0, om32).double()
-    mu = torch.einsum("rcsx,kx->krcs", primary_directions_to_voxels(GRID, geom, 0.0, DEV, torch.float32), om32).double()
+    fc = fc_source_at_directions(sol.lib, f.rho_quad, phi_uc, Q, geom, 0.0, om32).double()
+    mu = torch.einsum("rcsx,kx->krcs", primary_directions_to_voxels(Q, geom, 0.0, DEV, torch.float32), om32).double()
     I = torch.stack([torch.einsum("k,kg...->g...", w64, fc), torch.einsum("k,k...,kg...->g...", w64, mu, fc),
                      torch.einsum("k,k...,kg...->g...", w64, mu * mu, fc)])
     ref_a = fc_correction_factors(I, E)
     # (b) everything in float64
-    c64 = fc_sampling_correction(sol.lib, f.rho_fine.double(), phi_uc.double(), GRID, geom, 0.0,
+    c64 = fc_sampling_correction(sol.lib, f.rho_quad.double(), phi_uc.double(), Q, geom, 0.0,
                                  ctx.quad.omega.to(DEV, torch.float64), w64, batch=CFG.direction_chunk)
     ref_b = (c64.scale, c64.beta)
     for name, (s_ref, b_ref) in (("float64 sums", ref_a), ("all float64", ref_b)):
@@ -251,9 +257,9 @@ def test_fc_sampling_float32_accumulation(rho, monkeypatch):
         assert float(b_ref.abs().max()) > 1e-2  # the correction is not trivial
 
     # several float32 blocks (block of 16 directions, FC batches of 5 that do not divide it) == one block
-    I1 = fc_quadrature_sums(sol.lib, f.rho_fine, phi_uc, GRID, geom, 0.0, om32, w64, batch=8)
+    I1 = fc_quadrature_sums(sol.lib, f.rho_quad, phi_uc, Q, geom, 0.0, om32, w64, batch=8)
     monkeypatch.setattr(uncollided_mod, "_FC_SUM_MAX_DIRECTIONS", 16)
-    I2 = fc_quadrature_sums(sol.lib, f.rho_fine, phi_uc, GRID, geom, 0.0, om32, w64, batch=5)
+    I2 = fc_quadrature_sums(sol.lib, f.rho_quad, phi_uc, Q, geom, 0.0, om32, w64, batch=5)
     assert I1.dtype == I2.dtype == torch.float64
     assert float((I1 - I2).abs().max()) < 1e-6 * float(I1[0].abs().max())
     assert float((I1 - I).abs().max()) < 1e-6 * float(I[0].abs().max())
@@ -280,7 +286,7 @@ def test_real_library_wlab(rho):
     assert 0.2 < float(c) < 0.9, float(c)
 
 
-# ---- supervoxel factors: the transport grid and the sub-voxel points --------------------------------------------
+# ---- transport cells: the transport grid and the quadrature points ----------------------------------------------
 
 GRID4 = Grid((12, 16, 20), 2.0)  # divisible by 4
 
@@ -291,14 +297,16 @@ def rho4() -> torch.Tensor:
 
 
 @pytest.mark.parametrize("factor", [1, 2, 4])
-def test_supervoxel_factors(rho4, factor):
-    """solve_view for supervoxel factors 1, 2, 4: all images are finite and non-negative; at factor 1 the first-order
-    image (the solver's scatter image with a zero multiple-collision source) is the single-grid collapsed-cone image
-    of the FC source (scatter_image.scatter_image_from_source, same footprint); coarser transport grids change it by a
-    bounded amount."""
+def test_transport_cells(rho4, factor):
+    """solve_view with transport cells of 1, 2, 4 fine voxels (2, 4, 8 cm) and q = cells / voxel (the quadrature grid
+    is the fine grid; uncollided fluence traced through the fine grid, so that only the transport grid changes; the
+    coarse trace is tested in test_quadrature_grid.py): all images are finite and non-negative;
+    with 2 cm cells the first-order image (the solver's scatter image with a zero multiple-collision source) is the
+    single-grid collapsed-cone image of the FC source (scatter_image.scatter_image_from_source, same footprint);
+    coarser transport grids change it by a bounded amount."""
     from citrus.scatter_solver.scatter_image import scatter_image_from_source
 
-    cfg = replace(CFG, supervoxel_factor=factor)
+    cfg = replace(CFG, transport_cell_cm=2.0 * factor, fc_points_per_axis=factor, fc_trace_grid="fine")
     s = make_solver(cfg)
     r = s.solve_view(rho4, GRID4, 0.0)
     assert r.si.converged
@@ -310,7 +318,7 @@ def test_supervoxel_factors(rho4, factor):
     f = s.material_fields(rho4, GRID4)
     first = s.scatter_image(f, 0.0, s.uncollided(f, 0.0), _zero_mc(s, f))
     # the single-grid image of the FC source on the fine grid, attenuated with the fine mu_t
-    s1 = make_solver(replace(cfg, supervoxel_factor=1))
+    s1 = make_solver(replace(cfg, transport_cell_cm=2.0, fc_points_per_axis=1))
     f1 = s1.material_fields(rho4, GRID4)
     phi_uc = s1.uncollided(f1, 0.0)
     fine = scatter_image_from_source(
@@ -337,11 +345,13 @@ def test_scatter_image_is_combined_pass(rho):
     T = _zero_mc(s, f)
     got = s.scatter_image(f, 0.0, phi_uc, T)
     q = s.cone_quadrature(GRID, 0.0)
-    exp = combined_scatter_image(s.lib, f.rho_fine, phi_uc, GRID, 2, T, s.L, s.geom, 0.0, q, f.mu_t_coarse,
-                                 s.projectors, s.detector, s.grid_response, chunk=CFG.direction_chunk)
+    exp = combined_scatter_image(s.lib, f.rho_quad, phi_uc, f.grid_quad, f.q, T, s.L, s.geom, 0.0, q, f.mu_t_coarse,
+                                 s.projectors, s.detector, s.grid_response, chunk=CFG.direction_chunk,
+                                 grid_coarse=f.grid_coarse)
     assert torch.allclose(got["signal"], exp["signal"], rtol=1e-6)
-    more = combined_scatter_image(s.lib, f.rho_fine, phi_uc, GRID, 2, T, s.L, s.geom, 0.0, q, 1.2 * f.mu_t_coarse,
-                                  s.projectors, s.detector, s.grid_response, chunk=CFG.direction_chunk)
+    more = combined_scatter_image(s.lib, f.rho_quad, phi_uc, f.grid_quad, f.q, T, s.L, s.geom, 0.0, q,
+                                  1.2 * f.mu_t_coarse, s.projectors, s.detector, s.grid_response,
+                                  chunk=CFG.direction_chunk)
     assert float(got["signal"].sum()) > float(more["signal"].sum())
 
 

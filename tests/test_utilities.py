@@ -257,7 +257,7 @@ def test_synthesize_cone_beam_data_generic():
     rho[WATER, 3:5, 3:5] = 0.0
     rho[BONE, 3:5, 3:5] = 1.5
     cfg = SolverConfig(num_groups=3, legendre_order=1, num_polar=2, num_azimuthal=4, cone_num_polar=4,
-                       cone_num_azimuthal=8, supervoxel_factor=2, si_tol=1e-3)
+                       cone_num_azimuthal=8, transport_cell_cm=4.0, si_tol=1e-3)
     solver = ScatterSolver(synthetic_library(3, 2, num_materials=7), cfg, geom, detector=ideal_counting_response(),
                            grid_response=no_grid(), device=dev, dtype=torch.float32)
     angles = [0.0, 1.0, 2.5]

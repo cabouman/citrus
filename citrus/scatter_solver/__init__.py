@@ -6,7 +6,8 @@ order, and a collapsed-cone projection of the last-collided source onto the dete
 
 Modules
     config                 SolverConfig: every discretization parameter
-    geometry               Grid, ConeGeometry (MBIRTORCH conventions)
+    geometry               Grid (transport and quadrature grids), ConeGeometry (MBIRTORCH conventions), conservative
+                           resampling between grids
     cross_sections         MultigroupLibrary container, per-voxel coefficients, synthetic test library
     cross_section_library  library builder from XrayPhysics (EPDL97) data, cached on disk
     source, detector       point source with collimation; detector and anti-scatter-grid responses

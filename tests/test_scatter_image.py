@@ -386,7 +386,7 @@ def test_subpoint_emission(device):
     det, grd = csi_response(), no_grid()
     f = 2
     coarse = grid.coarsen(f)
-    mu_c = coarsen_mu_t(mu_t_volume(lib, rho), f)
+    mu_c = coarsen_mu_t(mu_t_volume(lib, rho), grid, grid.coarsen(f))
     om = q.omega[:5].to(device, F64)
     S = fc_source_at_directions(lib, rho, phi_uc, grid, geom, 0.3, om)  # [5, G, 4, 4, 4]
     tau = PROJ.downstream_cumulative(mu_c, coarse, geom, 0.3, om)  # [5, G, 2, 2, 2]
@@ -446,7 +446,8 @@ def test_subpoint_projection_converges(device):
             return E.expand(om.shape[0], -1, -1, -1, -1)
 
         ref = scatter_image_from_source(fn, grid, geom, 0.0, q, mu, PROJ, det, grd, **kw)["fluence"]
-        fl = _subpoint_image(fn, grid, f, geom, 0.0, q, coarsen_mu_t(mu, f), PROJ, det, grd, **kw)["fluence"]
+        mu_c = coarsen_mu_t(mu, grid, grid.coarsen(f))
+        fl = _subpoint_image(fn, grid, f, geom, 0.0, q, mu_c, PROJ, det, grd, **kw)["fluence"]
         err[case] = float((fl - ref).norm() / ref.norm())
         bias[case] = float(fl.sum() / ref.sum() - 1)
     msg = "; ".join(f"{c}: rel L2 {err[c]:.2e}, sum {bias[c]:+.2e}" for c in err)
@@ -476,7 +477,8 @@ def test_first_order_wlab_cuda():
                                     lib, chunk=8)
     one = _first_order(lib, rho, phi_uc, grid, 1, geom, angle, q, mu, P, det, grd, chunk=8)
     _assert_images_close(one, ref, msg="factor 1")
-    two = _first_order(lib, rho, phi_uc, grid, 2, geom, angle, q, coarsen_mu_t(mu, 2), P, det, grd, chunk=8)
+    two = _first_order(lib, rho, phi_uc, grid, 2, geom, angle, q, coarsen_mu_t(mu, grid, grid.coarsen(2)), P, det, grd,
+                       chunk=8)
     assert float(two["signal"].min()) >= 0 and float(two["fluence"].min()) >= 0
     e = float((two["signal"] - ref["signal"]).norm() / ref["signal"].norm())
     b = float(two["signal"].sum() / ref["signal"].sum() - 1)
@@ -603,7 +605,7 @@ def test_direction_context_chunk_loop_no_sync():
     P = SiddonProjectors()
     mu = mu_t_volume(lib, rho)
     coarse = grid.coarsen(2)
-    mu_c = coarsen_mu_t(mu, 2)
+    mu_c = coarsen_mu_t(mu, grid, grid.coarsen(2))
     L = 2
     T = torch.rand(3, num_sh(L), *coarse.shape, device=dev) * 0.01
     S = torch.rand(1, 3, *coarse.shape, device=dev)
@@ -687,7 +689,7 @@ def test_combined_scatter_image_small(device):
         g = torch.Generator(device="cpu").manual_seed(5 + f)
         T = (torch.rand(3, num_sh(L), *coarse.shape, generator=g, dtype=F64) * 0.01).to(device)
         T[:, 1:] *= 0.3
-        mu_c = coarsen_mu_t(0.9 * mu, f)
+        mu_c = coarsen_mu_t(0.9 * mu, grid, grid.coarsen(f))
         msg = f"f={f}"
         fo, mc = _combined_references(lib, rho, phi_uc, grid, f, T, L, geom, 0.3, q, mu_c, PROJ, det, grd, ctx)
         tot = combined_scatter_image(lib, rho, phi_uc, grid, f, T, L, geom, 0.3, q, mu_c, PROJ, det, grd, ctx)
@@ -708,7 +710,8 @@ def test_combined_scatter_image_small(device):
     T = (torch.rand(3, num_sh(L), *coarse.shape, dtype=F64) * 0.01).to(device)
     T6 = torch.stack([T, torch.randn_like(T), torch.randn_like(T), torch.randn_like(T)], dim=2)
     a = combined_scatter_image(lib, rho, phi_uc, grid, 2, T6, L, geom, 0.3, q, None, PROJ, det, grd, chunk=5)
-    b = combined_scatter_image(lib, rho, phi_uc, grid, 2, T, L, geom, 0.3, q, coarsen_mu_t(mu, 2), PROJ, det, grd, ctx)
+    b = combined_scatter_image(lib, rho, phi_uc, grid, 2, T, L, geom, 0.3, q, coarsen_mu_t(mu, grid, grid.coarsen(2)),
+                               PROJ, det, grd, ctx)
     _assert_images_close(a, b, msg="6-D T / no context")
     with pytest.raises(ValueError, match="moments"):
         combined_scatter_image(lib, rho, phi_uc, grid, 2, T, 3, geom, 0.3, q, None, PROJ, det, grd, ctx)
@@ -740,7 +743,7 @@ def test_combined_scatter_image_wlab_cuda():
     ctx = make_direction_context(q, geom, angle, det, grd, lib, dev, torch.float32, chunk=8)
     for f in (1, 2):
         coarse = grid.coarsen(f)
-        mu_c = coarsen_mu_t(mu, f)
+        mu_c = coarsen_mu_t(mu, grid, grid.coarsen(f))
         # a smooth MC source (the multiple-collision source follows the density), weakly anisotropic
         rc = torch.nn.functional.avg_pool3d(rho[:1].unsqueeze(0), f, f).squeeze(0)[0]
         T = torch.zeros(3, num_sh(L), *coarse.shape, device=dev)
@@ -777,7 +780,7 @@ def test_combined_scatter_image_no_sync():
     det, grd = csi_response(), focused_1d_grid()
     P = SiddonProjectors()
     coarse = grid.coarsen(2)
-    mu_c = coarsen_mu_t(mu_t_volume(lib, rho), 2)
+    mu_c = coarsen_mu_t(mu_t_volume(lib, rho), grid, grid.coarsen(2))
     L = 2
     T = torch.rand(3, num_sh(L), *coarse.shape, device=dev) * 0.01
     ctx = make_direction_context(q, geom, angle, det, grd, lib, dev, torch.float32, chunk=8)

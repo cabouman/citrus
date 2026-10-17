@@ -84,19 +84,44 @@ The fused kernel follows ``ld_cell`` term by term and agrees with the PyTorch pa
 
 **First-collision sampling correction.** At the default 8 x 16 sweep quadrature, point samples of the forward-peaked
 first-collision source miss 1.4 % of its :math:`l = 0` and 11.7 % of its :math:`l = 1` moment on WLAB. Matching both
-moments per voxel and group (``fc_sampling_correction``) removes about 73 % of the sweep-quadrature sensitivity of the
-multiple-collision term and raises the total scatter by 1.7 % (the deficit of point sampling); 8 x 16 with the
-correction is about as accurate as point-sampled 12 x 24 at half the cost. The quadrature sums are formed by one
+moments per quadrature point and group (``fc_sampling_correction``) removes about 73 % of the sweep-quadrature
+sensitivity of the multiple-collision term and raises the total scatter by 1.7 % (the deficit of point sampling);
+8 x 16 with the correction is about as accurate as point-sampled 12 x 24 at half the cost. The quadrature sums are formed by one
 float32 matrix product per batch of directions and accumulated in float64 (factors within 1e-5 of an all-float64
-computation); the correction pass costs 8 ms per view at 1 cm and 23 ms at 0.5 cm (factor 2).
+computation); the correction pass runs on the quadrature points: 8 ms per view with q = 1 and 21-26 ms with q = 2
+(1 cm cells), for any fine voxel size.
 
 Scatter image
 -------------
 
-**Sub-voxel points.** All scatter orders are transported on the supervoxel grid; the first-collision source and the
-projection use the fine voxel centers inside each supervoxel, with the downstream attenuation traced on the
-supervoxel grid plus its first-order variation inside the cell. Against a fine-grid first-order pass on WLAB: 0.26 %
-RMS (max 0.86 %) for 0.5 cm voxels in 1 cm cells, 1.0 % (max 3.1 %) in 2 cm cells.
+**Quadrature points.** All scatter orders are transported on the transport grid C (cubic cells of
+``transport_cell_cm``, covering the fine box; :doc:`conventions`, "Grids"). The uncollided fluence, the first-collision
+source (sweep and cone directions), its sampling correction and restriction, and the first-order emission and its
+projection use the :math:`q^3` points per cell of the quadrature grid Q (``fc_points_per_axis``, default 2, bounded
+by round(cell / largest fine voxel edge) so that the points are not much denser than the data), with the
+densities resampled conservatively from the fine grid and the downstream attenuation traced on C plus its first-order
+variation inside the cell (Acuros CTS, Maslowski et al. 2018, Section 2.B). Only the primary image and the resampling
+touch the fine grid. Against the q = 2 sub-points of version 0.1.0 (the f^3 fine voxel centres, which q = cell / voxel
+with ``fc_trace_grid = "fine"`` reproduces to float rounding: 2e-7 on WLAB at 0.5 cm, bit for bit at 1 cm), on WLAB
+with 0.5 cm voxels in 1 cm cells (converged solve, AP / lateral view, rel. L2 of the scatter signal against q = 3):
+q = 1 0.93 % / 0.20 %, q = 2 0.20 % / 0.02 %; CITRUS step 120 / 300 / 790 ms for q = 1 / 2 / 3 (q = 3 measured
+before the resolution bound, which now limits 0.5 cm voxels to q = 2). The earlier
+fine-grid first-order pass agreed with 0.5 cm points in 1 cm cells to 0.26 % RMS (max 0.86 %) and with 2 cm cells to
+1.0 % (max 3.1 %). Any voxel / cell ratio works: 0.4 cm voxels (ratio 2.5) give the 0.5 cm scatter image to 0.34 %
+(the rasterized phantoms differ: the primary by 0.2 %).
+
+**Uncollided trace.** The uncollided fluence at the Q points is traced from the focal spot through C
+(``fc_trace_grid = "coarse"``), through Q ("quadrature", default) or through the fine grid ("fine"); the stage costs
+about 7 ms per view in every case (the fine-energy transmission dominates; the fine trace at 0.125 cm takes 11 ms). On
+WLAB with 0.5 cm voxels in 1 cm cells the phantom's boundaries lie on cell faces and the three agree to 4e-8. With the
+cells shifted by half a cell against the object (a 21 cm instead of 20 cm box along y), rays that run along a face
+inside a half-filled cell see half the density in the coarse trace: the coarse trace then differs from the fine one by
+0.13 % (AP) and 4.1 % (lateral), the quadrature trace by 0 (q = 2, Q = F) and 0.03 % / 0.8 % (q = 3). With 0.4 cm
+voxels: coarse 0.12 % / 0.06 %, quadrature 0.06 % / 0.03 %. The quadrature trace is therefore the default.
+
+**Pair and dense first-collision source.** ``rho_quad`` is checked once per density field: where every point has at
+most two nonzero materials the pair kernel runs, else the dense kernel over all seven materials (2.3 ms instead of
+0.85 ms per chunk of 8 directions on 192,000 points, G = 6).
 
 **Direction context.** Everything of an image that depends only on the view, the direction set and the detector / grid
 responses is precomputed once per view (``make_direction_context``): the panel-facing directions and their chunking,
@@ -107,7 +132,7 @@ for per-pixel tables; the solver keeps an LRU of contexts per view, so repeated 
 iteration) run without host synchronization.
 
 **Direction set and footprint.** The cone product set is limited to the smallest cone about the panel normal that
-contains every direction from the object box to the panel (51 degrees for the 100 x 75 panel at the AP view, 61-63
+contains every direction from the transport-grid box to the panel (51 degrees for the 100 x 75 panel at the AP view, 61-63
 degrees for the full-field panel). Per-pixel scatter of a finite direction set carries ray effects where the emission
 has sharp spatial structure (insert and object shadows along the beam). Against a 48 x 96 reference on the full-field
 panel, the uniform 16 x 32 set has 5.5 % / 13 % RMS per-pixel error in the AP / lateral views and 32 x 64 has
@@ -116,15 +141,15 @@ panel, the uniform 16 x 32 set has 5.5 % / 13 % RMS per-pixel error in the AP / 
 time (173 ms instead of 567 ms for 32 x 64 per scatter image at 0.5 cm). Splitting the emission into depth slabs adds
 40-100 % cost for under 0.35 % points and is not used.
 
-**Cost per view** (WLAB, AP view, 100 x 75 panel, 6 groups, L = 7): 0.39 s at 1 cm (source iteration 0.34 s, scatter
-image 0.04 s), 0.60 s for 0.5 cm voxels in 1 cm cells (0.45 s / 0.14 s); peak memory about 0.8 GB. The no-grid scatter
-fraction along the central row spans 0.29 behind the lung to 0.62 behind the bone; a focused 10:1 grid roughly halves
-it.
+**Cost per view** (WLAB, AP view, 100 x 75 panel, 6 groups, L = 7): 0.39 s at 1 cm with q = 1 (source iteration
+0.34 s, scatter image 0.04 s; q = 1 is the default there), 0.60 s for 0.5 cm voxels in 1 cm cells (0.45 s /
+0.14 s; q = 2, the same for any smaller voxel); peak memory about 0.8 GB. The no-grid scatter fraction along the central row spans 0.29 behind the lung to 0.62 behind the
+bone; a focused 10:1 grid roughly halves it.
 
 Ray tracing and kernels
 -----------------------
 
-``SiddonProjectors`` computes exact line integrals (Siddon / Amanatides-Woo) for the four operations of the solver.
+``SiddonProjectors`` computes exact line integrals (Siddon / Amanatides-Woo) for the five operations of the solver.
 The PyTorch path batches rays with a fixed number of plane crossings per ray and serves as the reference; on float32
 CUDA the fused Triton kernels trace every ray in registers (all groups at once). The downstream attenuation uses that
 all rays of one direction start at voxel centers and are parallel, so they share the crossing sequence. The kernels
@@ -167,17 +192,30 @@ sign by 13 %).
 CITRUS cost and memory
 ----------------------
 
-Per view and outer iteration (0.5 cm voxels in 1 cm cells, full-field 184 x 150 panel, 16 x 32 cone directions):
+Per view and outer iteration (0.5 cm voxels in 1 cm cells, q = 2, full-field 184 x 150 panel, 16 x 32 cone
+directions):
 about 0.29 s, of which the single sweep with its first-collision source 0.10 s (the first-collision source of the
 sweep is rebuilt every step because the densities change: sampling correction 21 ms, source at the sweep directions
 16 ms, restriction to LD moments 34 ms) and the scatter image 0.15-0.17 s (first-collision source at the cone
 directions 51 ms, sub-point emission 78 ms, downstream attenuation 18 ms, projection 22 ms, accumulation 9 ms).
-A converged solve of the same view costs about 0.55 s. At 1 cm (factor 1) a CITRUS step costs about 0.13 s.
-These are two-material (version 0.0.3) timings. The seven-material basis adds about 6 % (``benchmarks/
+A converged solve of the same view costs about 0.55 s. With 1 cm voxels in 1 cm cells a CITRUS step costs about
+0.12 s (q = 1 by the resolution bound: everything on one grid; 0.30 s if q = 2 were used, 8 points per cell
+finer than the voxels).
+These are two-material (version 0.0.3) timings; with q = 2 every first-order stage of version 0.2.0 has the same size
+at 0.5 cm and costs the same. The seven-material basis adds about 6 % (``benchmarks/
 profile_citrus_step.py`` in one session with the desktop sharing the GPU: 317 ms per view before, 335 ms after): the
 pair mode of the first-collision kernel (larger table, per-voxel row offsets; 0.76 vs 0.60 ms per chunk of 8
 directions) and one ray trace per material present (four instead of two for the WLAB reconstructions, whose lung and
 air inserts become lung / adipose and air / lung mixtures) in the uncollided fluence and the primary.
+
+Small voxels (``benchmarks/profile_citrus_step.py --voxel``, 1 cm cells, q = 2, one session with the desktop sharing
+the GPU): version 0.1.0 evaluated every first-order quantity at the fine voxel centres, 319 ms per view at 0.5 cm,
+1760 ms at 0.25 cm (factor 4: first-collision source and sub-point emission 8x larger) and out of memory at 0.125 cm
+on the 8 GB card (a chunk of 8 directions of the first-collision source alone is 2.4 GB; extrapolated 12 s per view).
+Version 0.2.0: 323 ms at 0.5 cm, 308 ms at 0.25 cm and 317 ms at 0.125 cm (160 x 240 x 320 voxels; peak 1.5 GB with
+two views' accumulators). What remains on the fine grid: the primary (6 ms per view at 0.5 cm, 8-10 ms at 0.125 cm)
+and, once per outer iteration rather than per view, the density model and the resampling onto C and Q (2 ms at
+0.5 cm, 7 ms at 0.125 cm).
 
 The per-view accumulator is :math:`G (L+1)^2 \cdot 4` values per cell: 141 MiB in float32 on the 0.5 cm WLAB grid
 with 1 cm cells (24.7 GiB for 180 views). It is stored compactly (LD cell mean, scaled float16: 17.6 MiB per view,

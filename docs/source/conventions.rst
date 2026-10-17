@@ -32,6 +32,26 @@ Frames and tensor layouts (MBIRTORCH conventions)
 * The solver works in the recon frame per view: ``ConeGeometry`` returns the source position, panel center and panel
   axes rotated into the recon frame. Directions are unit vectors in the recon frame unless a name says ``_view``.
 
+Grids
+-----
+
+The solver uses three grids (``geometry.Grid``):
+
+* **F**, the fine (reconstruction) grid: the densities ``rho_fine``; only the primary image and the resampling
+  below touch it.
+* **C**, the transport grid, ``Grid.covering(F, transport_cell_cm)``: cubic cells of edge
+  ``SolverConfig.transport_cell_cm``, ``ceil(extent / cell)`` cells per axis, centred on the box of F (symmetric
+  padding with empty space); any ratio of cell to voxel size. Every scatter order is transported on C; the
+  attenuation of the scatter image is traced on C.
+* **Q**, the quadrature grid, ``C.refine(q)`` with ``q = min(fc_points_per_axis, max(1, round(transport_cell_cm /
+  largest fine voxel edge)))`` (``SolverConfig.quadrature_points``; Python's round, halves to even): q^3 equal-weight points
+  per cell of C at local coordinates ``(2j + 1)/q - 1`` (the midpoint lattice). The uncollided fluence, the
+  first-collision source and the first-order emission of the scatter image live on Q.
+* ``rho_coarse`` and ``rho_quad`` are conservative overlap resamplings of ``rho_fine``
+  (``geometry.resample_conservative``): each target cell gets the exact average of the voxel-wise constant fine
+  field over its volume (zero outside the fine box), so every material's mass is conserved. For an integer ratio
+  with aligned boxes this is the block mean.
+
 Energy groups
 -------------
 
@@ -67,9 +87,11 @@ Materials
   Density maps ``rho: [7, rows, cols, slices]`` in g/cm^3. All coefficients are linear in rho:
   ``mu_x[g] = sum_m rho[m] * lib.mu_x[m, g]`` with per-unit-density (mass) coefficients; the library carries
   ``materials`` (names) and ``nominal_density [M]``.
-* At most two nonzero materials per voxel (the density model's output); the first-collision source uses the compact
-  pair representation ``MaterialPairs`` (``index [2, ...]`` int32, ``density [2, ...]``) derived once per density
-  field (``ScatterSolver.material_fields`` -> ``MaterialFields.pairs_fine``).
+* At most two nonzero materials per voxel of ``rho_fine`` (the density model's output). The resampled ``rho_quad``
+  can mix more materials at a point (a quadrature cell straddling a boundary): the first-collision source uses the
+  compact pair representation ``MaterialPairs`` (``index [2, ...]`` int32, ``density [2, ...]``) when every point of
+  ``rho_quad`` has at most two nonzero materials and evaluates all M materials densely otherwise; the choice is made
+  once per density field (``ScatterSolver.material_fields`` -> ``MaterialFields.pairs_quad``, None for dense).
 
 Device and dtype
 ----------------

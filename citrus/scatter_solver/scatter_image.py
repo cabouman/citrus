@@ -40,11 +40,12 @@ grid), so the detector signal is
 
 Grids
 -----
-`combined_scatter_image` evaluates the first-collision source S_FC at the sub-voxel points (the f^3 fine voxel
-centers of each supervoxel, equal weights) and the multiple-collision source S_MC per supervoxel, attenuates their
-sum with tau_down traced on the supervoxel grid plus its first-order variation inside the cell
-(`supervoxel_subpoint_emission`), and projects the sub-point emission on the fine grid (each sub-point traced to
-the panel separately), once per direction chunk (docs/source/design_notes.rst, "Scatter image").
+`combined_scatter_image` evaluates the first-collision source S_FC at the quadrature points (the voxel centers of the
+quadrature grid Q = C.refine(q): q^3 equal-weight points per transport cell, docs/source/conventions.rst, "Grids")
+and the multiple-collision source S_MC per transport cell, attenuates their sum with tau_down traced on the transport
+grid C plus its first-order variation inside the cell (`supervoxel_subpoint_emission`), and projects the sub-point
+emission on Q (each point traced to the panel separately), once per direction chunk (docs/source/design_notes.rst,
+"Scatter image"). Nothing of the image touches the fine reconstruction grid.
 `scatter_image_from_source` is the generic single-grid image of an arbitrary emission (constant per voxel,
 exp(-tau_down) at the voxel center), used by tests and diagnostics.
 
@@ -73,14 +74,13 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Optional, Union
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from .angular_quadrature import Quadrature, hemisphere_quadrature, real_spherical_harmonics
 from .config import SolverConfig
 from .cross_sections import MultigroupLibrary, group_transmission, mu_t_volume
 from .detector import DetectorResponse, GridResponse, detector_angle, grid_angles
-from .geometry import ConeGeometry, Grid
+from .geometry import ConeGeometry, Grid, resample_conservative
 from .kernels import triton_utils as _tu
 from .ray_tracing import Projectors
 from .source import SourceModel
@@ -201,7 +201,7 @@ class DirectionSetContext:
     per-pixel [K, G, Rd, Cd] table. All responses are evaluated in float64 and stored in the context dtype.
 
     Lazily cached per context: real spherical harmonics of the directions per order L (`spherical_harmonics`),
-    the sub-cell offsets Omega_k . (r_j - r_cell) per (fine grid, factor) (`subcell_offsets`) and the panel heights of
+    the sub-cell offsets Omega_k . (r_j - r_cell) per (quadrature grid, q) (`subcell_offsets`) and the panel heights of
     the finite-cone footprint per grid (`_Footprint`), so that repeated images of a view need no host synchronization.
     """
 
@@ -293,14 +293,15 @@ class DirectionSetContext:
             self._cache[key] = hit
         return hit[1:]
 
-    def subcell_offsets(self, grid_fine: Grid, factor: int) -> tuple[Tensor, ...]:
-        """Omega_k . (r_j - r_cell) for the f^3 fine voxel centers r_j of a supervoxel (`supervoxel_subpoint_emission`),
-        one [k, f, f, f] view per chunk (axes: rows, cols, slices), cached per (fine voxel deltas, factor)."""
-        f = int(factor)
-        key = ("subcell", tuple(float(d) for d in grid_fine.deltas), f)
+    def subcell_offsets(self, grid_quad: Grid, q: int) -> tuple[Tensor, ...]:
+        """Omega_k . (r_j - r_cell) for the q^3 quadrature points r_j of a transport cell (the voxel centers of
+        grid_quad inside the cell, `supervoxel_subpoint_emission`), one [k, q, q, q] view per chunk (axes: rows, cols,
+        slices), cached per (grid_quad voxel deltas, q)."""
+        f = int(q)
+        key = ("subcell", tuple(float(d) for d in grid_quad.deltas), f)
         hit = self._cache.get(key)
         if hit is None:
-            proj = _subcell_offsets(self.omega, grid_fine, f)  # [K, f, f, f]
+            proj = _subcell_offsets(self.omega, grid_quad, f)  # [K, q, q, q]
             hit = (proj,) + tuple(proj[s:e] for s, e in self.bounds)
             self._cache[key] = hit
         return hit[1:]
@@ -339,10 +340,11 @@ class DirectionSetContext:
         return {"fluence": fluence, "planar_fluence": planar, "signal_per_group": spg, "signal": spg.sum(0)}
 
 
-def _subcell_offsets(omega: Tensor, grid_fine: Grid, f: int) -> Tensor:
-    """Omega_k . (r_j - r_cell) [K, f_r, f_c, f_s] for the f^3 fine voxel centers of a supervoxel; omega [K, 3]."""
+def _subcell_offsets(omega: Tensor, grid_quad: Grid, f: int) -> Tensor:
+    """Omega_k . (r_j - r_cell) [K, q_r, q_c, q_s] for the q^3 = f^3 voxel centers of grid_quad inside one cell of
+    grid_quad.coarsen(f); omega [K, 3]."""
     dev, dt = omega.device, omega.dtype
-    dx, dy, dz = grid_fine.deltas
+    dx, dy, dz = grid_quad.deltas
     idx = torch.arange(f, device=dev, dtype=dt) - (f - 1) / 2.0
     om = omega.reshape(-1, 3)
     return (om[:, 1, None, None, None] * (dy * idx)[None, :, None, None]
@@ -521,51 +523,52 @@ def scatter_image_from_source(source_fn: SourceFn, grid: Grid, geom: ConeGeometr
 
 
 # =====================================================================================================
-# sub-voxel quadrature points of the supervoxel (transport) grid
+# quadrature points of the transport grid
 # =====================================================================================================
 
-def _check_subpoint_shapes(src_fine: Tensor, tau_coarse: Tensor, grid_fine: Grid, f: int) -> tuple[int, int, int]:
-    """Validate src_fine [k, G, R, C, S] on grid_fine and tau_coarse [k, G, Rc, Cc, Sc]; returns (Rc, Cc, Sc)."""
-    coarse = grid_fine.coarsen(f)
-    k, G = src_fine.shape[:2]
+def _check_subpoint_shapes(src_quad: Tensor, tau_coarse: Tensor, grid_quad: Grid, f: int) -> tuple[int, int, int]:
+    """Validate src_quad [k, G, Rq, Cq, Sq] on grid_quad and tau_coarse [k, G, Rc, Cc, Sc]; returns (Rc, Cc, Sc)."""
+    coarse = grid_quad.coarsen(f)
+    k, G = src_quad.shape[:2]
     Rc, Cc, Sc = coarse.shape
-    if tuple(src_fine.shape[2:]) != tuple(grid_fine.shape):
-        raise ValueError(f"src_fine spatial shape {tuple(src_fine.shape[2:])} != fine grid {grid_fine.shape}")
+    if tuple(src_quad.shape[2:]) != tuple(grid_quad.shape):
+        raise ValueError(f"src_quad spatial shape {tuple(src_quad.shape[2:])} != quadrature grid {grid_quad.shape}")
     if tuple(tau_coarse.shape) != (k, G, Rc, Cc, Sc):
         raise ValueError(f"tau_coarse {tuple(tau_coarse.shape)} != {(k, G, Rc, Cc, Sc)}")
     return Rc, Cc, Sc
 
 
-def supervoxel_subpoint_emission(src_fine: Tensor, tau_coarse: Tensor, mu_t_coarse: Tensor, omegas: Tensor,
-                                 grid_fine: Grid, factor: int, *, offsets: Optional[Tensor] = None) -> Tensor:
-    """Attenuated emission at every sub-voxel point, kept on the FINE grid (before the projection and the sum over j).
+def supervoxel_subpoint_emission(src_quad: Tensor, tau_coarse: Tensor, mu_t_coarse: Tensor, omegas: Tensor,
+                                 grid_quad: Grid, q: int, *, offsets: Optional[Tensor] = None) -> Tensor:
+    """Attenuated emission at every quadrature point, kept on the quadrature grid Q (before the projection and the sum
+    over j).
 
-    The sub-voxel points r_j of a supervoxel of C = grid_fine.coarsen(factor) are its f^3 fine voxel centers (equal
-    weights 1/f^3):
+    The quadrature points r_j of a transport cell of C = grid_quad.coarsen(q) are the q^3 voxel centers of grid_quad
+    inside it (equal weights 1/q^3):
 
         e[k, g, r_j] = S[k, g, r_j] exp(-tau_j),
         tau_j = max(0, tau_coarse[k, g, cell] - mu_t_coarse[g, cell] (Omega_k . (r_j - r_cell)))
 
     i.e. the downstream attenuation at the supervoxel center plus its first-order variation inside the cell (moving
     along Omega_k toward the panel shortens the path); exact for a uniform cell whose rays leave through the same
-    face as the center ray. Projecting this field on grid_fine traces each sub-point to the panel separately.
-    src_fine [k, G, R, C, S] on grid_fine; tau_coarse [k, G, Rc, Cc, Sc] on C (projectors.downstream_cumulative;
-    +inf allowed); mu_t_coarse [G, Rc, Cc, Sc] (1/cm); omegas [k, 3]. Returns e [k, G, R, C, S] in
-    photons/(cm^3 sr) on grid_fine, in the device / dtype of tau_coarse. For factor 1 this is S exp(-tau) (no
-    clamp). Peak extra memory ~ one fine-grid field [k, G, R, C, S]. offsets: optional precomputed
-    Omega_k . (r_j - r_cell) [k, f, f, f] (`DirectionSetContext.subcell_offsets`), computed here when None.
+    face as the center ray. Projecting this field on grid_quad traces each point to the panel separately.
+    src_quad [k, G, Rq, Cq, Sq] on grid_quad; tau_coarse [k, G, Rc, Cc, Sc] on C (projectors.downstream_cumulative;
+    +inf allowed); mu_t_coarse [G, Rc, Cc, Sc] (1/cm); omegas [k, 3]. Returns e [k, G, Rq, Cq, Sq] in
+    photons/(cm^3 sr) on grid_quad, in the device / dtype of tau_coarse. For q = 1 this is S exp(-tau) (no
+    clamp). Peak extra memory ~ one quadrature-grid field [k, G, Rq, Cq, Sq]. offsets: optional precomputed
+    Omega_k . (r_j - r_cell) [k, q, q, q] (`DirectionSetContext.subcell_offsets`), computed here when None.
     """
-    f = int(factor)
-    k, G = src_fine.shape[:2]
-    Rc, Cc, Sc = _check_subpoint_shapes(src_fine, tau_coarse, grid_fine, f)
+    f = int(q)
+    k, G = src_quad.shape[:2]
+    Rc, Cc, Sc = _check_subpoint_shapes(src_quad, tau_coarse, grid_quad, f)
     dev, dt = tau_coarse.device, tau_coarse.dtype
-    src_fine = src_fine.to(dev, dt)
+    src_quad = src_quad.to(dev, dt)
     if f == 1:
-        return torch.exp(-tau_coarse).mul_(src_fine)
-    s = src_fine.reshape(k, G, Rc, f, Cc, f, Sc, f)
-    # offsets of the fine centers from the supervoxel center along x (cols), y (rows), z (slices)
+        return torch.exp(-tau_coarse).mul_(src_quad)
+    s = src_quad.reshape(k, G, Rc, f, Cc, f, Sc, f)
+    # offsets of the quadrature points from the cell center along x (cols), y (rows), z (slices)
     if offsets is None:
-        proj = _subcell_offsets(omegas.to(dev, dt).reshape(k, 3), grid_fine, f)  # [k, f_r, f_c, f_s]
+        proj = _subcell_offsets(omegas.to(dev, dt).reshape(k, 3), grid_quad, f)  # [k, q_r, q_c, q_s]
     else:
         if tuple(offsets.shape) != (k, f, f, f):
             raise ValueError(f"offsets {tuple(offsets.shape)} != {(k, f, f, f)}")
@@ -574,18 +577,16 @@ def supervoxel_subpoint_emission(src_fine: Tensor, tau_coarse: Tensor, mu_t_coar
     mu = mu_t_coarse.to(dev, dt)[None, :, :, None, :, None, :, None]  # [1, G, Rc, 1, Cc, 1, Sc, 1]
     # tau_j = max(0, tau - mu (Omega . (r_j - r_c)))  [k, G, Rc, f, Cc, f, Sc, f]
     t = torch.addcmul(tau_coarse[:, :, :, None, :, None, :, None], mu, proj, value=-1.0).clamp_(min=0.0)
-    return t.neg_().exp_().mul_(s).reshape(src_fine.shape)
+    return t.neg_().exp_().mul_(s).reshape(src_quad.shape)
 
 
-def coarsen_mu_t(mu_t_fine: Tensor, factor: int) -> Tensor:
-    """Supervoxel average of a fine attenuation map [G, R, C, S] -> [G, R/f, C/f, S/f] (1/cm).
+def coarsen_mu_t(mu_t_fine: Tensor, grid_fine: Grid, grid_coarse: Grid) -> Tensor:
+    """Cell average of an attenuation map [G, R, C, S] on grid_fine over the cells of grid_coarse -> [G, Rc, Cc, Sc]
+    (1/cm; `geometry.resample_conservative`, zero outside the box of grid_fine).
 
-    Because mu_t is linear in the densities this equals mu_t_volume(lib, average-pooled rho).
+    Because mu_t is linear in the densities this equals mu_t_volume(lib, resampled rho).
     """
-    f = int(factor)
-    if f == 1:
-        return mu_t_fine
-    return F.avg_pool3d(mu_t_fine.unsqueeze(0), kernel_size=f, stride=f).squeeze(0)
+    return resample_conservative(mu_t_fine, grid_fine, grid_coarse)
 
 
 # =====================================================================================================
@@ -711,46 +712,51 @@ class _Footprint:
 # the scatter image: first-order + multiple-collision emission, traced together
 # =====================================================================================================
 
-def combined_scatter_image(lib: MultigroupLibrary, rho_fine: Tensor, phi_uc_fine: Tensor, grid_fine: Grid,
-                           factor: int, T_mean: Tensor, L: int, geom: ConeGeometry, angle: float, quad: Quadrature,
+def combined_scatter_image(lib: MultigroupLibrary, rho_quad: Tensor, phi_uc_quad: Tensor, grid_quad: Grid,
+                           q: int, T_mean: Tensor, L: int, geom: ConeGeometry, angle: float, quad: Quadrature,
                            mu_t_coarse: Optional[Tensor], projectors: Projectors, detector: DetectorResponse,
                            grid_response: GridResponse, context: Optional[DirectionSetContext] = None,
                            chunk: int = 8, *, fc_chunk: int = 4, footprint: bool = True,
-                           pairs=None) -> dict[str, Tensor]:
+                           pairs=None, grid_coarse: Optional[Grid] = None) -> dict[str, Tensor]:
     """Total scatter image (first-order + multiple-collision) in ONE collapsed-cone pass: the first- and
-    multiple-collision sources are summed and ray-traced to the detector together, on the supervoxel grid with
-    sub-voxel quadrature points.
+    multiple-collision sources are summed and ray-traced to the detector together, on the transport grid with q^3
+    quadrature points per cell.
 
-    lib; rho_fine [M, R, C, S] g/cm^3 and phi_uc_fine [G, R, C, S] (uncollided.uncollided_fluence) on grid_fine, whose
-    voxel centers are the f^3 equal-weight sub-voxel points of each supervoxel of C = grid_fine.coarsen(factor);
+    lib; rho_quad [M, Rq, Cq, Sq] g/cm^3 and phi_uc_quad [G, Rq, Cq, Sq] (uncollided.uncollided_fluence at the points)
+    on the quadrature grid grid_quad, whose voxel centers are the q^3 equal-weight quadrature points of each cell of the
+    transport grid C = grid_quad.coarsen(q) (grid_coarse: C itself when given, e.g. the solver's transport grid, of
+    which grid_quad = C.refine(q); it then also fixes the attenuation grid exactly);
     T_mean [G, (L+1)^2, Rc, Cc, Sc]: cell-mean SH moments of the multiple-collision emission (already contracted with
     the transfer moments, `ScatterSolver.mc_source_moments`), or the 6-D [G, (L+1)^2, 4, Rc, Cc, Sc] tensor whose LD
-    mean is used; mu_t_coarse [G, Rc, Cc, Sc] on C (None -> coarsen_mu_t(mu_t_volume(lib, rho_fine))). context: the
-    view's `make_direction_context` (built here when None; its chunking replaces `chunk`). fc_chunk: directions per
-    inner batch of the FC source (PyTorch path). pairs: the `cross_sections.MaterialPairs` of rho_fine for M > 2 basis
-    materials (built once here when None; the FC source of every chunk gathers the two table rows of each voxel by
-    material index); ignored for M <= 2.
+    mean is used; mu_t_coarse [G, Rc, Cc, Sc] on C (None -> the cell average of mu_t_volume(lib, rho_quad)). context:
+    the view's `make_direction_context` (built here when None; its chunking replaces `chunk`). fc_chunk: directions
+    per inner batch of the FC source (PyTorch path). pairs: the material representation of rho_quad
+    (`uncollided.resolve_pairs`: a `cross_sections.MaterialPairs`, `uncollided.DENSE`, or None to decide here once).
 
     Per direction chunk (Omega_k, k of them):
       tau    = downstream_cumulative(mu_t_coarse, C, Omega_k)   [k, G, Rc, Cc, Sc]
-      S_FC,j = fc_source_at_directions at the fine voxel centers r_j (exact eta table)    [k, G, R, C, S]
-      S_MC   = Y(Omega_k) . T per supervoxel (one matmul with the cached harmonics), broadcast to its sub-points
-      e_j    = (S_FC,j + S_MC) exp(-tau_j)   (`supervoxel_subpoint_emission`: tau at the supervoxel center plus its
-               in-cell variation)
-    ONE oblique_project of e on the fine grid (each sub-point traced to the panel separately; the attenuation stays
-    on C), the finite-cone footprint blur (`_Footprint`, footprint=True) and ONE fused accumulation
-    (`DirectionSetContext.accumulate`). Factor 1 is the single-grid image `scatter_image_from_source` of S_FC + S_MC.
-    The image is linear in (phi_uc, T_mean) apart from the footprint heights, which follow the summed emission.
+      S_FC,j = fc_source_at_directions at the quadrature points r_j (exact eta table)    [k, G, Rq, Cq, Sq]
+      S_MC   = Y(Omega_k) . T per cell (one matmul with the cached harmonics), broadcast to its quadrature points
+      e_j    = (S_FC,j + S_MC) exp(-tau_j)   (`supervoxel_subpoint_emission`: tau at the cell center plus its in-cell
+               variation)
+    ONE oblique_project of e on grid_quad (each point traced to the panel separately; the attenuation stays on C), the
+    finite-cone footprint blur (`_Footprint` with the heights of the Q points, footprint=True) and ONE fused
+    accumulation (`DirectionSetContext.accumulate`). q = 1 is the single-grid image `scatter_image_from_source` of
+    S_FC + S_MC on C. The image is linear in (phi_uc, T_mean) apart from the footprint heights, which follow the summed
+    emission.
 
     Returns the image dict of the total scatter (fluence, planar_fluence, signal_per_group [G, Rd, Cd],
-    signal [Rd, Cd]). Peak extra memory per chunk ~ 2-3 fine-grid fields [k, G, R, C, S].
+    signal [Rd, Cd]). Peak extra memory per chunk ~ 2-3 quadrature-grid fields [k, G, Rq, Cq, Sq].
     """
-    dev, dt = phi_uc_fine.device, phi_uc_fine.dtype
-    rho = rho_fine.to(device=dev, dtype=dt)
+    dev, dt = phi_uc_quad.device, phi_uc_quad.dtype
+    rho = rho_quad.to(device=dev, dtype=dt)
     pairs = resolve_pairs(rho, pairs)
-    f = int(factor)
-    coarse = grid_fine.coarsen(f)
-    mu_c = coarsen_mu_t(mu_t_volume(lib, rho), f) if mu_t_coarse is None else mu_t_coarse.to(device=dev, dtype=dt)
+    f = int(q)
+    coarse = grid_quad.coarsen(f) if grid_coarse is None else grid_coarse
+    if tuple(coarse.shape) != tuple(s // f for s in grid_quad.shape) or any(s % f for s in grid_quad.shape):
+        raise ValueError(f"grid_coarse {coarse.shape} is not grid_quad {grid_quad.shape} coarsened by q = {f}")
+    mu_c = (coarsen_mu_t(mu_t_volume(lib, rho), grid_quad, coarse) if mu_t_coarse is None
+            else mu_t_coarse.to(device=dev, dtype=dt))
     G = int(mu_c.shape[0])
     Rc, Cc, Sc = coarse.shape
     if tuple(mu_c.shape[1:]) != tuple(coarse.shape):
@@ -762,27 +768,27 @@ def combined_scatter_image(lib: MultigroupLibrary, rho_fine: Tensor, phi_uc_fine
     if T_mean.shape[1] != (L + 1) ** 2:
         raise ValueError(f"T_mean has {T_mean.shape[1]} moments, expected (L+1)^2 = {(L + 1) ** 2}")
     ctx = _resolve_context(context, quad, geom, angle, detector, grid_response, lib, mu_c, chunk, None)
-    offs = ctx.subcell_offsets(grid_fine, f) if f > 1 else None
+    offs = ctx.subcell_offsets(grid_quad, f) if f > 1 else None
     Y = ctx.spherical_harmonics(L)  # per chunk [k, N_sh]
     N = int(T_mean.shape[1])
     T_nm = T_mean.to(device=dev, dtype=dt).transpose(0, 1).reshape(N, -1)  # [N_sh, G * cells], once per image
-    fine_shape = tuple(grid_fine.shape)
-    fp = _Footprint(grid_fine, geom, angle, ctx) if footprint else None
+    quad_shape = tuple(grid_quad.shape)
+    fp = _Footprint(grid_quad, geom, angle, ctx) if footprint else None
 
     acc = ctx.new_accumulator()
     for i, om in enumerate(ctx.omega_chunks):
         k = int(om.shape[0])
-        src = fc_source_at_directions(lib, rho, phi_uc_fine, grid_fine, geom, angle, om, chunk=fc_chunk, pairs=pairs)
-        if tuple(src.shape) != (k, G, *fine_shape):
-            raise ValueError(f"FC source {tuple(src.shape)} != {(k, G, *fine_shape)}")
+        src = fc_source_at_directions(lib, rho, phi_uc_quad, grid_quad, geom, angle, om, chunk=fc_chunk, pairs=pairs)
+        if tuple(src.shape) != (k, G, *quad_shape):
+            raise ValueError(f"FC source {tuple(src.shape)} != {(k, G, *quad_shape)}")
         tau = projectors.downstream_cumulative(mu_c, coarse, geom, angle, om)  # [k, G, Rc, Cc, Sc]
         s_mc = torch.mm(Y[i], T_nm).view(k, G, Rc, Cc, Sc)  # S_MC(Omega_k) per supervoxel
-        # one source at the sub-points, one attenuation, one projection
-        both = src.reshape(k, G, Rc, f, Cc, f, Sc, f).add(s_mc[:, :, :, None, :, None, :, None]).view(k, G, *fine_shape)
+        # one source at the quadrature points, one attenuation, one projection
+        both = src.reshape(k, G, Rc, f, Cc, f, Sc, f).add(s_mc[:, :, :, None, :, None, :, None]).view(k, G, *quad_shape)
         del src, s_mc
-        e = supervoxel_subpoint_emission(both, tau, mu_c, om, grid_fine, f, offsets=None if offs is None else offs[i])
+        e = supervoxel_subpoint_emission(both, tau, mu_c, om, grid_quad, f, offsets=None if offs is None else offs[i])
         del both, tau
-        img = projectors.oblique_project(e, grid_fine, geom, angle, om)  # [k, G, Rd, Cd] photons/(cm^2 sr)
+        img = projectors.oblique_project(e, grid_quad, geom, angle, om)  # [k, G, Rd, Cd] photons/(cm^2 sr)
         if fp is not None:
             img = fp.blur(img, i, fp.mean_height(e))
         del e

@@ -22,15 +22,15 @@ Both demos write their figures to ``demo/output/`` (not tracked); the CITRUS dem
 ``demo_scatter_solver.py`` builds the seven-material library (about 16 s, then cached), rasterizes the WLAB phantom (a
 30 x 20 x 40 cm water prism with lung, air and bone inserts) and solves one view with the default configuration (6 groups, Legendre order 7, 8 x 16 sweep
 directions, 16 x 32 collapsed-cone directions). It plots the primary and scatter detector signals, the scatter
-fraction and central-row profiles. Options: ``--delta-voxel``, ``--supervoxel-factor``, ``--angle-deg``,
+fraction and central-row profiles. Options: ``--delta-voxel``, ``--transport-cell-cm``, ``--angle-deg``,
 ``--panel small|full``, ``--grid`` (focused anti-scatter grid).
 
 ``demo_citrus.py`` synthesizes a cone-beam dataset (primary from MBIRTORCH's projector at the effective energy, scatter
 from the solver's scatter-to-primary ratio, Poisson noise), runs CITRUS and the uncorrected MBIR loop with the same
 initialization, weights, partition sequence and frozen regularization, and plots central slices, central-row profiles,
 the relative RMSE per outer iteration and the estimated vs true scatter-to-primary ratio of one view. Options:
-``--views`` (default 180), ``--delta-voxel`` (default 0.5), ``--supervoxel-factor`` (fine voxels per transport cell,
-default ~1 cm cells), ``--outer`` (default 80), ``--I0``, ``--seed``, ``--no-noise``, ``--full``, ``--regenerate``,
+``--views`` (default 180), ``--delta-voxel`` (default 0.5), ``--transport-cell-cm`` (transport cell edge, default
+1 cm, any ratio to the voxel pitch), ``--outer`` (default 80), ``--I0``, ``--seed``, ``--no-noise``, ``--full``, ``--regenerate``,
 ``--truth-sweep``, ``--truth-cone``, ``--start-view-angle`` / ``--end-view-angle`` (degrees),
 ``--scatter-view-stride`` (default 8), ``--scatter-view-interp-order`` (``0``-``3`` or ``none``, default ``3``),
 ``--scatter-every`` (default 8).
@@ -62,7 +62,7 @@ The scatter solver
    from citrus.utilities import wlab_setup
 
    grid, geom, rho = wlab_setup(1.0, device="cuda")           # 1 cm grid, 100 x 75 panel, [7, R, C, S] densities
-   config = SolverConfig(supervoxel_factor=1)                 # 1 cm transport cells on the 1 cm grid
+   config = SolverConfig()                                    # 1 cm transport cells, 2^3 first-collision points
    lib = build_solver_library(config)                         # cached on disk
    solver = ScatterSolver(lib, config, geom, detector=csi_response(0.06), grid_response=no_grid(),
                           device="cuda", dtype=torch.float32)
@@ -71,8 +71,11 @@ The scatter solver
 
 ``rho`` holds the densities (g/cm^3) of the seven basis materials (air, lung, adipose, water, muscle, soft tissue,
 cortical bone; ``cross_sections.MATERIALS``, at most two nonzero per voxel; the WLAB phantom uses the water and bone
-rows) on the fine grid, whose shape must be divisible by ``supervoxel_factor``; the transport runs on the supervoxel grid, the primary and the scatter projection on the fine
-grid. ``ViewResult`` also carries the scalar and planar fluences per group, the source-iteration history, per-stage
+rows) on the fine grid (any voxel size). The transport runs on the grid of ``transport_cell_cm`` cells that covers the
+fine box; the uncollided fluence, the first-collision source and the first-order scatter emission on
+q\ :sup:`3` points per cell (q = ``fc_points_per_axis``, default 2, at most round(cell / voxel): 8 points for
+0.5 cm and smaller voxels in 1 cm cells, 1 for 1 cm voxels); only the primary image is computed on the fine
+grid (:doc:`conventions`, "Grids"). ``ViewResult`` also carries the scalar and planar fluences per group, the source-iteration history, per-stage
 timings and peak memory.
 
 CITRUS

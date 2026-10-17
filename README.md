@@ -36,8 +36,8 @@ iteration.
 
 `citrus.scatter_solver` is a deterministic LBTE solver for kV photons: multigroup in energy (Compton and Rayleigh
 cross sections from EPDL97 via XrayPhysics), discrete ordinates in angle with real spherical harmonics,
-linear-discontinuous finite elements on a supervoxel grid swept in wavefront order, an analytic (exact-in-energy)
-uncollided fluence and first-collision source, source iteration over collision order, and a collapsed-cone
+linear-discontinuous finite elements on a grid of transport cells swept in wavefront order, an analytic
+(exact-in-energy) uncollided fluence and first-collision source on a few quadrature points per cell, source iteration over collision order, and a collapsed-cone
 projection of the last-collided source onto the detector with a finite-cone footprint, detector and anti-scatter-grid
 responses. It runs in PyTorch with fused Triton kernels (ray tracing, first-collision source, sweep).
 
@@ -109,7 +109,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.1.0},
+  note = {Version 0.2.0},
   year = 2026
 }
 ```

@@ -7,9 +7,10 @@ Usage:
 
 Setting: WLAB phantom (utilities.wlab_setup), angle 0, real XrayPhysics library (G = 6, the cached build at
 Legendre order 10), CsI 0.6 mm response, no grid, float32, CUDA, caching-allocator cap 5000 MiB. The
-solver traces the attenuation tau_down on the supervoxel (coarse) grid and projects the sub-point emission on the
-FINE grid (scatter_image.combined_scatter_image). Here the fine grid is 0.5 cm and the coarse grid 2 / 1 / 0.5 cm (supervoxel
-factor 4 / 2 / 1). Direction sets: `scatter_image.panel_direction_set` in the 51 deg covering cone, 16x32 = 512 and
+solver traces the attenuation tau_down on the transport (coarse) grid and projects the emission at the quadrature
+points (scatter_image.combined_scatter_image). Here the quadrature points are the 0.5 cm grid and the coarse grid
+2 / 1 / 0.5 cm (q = 4 / 2 / 1 points per cell and axis). Direction sets: `scatter_image.panel_direction_set` in the
+51 deg covering cone, 16x32 = 512 and
 32x64 = 2048 directions; the scatter image's chunks of 8 panel-facing directions.
 
 Backends:
@@ -29,8 +30,8 @@ Parts (--parts):
               source) with a fresh projector per image, seconds (wall, synchronized, after an untimed warm-up of every
               backend on a 4x8 set), peak MiB, and rel RMS of the detector signal vs the PyTorch Siddon image of the
               same set and factor. phi_uc comes from the PyTorch Siddon upstream operator once (identical inputs).
-    fine      the first-order image on a single grid (supervoxel factor 1) at 2 / 1 cm (0.5 cm is the images part at
-              factor 1, the identical computation).
+    fine      the first-order image on a single grid (q = 1, the quadrature grid equal to the transport grid) at
+              2 / 1 cm (0.5 cm is the images part at factor 1, the identical computation).
 Outputs: <out>/records.jsonl, <out>/img/<key>.npz, <out>/bench_ray_tracing.md (printed).
 """
 
@@ -188,8 +189,8 @@ class Bench:
 
         for d in coarse:
             f = int(round(d / FINE))
-            mu_c = coarsen_mu_t(mu_f, f)
             grid_c = grid_f.coarsen(f)
+            mu_c = coarsen_mu_t(mu_f, grid_f, grid_c)
             ref = T.downstream_cumulative(mu_c, grid_c, geom, 0.0, om)
             r64 = T.downstream_cumulative(mu_c.double(), grid_c, geom, 0.0, om.double())
             got = MAKERS["triton"]().downstream_cumulative(mu_c, grid_c, geom, 0.0, om)
@@ -225,7 +226,8 @@ class Bench:
             return self.records.get(key, {})
         grid_f, geom, _, mu_f = self.setup(FINE)[:4]
         f = int(round(d / FINE))
-        grid_c, mu_c = grid_f.coarsen(f), coarsen_mu_t(mu_f, f)
+        grid_c = grid_f.coarsen(f)
+        mu_c = coarsen_mu_t(mu_f, grid_f, grid_c)
         chunks = self.chunks(cone)
         G = mu_f.shape[0]
         field = torch.rand(8, G, *grid_f.shape, device=self.dev, generator=torch.Generator(self.dev).manual_seed(3))
@@ -376,7 +378,7 @@ def tables(b: Bench, coarse: list[float], cones: list[tuple[int, int]], parts: s
                               f"{_f(rel_rms(img, ref_t), '.2e')} | {_f(rel_rms(img, ref_k), '.2e')} |")
         md.append("")
     if "fine" in parts:
-        md += ["### First-order image on a single grid (supervoxel factor 1)", "",
+        md += ["### First-order image on a single grid (q = 1)", "",
                "| grid | dirs | backend | image s | peak MiB | rel RMS vs Siddon (PyTorch) | rel RMS vs Siddon (Triton) |",
                "|---|---|---|---|---|---|---|"]
         for d in sorted({float(x) for x in b.args.fine_grids}, reverse=True):

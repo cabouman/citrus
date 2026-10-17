@@ -1,6 +1,6 @@
 """Demo: the LBTE source iteration scatter solver on one view of the WLAB phantom.
 
-    python demo/demo_scatter_solver.py [--delta-voxel 1.0] [--supervoxel-factor 1] [--angle-deg 0]
+    python demo/demo_scatter_solver.py [--delta-voxel 1.0] [--transport-cell-cm 1.0] [--angle-deg 0]
                                        [--panel small|full] [--grid] [--device cuda] [--memory-cap-mib 4400]
 
 Builds the seven-material multigroup library from XrayPhysics (cached in $CITRUS_CACHE_DIR or ~/.cache/citrus; about
@@ -35,8 +35,8 @@ OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--delta-voxel", type=float, default=1.0, help="fine grid pitch in cm (default 1.0)")
-    ap.add_argument("--supervoxel-factor", type=int, default=1,
-                    help="fine voxels per transport cell along each axis (default 1)")
+    ap.add_argument("--transport-cell-cm", type=float, default=1.0,
+                    help="transport cell edge length in cm (default 1.0; any ratio to --delta-voxel)")
     ap.add_argument("--angle-deg", type=float, default=0.0, help="view angle in degrees (default 0: AP view)")
     ap.add_argument("--panel", choices=["small", "full"], default="small",
                     help="small: 100 x 75 pixels (40 x 30 cm); full: 150 x 184 pixels (the whole prism)")
@@ -50,7 +50,7 @@ def main() -> None:
     if dev.type == "cuda":
         set_memory_cap(args.memory_cap_mib)
     os.makedirs(args.out, exist_ok=True)
-    config = replace(SolverConfig(), supervoxel_factor=args.supervoxel_factor,
+    config = replace(SolverConfig(), transport_cell_cm=args.transport_cell_cm,
                      dtype="float32" if dev.type == "cuda" else "float64")
     t0 = time.perf_counter()
     lib = build_solver_library(config)
@@ -69,7 +69,9 @@ def main() -> None:
     t0 = time.perf_counter()
     res = solver.solve_view(rho, grid, angle)
     seconds = time.perf_counter() - t0
-    print(f"grid {grid.shape} at {grid.delta_voxel} cm, transport grid {grid.coarsen(args.supervoxel_factor).shape}, "
+    print(f"grid {grid.shape} at {grid.delta_voxel} cm, transport grid {solver.transport_grid(grid).shape} "
+          f"({config.transport_cell_cm:g} cm cells, {solver.quadrature_points(grid)} first-collision points per "
+          f"axis), "
           f"panel {geom.num_det_rows} x {geom.num_det_channels}, device {dev}")
     print(f"solve_view: {seconds:.2f} s, {res.si.num_iterations} source iterations "
           f"(converged {res.si.converged}, last change {res.si.history[-1]:.1e})")
