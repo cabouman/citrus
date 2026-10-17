@@ -1,9 +1,11 @@
 """Build docs/figures/citrus_pipeline.pptx, the flowchart of the scatter-corrected MBIR pipeline of CITRUS (one
 16:9 slide, editable in PowerPoint), and export it to docs/source/_static/citrus_pipeline.png with PowerPoint.
 
-    python docs/figures/make_pipeline_flowchart.py            # writes the .pptx and, on Windows with PowerPoint, the .png
+    python docs/figures/make_pipeline_flowchart.py            # exports the existing .pptx to .png (PowerPoint, Windows)
+    python docs/figures/make_pipeline_flowchart.py --rebuild  # regenerates the .pptx from this script first
 
-Edit the slide in PowerPoint and re-export (File > Save As > PNG, or rerun this script) when the pipeline changes.
+The slide is edited by hand in PowerPoint; the default run only re-exports it, so hand edits are never overwritten.
+``--rebuild`` discards them and regenerates the slide from the layout code below.
 """
 from __future__ import annotations
 
@@ -256,10 +258,12 @@ def export_png(pptx_path: str, png_path: str, width_px: int = 2400) -> bool:
     if sys.platform != "win32":
         return False
     os.makedirs(os.path.dirname(png_path), exist_ok=True)
+    deck = Presentation(pptx_path)  # the slide's own aspect ratio (the hand-edited slide may not be 16:9)
+    height_px = int(round(width_px * deck.slide_height / deck.slide_width))
     ps = (
         "$app = New-Object -ComObject PowerPoint.Application; "
         f"$p = $app.Presentations.Open('{os.path.abspath(pptx_path)}', $true, $true, $false); "
-        f"$p.Slides.Item(1).Export('{os.path.abspath(png_path)}', 'PNG', {width_px}, {int(width_px * 7.5 / 13.333)}); "
+        f"$p.Slides.Item(1).Export('{os.path.abspath(png_path)}', 'PNG', {width_px}, {height_px}); "
         "$p.Close(); $app.Quit()"
     )
     r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True)
@@ -269,8 +273,12 @@ def export_png(pptx_path: str, png_path: str, width_px: int = 2400) -> bool:
 
 
 if __name__ == "__main__":
-    path = build()
-    print("wrote", path)
+    if "--rebuild" in sys.argv[1:] or not os.path.exists(PPTX):
+        path = build()
+        print("wrote", path)
+    else:
+        path = PPTX
+        print("keeping the hand-edited slide", path, "(--rebuild regenerates it)")
     if export_png(path, PNG):
         print("exported", os.path.abspath(PNG))
     else:
