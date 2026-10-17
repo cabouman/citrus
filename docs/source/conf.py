@@ -72,6 +72,9 @@ try:
                                       else "_static/citrus_logo.png"}
 except ImportError:
     html_theme = "alabaster"
+_favicon = os.path.join(_static, "citrus_favicon.png")
+if os.path.exists(_favicon):
+    html_favicon = "_static/citrus_favicon.png"
 html_title = "CITRUS"
 html_short_title = "CITRUS"
 ogp_site_url = "https://purduecitrus.readthedocs.io/"
