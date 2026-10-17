@@ -24,25 +24,25 @@ Kernel `_first_collision_kernel`, per program (block of BLOCK flattened voxels, 
   - writes acc to out[k, :G, v] (coalesced along v).
 The table is re-laid out once per (library tensor, device) as tab [N, G_in, M, GP] float32 (GP = next power of
 two >= G) with zeros where g_out < g_in (the no-upscatter mask) or g_out >= G (padding), so for a given voxel all
-entries it needs lie in two contiguous G M GP-float rows (one per eta node). At G = 6, N = 2001 the table is 0.8 MB
-for M = 2 and 2.7 MB for the seven-material table, and stays L2 resident; neighboring voxels hit neighboring eta rows.
+entries it needs lie in two contiguous G M GP-float rows (one per eta node). The table (N G M GP floats) is small
+enough to stay L2 resident; neighboring voxels hit neighboring eta rows.
 In pair mode the material slot offset (index x GP) is per voxel; the gathers per (voxel, direction, g_in) are four,
-so the cost is close to that of a two-material basis for any M (0.76 vs 0.60 ms per chunk of 8 directions on the
-0.5 cm WLAB problem: the larger table and the per-voxel offsets). Dense mode gathers 2 MT rows per (voxel, direction,
-g_in) at the constant offsets m GP: about MT / 2 times the pair-mode cost per point.
+so the cost is close to that of a two-material basis for any M (only the larger table and the per-voxel offsets
+add). Dense mode gathers 2 MT rows per (voxel, direction, g_in) at the constant offsets m GP: about MT / 2 times the
+pair-mode cost per point.
 
 Memory: the kernel reads rho, phi_uncollided (and the tiny axis/direction/table inputs) and writes the [K, G, V] output;
 no temporaries. The `chunk` argument of the PyTorch path is irrelevant here (all K directions in one launch).
 
-Tile: BLOCK_V = 64 voxels x GP output groups with 8 warps (about 2 elements per thread), measured best among
-BLOCK 32-512 x 2-16 warps; the kernel is bound by the table gathers, not by DRAM (docs/source/design_notes.rst).
+Tile: BLOCK_V = 64 voxels x GP output groups with 8 warps (about 2 elements per thread), the best of the block sizes
+and warp counts tried; the kernel is bound by the table gathers, not by DRAM (docs/source/design_notes.rst).
 
 Numerics: float32 only (float64 and CPU tensors use the PyTorch path, which stays the reference). The result
-equals the PyTorch path up to float32 rounding of Omega_UC / eta and the summation order of the (identical) terms:
-typically ~2e-7 of the field maximum. Where a steep part of the table is hit (the real library's Rayleigh forward
-peak, eta -> 1), one float32 ulp of eta moves the interpolation point by ~1e-4 table cells, and BOTH float32 paths
-then deviate from a float64 evaluation (and from each other) by up to ~7e-5 of the field maximum
-(tests/test_uncollided.py asserts 1e-5 between the paths on the synthetic tables and on the WLAB solver problems).
+equals the PyTorch path up to float32 rounding of Omega_UC / eta and the summation order of the (identical) terms.
+Where a steep part of the table is hit (the real library's Rayleigh forward peak, eta -> 1), one float32 ulp of eta
+moves the interpolation point by ~1e-4 table cells, and BOTH float32 paths then deviate from a float64 evaluation (and
+from each other) by more than that rounding (tests/test_uncollided.py asserts 1e-5 between the paths on the synthetic
+tables and on the WLAB solver problems).
 
 Availability: `triton_utilities.triton_available()` (shared probe, kill switch `CITRUS_DISABLE_TRITON=1`) and a
 per-device self-check of the kernel against the PyTorch path on a tiny random problem (rho = 0 voxels, directions

@@ -7,11 +7,10 @@ A 20 x 30 x 40 cm^3 water prism (1.0 g/cm^3) with full-length (40 cm along z) in
 0.26 g/cm^3), air (2 x 2 cm^2, 1.205e-3 g/cm^3) and bone (2 x 2 cm^2, 1.85 g/cm^3). The phantom is given in the
 material basis of a library (rho [M, ...], `library.materials`; default the seven `cross_sections.MATERIALS`) but uses
 only two of its rows, looked up by name: lung and air are modeled as water of the stated density (the "water" row),
-bone as cortical bone (the "bone" row); a set of reference materials without water or bone cannot hold it. Orientation
-(source on
-+y at angle 0): 30 cm along x (cols), 20 cm along y (rows, the source-detector axis at angle 0), 40 cm along z (slices),
-centered at the isocenter. Default insert centers: lung at (x, y) = (-5, 0), air at (+3, 0), bone at (+7, 0) cm (keyword
-arguments of `wlab_phantom`). Outside the prism the density is 0 (vacuum).
+bone as cortical bone (the "bone" row); a set of reference materials without water or bone cannot hold it.
+Orientation (source on +y at angle 0): 30 cm along x (cols), 20 cm along y (rows, the source-detector axis at angle 0),
+40 cm along z (slices), centered at the isocenter. Default insert centers: lung at (x, y) = (-5, 0), air at (+3, 0),
+bone at (+7, 0) cm (keyword arguments of `wlab_phantom`). Outside the prism the density is 0 (vacuum).
 
 Attenuation <-> density model
 -----------------------------
@@ -23,10 +22,9 @@ default M = 7: air, lung, adipose, water, muscle, soft tissue, cortical bone, `c
     forward  X = sum_m rho_m m_m(E_eff)                                     (exact, linear)
 
 The inverse is the interpolating model between the reference materials. Every reference material m has a NOMINAL
-density rho_m^nom
-(`library.nominal_density`) and a nominal attenuation mu_m = rho_m^nom m_m(E_eff); the reference materials are taken in
-the fixed
-library order, in which mu_m increases at every library energy (the builder sorts them; `material_order` checks it).
+density rho_m^nom (`library.nominal_density`) and a nominal attenuation mu_m = rho_m^nom m_m(E_eff); the reference
+materials are taken in the fixed library order, in which mu_m increases at every library energy (the builder sorts
+them; `material_order` checks it).
 For each voxel:
 
     mu_a <= X < mu_b (consecutive reference materials a, b):   f = (X - mu_a) / (mu_b - mu_a),
@@ -36,12 +34,10 @@ For each voxel:
     X < 0 clamps to 0.
 
 At E_eff = 63.03 keV the nominal attenuations of the default reference materials are 0.00022 (air), 0.0520 (lung),
-0.1846
-(adipose), 0.2013 (water), 0.2102 (muscle), 0.2122 (soft tissue), 0.5366 (bone) /cm (the other catalogue materials:
-`cross_sections` module docstring). With the reference materials air, water, bone a voxel between water and bone
-becomes a
-water / bone mixture, one between air and water an air / water mixture (lung tissue is then water of reduced density
-mixed with air). The model is exact in attenuation at E_eff
+0.1846 (adipose), 0.2013 (water), 0.2102 (muscle), 0.2122 (soft tissue), 0.5366 (bone) /cm (the other catalogue
+materials: `cross_sections` module docstring). With the reference materials air, water, bone a voxel between water and
+bone becomes a water / bone mixture, one between air and water an air / water mixture (lung tissue is then water of
+reduced density mixed with air). The model is exact in attenuation at E_eff
 (densities_to_attenuation(library, attenuation_to_densities(library, X)) == max(X, 0)), gives the pure material m at
 X = mu_m (a WLAB water voxel is pure water, a bone voxel pure bone at 1.85 g/cm^3) and at most two nonzero materials
 per voxel, the pair representation of the solver's first-collision source (`cross_sections.material_pairs`).
@@ -49,9 +45,7 @@ per voxel, the pair representation of the solver's first-collision source (`cros
 `attenuation_to_densities(library, X)[m]` without forming the others: the CITRUS loop resamples the densities material
 by material and never holds the [M, R, C, S] fine-grid volume (`ScatterSolver.material_fields_from_attenuation`).
 m_m(E) are the library's fine-energy total mass attenuation coefficients (`library.fine_mu_t`, cm^2/g), interpolated
-linearly in (log E, log m). (Up to citrus 0.0.3 the model was a two-material split, water of reduced density below
-mu_water and unit water PLUS bone above it: a pure-bone voxel came back as water 1.0 + bone 1.156 g/cm^3, the same
-attenuation at E_eff but another composition, which made the CITRUS loop overshoot the WLAB bone insert by 6 %.)
+linearly in (log E, log m).
 
 Synthetic cone-beam data
 ------------------------
@@ -66,10 +60,9 @@ Synthetic cone-beam data
                 rho_true, fully converged source iteration; photon counting: no detector or grid response unless the
                 solver has one), p_sol its primary planar fluence image with the primary model of the CITRUS loop:
                 MBIRTORCH's pixel-averaged per-material line integrals of rho_true through the solver's polychromatic
-                transmission (`citrus.citrus.primary_signals`; data-set format 2, citrus >= 0.3.0; meta records
-                primary_projector "mbirtorch" and data_format 2 as in versions 0.3.0 and 0.4.0, so data sets of
-                those versions stay valid). Data sets of format 1 (citrus <= 0.2.0) used the solver's Siddon primary
-                of solve_view (one ray to each pixel centre) instead.
+                transmission (`citrus.citrus.primary_signals`; meta records primary_projector "mbirtorch" and
+                data_format 2). Data sets of format 1 used the solver's Siddon primary of solve_view (one ray to each
+                pixel centre) instead.
     S         = SPR P,   Y_mean = P + S,   Y = Poisson(Y_mean) (noise=True) or Y_mean
 
 Units. The solver's images are photons/cm^2 per source photon/sr; its primary carries the inverse-square and
@@ -84,7 +77,7 @@ reconstruction grid, so the only model errors the reconstruction sees are the sc
 truth comes from the same solver as the correction (use a finer angular discretization for the truth solver to
 expose the solver's own discretization error). Reproducibility: the Poisson draws use torch.Generator(seed), but the
 rates vary between runs at the float32 ulp level (atomic accumulation in MBIRTORCH's and the solver's CUDA kernels),
-which flips a few draws in 10^4; save and reuse the data when bitwise identity matters.
+which flips a few draws; save and reuse the data when bitwise identity matters.
 """
 
 from __future__ import annotations
@@ -487,7 +480,7 @@ def synthesize_cone_beam_data(rho: Tensor, grid: Grid, geometry: ConeGeometry, a
     Y = Y_mean; energy_kev: E_eff (None: the spectrum mean of the solver's library). progress(view_index, seconds) is
     called after every solved view. The SPR's denominator is always the primary model of the CITRUS loop (MBIRTORCH's
     per-material line integrals through the solver's transmission, `citrus.citrus.primary_signals`); meta records
-    primary_projector "mbirtorch" and data_format 2 (unchanged since version 0.3.0).
+    primary_projector "mbirtorch" and data_format 2.
 
     Returns a dict of numpy arrays (float32 unless noted): X_true [R, C, S] (1/cm), rho_true [M, R, C, S], angles [V]
     (float64), line_integrals, P, S, Y, Y_mean, SPR [V, Rd, Cd], solver_primary, solver_scatter [V, Rd, Cd] (planar

@@ -52,8 +52,8 @@ the densities touch the fine grid F.
 Densities from the attenuation (`ScatterSolver.material_fields_from_attenuation(X, grid_fine, density_model)`): the
 CITRUS loop has the attenuation X [R, C, S] (1/cm) on F, not the densities. The fields are then built material by
 material: the density model evaluates ONE material's map rho_m = density_model.material(X, m) [R, C, S] at a time,
-which is resampled onto C and Q and dropped, so the largest fine-grid tensor is one material map (never [M, R, C, S],
-7 GB at 256 M voxels). The fields keep X and the model instead of rho_fine; the primary (and the "fine" uncollided
+which is resampled onto C and Q and dropped, so the largest fine-grid tensor is one material map (never
+[M, R, C, S]). The fields keep X and the model instead of rho_fine; the primary (and the "fine" uncollided
 trace) then trace the materials one map at a time (`MaterialFields.fine_material`). The result equals
 `material_fields(density_model(X), grid_fine)` to float rounding (the resampling is the same matrix products on one
 material instead of all M).
@@ -109,11 +109,10 @@ def build_solver_library(config: SolverConfig, spectrum=None, cache_dir: Optiona
     """`cross_section_library.build_library(config, spectrum, cache_dir, materials=materials)` (spectrum None -> the
     default 125 kVp spectrum; cache_dir "default" -> `cross_section_library.default_cache_dir()`, None -> no cache).
     materials None (default): the reference materials of `config.materials` (at least two catalogue names,
-    `SolverConfig.validate`)
-    as the table `cross_sections.material_table(config.materials)`; the default seven give the library and cache entry
-    of earlier versions. An explicit table (name, nominal density, formula) per material overrides config.materials.
-    The library's materials come out sorted by nominal attenuation (`library.materials`). Needs XrayPhysics (also to
-    sort the set and find the cache entry); about 16 s to build seven materials, then cached. float64 CPU tensors."""
+    `SolverConfig.validate`) as the table `cross_sections.material_table(config.materials)`. An explicit table (name,
+    nominal density, formula) per material overrides config.materials. The library's materials come out sorted by
+    nominal attenuation (`library.materials`). Needs XrayPhysics (also to sort the set and find the cache entry); built
+    once, then cached. float64 CPU tensors."""
     from .cross_section_library import build_library  # lazy: XrayPhysics only needed here
 
     if materials is None:
@@ -322,7 +321,7 @@ class ScatterSolver:
                      attribute, else 1).
     direction_context_cache_size : number of scatter-image direction contexts kept (LRU, keyed by view angle,
                      direction set and grid shapes; 0 disables the cache). A context holds the response weights of one
-                     view's collapsed-cone set: about 4.4 MiB at 512 directions (WLAB panel, G = 6).
+                     view's collapsed-cone set ([G Rd, 3, K] values per weight, `scatter_image.DirectionSetContext`).
     The attribute `L` is the Legendre order of the collided transport (config.legendre_order).
     """
 

@@ -513,8 +513,7 @@ def scatter_source_moments(mu_s_l_volume: Tensor, phi: Tensor, *, moment_major: 
     (g_in, g_out) is accumulated into it in place, `out[g_out] += mu_s_l_volume[g_in, g_out, l(n)] * phi[g_in]`,
     so the only temporary is one [N, *spatial] gather of the transfer. Zero blocks (upscatter) are skipped
     (one host sync to find them). Peak extra memory ~ N |spatial| values instead of the
-    [G_in, G_out, N, *spatial] gather plus an output-sized term of a broadcast implementation (which peaks
-    at ~6.5 GB on a 40x60x80 grid with G = 6, L = 7).
+    [G_in, G_out, N, *spatial] gather plus an output-sized term of a broadcast implementation.
     """
     G_in, G_out, num_legendre = mu_s_l_volume.shape[:3]
     spatial = tuple(mu_s_l_volume.shape[3:])

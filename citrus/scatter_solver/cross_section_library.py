@@ -55,8 +55,8 @@ reference materials; ``build_solver_library`` uses ``cross_sections.material_tab
 sorts the
 table by nominal attenuation at the spectrum-mean energy (``sort_material_table``; a table already in that order is
 unchanged) and asserts at every fine energy that the order holds (``check_material_order``: no two materials cross).
-The cache key holds the sorted table (names, nominal densities, formulas), so different sets never share a cache entry
-and the default set keeps the key of earlier versions. The default seven:
+The cache key holds the sorted table (names, nominal densities, formulas), so different sets never share a cache entry.
+The default seven:
   * air     = XrayPhysics library string 'air' (78.084*N2 + 20.946*O2 + 0.9340*Ar + 0.0397*CO2, read as mass
               fractions of the compounds exactly as XrayPhysics' parser does), 0.0012 g/cm^3.
   * lung    = XrayPhysics 'lung', 0.26 g/cm^3 (the WLAB lung; XrayPhysics lists 0.25).
@@ -64,14 +64,12 @@ and the default set keeps the key of earlier versions. The default seven:
   * water   = 'H2O' -> with XrayPhysics atomic masses (H 1.008, O 15.999): H 0.111907, O 0.888093; 1.0 g/cm^3.
   * muscle  = ICRU-44 skeletal muscle mass fractions, 1.05 g/cm^3.
   * soft_tissue = ICRU-44 soft tissue mass fractions, 1.06 g/cm^3. Muscle lies BELOW soft tissue at every energy
-              (attenuation ratio 0.986-0.991 over 10-125 keV), hence the order.
+              of the library, hence the order.
   * bone    = XrayPhysics library entry 'bone_cortical' (ICRP cortical bone, 1.85 g/cm^3), mass
     fractions H 0.047234, C 0.144330, N 0.041990, O 0.446096, Mg 0.002200, P 0.104970,
-    S 0.003150, Ca 0.209930, Zn 0.000100 (sum 1.000000). Note this is ICRP (not ICRU-44) cortical bone; mu/rho differs
-    from ICRU-44 by ~1.5% at 60 keV.
-Measured ratios of the nominal attenuations of consecutive materials over 10-125 keV: lung/air 238-240, adipose/lung
-2.12-3.68, water/adipose 1.055-1.79, muscle/water 1.041-1.064, soft tissue/muscle 1.0095-1.0137, bone/soft tissue
-1.80-8.98. Other tables (any number of materials) can be passed as ``materials=`` (name, nominal density, formula).
+    S 0.003150, Ca 0.209930, Zn 0.000100 (sum 1.000000). Note this is ICRP (not ICRU-44) cortical bone; its mu/rho
+    differs slightly from ICRU-44.
+Other tables (any number of materials) can be passed as ``materials=`` (name, nominal density, formula).
 """
 
 from __future__ import annotations
@@ -800,9 +798,7 @@ def build_library(
 
     The cache file is ``<cache_dir>/mglib_<hash>.pt`` keyed by the build version, the relevant config
     fields, the spectrum arrays, the backend name, the numerical parameters and the SORTED material table (names,
-    nominal densities, formulas: every set of materials has its own entry, any order of the same set the same one, and
-    the default seven keep the key of earlier versions; the two-material caches of citrus < 0.1.0 have other keys and
-    are never loaded).
+    nominal densities, formulas: every set of materials has its own entry, any order of the same set the same one).
     ``cache_dir="default"`` is `default_cache_dir()`; ``cache_dir=None`` disables the cache. A cache file that cannot be
     loaded as a complete library (e.g. one lacking the fine-energy table) is rebuilt and overwritten.
     """

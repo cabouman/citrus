@@ -234,7 +234,7 @@ class SiddonProjectors:
       path, else PyTorch), "torch" (the PyTorch traversal below: the reference and test oracle), or "triton" (raises
       if the kernels are unusable). float64 and CPU tensors always use PyTorch, so
       "auto" equals "torch" bit for bit there. The kernels need no chunking (ray_chunk / element_budget only
-      apply to the PyTorch path) and equal it to float32 rounding (~1e-6 of the field maximum).
+      apply to the PyTorch path) and equal it to float32 rounding.
     """
 
     def __init__(self, ray_chunk: int = 1 << 20, element_budget: int = 1 << 23, samples_per_pixel_axis: int = 1,

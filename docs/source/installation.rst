@@ -63,18 +63,18 @@ On Windows this needs Visual Studio (C++ build tools) and CMake on ``PATH``; the
 ``python -c "from xrayphysics import xrayPhysics; xrayPhysics()"``.
 
 The built library is cached in ``$CITRUS_CACHE_DIR`` (default ``~/.cache/citrus``), keyed by the configuration, the
-spectrum and the build parameters; a build takes about 10 s. Once cached, XrayPhysics is no longer needed for that
-configuration. Tests that need the real library are skipped when XrayPhysics is unavailable and nothing is cached.
+spectrum and the build parameters. Once cached, XrayPhysics is no longer needed for that configuration. Tests that need
+the real library are skipped when XrayPhysics is unavailable and nothing is cached.
 
 Triton
 ------
 
 On float32 CUDA tensors the ray tracer, the first-collision source and the sweep's cell solve run as fused Triton
-kernels (10-80x faster than the PyTorch paths). Every kernel is checked against its PyTorch reference once per device
-(a tiny self-check problem) and the PyTorch path is used automatically when Triton is missing or the check fails.
-``CITRUS_DISABLE_TRITON=1`` forces the PyTorch paths. On Windows install ``triton-windows`` (it needs a matching
-PyTorch version). The fast launch path of the kernels uses Triton internals verified for Triton 3.8; other versions
-(or ``CITRUS_TRITON_FAST_LAUNCH=0``) use the public launch path.
+kernels. Every kernel is checked against its PyTorch reference once per device (a tiny self-check problem) and the
+PyTorch path is used automatically when Triton is missing or the check fails. ``CITRUS_DISABLE_TRITON=1`` forces the
+PyTorch paths. On Windows install ``triton-windows`` (it needs a matching PyTorch version). The fast launch path of the
+kernels uses Triton internals verified for Triton 3.8; other versions (or ``CITRUS_TRITON_FAST_LAUNCH=0``) use the
+public launch path.
 
 GPU memory
 ----------

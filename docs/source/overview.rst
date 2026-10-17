@@ -49,11 +49,9 @@ Scope of the solver
 
 * Photon energies of kV imaging (default 10-125 keV, 6 equal-fluence groups); Compton scattering (no Doppler
   broadening) and Rayleigh scattering from EPDL97 via XrayPhysics; photoelectric absorption as local deposition.
-* Reference materials chosen from a catalogue of seventeen (``SolverConfig.materials``; default the seven air, lung,
-  adipose, water, skeletal muscle, soft tissue, ICRP cortical bone; also trabecular bone, brain, blood, cartilage,
-  skin, PMMA, polyethylene, aluminium, titanium, carbon fibre); every voxel is a mixture of at most two of them, the
-  two whose nominal attenuations bracket its attenuation (the library, the solver and the kernels are general in the
-  number of materials).
+* Reference materials chosen from a catalogue of seventeen (``SolverConfig.materials``, :doc:`conventions`,
+  "Materials"); every voxel is a mixture of at most two of them, the two whose nominal attenuations bracket its
+  attenuation.
 * A point source collimated to the flat panel; detector and anti-scatter-grid responses as lookup tables.
 * Float32 on CUDA (production; fused Triton kernels) and float64 / CPU (reference and tests).
 

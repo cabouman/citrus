@@ -34,12 +34,12 @@ iteration.
 
 ## The scatter solver
 
-`citrus.scatter_solver` is a deterministic LBTE solver for kV photons: multigroup in energy (Compton and Rayleigh
-cross sections from EPDL97 via XrayPhysics), discrete ordinates in angle with real spherical harmonics,
-linear-discontinuous finite elements on a grid of transport cells swept in wavefront order, an analytic
-(exact-in-energy) uncollided fluence and first-collision source on a few quadrature points per cell, source iteration over collision order, and a collapsed-cone
-projection of the last-collided source onto the detector with a finite-cone footprint, detector and anti-scatter-grid
-responses. It runs in PyTorch with fused Triton kernels (ray tracing, first-collision source, sweep).
+`citrus.scatter_solver` is a deterministic LBTE solver for kV photons: multigroup in energy (Compton and Rayleigh cross
+sections from EPDL97 via XrayPhysics), discrete ordinates in angle with real spherical harmonics, linear-discontinuous
+finite elements on a grid of transport cells swept in wavefront order, an analytic (exact-in-energy) uncollided fluence
+and first-collision source on a few quadrature points per cell, source iteration over collision order, and a
+collapsed-cone projection of the last-collided source onto the detector with a finite-cone footprint, detector and
+anti-scatter-grid responses. It runs in PyTorch with fused Triton kernels (ray tracing, first-collision source, sweep).
 
 ## Installation
 
@@ -71,15 +71,14 @@ step).
 ## Quick start
 
 ```bash
-python demo/demo_scatter_solver.py   # the scatter solver on one view of the WLAB phantom (seconds)
+python demo/demo_scatter_solver.py   # the scatter solver on one view of the WLAB phantom
 python demo/demo_citrus.py           # CITRUS vs uncorrected MBIR: 180 views over a short scan, 0.5 cm grid,
                                      # 80 outer iterations, scatter step on every 8th view at every 8th iteration
-                                     # (~4 min)
 python demo/demo_citrus.py --end-view-angle 360      # the same over a full rotation
-python demo/demo_citrus.py --full    # the report study: 180 views over a full rotation, 0.5 cm grid, 20 iterations,
+python demo/demo_citrus.py --full    # 180 views over a full rotation, 0.5 cm grid, 20 iterations,
                                      # scatter step on every view at every iteration
 python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 --scatter-every 1
-                                     # a quick run (~2 min)
+                                     # a quick run
 python demo/demo_citrus.py --materials air,water,bone   # three reference materials in the density model
 ```
 
@@ -101,13 +100,7 @@ recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, CitrusConfig(n
 Tests: `dev_scripts/run_tests.sh` or `python -m pytest -q` (GPU, Triton, MBIRTORCH and XrayPhysics tests are skipped
 when unavailable).
 
-Version 0.5.0 adds a material catalogue (`citrus.scatter_solver.cross_sections.MATERIAL_CATALOGUE`: the seven
-default materials plus trabecular bone, brain, blood, cartilage, skin, PMMA, polyethylene, aluminium, titanium and
-carbon fibre) and lets you choose the reference materials of the density model (`SolverConfig.materials`, demo flag
-`--materials air,water,bone`); the CITRUS loop always computes the primary with MBIRTORCH's projector (the Siddon
-option of `CitrusConfig.primary_projector` is gone). Version 0.4.0 spelled out every abbreviated name of the package;
-`CHANGELOG.md` has the complete old -> new table. Data sets, demo outputs and cached cross-section libraries of
-earlier versions are read unchanged.
+`CHANGELOG.md` lists the changes of every version, including the old -> new table of renamed settings.
 
 ## Citation
 

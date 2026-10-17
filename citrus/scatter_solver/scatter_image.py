@@ -62,9 +62,9 @@ tests; the solver always applies it.
 Primary
 -------
 `primary_image` is exact in energy: it projects the density maps of the materials present (g/cm^2) and sums the
-transmission over the
-library's fine-energy table within each group (`cross_sections.group_transmission`), per sub-ray before the pixel
-average, instead of exp(-int mu_t,g dl) with group-averaged mu_t (within-group beam hardening, -1.4 % at WLAB). It is
+transmission over the library's fine-energy table within each group (`cross_sections.group_transmission`), per
+sub-ray before the pixel average, instead of exp(-int mu_t,g dl) with group-averaged mu_t (which misses the
+within-group beam hardening). It is
 the composition of two steps that can be fed separately: `primary_path_lengths` (the projector: per-material density
 line integrals [M', Rd n, Cd n] of the maps given, one material at a time if the caller wishes) and
 `primary_from_path_lengths` (the fine-energy transmission, the source and inverse-square factors and the detector and
@@ -206,8 +206,8 @@ class DirectionSetContext:
     Representation choice (exact, smallest): the detector response depends on the direction only through theta0 ->
     [K, G]; the grid response depends on (theta1, theta2), which for the flat panel vary with the direction and the
     detector ROW only -> [K, G, Rd] (per group because the table is energy dependent). The fused weights are
-    [G * Rd, 3, K]: 2048 directions x 6 groups x 75 rows x 3 = 11 MB in float32, instead of 370 MB per weight for a
-    per-pixel [K, G, Rd, Cd] table. All responses are evaluated in float64 and stored in the context dtype.
+    [G * Rd, 3, K], a factor Cd / 3 smaller than a per-pixel [K, G, Rd, Cd] table per weight. All responses are
+    evaluated in float64 and stored in the context dtype.
 
     Lazily cached per context: real spherical harmonics of the directions per order L (`spherical_harmonics`),
     the sub-cell offsets Omega_k . (r_j - r_cell) per (quadrature grid, q) (`subcell_offsets`) and the panel heights of
@@ -327,7 +327,7 @@ class DirectionSetContext:
     def accumulate(self, accumulator: Tensor, image: Tensor, chunk_index: int) -> None:
         """accumulator += the weighted chunk image: image [k, G, Rd, Cd] = the projected attenuated emission of chunk
         `chunk_index` (k directions) in photons/(cm^2 sr). Separable: ONE batched matmul (baddbmm, no copy when image
-        is contiguous; cuBLAS picks a small-N kernel, ~7 us per chunk on the WLAB panel):
+        is contiguous):
         accumulator[(g, r), j, c] += sum_k W[(g, r), j, k] image[k, g, r, c], j = (fluence, planar, signal)."""
         start, stop = self.chunk_bounds[chunk_index]
         k = stop - start
@@ -623,8 +623,8 @@ def box_blur_rows_cols(image: Tensor, width_channels: Tensor, width_rows: Tensor
     channels (width_channels [k]) and the rows (width_rows [k]): out[c] = (1/|W|) int_W x over the window
     W = [c + 1/2 - w/2, c + 1/2 + w/2] clipped to the panel [0, Cd] (pixel j covers [j, j + 1]; x is piecewise constant;
     the window is renormalized at the panel edges). A width <= 1 pixel leaves a pixel unchanged (the window stays inside
-    the pixel). Done as two batched matmuls with the [k, N, N] window-overlap matrices (`box_matrix`; ~0.1 ms per chunk
-    of 8 directions on the 184 x 150 panel, cheaper than gathers from a cumulative sum). Returns [k, G, Rd, Cd]."""
+    the pixel). Done as two batched matmuls with the [k, N, N] window-overlap matrices (`box_matrix`; cheaper than
+    gathers from a cumulative sum). Returns [k, G, Rd, Cd]."""
     k, G, Rd, Cd = image.shape
     channel_matrix = box_matrix(Cd, width_channels, image.dtype)  # [k, Cd, Cd]
     row_matrix = box_matrix(Rd, width_rows, image.dtype)  # [k, Rd, Rd]

@@ -23,10 +23,9 @@ the model device (`output_sharded=True` on a single-device model), never numpy.
 
 Projections in chunks of views (`ViewChunkProjector`): a ConeBeamModel projects a volume onto ALL its views at once.
 To project onto a subset of consecutive views (e.g. the CITRUS loop's per-material primary path lengths, which must
-not grow to [M', V, Rd, Cd]), a sub-model over those angles is built with `make_cone_model` (measured on the WLAB
-grids: about 1 ms to build, 0.1 s for its first projection, which compiles; then the same time per view as the full
-model). The projections of a sub-model equal the matching views of the full model to float rounding (~1e-5 absolute
-in line integrals of order 10).
+not grow to [M', V, Rd, Cd]), a sub-model over those angles is built with `make_cone_model` (cheap to build; its
+first projection compiles, later ones cost the same per view as the full model). The projections of a sub-model equal
+the matching views of the full model to float rounding.
 
 Resuming MBIR (`mbir_iterations(..., error_sinogram=e, return_checkpoint=True)`): MBIRTORCH's public `recon` (0.1.2)
 recomputes the error sinogram e = y - A x_init on every call (one forward projection) and does not forward the

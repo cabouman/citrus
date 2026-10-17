@@ -21,7 +21,8 @@ A reconstruction in a few lines
 
    solver = wlab_solver(delta_voxel, geometry=geometry)   # LBTE solver with the cached cross-section library
    recon, info = citrus_recon(counts, flat_field, angles, grid, geometry, solver,
-                              CitrusConfig(num_outer=80, scatter_every=8, scatter_view_stride=8))
+                              CitrusConfig(num_outer_iterations=80, scatter_every=8,
+                                           scatter_view_stride=8))
 
 ``counts`` are the measured projections (primary plus scatter), ``grid`` and ``geometry`` describe the volume and the
 cone-beam scanner in MBIRTORCH's conventions, and the configuration sets how often the scatter is refreshed.
@@ -47,14 +48,14 @@ What CITRUS gives you
 
    .. grid-item-card:: Independent of the reconstruction grid
 
-      The transport runs on cells of a chosen size (1 cm by default) with a few quadrature points per cell, so a
-      0.5 mm reconstruction costs the solver the same as a 5 mm one. Any voxel-to-cell ratio works.
+      The transport runs on cells of a chosen size (1 cm by default) with a few quadrature points per cell, so the
+      cost of the scatter solve does not grow with the reconstruction resolution. Any voxel-to-cell ratio works.
 
-   .. grid-item-card:: Fast on one GPU
+   .. grid-item-card:: Built for one GPU
 
-      Fused Triton kernels for the ray tracer, the first-collision source and the sweep. On the synthetic study
-      (180 views, 0.5 cm voxels) the scatter step costs about 0.3 s per view, and the demo reconstruction with ten
-      scatter stages runs in under four minutes on a laptop-class GPU.
+      Fused Triton kernels for the ray tracer, the first-collision source and the sweep, with PyTorch reference paths
+      for the CPU and float64. The scatter can be refreshed at every n-th outer iteration and on every m-th view, and
+      the per-view state is stored compactly.
 
 How it works
 ------------
@@ -85,11 +86,7 @@ on: the dominant low orders are refreshed first while stale information is pushe
 The projected scatter :math:`s_v` and the primary :math:`p_v` of the current volume give the correction
 :math:`Y_v / (1 + s_v / p_v)`, which is independent of the flat field and of any mismatch between the solver's
 polychromatic model and MBIR's monoenergetic one. :doc:`method` has the derivation and :doc:`design_notes` the
-measurements behind each choice.
-
-On the synthetic water-lung-air-bone study (180 views over a short scan, 0.5 cm voxels, scatter-to-primary ratios up
-to 24) the uncorrected MBIR reconstruction has a relative RMSE of 0.29 and FDK 0.32; CITRUS reaches 0.022 with ten
-scatter stages. :doc:`results` has the full tables.
+reasons behind the main implementation choices.
 
 Built on MBIRTORCH and XrayPhysics
 ----------------------------------
@@ -116,14 +113,14 @@ Documentation
       :link: method
       :link-type: doc
 
-      The method, the conventions of grids, units and materials, the design decisions with their measurements, and
-      the results of the synthetic study.
+      The method, the conventions of grids, units and materials, and the design decisions.
 
    .. grid-item-card:: Reference
       :link: api
       :link-type: doc
 
-      The API of the reconstruction loop, the scatter solver and the MBIRTORCH bridge; how to cite the package.
+      One page per module: the reconstruction loop, the MBIRTORCH bridge, the scatter solver and its kernels; how to
+      cite the package.
 
 .. toctree::
    :maxdepth: 2
@@ -142,7 +139,6 @@ Documentation
    method
    conventions
    design_notes
-   results
 
 .. toctree::
    :maxdepth: 2

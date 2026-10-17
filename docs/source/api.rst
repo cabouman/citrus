@@ -1,124 +1,128 @@
 API reference
 =============
 
+One page per module; each page renders the module docstring and the public members.
+
 CITRUS
 ------
 
-``citrus.citrus``
-~~~~~~~~~~~~~~~~~
+The reconstruction loop and its utilities.
 
-.. automodule:: citrus.citrus
+:doc:`api/citrus`
+    The CITRUS loop, the per-view scatter step and its operators, the density model and the state storage.
 
-``citrus.utilities``
-~~~~~~~~~~~~~~~~~~~~
+:doc:`api/utilities`
+    The WLAB phantom and geometry, the density model, view angles, synthetic data and plotting helpers.
 
-.. automodule:: citrus.utilities
+.. toctree::
+   :hidden:
+
+   api/citrus
+   api/utilities
 
 MBIRTORCH bridge
 ----------------
 
-``citrus.recon.mbir_bridge``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The interface to the reconstruction package.
 
-.. automodule:: citrus.recon.mbir_bridge
+:doc:`api/mbir_bridge`
+    The MBIRTORCH model of the solver's geometry, FDK with short-scan weights, warm-started MBIR iterations.
+
+.. toctree::
+   :hidden:
+
+   api/mbir_bridge
 
 Scatter solver
 --------------
 
-``citrus.scatter_solver.scatter_solver``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The LBTE source iteration solver, one module per stage.
 
-.. automodule:: citrus.scatter_solver.scatter_solver
+:doc:`api/scatter_solver`
+    ``ScatterSolver``: the assembled solver for one view.
 
-``citrus.scatter_solver.config``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+:doc:`api/config`
+    ``SolverConfig``: every discretization parameter of the solver.
 
-.. automodule:: citrus.scatter_solver.config
+:doc:`api/geometry`
+    Transport and quadrature grids, the cone-beam geometry and the conservative resampling between grids.
 
-``citrus.scatter_solver.geometry``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+:doc:`api/cross_sections`
+    The material catalogue, the multigroup library container, per-voxel coefficients and a synthetic test library.
 
-.. automodule:: citrus.scatter_solver.geometry
+:doc:`api/cross_section_library`
+    The multigroup library builder from XrayPhysics (EPDL97) data, cached on disk.
 
-``citrus.scatter_solver.cross_sections``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+:doc:`api/source`
+    The point source: spectrum and collimation.
 
-.. automodule:: citrus.scatter_solver.cross_sections
+:doc:`api/detector`
+    Detector and anti-scatter-grid responses.
 
-``citrus.scatter_solver.cross_section_library``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+:doc:`api/angular_quadrature`
+    Direction sets, real spherical harmonics and the scattering-source operator.
 
-.. automodule:: citrus.scatter_solver.cross_section_library
+:doc:`api/linear_discontinuous_cell`
+    The linear-discontinuous cell equations and their closed-form solve.
 
-``citrus.scatter_solver.source``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+:doc:`api/wavefront`
+    The diagonal-plane (wavefront) ordering of the sweep.
 
-.. automodule:: citrus.scatter_solver.source
+:doc:`api/transport_sweep`
+    The batched linear-discontinuous discrete-ordinates sweep.
 
-``citrus.scatter_solver.detector``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+:doc:`api/source_iteration`
+    Source iteration over collision order and the multiple-collision source.
 
-.. automodule:: citrus.scatter_solver.detector
+:doc:`api/uncollided`
+    The uncollided fluence and the first-collision source.
 
-``citrus.scatter_solver.angular_quadrature``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+:doc:`api/scatter_image`
+    The collapsed-cone scatter image, the finite-cone footprint and the primary image.
 
-.. automodule:: citrus.scatter_solver.angular_quadrature
+:doc:`api/ray_tracing`
+    The exact Siddon ray tracer behind the ``Projectors`` interface.
 
-``citrus.scatter_solver.linear_discontinuous_cell``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. toctree::
+   :hidden:
 
-.. automodule:: citrus.scatter_solver.linear_discontinuous_cell
-
-``citrus.scatter_solver.wavefront``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: citrus.scatter_solver.wavefront
-
-``citrus.scatter_solver.transport_sweep``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: citrus.scatter_solver.transport_sweep
-
-``citrus.scatter_solver.source_iteration``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: citrus.scatter_solver.source_iteration
-
-``citrus.scatter_solver.uncollided``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: citrus.scatter_solver.uncollided
-
-``citrus.scatter_solver.scatter_image``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: citrus.scatter_solver.scatter_image
-
-``citrus.scatter_solver.ray_tracing``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: citrus.scatter_solver.ray_tracing
+   api/scatter_solver
+   api/config
+   api/geometry
+   api/cross_sections
+   api/cross_section_library
+   api/source
+   api/detector
+   api/angular_quadrature
+   api/linear_discontinuous_cell
+   api/wavefront
+   api/transport_sweep
+   api/source_iteration
+   api/uncollided
+   api/scatter_image
+   api/ray_tracing
 
 Triton kernels
 --------------
 
-``citrus.scatter_solver.kernels.triton_utilities``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Fused GPU kernels of the scatter solver, with PyTorch reference paths.
 
-.. automodule:: citrus.scatter_solver.kernels.triton_utilities
+:doc:`api/triton_utilities`
+    Shared Triton helpers: the availability probe and the kernel launch path.
 
-``citrus.scatter_solver.kernels.ray_tracing_kernels``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+:doc:`api/ray_tracing_kernels`
+    Fused Triton kernels of the ray tracer.
 
-.. automodule:: citrus.scatter_solver.kernels.ray_tracing_kernels
+:doc:`api/uncollided_kernels`
+    Fused Triton kernel of the first-collision source.
 
-``citrus.scatter_solver.kernels.uncollided_kernels``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+:doc:`api/sweep_kernels`
+    Fused Triton kernel of the sweep's per-plane cell solve.
 
-.. automodule:: citrus.scatter_solver.kernels.uncollided_kernels
+.. toctree::
+   :hidden:
 
-``citrus.scatter_solver.kernels.sweep_kernels``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. automodule:: citrus.scatter_solver.kernels.sweep_kernels
+   api/triton_utilities
+   api/ray_tracing_kernels
+   api/uncollided_kernels
+   api/sweep_kernels

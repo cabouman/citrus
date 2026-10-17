@@ -103,7 +103,7 @@ def uncollided_fluence(library: MultigroupLibrary, rho: Tensor, grid: Grid, geom
     (source photons/sr per fine bin; their sum over group g is f_g = source.per_group_strength), m_m(E) =
     library.fine_mu_t (`cross_sections.group_transmission`). Since mu_t is linear in the densities this is the exact
     group-integrated polychromatic Beer's law (up to the fine quadrature); the group-averaged attenuation
-    f_g exp(-int mu_t,g dl) ignores beam hardening within a group (-1.4% after 20 cm of water with 6 groups).
+    f_g exp(-int mu_t,g dl) ignores beam hardening within a group.
 
     rho: [M, rows, cols, slices] g/cm^3 on grid. Returns phi_uncollided [G, *points.shape] in photons/cm^2 per source
     photon/sr (point values at the voxel centers of `points`).
@@ -163,7 +163,7 @@ def first_collision_source_at_directions(library: MultigroupLibrary, rho: Tensor
     `kernels/uncollided_kernels.py` when it is usable on the device (shared Triton probe, CITRUS_DISABLE_TRITON=1 kill
     switch, per-device self-check against the PyTorch path), else the PyTorch path; "torch" forces the PyTorch path;
     "triton" requires the kernel for float32 CUDA inputs (raises if it is unusable). float64 and CPU inputs always use
-    the PyTorch path (the reference). The two paths agree to float32 rounding (~1e-6 relative).
+    the PyTorch path (the reference). The two paths agree to float32 rounding.
     chunk: directions per batch of the PyTorch path (peak memory ~ 3 M G^2 chunk |F| scalars); the kernel
     evaluates all K directions in one launch without temporaries, so it ignores `chunk`.
     pairs: the material representation (`resolve_pairs`): a `cross_sections.MaterialPairs` of rho (at most two

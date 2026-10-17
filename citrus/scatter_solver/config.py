@@ -10,7 +10,7 @@ from .cross_sections import MATERIALS, check_material_names
 
 @dataclass(frozen=True)
 class SolverConfig:
-    """Discretization of the scatter solver (docs: "Method" and "Accuracy and cost").
+    """Discretization of the scatter solver (docs/source/method.rst).
 
     Energy
       num_groups        number of energy groups G (equal photon count of the source spectrum per group)
@@ -25,9 +25,8 @@ class SolverConfig:
                         (at least two, any order): the library is built for exactly this set (`build_solver_library`,
                         `utilities.wlab_solver`; sorted by nominal attenuation, its cache key holds the set), and the
                         density model interpolates between the two reference materials whose nominal attenuations
-                        bracket a voxel
-                        (`citrus.utilities.attenuation_to_densities`). Default: the seven `cross_sections.MATERIALS`
-                        (air, lung, adipose, water, muscle, soft_tissue, bone), the library of earlier versions
+                        bracket a voxel (`citrus.utilities.attenuation_to_densities`). Default: the seven
+                        `cross_sections.MATERIALS` (air, lung, adipose, water, muscle, soft_tissue, bone)
 
     Angle (sweep quadrature: Gauss-Legendre in cos(theta) x equally spaced azimuths)
       num_polar         polar nodes (>= L + 1)
@@ -47,7 +46,7 @@ class SolverConfig:
       uncollided_trace_grid  grid through which the uncollided fluence at the Q points is ray traced: "quadrature"
                         (default: Q itself with rho_quadrature, material boundaries resolved at the Q spacing),
                         "coarse" (the transport grid C with the resampled densities: smears a boundary inside a cell,
-                        up to a few percent of the scatter where rays run along it) or "fine" (the reconstruction
+                        which matters where rays run along it) or "fine" (the reconstruction
                         grid; for validation); the cost is about the same for all three
 
     Source iteration

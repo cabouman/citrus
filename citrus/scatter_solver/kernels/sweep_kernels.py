@@ -26,8 +26,8 @@ Plane entries are read from a flat, plane-sorted int32 copy of the sweep plan (`
 that are not specialized (one compiled variant per (G, Dc)).
 
 Numerics: float32 only (the PyTorch path serves float64 and CPU tensors). The per-lane arithmetic follows
-`linear_discontinuous_cell.py` term by term, so the result equals the PyTorch path up to float32 rounding (measured max
-deviation ~1e-6 relative to the field maximum, see tests/test_transport_sweep.py).
+`linear_discontinuous_cell.py` term by term, so the result equals the PyTorch path up to float32 rounding (see
+tests/test_transport_sweep.py).
 
 Availability: `triton_available()` (shared, from `triton_utilities`: probe kernel, cached per
 process; `CITRUS_DISABLE_TRITON=1` is the kill switch) and `kernels_usable(device)`, which additionally runs

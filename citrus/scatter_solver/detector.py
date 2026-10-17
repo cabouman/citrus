@@ -20,7 +20,8 @@ Attenuation data: coarse log-log tables of total mass attenuation (coherent incl
 values read from NIST XCOM (Berger et al., XCOM: Photon Cross Sections Database, NIST Standard
 Reference Database 8, https://physics.nist.gov/xcom), rounded to 2 to 3 significant digits.
 K-edges are included as a pair of points 1 eV apart (I 33.17 keV, Cs 35.98 keV, Pb 88.00 keV;
-Pb L3 13.04 keV). Accuracy ~ few % between nodes: adequate for detector modelling, not for dosimetry.
+Pb L3 13.04 keV). The interpolation between the nodes is approximate: adequate for detector modelling, not for
+dosimetry.
 """
 
 from __future__ import annotations

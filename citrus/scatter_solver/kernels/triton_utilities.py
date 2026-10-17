@@ -4,8 +4,8 @@
   never raises. `CITRUS_DISABLE_TRITON=1` (`DISABLE_ENV_VAR`) is the kill switch: every kernel module then falls
   back to its PyTorch path (backend "auto") or raises (backend "triton").
 - `launch(kernel, grid, args, constexprs, num_warps)`: launches a kernel compiled without value or alignment
-  specialization (`do_not_specialize*`) through its cached `CompiledKernel.run` (about 6 us instead of 20 us per
-  launch through `JITFunction.run`). The binary is cached per (kernel, constexprs, num_warps, device). This uses
+  specialization (`do_not_specialize*`) through its cached `CompiledKernel.run`, which skips the argument handling of
+  `JITFunction.run`. The binary is cached per (kernel, constexprs, num_warps, device). This uses
   Triton's internal launcher signature, verified for triton 3.8 only; other versions (or
   `CITRUS_TRITON_FAST_LAUNCH=0`) take the public launch path.
 

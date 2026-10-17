@@ -37,17 +37,16 @@ converges together with the reconstruction ("age-ordered" source iteration: the 
 estimate was computed n - 1 outer iterations ago). The collided transport is the expensive part of a converged
 scatter solve; CITRUS spends one sweep per view per outer iteration instead of a full source iteration.
 
-Densities and primary (versions 0.3.0 and 0.5.0): the loop never forms the density volume [M, R, C, S] of the M
-reference materials on the reconstruction grid (7 GB at 256 M voxels for the default seven).
+Densities and primary: the loop never forms the density volume [M, R, C, S] of the M reference materials on the
+reconstruction grid (M reconstruction-sized volumes).
 `ScatterSolver.material_fields_from_attenuation(X_k, grid, density)` evaluates one material's map at a time
 (`DensityModel.material`, bit for bit the row of the full model) and resamples it onto the transport and quadrature
 grids. The primary signal of every view is the MBIRTORCH per-material primary: the path lengths P_m = A rho_m
 (g/cm^2) of the materials present with MBIRTORCH's projector over all views at once (one material map at a time, in
 chunks of views so that the path lengths [M', V_chunk, Rd, Cd] stay within one sinogram, `primary_signals`), then the
 solver's polychromatic transmission and detector / grid response per view (`ScatterSolver.primary_from_path_lengths`).
-These are pixel-averaged line integrals (separable footprint), the reconstruction's own operator A, about 2.4 ms per
-view and material on the 12 M-voxel grid. (Versions 0.3.0 and 0.4.0 offered the solver's Siddon primary, one ray to
-each pixel center, as an alternative; the standalone solver keeps it: `ScatterSolver.primary`, `solve_view`.)
+These are pixel-averaged line integrals (separable footprint), the reconstruction's own operator A. The standalone
+solver uses the Siddon primary instead, one ray to each pixel center (`ScatterSolver.primary`, `solve_view`).
 
 Scatter model -> correction: the solver gives per view the scatter and primary signals (s, p) of the current
 densities, so the correction is the multiplicative Y_c = Y p / (p + s) = Y / (1 + SPR(X)); it is independent of I0 and
@@ -62,25 +61,20 @@ for a short scan; orders 0-2 and None also exist;
 `interpolate_scatter`), its primary signal comes from the primary projection of every view (`primary_signals`; cheap:
 no transport), and the correction ratio s / p is formed on every view. The scatter
 signal is interpolated, not the ratio: the scatter is smooth on the panel and in angle, the ratio carries the object's
-shadow edges, which move across the panel with the angle. Measured on WLAB (180 views, 0.5 cm grid, 20 outer
-iterations): stride 2 costs +0.0014 relative RMSE for 51 % of the scatter time, stride 4 +0.008 for 26 %; the penalty
-is mostly the slower convergence of the coupled loop on the skipped views, not the interpolation error.
+shadow edges, which move across the panel with the angle.
 
 Scatter step every n outer iterations (CitrusConfig.scatter_every n > 1): the scatter stage runs at the outer
 iterations 0, n, 2n, ... only; in between, the previous scatter-to-primary ratio is reused and only the MBIR iteration
 runs, so n MBIR iterations run per scatter step and the accumulators keep their age across the skipped iterations. An
-MBIR iteration is cheap next to a scatter stage (0.75 s against 56 s on the 180-view WLAB study), so for a given
-number of scatter steps more MBIR iterations are nearly free. Measured on WLAB (180 views, 0.5 cm grid): at a fixed 20
-outer iterations the scatter step at every 2nd / 4th iteration raises the final relative RMSE from 0.0429 to 0.0513 /
-0.0700 (the MBIR iterations converge towards a stale correction between refreshes); the same 20 scatter steps spread
-over 40 (n = 2) / 80 (n = 4) outer iterations lower it to 0.0310 / 0.0286 in the same wall time, and at 40 iterations
-n = 2 is within 0.0008 of a scatter step at every iteration (0.0302) at half the scatter cost. The default is 1.
+MBIR iteration is cheap next to a scatter stage, so for a given number of scatter steps more MBIR iterations cost
+little; at a fixed number of outer iterations, skipping scatter stages lets MBIR converge towards a stale correction
+between refreshes. The default is 1.
 
 Per-view state: one accumulator [G, (L+1)^2, 4, Rc, Cc, Sc] per view (G energy groups, (L+1)^2 spherical-harmonic
 moments, 4 linear-discontinuous moments, Rc x Cc x Sc transport cells), stored compactly (`StateStore`): only the
 linear-discontinuous cell mean (the aged accumulator re-enters the next sweep with zero slopes) in float16 with a
-per-(group, moment) scale, 1/8 of float32 (17.6 MiB per view on a 0.5 cm WLAB grid with 1 cm transport cells). The
-reconstruction differs from exact float32 storage by ~6e-5 (relative), far below the reconstruction error.
+per-(group, moment) scale, 1/8 of float32. The aged accumulator re-enters only through the scattering source of the
+next sweep, so the compact storage changes the reconstruction far less than its own error.
 
 MBIR resume (CitrusConfig.resume_error_sinogram): MBIRTORCH's `recon` recomputes the error sinogram y_c - A X with
 one forward projection per call. With the switch on, the loop keeps it between outer iterations (as -A X, one
@@ -323,9 +317,9 @@ def primary_signals(solver: ScatterSolver, fields: MaterialFields, angles: Union
 
     i.e. the solver's primary (fine-energy transmission, inverse square, source, detector and grid responses) on the
     line integrals of `projector`, a `recon.mbir_bridge.ViewChunkProjector` (MBIRTORCH's separable-footprint
-    pixel-averaged line integrals, the reconstruction's operator A; all views of a chunk in one projection). It agrees
-    with the solver's Siddon primary (`ScatterSolver.primary`, one ray to each pixel center) to 0.9 % (relative L2 on
-    the 180-view WLAB study; the pixels whose rays graze a face of the prism differ most). Only the materials present
+    pixel-averaged line integrals, the reconstruction's operator A; all views of a chunk in one projection). It differs
+    from the solver's Siddon primary (`ScatterSolver.primary`, one ray to each pixel center) mainly on the pixels whose
+    rays graze a face of the object, where a center ray and a pixel average differ. Only the materials present
     are projected (`fields.fine_materials`, or `uncollided.present_materials(rho_fine)`). The views are processed in
     chunks of consecutive views so that the path lengths [M', V_chunk, Rd, Cd] (float32) and the projection being
     copied stay within one sinogram: views_per_chunk None = max(1, V // (M' + 1)) (M' = number of materials
@@ -570,8 +564,8 @@ class CitrusConfig:
     scatter_every  : n >= 1. 1 (default): a scatter step at every outer iteration. n > 1: the scatter stage runs at
                      the outer iterations 0, n, 2n, ... only and the previous scatter-to-primary ratio is reused in
                      between (n MBIR iterations per scatter step; the accumulators keep their age). For a fixed number
-                     of scatter steps, spreading them over n times more outer iterations costs almost nothing (an MBIR
-                     iteration is ~1 % of a scatter stage) and improves the reconstruction (module docstring).
+                     of scatter steps, spreading them over n times more outer iterations costs little (an MBIR
+                     iteration is cheap next to a scatter stage) and improves the reconstruction (module docstring).
     primary_views_per_chunk : views per chunk of `primary_signals` (the MBIRTORCH projections of the material maps
                      that give every view's primary signal, module docstring); None (default): max(1, V // (M' + 1))
                      with M' the materials present, so the per-material path lengths [M', chunk, Rd, Cd] and the

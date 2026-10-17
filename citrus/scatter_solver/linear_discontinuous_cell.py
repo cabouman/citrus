@@ -1,7 +1,7 @@
 """Linear-discontinuous Galerkin cell equations on a cuboid and their closed-form solve.
 
 Derivation: docs/source/method.rst, "Linear-discontinuous cells" (verified against a dense Galerkin assembly to
-2e-15, tests/test_linear_discontinuous_cell.py).
+float64 rounding, tests/test_linear_discontinuous_cell.py).
 
 For one direction with signs s_a = sign(Omega_a) and c_a = |Omega_a| / Delta_a, a in {x, y, z},
 the four linear-discontinuous unknowns (psi_0, psi_x, psi_y, psi_z) of a cell satisfy

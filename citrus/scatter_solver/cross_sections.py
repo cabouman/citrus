@@ -51,26 +51,22 @@ and polyethylene; it has no brain, blood, skin, cartilage or spongiosa, which co
 tables as cited, the ICRU-44 ones as tabulated by Hubbell and Seltzer, NISTIR 5632.)
 
 REFERENCE materials. The library is built for a chosen subset of the catalogue, the reference materials of the density
-model
-(`config.SolverConfig.materials`, at least two names; default the seven `MATERIALS`):
+model (`config.SolverConfig.materials`, at least two names; default the seven `MATERIALS`):
 
     air 0.0012, lung 0.26, adipose 0.95, water 1.0, muscle 1.05, soft tissue 1.06, cortical bone 1.85
 
 The builder sorts the reference materials by nominal attenuation (`cross_section_library.sort_material_table`) and
-asserts that
-the order is the same at every energy of the library (10-125 keV, `cross_section_library.check_material_order`: no
-two reference materials cross), so `MultigroupLibrary.materials` is always in order of INCREASING attenuation at the
-nominal
-density. Density maps are rho [M, rows, cols, slices] with M = the number of reference materials, in the library's
-order (look a
-row up by name: `material_index(library, "water")`); every coefficient is linear in rho. The density model
+asserts that the order is the same at every energy of the library (10-125 keV,
+`cross_section_library.check_material_order`: no two reference materials cross), so `MultigroupLibrary.materials` is
+always in order of INCREASING attenuation at the nominal density. Density maps are rho [M, rows, cols, slices] with
+M = the number of reference materials, in the library's order (look a row up by name:
+`material_index(library, "water")`); every coefficient is linear in rho. The density model
 (`citrus.utilities.attenuation_to_densities`) gives every voxel at most two nonzero materials, the two reference
-materials whose
-nominal attenuations bracket the voxel's attenuation; the first-collision source works on that compact pair
-representation (`MaterialPairs`, `material_pairs`) wherever its evaluation points have at most two nonzero materials
-(`material_pairs_if_compact`; block means of such a field can mix more, and are then evaluated densely over all M
-materials). The library, the solver and the kernels are general in M; `synthetic_library` builds test libraries of
-any M.
+materials whose nominal attenuations bracket the voxel's attenuation; the first-collision source works on that compact
+pair representation (`MaterialPairs`, `material_pairs`) wherever its evaluation points have at most two nonzero
+materials (`material_pairs_if_compact`; block means of such a field can mix more, and are then evaluated densely over
+all M materials). The library, the solver and the kernels are general in M; `synthetic_library` builds test libraries
+of any M.
 """
 
 from __future__ import annotations

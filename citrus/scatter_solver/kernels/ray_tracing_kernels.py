@@ -35,9 +35,8 @@ Kernels
     expression (passed in as a [K] flag tensor) so it is bit-identical for grazing directions.
 
 Numerics: float32. Each ray's integral equals the reference up to float32 rounding of the crossing parameters and
-the summation order: on the WLAB grids 2e-7 - 6e-7 of the maximum for downstream_cumulative and 1e-6 - 3.4e-6 for
-oblique / upstream / primary at 0.5 cm, the same order as the float32 reference's own deviation from its float64
-evaluation (up to 6.4e-6); tests/test_ray_tracing.py asserts 1e-5. No atomics: results are bitwise reproducible.
+the summation order, the same order as the float32 reference's own deviation from its float64 evaluation;
+tests/test_ray_tracing.py asserts 1e-5. No atomics: results are bitwise reproducible.
 
 Availability (the pattern of `uncollided_kernels.py` / `sweep_kernels.py`): `triton_available()` is the shared
 probe of `triton_utilities` (kill switch CITRUS_DISABLE_TRITON=1); `kernels_usable(device)` additionally runs

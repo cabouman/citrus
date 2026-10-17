@@ -85,9 +85,87 @@ Linear-discontinuous cell moments
 Materials
 ---------
 
-* Material catalogue ``cross_sections.MATERIAL_CATALOGUE``: name -> (nominal density g/cm^3, composition) for air,
-  lung, adipose, water, muscle, soft_tissue, bone (cortical, ICRP), trabecular_bone, brain, blood, cartilage, skin,
-  pmma, polyethylene, aluminium, titanium and carbon_fibre (sources in the module docstring and :doc:`method`).
+The material catalogue ``cross_sections.MATERIAL_CATALOGUE`` maps a name to (nominal density, composition). The
+nominal density is the density of the material in the body or the scanner; the nominal attenuation is given at the
+spectrum mean of the default 125 kVp spectrum (63 keV). The first seven are the default reference materials.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 16 44 14 14
+
+   * - name
+     - composition
+     - :math:`\rho^{nom}` (g/cm³)
+     - :math:`\mu` at 63 keV (1/cm)
+   * - ``air``
+     - XrayPhysics ``air``
+     - 0.0012
+     - 0.00022
+   * - ``lung``
+     - XrayPhysics ``lung``
+     - 0.26
+     - 0.0520
+   * - ``adipose``
+     - XrayPhysics ``adipose_tissue``
+     - 0.95
+     - 0.1846
+   * - ``water``
+     - H₂O
+     - 1.0
+     - 0.2013
+   * - ``muscle``
+     - ICRU-44 skeletal muscle
+     - 1.05
+     - 0.2102
+   * - ``soft_tissue``
+     - ICRU-44 soft tissue
+     - 1.06
+     - 0.2122
+   * - ``bone``
+     - XrayPhysics ``bone_cortical`` (ICRP cortical bone)
+     - 1.85
+     - 0.5366
+   * - ``trabecular_bone``
+     - spongiosa, Woodard and White (1986) / ICRU-46
+     - 1.18
+     - 0.2697
+   * - ``brain``
+     - ICRU-44 brain (grey / white matter)
+     - 1.04
+     - 0.2092
+   * - ``blood``
+     - ICRU-44 whole blood
+     - 1.06
+     - 0.2130
+   * - ``cartilage``
+     - Woodard and White (1986) / ICRU-46
+     - 1.10
+     - 0.2234
+   * - ``skin``
+     - ICRU-44 skin
+     - 1.09
+     - 0.2160
+   * - ``pmma``
+     - XrayPhysics ``PMMA`` (C₅H₈O₂)
+     - 1.18
+     - 0.2230
+   * - ``polyethylene``
+     - XrayPhysics ``Polyethylene`` (C₂H₄)
+     - 0.94
+     - 0.1826
+   * - ``aluminium``
+     - Al
+     - 2.699
+     - 0.7034
+   * - ``titanium``
+     - Ti
+     - 4.54
+     - 3.0928
+   * - ``carbon_fibre``
+     - carbon-fibre epoxy laminate (couch top): 60 % fibre volume, 0.692 C + 0.308 C₂₁H₂₄O₄ by mass
+     - 1.56
+     - 0.2756
+
 * Reference materials: the library is built for ``SolverConfig.materials`` (at least two catalogue names, any order),
   sorted by increasing attenuation at the nominal density (the order must hold at every library energy). Default: the
   seven ``cross_sections.MATERIALS``, in library order 0 air (0.0012 g/cm^3), 1 lung (0.26), 2 adipose (0.95), 3 water
