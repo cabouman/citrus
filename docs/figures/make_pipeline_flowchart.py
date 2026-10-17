@@ -146,110 +146,97 @@ def build() -> str:
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
     slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank
-    L = 3.05  # left edge of the loop container
 
     # ---- inputs (left column) -----------------------------------------------------------------------------------
-    y_data = add_box(slide, 0.35, 0.95, 2.25, 0.95,
-                     "Measured projections\ncounts Y = primary + scatter,\nflat field I0, view angles", "data")
-    fdk = add_box(slide, 0.35, 2.45, 2.25, 0.95,
-                  "FDK initialization\nParker weights for a short scan\n(MBIRTORCH)", "mbir")
-    x0 = add_box(slide, 0.35, 3.95, 2.25, 0.7, "Initial volume X₀", "data", size=11)
-    add_arrow(slide, cx(y_data), bottom(y_data), cx(fdk), top(fdk))
-    add_arrow(slide, cx(fdk), bottom(fdk), cx(x0), top(x0))
+    y_data = add_box(slide, 0.4, 1.6, 2.2, 0.95,
+                     "Measured projections Y\nprimary + scatter, all views", "data", size=12)
+    x0 = add_box(slide, 0.4, 3.3, 2.2, 0.95, "Initial reconstruction X₀\n(FDK)", "data", size=12)
+    add_arrow(slide, cx(y_data), bottom(y_data), cx(x0), top(x0))
 
     # ---- outer loop container ------------------------------------------------------------------------------------
-    loop = add_box(slide, L, 0.45, 13.0 - L, 5.95, "", "note", shape=MSO_SHAPE.ROUNDED_RECTANGLE, dashed=True,
+    L, R = 3.0, 13.0
+    loop = add_box(slide, L, 0.4, R - L, 6.35, "", "note", shape=MSO_SHAPE.ROUNDED_RECTANGLE, dashed=True,
                    fill=False)
     loop.adjustments[0] = 0.04
     loop.line.color.rgb = rgb("595959")
-    add_label(slide, L + 0.25, 0.5, 9.5, 0.3,
-              "Outer iteration k:  one scatter step per view  +  one MBIR iteration   (repeated N times)",
-              color="404040", size=11, bold=True)
+    add_label(slide, L + 0.25, 0.45, 9.0, 0.3, "Outer iteration k", color="404040", size=13, bold=True)
 
-    # row A: density model and grids
-    dens = add_box(slide, 3.5, 1.0, 3.9, 1.05,
-                   "Density model\nXₖ → densities of the anchor materials\n"
-                   "(two materials per voxel, one map at a time)", "density")
-    grids = add_box(slide, 7.8, 1.0, 5.0, 1.05,
-                    "Transport and quadrature grids\nconservative resampling onto cubic transport cells (1 cm)\n"
-                    "and q³ quadrature points per cell, any voxel size", "density")
-    add_arrow(slide, right(dens), cy(dens), left(grids), cy(grids))
+    # step 1: densities
+    dens = add_box(slide, 3.35, 1.0, 2.45, 1.05,
+                   "Material densities\nρ(Xₖ): each voxel a mixture of\ntwo anchor materials", "density", size=11)
 
-    # row B: the LBTE scatter solver (per view)
-    band_left = 3.95
-    solver_bg = add_box(slide, band_left, 2.35, 12.85 - band_left, 1.95, "", "scatter", shape=MSO_SHAPE.RECTANGLE,
-                        fill=True)
-    solver_bg.fill.fore_color.rgb = rgb("FDF3EC")
-    solver_bg.line.color.rgb = rgb("C55A11")
-    solver_bg.line.width = Pt(0.75)
-    add_label(slide, band_left + 0.1, 2.38, 8.5, 0.28,
-              "LBTE scatter solver, one step per view v (deterministic, multigroup, discrete ordinates)",
-              color="843C0C", size=10, bold=True)
-    uncol = add_box(slide, 4.1, 2.75, 2.75, 1.25,
-                    "Uncollided fluence\nray traced through the quadrature grid,\nfirst-collision source on its points",
-                    "scatter")
-    sweep = add_box(slide, 7.15, 2.75, 2.95, 1.25,
-                    "One transport sweep\nlinear-discontinuous cells of C, fed by\nthe first-collision source + the\n"
-                    "aged accumulator Φᵥ⁽ᵏ⁻¹⁾ → Φᵥ⁽ᵏ⁾",
-                    "scatter", size=10)
-    proj = add_box(slide, 10.4, 2.75, 2.35, 1.25,
-                   "Collapsed-cone projection\nfirst-order + multiple-collision\nemission to the panel\n"
-                   "→ scatter sᵥ", "scatter", size=10)
-    add_arrow(slide, right(uncol), cy(uncol), left(sweep), cy(sweep))
-    add_arrow(slide, right(sweep), cy(sweep), left(proj), cy(proj))
-    add_polyline_arrow(slide, [(cx(sweep) + 0.9, bottom(sweep)), (cx(sweep) + 0.9, bottom(sweep) + 0.17),
-                               (cx(sweep) - 0.9, bottom(sweep) + 0.17), (cx(sweep) - 0.9, bottom(sweep) + 0.01)],
-                       color="C55A11", width=1.25, dashed=True)
-    add_label(slide, cx(sweep) - 1.4, bottom(sweep) + 0.02, 2.8, 0.2,
-              "Φᵥ kept per view across outer iterations (age-ordered source iteration)",
-              color="843C0C", size=8, italic=True, align=PP_ALIGN.CENTER)
+    # step 2: the age-ordered recursion (the central element)
+    rec = add_box(slide, 6.2, 0.95, 6.5, 2.2, "", "scatter", size=12)
+    tf = rec.text_frame
+    tf.vertical_anchor = MSO_ANCHOR.TOP
+    tf.margin_top = Inches(0.08)
+    lines = [
+        ("Age-ordered scatter recursion:  one transport sweep Gₖ per view", 13, True, "843C0C"),
+        ("", 4, False, "843C0C"),
+        ("Φᵥ⁽ᵏ⁾  =  Gₖ φ₁(Xₖ)  +  Gₖ Φᵥ⁽ᵏ⁻¹⁾", 18, True, "843C0C"),
+        ("newest first-collision source        previous accumulator", 9, False, "C55A11"),
+        ("", 4, False, "843C0C"),
+        ("=  Gₖ φ₁⁽ᵏ⁾  +  GₖGₖ₋₁ φ₁⁽ᵏ⁻¹⁾  +  GₖGₖ₋₁Gₖ₋₂ φ₁⁽ᵏ⁻²⁾  +  …",
+         13, False, "843C0C"),
+        ("2nd-order scatter from Xₖ,  3rd order from Xₖ₋₁,  4th order from Xₖ₋₂, …", 10, False, "843C0C"),
+        ("the dominant low orders are refreshed from the newest reconstruction;", 10, False, "843C0C"),
+        ("stale information is pushed into the weak, smooth high orders", 10, False, "843C0C"),
+    ]
+    for i, (text, size, bold, color) in enumerate(lines):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        p.alignment = PP_ALIGN.CENTER
+        r = p.add_run()
+        r.text = text
+        r.font.name = FONT
+        r.font.size = Pt(size)
+        r.font.bold = bold
+        r.font.color.rgb = rgb(color)
+    add_arrow(slide, right(dens), cy(dens), left(rec), cy(dens))
 
-    # row C: primary, ratio, correction, MBIR
-    prim = add_box(slide, 3.5, 4.75, 2.3, 1.05,
-                   "Primary pᵥ of every view\nMBIRTORCH per-material projections,\nspectrum + detector response",
-                   "primary", size=10)
-    ratio = add_box(slide, 6.05, 4.75, 2.2, 1.05,
-                    "Scatter-to-primary ratio\nSPRᵥ = sᵥ / pᵥ\n(interpolated in angle for\nskipped views)",
-                    "correct", size=10)
-    corr = add_box(slide, 8.5, 4.75, 2.0, 1.05,
-                   "Corrected counts\nYᵥ / (1 + SPRᵥ)\nline integrals\n−log(Yᵥ / I0)", "correct",
-                   size=10)
-    mbir = add_box(slide, 10.75, 4.75, 2.0, 1.05,
-                   "One warm-started\nMBIR iteration\nMBIRTORCH coordinate descent,\n"
-                   "resumed error sinogram → Xₖ₊₁", "mbir", size=10)
-    add_arrow(slide, right(prim), cy(prim), left(ratio), cy(ratio))
-    add_arrow(slide, right(ratio), cy(ratio), left(corr), cy(corr))
+    # the accumulator carried across outer iterations: a loop around the recursion box
+    add_polyline_arrow(slide, [(right(rec) - 1.2, bottom(rec)), (right(rec) - 1.2, bottom(rec) + 0.3),
+                               (left(rec) + 1.2, bottom(rec) + 0.3), (left(rec) + 1.2, bottom(rec) + 0.01)],
+                       color="C55A11", width=2.0, dashed=True)
+    add_label(slide, left(rec) + 1.3, bottom(rec) + 0.06, 3.9, 0.2,
+              "Φᵥ⁽ᵏ⁾ kept per view → enters the next outer iteration as Φᵥ⁽ᵏ⁾",
+              color="843C0C", size=9, italic=True, align=PP_ALIGN.LEFT)
+
+    # step 3: scatter and primary -> ratio -> corrected projections
+    spr = add_box(slide, 3.35, 4.35, 3.95, 1.1,
+                  "Scatter-to-primary ratio of every view\nSPRᵥ = sᵥ / pᵥ\nsᵥ: projected scatter of Φᵥ⁽ᵏ⁾;  pᵥ: primary of Xₖ",
+                  "correct", size=11)
+    corr = add_box(slide, 7.65, 4.35, 2.4, 1.1,
+                   "Corrected projections\nYᵥ / (1 + SPRᵥ)", "correct", size=11)
+    mbir = add_box(slide, 10.4, 4.35, 2.3, 1.1,
+                   "n MBIR iterations\nwarm-started at Xₖ  →  Xₖ₊₁", "mbir", size=11)
+    add_polyline_arrow(slide, [(cx(rec) - 2.0, bottom(rec) + 0.3), (cx(rec) - 2.0, 4.1), (cx(spr) + 0.6, 4.1),
+                               (cx(spr) + 0.6, top(spr))])
+    add_label(slide, cx(spr) + 0.68, 4.1, 0.5, 0.2, "sᵥ", color="843C0C", size=10, italic=True)
+    add_polyline_arrow(slide, [(cx(dens) - 0.6, bottom(dens)), (cx(dens) - 0.6, top(spr))], color="7030A0", width=1.5)
+    add_label(slide, cx(dens) - 0.55, 3.6, 0.9, 0.2, "pᵥ(Xₖ)", color="7030A0", size=10, italic=True)
+    add_arrow(slide, right(spr), cy(spr), left(corr), cy(corr))
     add_arrow(slide, right(corr), cy(corr), left(mbir), cy(mbir))
 
-    # vertical flow: density -> uncollided, grids -> sweep, density -> primary (left margin), projection -> ratio
-    add_arrow(slide, cx(uncol), bottom(dens), cx(uncol), top(uncol))
-    add_arrow(slide, cx(sweep), bottom(grids), cx(sweep), top(solver_bg))
-    add_polyline_arrow(slide, [(3.7, bottom(dens)), (3.7, top(prim))], color="548235", width=1.25)
-    add_label(slide, 3.28, 3.2, 0.5, 0.2, "ρₘ", color="385723", size=9, italic=True)
-    add_polyline_arrow(slide, [(cx(proj), bottom(proj)), (cx(proj), 4.52), (cx(ratio) + 0.3, 4.52),
-                               (cx(ratio) + 0.3, top(ratio))])
-    add_label(slide, cx(ratio) + 0.38, 4.5, 0.6, 0.2, "sᵥ", color="843C0C", size=9, italic=True)
-
-    # X0 into the loop; X_{k+1} back to the density model
-    add_polyline_arrow(slide, [(right(x0), cy(x0)), (2.85, cy(x0)), (2.85, cy(dens) - 0.2),
-                               (left(dens), cy(dens) - 0.2)])
-    add_polyline_arrow(slide, [(right(mbir), cy(mbir)), (12.9, cy(mbir)), (12.9, 6.15), (3.25, 6.15),
-                               (3.25, cy(dens) + 0.2), (left(dens), cy(dens) + 0.2)], color="2F5597", width=1.5)
-    add_label(slide, 6.5, 5.95, 3.5, 0.2, "Xₖ₊₁ → next outer iteration", color="1F3864", size=9,
-              italic=True, align=PP_ALIGN.CENTER)
+    # X0 into the loop; X_{k+1} back to the densities
+    add_polyline_arrow(slide, [(right(x0), cy(x0)), (2.8, cy(x0)), (2.8, cy(dens)), (left(dens), cy(dens))])
+    add_polyline_arrow(slide, [(cx(mbir), bottom(mbir)), (cx(mbir), 6.1), (3.2, 6.1), (3.2, cy(dens) + 0.3),
+                               (left(dens), cy(dens) + 0.3)], color="2F5597", width=1.5)
+    add_label(slide, 5.5, 5.88, 4.5, 0.2, "Xₖ₊₁ → next outer iteration (k ← k + 1)",
+              color="1F3864", size=10, italic=True, align=PP_ALIGN.CENTER)
+    add_label(slide, 10.55, 5.55, 2.3, 0.3, "n ≥ 1: several MBIR iterations\nper scatter update", color="1F3864",
+              size=9, italic=True, align=PP_ALIGN.CENTER)
 
     # output
-    out = add_box(slide, 10.75, 6.65, 2.0, 0.65, "Scatter-corrected\nreconstruction X", "data", size=10)
-    add_arrow(slide, cx(mbir), bottom(mbir), cx(out), top(out))
+    out = add_box(slide, 10.4, 6.9, 2.3, 0.5, "Scatter-corrected reconstruction", "data", size=11)
+    add_polyline_arrow(slide, [(right(mbir), cy(mbir)), (12.85, cy(mbir)), (12.85, cy(out)), (right(out), cy(out))],
+                       color="2F5597", width=1.5)
 
-    # options note and caption
-    add_box(slide, 0.35, 5.0, 2.25, 1.35,
-            "Options\nscatter stage every n outer iterations;\nscatter step on every n-th view, the\n"
-            "others interpolated in angle; anchor\nmaterials chosen from the catalogue", "note", size=9)
-    add_label(slide, 0.35, 6.75, 8.5, 0.45,
-              "CITRUS: Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter.\n"
-              "With the densities held fixed, N steps reproduce N source iterations; the scatter converges with the "
-              "reconstruction.", color="404040", size=9, italic=True)
+    # caption
+    add_label(slide, 0.4, 6.9, 9.6, 0.5,
+              "With X held fixed, N outer iterations reproduce N source iterations of the transport solver: the scatter "
+              "estimate converges together with the reconstruction,\nfor the cost of one sweep per view per outer "
+              "iteration instead of a converged scatter solve for every new volume.",
+              color="404040", size=9, italic=True)
 
     prs.save(PPTX)
     return PPTX

@@ -61,14 +61,14 @@ How it works
 
 .. figure:: _static/citrus_pipeline.png
    :width: 100%
-   :alt: Flowchart of the CITRUS pipeline: measured projections, FDK initialization, then per outer iteration the
-         density model, the transport and quadrature grids, the LBTE scatter solver (uncollided fluence and
-         first-collision source, one transport sweep fed by the aged accumulator, collapsed-cone projection), the
-         MBIRTORCH primary, the scatter-to-primary ratio, the corrected counts and one warm-started MBIR iteration.
+   :alt: Flowchart of the CITRUS algorithm: measured projections and an initial reconstruction, then per outer
+         iteration the material densities, the age-ordered scatter recursion (one transport sweep per view applied
+         to the newest first-collision source and the previous accumulator), the scatter-to-primary ratio, the
+         corrected projections and n MBIR iterations, looping back.
 
-   The CITRUS pipeline. Every outer iteration converts the current volume into material densities, takes one scatter
-   step per view, divides the measured counts by one plus the estimated scatter-to-primary ratio and runs one
-   warm-started MBIR iteration on the result.
+   The CITRUS algorithm. Every outer iteration converts the current volume into material densities, advances the
+   per-view scatter accumulator by one transport sweep (the age-ordered recursion), divides the measured projections
+   by one plus the scatter-to-primary ratio and runs one or more warm-started MBIR iterations on the result.
 
 Each outer iteration :math:`k` turns the reconstruction :math:`X_k` into densities of the anchor materials, resamples
 them onto the transport cells, and updates the per-view collided fluence :math:`\Phi_v` with one transport sweep
