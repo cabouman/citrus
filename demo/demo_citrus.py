@@ -61,9 +61,12 @@
    citrus.scatter_solver.cross_sections.MATERIAL_CATALOGUE, at least two; default the seven air, lung, adipose,
    water, muscle, soft_tissue, bone) sets the reference materials of the loop's density model (SolverConfig.materials;
    the library is built once per set and cached; output suffix ``_materials-<names>`` for a set other than the
-   default). ``--save-recon`` also writes the CITRUS volume (``citrus_<tag>_recon.npy``). The summary JSON records
-   the reference materials and the peak allocated GPU memory of the CITRUS run (``torch.cuda.max_memory_allocated``,
-   MiB: whole run and largest outer iteration).
+   default). ``--save-recon`` also writes the CITRUS volume (``citrus_<tag>_recon.npy``). The energy groups of the
+   loop's library follow the object size measured on the FDK volume (CitrusConfig.grouping_object_size "auto"; the
+   library is built after the FDK; the medium of the grouping balance too), those of the truth the size and the mean
+   composition of the phantom. The summary JSON records the reference materials, both object sizes and media and the
+   peak allocated GPU memory of the CITRUS run
+   (``torch.cuda.max_memory_allocated``, MiB: whole run and largest outer iteration).
 3. The same MBIR loop without scatter correction (citrus.mbir_recon), for comparison.
 Both reconstructions use the same frozen regularization (MBIRTORCH's automatic estimate on the scatter-free
 sinogram), the same FDK initialization, weights and partition sequence, so they differ only by the scatter
@@ -91,7 +94,7 @@ from citrus import CitrusConfig, citrus_recon, mbir_recon  # noqa: E402
 from citrus.citrus import estimate_regularization  # noqa: E402
 from citrus.recon.mbir_bridge import is_short_scan, make_cone_model, scan_range  # noqa: E402
 from citrus.scatter_solver.config import SolverConfig  # noqa: E402
-from citrus.scatter_solver.cross_sections import MATERIAL_CATALOGUE, check_material_names  # noqa: E402
+from citrus.scatter_solver.cross_sections import COMPOUND_NAMES, check_material_names  # noqa: E402
 from citrus.scatter_solver.geometry import ConeGeometry, Grid  # noqa: E402
 from citrus.utilities import (full_field_wlab_geometry, load_dataset,  # noqa: E402
                               nominal_attenuation, plot_history, plot_profiles, plot_slices, set_memory_cap,
@@ -154,7 +157,8 @@ def main() -> None:
     parser.add_argument("--materials", default=",".join(SolverConfig().materials),
                         help="reference materials of the loop's density model, comma-separated names from the "
                              "catalogue "
-                             f"({', '.join(MATERIAL_CATALOGUE)}); at least two (default: "
+                             f"({', '.join(COMPOUND_NAMES)} and every element by its English name, e.g. lead); at "
+                             "least two (default: "
                              f"{','.join(SolverConfig().materials)})")
     parser.add_argument("--resume-error-sinogram", default=True, action=argparse.BooleanOptionalAction,
                         help="resume MBIR from its error sinogram between outer iterations (default) or restart it "
@@ -257,10 +261,9 @@ def main() -> None:
     print(f"truth solver: sweep {truth_polar}x{truth_azimuthal}, cone {cone_polar}x{cone_azimuthal}; "
           f"loop solver: sweep {loop_config.num_polar}x{loop_config.num_azimuthal}, "
           f"cone {loop_config.cone_num_polar}x{loop_config.cone_num_azimuthal}")
-    reference_materials = solver.library.materials  # sorted by nominal attenuation
-    print("reference materials of the density model (nominal attenuation at E_eff, 1/cm): "
-          + ", ".join(f"{name} {mu:.4g}" for name, mu
-                      in zip(reference_materials, nominal_attenuation(solver.library).tolist())))
+    # sorted by nominal attenuation; the library itself is built by citrus_recon after it has measured the object
+    # (the object size of the energy groups, CitrusConfig.grouping_object_size "auto")
+    reference_materials = solver.materials
     model = make_cone_model(grid, geometry, angles, device=device)
     Y_device = torch.as_tensor(Y, device=device)
     regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=device) / I0),
@@ -303,6 +306,16 @@ def main() -> None:
                                          model=model,
                                          callback=tracker(citrus_history))
     t_citrus = time.perf_counter() - t0
+    print("reference materials of the density model (nominal attenuation at E_eff, 1/cm): "
+          + ", ".join(f"{name} {mu:.4g}" for name, mu
+                      in zip(reference_materials, nominal_attenuation(solver.library).tolist())))
+    def medium_text(medium) -> str:
+        return medium if isinstance(medium, str) or medium is None else ", ".join(f"{n} {d:.3g}" for n, d in medium)
+
+    print(f"energy groups for an object of {citrus_info['grouping_object_size_cm']} cm made of "
+          f"{medium_text(citrus_info['grouping_medium'])} g/cm^3 (measured on the FDK volume; the truth used "
+          f"{data['meta'].get('grouping_object_size_cm')} cm of {medium_text(data['meta'].get('grouping_medium'))} "
+          f"g/cm^3): edges {np.round(solver.library.group_edges.double().cpu().numpy(), 1).tolist()} keV")
 
     # ---- 3. no scatter correction ------------------------------------------------------------------------------
     no_correction_history: list = []
@@ -318,6 +331,10 @@ def main() -> None:
         "views": len(angles), "start_view_angle_deg": math.degrees(float(angles[0])), "scan_range_deg": span,
         "short_scan": bool(is_short_scan(angles)), "delta_voxel_cm": args.delta_voxel, "grid": list(grid.shape),
         "transport_cell_cm": args.transport_cell_cm, "data_tag": tag, "materials": list(reference_materials),
+        "grouping_object_size_cm": citrus_info["grouping_object_size_cm"],
+        "grouping_medium": citrus_info["grouping_medium"],
+        "truth_grouping_object_size_cm": data["meta"].get("grouping_object_size_cm"),
+        "truth_grouping_medium": data["meta"].get("grouping_medium"),
         "quadrature_point_spacing_cm": loop_config.quadrature_point_spacing_cm,
         "quadrature_points_per_axis": loop_config.quadrature_points(max(grid.deltas)),
         "outer": args.outer_iterations,

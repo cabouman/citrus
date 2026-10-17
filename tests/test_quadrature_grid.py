@@ -346,7 +346,8 @@ def test_reproduces_pre_quadrature_solver(device, dtype, tolerance):
 def test_reproduces_pre_quadrature_solver_wlab():
     """(a) The real library on WLAB, one view: 1 cm voxels in 1 cm cells (q = 1: everything on one grid) and 0.5 cm
     voxels in 1 cm cells (q = 2) against version 0.1.0, with every trace grid (the WLAB phantom's boundaries lie on the
-    cell faces here, so the three traces agree to rounding)."""
+    cell faces here, so the three traces agree to rounding). The library of version 0.1.0 has a uniform eta table and
+    equal-fluence groups (the defaults up to version 0.5)."""
     from citrus.utilities import wlab_solver
 
     cases = json.loads(REFERENCE.read_text())["cases"]
@@ -355,7 +356,9 @@ def test_reproduces_pre_quadrature_solver_wlab():
         rho = wlab_phantom(grid, device="cuda")
         case = cases[f"wlab_{str(dv).replace('.', 'p')}cm_f{q}"]
         for trace in ("fine", "quadrature", "coarse"):
-            s = wlab_solver(dv, config=replace(SolverConfig(), uncollided_trace_grid=trace), device="cuda")
+            config = replace(SolverConfig(), uncollided_trace_grid=trace, angular_table_grid="uniform",
+                             group_edges_method="equal_fluence")
+            s = wlab_solver(dv, config=config, device="cuda")
             assert s.quadrature_points(grid) == q
             _check_reference(s.solve_view(rho, grid, 0.3), case, 1e-5)
 

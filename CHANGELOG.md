@@ -1,5 +1,126 @@
 # Changelog
 
+## v0.6.0 - 2026-10-17
+
+An adaptive angular transfer table and energy groups that follow the scattered photons, so that the solver is accurate
+from kV to MV with the same table size and group count. **Breaking changes: the new defaults change the library**
+(the angular nodes, the group edges and with them every scatter result), the cache version is `citrus-xsec-3` (every
+cached library of earlier versions is rebuilt once; the names of the unchanged library fields are kept), and the
+CITRUS loop builds the solver's library after the FDK reconstruction. The options of version 0.5 reproduce its
+library bit for bit: `SolverConfig(angular_table_grid="uniform", group_edges_method="equal_fluence")` (tested by a
+hash of the version 0.5.1 build and by the WLAB regression anchors). The validation against Monte Carlo at 125 kVp
+and 6 MV is in the validation folder (`validation/wlab/production_6mv_status.md`).
+
+### Adaptive angular table
+
+- **New** `SolverConfig.angular_table_grid`: `"adaptive"` (default) or `"uniform"` (the table of version 0.5). The
+  first-collision source's direct transfer table `mu_s_eta [M, G, G, num_eta_table]` (still 2001 nodes by default)
+  places its nodes by a map u = h(eta) built from the transfer curves: in q = sin(theta/2) the node density is the
+  maximum over the curves (Compton with its kinematic group fractions plus Rayleigh, of the catalogue's water and
+  cortical bone in the library's groups, `cross_section_library.ANGULAR_MAP_MATERIALS`, so every material set shares
+  the nodes) of sqrt(|f''| / max f), smoothed, with a floor of 10 % of the density of a uniform table
+  (`cross_section_library.angular_map`; curves on 20001 points uniform in q from cubic splines through the reference
+  quadrature). At MeV energies the forward peaks are far narrower than the spacing of a uniform table, whose linear
+  interpolation overestimated the first-order scatter; the adaptive nodes resolve them at the same table size.
+- **Lookup stays index arithmetic.** `MultigroupLibrary.eta_map [512]` (None for a uniform table) holds u at equally
+  spaced knots of q; `cross_sections.angular_table_position(eta, N, eta_map)` evaluates q = sqrt((1 - eta)/2), one
+  lookup in the map, pos = u (N - 1), then the existing two-node interpolation; `angular_table_nodes(N, eta_map)` gives
+  the node cosines (`eta_grid`). `transfer_eta_at`, `transfer_eta_at_pairs` and the fused Triton first-collision
+  kernel (dense and pair modes; the map is an L1-resident table of 512 values) use it; the kernel's self-check covers
+  uniform and adaptive tables (`check_cuda.sh`). `synthetic_library(..., angular_table_grid="adaptive")` and
+  `synthetic_angular_map()` give a synthetic adaptive table for tests.
+- The map's knots are equally spaced in q, not in eta: the forward peaks are a few 1e-7 wide in 1 - eta at 6 MeV,
+  narrower than the knot spacing of any small table uniform in eta, while in q they are smooth and spread out.
+- **New** `cross_section_library.transfer_at_eta(config, eta, ...)`: the exact transfer at any cosines (no
+  interpolation), to measure the interpolation error of a table.
+- The library cache stores `eta_map`; `MultigroupLibrary.load` reads a file without it as a uniform table.
+
+### Energy groups
+
+- **New** `SolverConfig.group_edges_method`: `"scattered_fluence"` (default), `"equal_fluence"` (the rule of version
+  0.5, unchanged to the last bit) or `"log"` (geometric spacing between `energy_min_kev` and the spectrum maximum).
+  Explicit `group_edges_kev` still override it. "Equal area under the spectrum" taken on the SOURCE spectrum is
+  `"equal_fluence"`; the default takes equal areas under an estimate of the total photon fluence in the object, source
+  plus scattered photons, because the groups must resolve the downscattered photons that carry the multiple-collision
+  scatter (at 6 MV equal source fluence left one group across 10-609 keV).
+- **New** `cross_section_library.scattered_fluence_spectrum`: the estimate, a one-dimensional slowing-down balance in
+  the object's medium with Klein-Nishina downscatter (closed-form bin probabilities), Rayleigh left out, photons below
+  `energy_min_kev` absorbed and a leakage loss 1/L,
+  phi(E) = [S(E) + int mu_C(E') p(E | E') phi(E') dE'] / (mu_t(E) - mu_R(E) + 1/L), one sweep from the highest
+  energy down. **New** `SolverConfig.grouping_object_size_cm` = L (default 20 cm), the characteristic chord length of
+  the object: L -> 0 recovers `"equal_fluence"`, L -> infinity the infinite medium. A grouping heuristic only.
+- **New** `SolverConfig.grouping_medium`: the medium of the balance, `"auto"` (default: the object's mean densities
+  of the reference materials, measured by `citrus_recon` on the FDK volume and by `synthesize_cone_beam_data` on the
+  true object; water at 1 g/cm^3 while unmeasured), a catalogue name (that material at its nominal density, e.g. a
+  part of one known material) or a mapping {reference material: density g/cm^3}; named materials must be among
+  `SolverConfig.materials`. Stored as sorted (name, density) pairs; `cross_section_library.grouping_medium_densities`
+  gives the form used by the balance and the cache key (3 significant digits, traces below 1e-3 of the largest
+  density dropped).
+- **Within-group weights of the "scattered_fluence" rule.** Its group constants weight the energies within each group
+  by the estimated total fluence instead of the source spectrum (`_within_group_weights`; the other rules and
+  explicit edges keep the source weighting of version 0.5). At MV the lowest group spans 10 keV to about 150 keV with
+  a flat or no source spectrum, while its scattered photons sit near its top; a source weighting gave it the
+  photoelectric attenuation of its lowest energies and absorbed the multiply scattered photons too early. The
+  spectrum fractions and the fine-energy table of the uncollided fluence keep the source spectrum.
+- `make_group_edges(config, spectrum, backend=None, *, fine_bin_width_kev=0.5)` takes the backend (needed by the
+  default rule). **New** `mass_attenuation_preview(config, names, ...)`: E_eff and the mass attenuation of catalogue
+  materials without building the library.
+- The cache key holds `angular_table_grid`, `group_edges_method`, `grouping_object_size_cm` and the grouping medium.
+
+### Object size and the lazy library
+
+- **New** `citrus.utilities.object_size_cm(X, grid, reference)`: the mean chord 4 V / S of the object in an
+  attenuation volume, the mask being the voxels above the attenuation midway between air and water at E_eff
+  (`air_water_threshold(reference)`; cavities such as the WLAB lung and air inserts are holes of the mask), V the mask
+  volume, S the area of the exposed voxel faces (the neighbour outside the mask or the grid), rounded to whole
+  centimetres, at least 1 cm, the default for an empty mask.
+- **Lazy library.** `ScatterSolver(None, config, geometry, ..., spectrum=None)` builds its library on first use (the
+  `library` / `transport_library` properties; `library_built`; `library_cache_dir`); `solver.config` can be replaced
+  until then and raises `RuntimeError` afterwards (an equal config is accepted). `solver.materials` gives the sorted
+  material names without a build, `solver.num_groups` falls back to `config.num_groups`. A solver given a library
+  works as before. `utilities.wlab_solver(..., spectrum=None)` returns the lazy form (its `library=` argument still
+  takes a prebuilt one).
+- **New** `citrus.utilities.grouping_medium_estimate(X, reference)`: the object's mean composition, the density
+  model applied to the object voxels (`object_mask`) and averaged per reference material, from the nominal
+  attenuations alone (no library needed).
+- **New** `CitrusConfig.grouping_object_size`: `"auto"` (default) or a size in cm. `citrus_recon` measures the object
+  on the FDK volume (`object_size_cm`, and `grouping_medium_estimate` for an "auto" medium), writes both into a lazy
+  solver's config before the first scatter stage builds the library (once per run, cached per size and medium), and
+  records `info["grouping_object_size_cm"]`, `info["grouping_medium"]`, `info["grouping_applied"]` and
+  `info["library_seconds"]`; a prebuilt library keeps its config (verbose prints a note). Only the
+  "scattered_fluence" rule without explicit edges uses them; `mbir_recon` is unaffected.
+- `synthesize_cone_beam_data` sets a lazy solver's size from the attenuation of the true object and, for an "auto"
+  medium, the true mean densities before its first solve (meta `grouping_object_size_cm`, `grouping_medium`);
+  `synthesize_wlab_dataset` places the phantom in `solver.materials`.
+- Demo `demo/demo_citrus.py`: the loop's library is built by `citrus_recon` after the FDK; the summary JSON records
+  `grouping_object_size_cm` and `truth_grouping_object_size_cm`. The cached data sets of earlier versions were made
+  with the library of version 0.5; regenerate them with `--regenerate` (the cache name is unchanged).
+
+### Material catalogue: every element
+
+`cross_sections.MATERIAL_CATALOGUE` keeps its seventeen compound, tissue and mixture entries first (`COMPOUND_NAMES`)
+and then holds every element Z = 1..100 of EPDL97 under its English (IUPAC) name, `hydrogen` ... `fermium`, among
+them `lead` (Pb, 11.35 g/cm^3) and `tungsten` (W, 19.3 g/cm^3); aluminium and titanium remain the existing entries.
+The entries are generated from `ELEMENT_NAMES`, `ELEMENT_SYMBOLS` (also the symbol table of the formula parser) and
+`ELEMENT_DENSITIES`, the standard densities of XrayPhysics' element table (NIST's standard-state densities of Hubbell
+and Seltzer, NISTIR 5632; tested against XrayPhysics). An unknown name lists the compounds and "every element by its
+English name"; so do the demos' `--materials` help texts. Elements with K edges inside a kV spectrum (lead at 88 keV,
+tungsten at 69.5 keV) build like any other entry.
+
+### Tests
+
+`tests/test_angular_table.py` (the map and its nodes; interpolation error of the uniform and the adaptive table against
+`transfer_at_eta` on water at 125 kVp and 6 MV; the l = 0 integral of the interpolated table against the group cross
+section; kernel against PyTorch on adaptive tables), `tests/test_group_edges.py` (the three rules on both spectra,
+equal-fluence edges identical to version 0.5.1, edges below 600 keV at 6 MV, the object-size limits, the balance, the
+object size of boxes and of the WLAB phantom at 1 and 0.5 cm, the lazy solver, citrus_recon measuring the object and
+building once, the grouping medium: "auto" on the WLAB phantom, explicit water, a two-material mapping, refused
+names; the fluence-weighted group constants), `tests/test_material_catalogue.py` (every entry parses with a positive
+density, the element densities equal XrayPhysics'; one library build per compound and per sampled element, every 10th
+atomic number plus lead and tungsten), `tests/data/spectrum_6mv.txt` (the Mohan 6 MV spectrum of the validation).
+The regression anchors of `tests/data/pre_quadrature_reference.json` run with the options of version 0.5; the
+cache-key test holds the keys of version 0.6.0 and the hash of the version 0.5.1 library.
+
 ## v0.5.1 - 2026-10-17
 
 Ground-truth data for fine reconstruction grids. `utilities.synthesize_cone_beam_data` takes a density MODEL that gives

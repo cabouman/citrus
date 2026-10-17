@@ -59,7 +59,8 @@ The solver uses three grids (``geometry.Grid``):
 Energy groups
 -------------
 
-* Groups are indexed g = 0..G-1 from HIGHEST to LOWEST energy; ``group_edges`` has G+1 entries, descending.
+* Groups are indexed g = 0..G-1 from HIGHEST to LOWEST energy; ``group_edges`` has G+1 entries, descending, from the
+  spectrum maximum to ``energy_min_kev`` (placed by ``SolverConfig.group_edges_method`` unless given explicitly).
   Downscatter goes from lower to higher index. Transfer tensors are ``[..., g_in, g_out, ...]`` and are zero for
   ``g_out < g_in`` (no upscatter).
 
@@ -68,6 +69,11 @@ Scattering convention
 
 * Per-steradian transfer ``mu_s(Omega' -> Omega) = sum_l (2l+1)/(4 pi) mu_s_l P_l(Omega . Omega')``, so ``mu_s_0``
   is the group-to-group scattering coefficient. Legendre index l = 0..L.
+* Direct table ``mu_s_eta [M, G, G, N]`` at the nodes ``eta_grid [N]``, ascending from -1 to 1. Uniform table
+  (``eta_map`` None): equally spaced nodes. Adaptive table: ``eta_map [K]`` holds the table coordinate ``u`` at the
+  knots ``q_k = k / (K - 1)`` of ``q = sin(theta/2) = sqrt((1 - eta)/2)``, decreasing from 1 (eta = 1) to 0
+  (eta = -1), linear in q between knots; node j sits at ``u = j / (N - 1)``
+  (``cross_sections.angular_table_position``, ``angular_table_nodes``).
 * Real orthonormal spherical harmonics ``Y_lk`` (polar axis +z, no Condon-Shortley phase), flat index
   ``n = l*l + (k + l)``, n = 0..(L+1)^2-1; ``sum_m w_m Y_n(Omega_m) Y_n'(Omega_m) = delta_nn'`` up to degree L.
 * Moments ``phi_n = sum_m w_m Y_n(Omega_m) psi_m``; scattering source
@@ -165,6 +171,11 @@ spectrum mean of the default 125 kVp spectrum (63 keV). The first seven are the 
      - carbon-fibre epoxy laminate (couch top): 60 % fibre volume, 0.692 C + 0.308 C₂₁H₂₄O₄ by mass
      - 1.56
      - 0.2756
+
+After these compounds the catalogue holds every element Z = 1..100 under its English (IUPAC) name, ``hydrogen`` to
+``fermium`` (for example ``lead``, 11.35 g/cm³, and ``tungsten``, 19.3 g/cm³; aluminium and titanium are the entries
+above), with the element as the composition and the standard-state density of XrayPhysics' element table (the NIST
+densities of Hubbell and Seltzer, NISTIR 5632; gases at 20 °C and 1 atm) as the nominal density.
 
 * Reference materials: the library is built for ``SolverConfig.materials`` (at least two catalogue names, any order),
   sorted by increasing attenuation at the nominal density (the order must hold at every library energy). Default: the

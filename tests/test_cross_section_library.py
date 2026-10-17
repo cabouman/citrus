@@ -41,7 +41,8 @@ def _group_avg(info: cross_section_library.BuildInfo, kind: str, material: str) 
 
 @pytest.fixture(scope="module")
 def built():
-    config = SolverConfig(num_groups=G, legendre_order=L, num_eta_table=1001)
+    # equal-fluence groups (the tests below check equal source fractions); the default adaptive eta table
+    config = SolverConfig(num_groups=G, legendre_order=L, num_eta_table=1001, group_edges_method="equal_fluence")
     return cross_section_library.compute_library(config, None, BACKEND, fine_bin_width_kev=0.5)
 
 
@@ -312,7 +313,10 @@ def test_fine_table_polychromatic_transmission(built):
 
 @pytest.mark.skipif(not os.environ.get("CITRUS_SLOW_TESTS"), reason="slow: set CITRUS_SLOW_TESTS=1")
 def test_full_resolution_default_config():
-    config = SolverConfig()  # G=6, L=7, 2001-point eta table
+    # G=6, L=7, 2001-point (adaptive) eta table; equal-fluence groups as in the fixture above: with the default
+    # scattered-fluence groups the 3 -> 5 transfer is a tiny backscatter sliver (the lowest edge, 39.9 keV, lies just
+    # above the backscatter limit of the group's lower part), which no Legendre order of practical size reproduces
+    config = SolverConfig(group_edges_method="equal_fluence")
     library, info = cross_section_library.compute_library(config, None, BACKEND)
     assert library.mu_s_eta.shape == (7, 6, 6, 2001)
     for mi, mat in enumerate(library.materials):

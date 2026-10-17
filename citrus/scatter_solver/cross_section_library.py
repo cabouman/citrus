@@ -9,10 +9,13 @@ Data: XrayPhysics (github.com/kylechampley/XrayPhysics, EPDL97 tables), loaded b
 
 Physics summary (all coefficients per unit density, cm^2/g):
   * Groups g = 0..G-1 from HIGHEST to LOWEST energy; ``group_edges`` [G+1] descending.
-  * Groups have equal source photon counts (``make_group_edges``) unless explicit edges are given.
-  * Within-group weight w(E): the source spectrum, normalized to 1 within each group. A group with zero
-    spectrum falls back to a flat weight (a ``RuntimeWarning`` is raised and the group is listed in
-    ``BuildInfo.flat_fallback_groups``).
+  * Group edges (``make_group_edges``): explicit edges if given, else the rule ``SolverConfig.group_edges_method``:
+    equal area under an estimate of the total (source plus scattered) photon fluence spectrum in a water object of
+    chord ``grouping_object_size_cm`` (``scattered_fluence_spectrum``; the default), equal source photon counts
+    ("equal_fluence") or geometric spacing ("log").
+  * Within-group weight w(E), normalized to 1 within each group: the source spectrum, or for the "scattered_fluence"
+    rule the estimated total fluence of that rule (``_within_group_weights``). A group with zero weight falls back to
+    a flat weight (a ``RuntimeWarning`` is raised and the group is listed in ``BuildInfo.flat_fallback_groups``).
   * Fine energy grid: each group is cut into equal bins of width <= ``fine_bin_width_kev`` (default 0.5 keV);
     every quantity is evaluated at the bin midpoint and weighted by the exact integral of w(E)
     over the bin (midpoint rule in E; the spectrum is integrated exactly as a piecewise-linear
@@ -41,6 +44,14 @@ Physics summary (all coefficients per unit density, cm^2/g):
     At fixed eta the indicator is a cut in E at E_b = 1/(1/E_edge - (1-eta)/m_e c^2); each fine
     energy bin contributes the fraction of its width on the right side of the cut, so the table
     is continuous in eta instead of a 0.5 keV staircase.
+  * Table nodes (``SolverConfig.angular_table_grid``): "uniform" places the ``num_eta_table`` nodes equally in eta;
+    "adaptive" (default) places them by a map u = h(eta) built from the transfer curves of the catalogue's water and
+    cortical bone (``ANGULAR_MAP_MATERIALS``, whatever the library's materials, so that every material set shares the
+    nodes and a material's rows do not depend on the set) in the library's groups (``angular_map``): the node density
+    follows max over the curves of sqrt(|d^2 f / d q^2| / max f) in
+    q = sin(theta/2), the density that equalizes the relative error of linear interpolation, plus a floor, so the
+    Rayleigh and Compton forward peaks (a few 1e-7 wide in 1 - eta at MeV energies) are resolved with the same node
+    count. The map is stored as ``eta_map`` and evaluated by ``cross_sections.angular_table_position``.
   * Fine-energy attenuation table (``fine_energy``, ``fine_mu_t``, ``fine_weight``, ``fine_group``):
     the same fine quadrature, i.e. the total mass attenuation of each material at every bin midpoint
     and the exact spectrum integral over every bin normalized to 1 over the whole group structure
@@ -87,13 +98,15 @@ import numpy as np
 import torch
 
 from .config import SolverConfig
-from .cross_sections import ELECTRON_REST_KEV, MATERIAL_CATALOGUE, MATERIALS, MultigroupLibrary, material_table
+from .cross_sections import (ANGULAR_MAP_KNOTS, ELECTRON_REST_KEV, ELEMENT_SYMBOLS, MATERIAL_CATALOGUE, MATERIALS,
+                             MultigroupLibrary, angular_table_nodes, material_table)
 
 __all__ = [
     "BuildInfo",
     "MATERIAL_FORMULAS",
     "default_material_table",
     "sort_material_table",
+    "mass_attenuation_preview",
     "check_material_order",
     "build_library",
     "default_cache_dir",
@@ -101,6 +114,10 @@ __all__ = [
     "default_spectrum_125kvp",
     "load_spectrum_txt",
     "make_group_edges",
+    "scattered_fluence_spectrum",
+    "grouping_medium_densities",
+    "angular_map",
+    "transfer_at_eta",
     "fine_energy_grid",
     "group_of_energy",
     "material_composition",
@@ -110,8 +127,13 @@ __all__ = [
     "eta_quadrature_in_q",
 ]
 
-_BUILD_VERSION = "citrus-xsec-2"  # 2: the seven-material table; names, nominal densities and formulas in the key
+# 2: the seven-material table; names, nominal densities and formulas in the key. 3 (citrus 0.6.0): the angular table
+# grid (adaptive tables with eta_map), the group edge rule and the grouping object size in the key
+_BUILD_VERSION = "citrus-xsec-3"
 _TWO_PI = 2.0 * math.pi
+# catalogue materials whose transfer curves place the nodes of an adaptive angular table (`angular_map`): low-Z soft
+# tissue and calcium-bearing bone; the same for every library, so that the nodes do not depend on the material set
+ANGULAR_MAP_MATERIALS = ("water", "bone")
 
 # Compositions (formula strings in XrayPhysics syntax: 'a*F1 + b*F2' with a, b mass fractions of the compounds F1, F2;
 # a bare formula is a stoichiometric compound) of every catalogue material, `cross_sections.MATERIAL_CATALOGUE`
@@ -142,13 +164,7 @@ _Q_BREAKPOINTS = np.array(
 )
 _THETA_MIN_DEG = 1.0e-3  # XrayPhysics' coherent amplitude is wrong at exactly theta = 0 (x < 1e-6)
 
-_SYMBOLS = (
-    "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se "
-    "Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb "
-    "Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm "
-    "Bk Cf Es Fm"
-).split()
-_SYMBOL_TO_Z = {s: i + 1 for i, s in enumerate(_SYMBOLS)}
+_SYMBOL_TO_Z = {s: i + 1 for i, s in enumerate(ELEMENT_SYMBOLS)}
 
 
 # =============================================================================================
@@ -291,11 +307,13 @@ def material_composition(backend: _XrayPhysicsBackend,
     return {n: parse_formula(f, backend.atomic_mass) for n, _, f in _material_table(materials)}
 
 
-def _mean_energy(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], fine_bin_width_kev: float) -> float:
+def _mean_energy(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], fine_bin_width_kev: float,
+                 backend: Optional["_XrayPhysicsBackend"] = None) -> float:
     """Spectrum-mean photon energy (keV) over the group structure of ``config`` on the fine energy quadrature of the
     build: sum_e w_e E_e / sum_e w_e with w_e the exact spectrum integral over fine bin e, the effective energy of the
-    library's density model (``citrus.utilities.effective_energy``, 63.03 keV for the default 125 kVp spectrum)."""
-    edges = make_group_edges(config, spectrum)
+    library's density model (``citrus.utilities.effective_energy``, about 63 keV for the default 125 kVp spectrum).
+    backend: needed by the "scattered_fluence" group rule (None loads one when needed)."""
+    edges = make_group_edges(config, spectrum, backend, fine_bin_width_kev=fine_bin_width_kev)
     E, _, bin_low, bin_high = fine_energy_grid(edges, fine_bin_width_kev)
     density = _Spectrum(*spectrum)
     photons = density.cumulative_integral(bin_high) - density.cumulative_integral(bin_low)
@@ -317,12 +335,34 @@ def sort_material_table(config: SolverConfig, materials: Optional[MaterialTable]
     table = _material_table(materials)
     backend = resolve_backend() if backend is None else backend
     spectrum_arrays = _spectrum_or_default(spectrum, backend)
-    energy = np.array([_mean_energy(config, spectrum_arrays, fine_bin_width_kev)])
+    energy = np.array([_mean_energy(config, spectrum_arrays, fine_bin_width_kev, backend)])
     composition = material_composition(backend, table)
     attenuation = [density * sum(w * float(backend.sigma("total", Z, energy)[0]) for Z, w in composition[name].items())
                    for name, density, _ in table]
     order = sorted(range(len(table)), key=lambda i: attenuation[i])
     return tuple(table[i] for i in order)
+
+
+def mass_attenuation_preview(config: SolverConfig, names: Sequence[str],
+                             spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+                             backend: _XrayPhysicsBackend | None = None, *, energy_kev: float | None = None,
+                             fine_bin_width_kev: float = 0.5) -> tuple[float, np.ndarray]:
+    """(E_eff keV, total mass attenuation [len(names)] cm^2/g at E_eff) of catalogue materials WITHOUT building the
+    library: E_eff = energy_kev, or the spectrum-mean energy of the build of `config` (``_mean_energy``, the value
+    ``citrus.utilities.effective_energy`` gives for the built library); the attenuation from the backend's elemental
+    cross sections mixed by mass fraction at E_eff (the library interpolates its fine table there instead: the two
+    agree closely). For decisions taken before a lazy solver builds its library (``citrus.utilities.object_size_cm``).
+    """
+    backend = resolve_backend() if backend is None else backend
+    spectrum_arrays = _spectrum_or_default(spectrum, backend)
+    energy = (_mean_energy(config, spectrum_arrays, fine_bin_width_kev, backend) if energy_kev is None
+              else float(energy_kev))
+    table = material_table(tuple(names))
+    composition = material_composition(backend, table)
+    point = np.array([energy])
+    mass = np.array([sum(w * float(backend.sigma("total", Z, point)[0]) for Z, w in composition[name].items())
+                     for name, _, _ in table])
+    return energy, mass
 
 
 def check_material_order(fine_mu_t: np.ndarray, nominal_density: np.ndarray, names=None) -> None:
@@ -409,11 +449,49 @@ class _Spectrum:
         return float(self.energies[min(j + 1, self.energies.size - 1)])
 
 
-def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
-    """Group edges [G+1] in keV, descending, spanning [energy_min_kev, kVp].
+def _equal_area_edges(grid: np.ndarray, cumulative: np.ndarray, G: int, energy_min: float,
+                      energy_max: float) -> np.ndarray:
+    """Descending edges [G + 1] that cut the area of a nonnegative density into G equal parts: grid [n] ascending
+    energies (keV) with grid[0] = energy_min and grid[-1] = energy_max, cumulative [n] the integral of the density from
+    energy_min to each grid energy (linear interpolation in between)."""
+    if cumulative[-1] <= 0:
+        raise ValueError("spectrum has no photons in [energy_min_kev, kVp]")
+    targets = cumulative[-1] * np.arange(1, G) / G
+    indices = np.clip(np.searchsorted(cumulative, targets, side="left"), 1, grid.size - 1)
+    c0, c1 = cumulative[indices - 1], cumulative[indices]
+    t = np.where(c1 > c0, (targets - c0) / np.where(c1 > c0, c1 - c0, 1.0), 0.0)
+    inner = grid[indices - 1] + t * (grid[indices] - grid[indices - 1])
+    ascending = np.concatenate([[energy_min], inner, [energy_max]])
+    return ascending[::-1].copy()
 
-    ``config.group_edges_kev`` if given (must be strictly descending); else equal-fluence groups
-    (equal photon count of the spectrum per group). kVp = upper end of the spectrum support.
+
+# group edges of the "scattered_fluence" rule already computed in this process: key -> edges
+_EDGES_MEMO: dict[str, np.ndarray] = {}
+
+
+def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray],
+                     backend: Optional["_XrayPhysicsBackend"] = None, *,
+                     fine_bin_width_kev: float = 0.5) -> np.ndarray:
+    """Group edges [G+1] in keV, descending, spanning [energy_min_kev, kVp] (kVp = upper end of the spectrum support).
+
+    ``config.group_edges_kev`` if given (must be strictly descending). Otherwise ``config.group_edges_method``:
+
+    * "scattered_fluence" (default): equal area per group under the TOTAL photon fluence spectrum phi(E), source plus
+      scattered photons, of an object of chord L = ``config.grouping_object_size_cm`` made of the medium
+      ``grouping_medium_densities(config)`` (``scattered_fluence_spectrum``; needs the backend, None loads one). A
+      grouping heuristic, not a transport result. The library then also weights the energies within each group by
+      phi (``_within_group_weights``).
+    * "equal_fluence": equal area under the SOURCE spectrum (equal source photon count per group; the rule of
+      citrus <= 0.5, unchanged to the last bit).
+    * "log": geometric spacing, edges energy_min_kev (kVp / energy_min_kev)^(k / G).
+
+    Why the scattered fluence: "equal area under the spectrum" taken on the SOURCE spectrum is "equal_fluence". It
+    resolves the source photons, but the groups carry the collided photons too, and the multiple-collision scatter
+    consists of downscattered photons. At 125 kVp both spectra lie in the same range and the rules nearly agree; at
+    6 MV the source has few photons below 600 keV, so equal source fluence puts one group across 10-600 keV, where most
+    multiply scattered photons are, and the group-averaged attenuation of that wide group is too coarse. The total
+    fluence spectrum puts edges where the photons of every collision order are.
+    fine_bin_width_kev: bin width of the energy grid of the "scattered_fluence" balance.
     """
     G = int(config.num_groups)
     if config.group_edges_kev is not None:
@@ -425,18 +503,167 @@ def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarra
     energy_max, energy_min = spectrum_density.max_energy(), float(config.energy_min_kev)
     if not energy_max > energy_min:
         raise ValueError(f"spectrum max energy {energy_max} <= energy_min_kev {energy_min}")
-    grid = np.linspace(energy_min, energy_max, 200001)
-    cumulative = (spectrum_density.cumulative_integral(grid)
-                  - spectrum_density.cumulative_integral(np.array([energy_min]))[0])
-    if cumulative[-1] <= 0:
-        raise ValueError("spectrum has no photons in [energy_min_kev, kVp]")
-    targets = cumulative[-1] * np.arange(1, G) / G
-    indices = np.clip(np.searchsorted(cumulative, targets, side="left"), 1, grid.size - 1)
-    c0, c1 = cumulative[indices - 1], cumulative[indices]
-    t = np.where(c1 > c0, (targets - c0) / np.where(c1 > c0, c1 - c0, 1.0), 0.0)
-    inner = grid[indices - 1] + t * (grid[indices] - grid[indices - 1])
-    ascending = np.concatenate([[energy_min], inner, [energy_max]])
-    return ascending[::-1].copy()
+    method = config.group_edges_method
+    if method == "equal_fluence":
+        grid = np.linspace(energy_min, energy_max, 200001)
+        cumulative = (spectrum_density.cumulative_integral(grid)
+                      - spectrum_density.cumulative_integral(np.array([energy_min]))[0])
+        return _equal_area_edges(grid, cumulative, G, energy_min, energy_max)
+    if method == "log":
+        ascending = energy_min * (energy_max / energy_min) ** (np.arange(G + 1) / G)
+        ascending[0], ascending[-1] = energy_min, energy_max
+        return ascending[::-1].copy()
+    if method != "scattered_fluence":
+        raise ValueError(f"unknown group_edges_method {method!r}")
+    backend = resolve_backend() if backend is None else backend
+    medium = grouping_medium_densities(config)
+    key = hashlib.sha256(json.dumps([backend.name, energy_min, float(config.grouping_object_size_cm), G,
+                                     float(fine_bin_width_kev), [list(m) for m in medium]]).encode()
+                         + np.ascontiguousarray(spectrum[0], dtype=np.float64).tobytes()
+                         + np.ascontiguousarray(spectrum[1], dtype=np.float64).tobytes()).hexdigest()
+    if key not in _EDGES_MEMO:
+        bin_edges, photons = scattered_fluence_spectrum(spectrum, backend, energy_min_kev=energy_min,
+                                                        object_size_cm=float(config.grouping_object_size_cm),
+                                                        medium=medium, fine_bin_width_kev=fine_bin_width_kev)
+        cumulative = np.concatenate([[0.0], np.cumsum(photons)])
+        _EDGES_MEMO[key] = _equal_area_edges(bin_edges, cumulative, G, energy_min, energy_max)
+    return _EDGES_MEMO[key].copy()
+
+
+def _within_group_weights(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], backend, E: np.ndarray,
+                          fine_groups: np.ndarray, bin_low: np.ndarray, bin_high: np.ndarray,
+                          photons_per_bin: np.ndarray, G: int, fine_bin_width_kev: float) -> tuple[np.ndarray, list]:
+    """The weights w(E) of the fine bins within their group (they sum to 1 per group) for the group constants, and the
+    groups that fell back to a flat weight.
+
+    The source spectrum (the exact photons per bin, photons_per_bin [K]) for explicit edges and the rules
+    "equal_fluence" and "log" (the weighting of citrus <= 0.5); for "scattered_fluence" the estimated total fluence
+    phi(E) of ``scattered_fluence_spectrum`` (its density at the bin midpoint times the bin width), the spectrum of the
+    photons the groups transport: in a group far below the source energies (the lowest groups at MV) the scattered
+    photons sit near the top of the group while the source spectrum may be flat or zero there, and a source weighting
+    would give that group the attenuation of its lowest energies. A group whose weight is zero falls back to a flat
+    weight."""
+    if config.group_edges_kev is None and config.group_edges_method == "scattered_fluence":
+        bin_edges, photons = scattered_fluence_spectrum(
+            spectrum, backend, energy_min_kev=float(config.energy_min_kev),
+            object_size_cm=float(config.grouping_object_size_cm), medium=grouping_medium_densities(config),
+            fine_bin_width_kev=fine_bin_width_kev)
+        index = np.clip(np.searchsorted(bin_edges, E, side="right") - 1, 0, photons.size - 1)
+        raw = photons[index] / np.diff(bin_edges)[index] * (bin_high - bin_low)
+    else:
+        raw = photons_per_bin
+    weights = np.empty(E.size)
+    flat_fallback: list[int] = []
+    for g in range(G):
+        in_group = fine_groups == g
+        total = raw[in_group].sum()
+        if total <= 0:
+            flat_fallback.append(g)
+            weights[in_group] = (bin_high - bin_low)[in_group] / (bin_high - bin_low)[in_group].sum()
+        else:
+            weights[in_group] = raw[in_group] / total
+    return weights, flat_fallback
+
+
+def _klein_nishina_cumulative(epsilon: np.ndarray, k: np.ndarray) -> np.ndarray:
+    """Antiderivative in epsilon = E'/E of the Klein-Nishina cross section per unit epsilon (up to the factor
+    pi r_e^2 / k): d sigma / d epsilon ~ epsilon + 1/epsilon - sin^2(theta), cos(theta) = 1 + 1/k - 1/(k epsilon),
+    k = E / m_e c^2, which expands to epsilon + (1 - 2a/k)/epsilon + (a^2 - 1) + 1/(k^2 epsilon^2), a = 1 + 1/k.
+    epsilon, k broadcastable arrays (epsilon in [1/(1 + 2k), 1])."""
+    a = 1.0 + 1.0 / k
+    return (0.5 * epsilon * epsilon + (1.0 - 2.0 * a / k) * np.log(epsilon) + (a * a - 1.0) * epsilon
+            - 1.0 / (k * k * epsilon))
+
+
+def grouping_medium_densities(config: SolverConfig) -> tuple[tuple[str, float], ...]:
+    """The medium of the "scattered_fluence" balance as ((catalogue name, density g/cm^3), ...), sorted by name, the
+    densities rounded to 3 significant digits and the traces below 1e-3 of the largest density dropped (the form that
+    enters the cache key and the balance, so that nearly equal media share a cache entry): ``config.grouping_medium``
+    "auto" not yet replaced by a measurement (`citrus_recon`, `synthesize_cone_beam_data` do that) -> water at 1.0; a
+    catalogue name -> that material at its nominal density; a mapping -> its entries."""
+    medium = config.grouping_medium
+    if isinstance(medium, str):
+        name = "water" if medium == "auto" else medium
+        entries = [(name, float(MATERIAL_CATALOGUE[name][0]))]
+    else:
+        entries = [(str(name), float(density)) for name, density in medium]
+    largest = max((density for _, density in entries), default=0.0)
+    rounded = sorted((name, float(f"{density:.3g}")) for name, density in entries
+                     if density > 0 and density >= 1e-3 * largest)
+    if not rounded:
+        raise ValueError(f"grouping_medium {medium!r} has no material of positive density")
+    return tuple(rounded)
+
+
+def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend: Optional["_XrayPhysicsBackend"] = None,
+                               *, energy_min_kev: float = 10.0, object_size_cm: float = 20.0,
+                               medium: Sequence[tuple[str, float]] = (("water", 1.0),),
+                               fine_bin_width_kev: float = 0.5,
+                               max_bins: int = 2000) -> tuple[np.ndarray, np.ndarray]:
+    """Estimate of the total photon fluence spectrum (source plus scattered photons) inside the object: the grouping
+    heuristic of ``make_group_edges`` ("scattered_fluence"), also the within-group weight of that rule. Not a transport
+    result.
+
+    One-dimensional (energy only) slowing-down balance in a medium (``medium``: (catalogue name, density g/cm^3) per
+    material; default water at 1 g/cm^3) with a leakage loss 1/L, L = object_size_cm the characteristic chord length of
+    the object:
+
+        phi(E) = [S(E) + int_{E' > E} mu_C(E') p(E | E') phi(E') dE'] / (mu_t(E) - mu_R(E) + 1/L)
+
+    with S the source spectrum, mu_C, mu_R, mu_t the Compton, Rayleigh and total attenuation of the medium (elemental
+    XrayPhysics cross sections mixed by the catalogue compositions and the densities),
+    p(E | E') the energy distribution of a Compton photon scattered at E' (Klein-Nishina, normalized; Compton
+    kinematics without binding), Rayleigh ignored (it does not change the energy, so it is neither a loss nor a gain
+    here), photons below energy_min_kev absorbed. L -> 0 gives phi = S L (the source spectrum, "equal_fluence");
+    L -> infinity the spectrum of an infinite medium, where every photon is eventually absorbed.
+
+    Discretization: equal bins of width max(fine_bin_width_kev, (kVp - energy_min_kev) / max_bins) over
+    [energy_min_kev, kVp], source photons per bin integrated exactly from the piecewise-linear spectrum, the
+    Klein-Nishina probability of each bin integrated in closed form (``_klein_nishina_cumulative``) for a photon at the
+    centre of the source bin (scattering within the bin is kept, on the left side), one sweep from the highest bin
+    down. Returns (bin_edges [n + 1] keV ascending, photons [n]: phi integrated over each bin, in units of the source
+    spectrum times cm)."""
+    backend = resolve_backend() if backend is None else backend
+    density = _Spectrum(*spectrum)
+    energy_max, energy_min = density.max_energy(), float(energy_min_kev)
+    if not energy_max > energy_min:
+        raise ValueError(f"spectrum max energy {energy_max} <= energy_min_kev {energy_min}")
+    if not object_size_cm > 0:
+        raise ValueError(f"object_size_cm must be > 0, got {object_size_cm}")
+    width = max(float(fine_bin_width_kev), (energy_max - energy_min) / int(max_bins))
+    n = max(1, int(math.ceil((energy_max - energy_min) / width - 1e-9)))
+    bin_edges = np.linspace(energy_min, energy_max, n + 1)
+    low, high = bin_edges[:-1], bin_edges[1:]
+    E = 0.5 * (low + high)
+    source = density.cumulative_integral(high) - density.cumulative_integral(low)
+    element_density: dict[int, float] = {}  # g/cm^3 of every element in the medium
+    for name, material_density in medium:
+        if name not in MATERIAL_CATALOGUE:
+            raise ValueError(f"unknown material {name!r} in the grouping medium (not in the catalogue, "
+                             f"cross_sections.MATERIAL_CATALOGUE)")
+        for Z, fraction in parse_formula(MATERIAL_CATALOGUE[name][1], backend.atomic_mass).items():
+            element_density[Z] = element_density.get(Z, 0.0) + float(material_density) * fraction
+
+    def mu(kind: str) -> np.ndarray:  # linear attenuation of the medium, 1/cm, at the bin centres
+        return sum(rho_Z * backend.sigma(kind, Z, E) for Z, rho_Z in sorted(element_density.items()))
+
+    mu_compton = mu("compton")
+    removal = mu("total") - mu("rayleigh") + 1.0 / float(object_size_cm)
+    # p[j, i]: probability that a Compton photon at E[j] lands in bin i (energy E[j] epsilon, epsilon in [eps_min, 1])
+    k = (E / ELECTRON_REST_KEV)[:, None]
+    epsilon_min = 1.0 / (1.0 + 2.0 * k)
+    epsilon_low = np.clip(low[None, :] / E[:, None], epsilon_min, 1.0)
+    epsilon_high = np.clip(np.minimum(high[None, :], E[:, None]) / E[:, None], epsilon_min, 1.0)
+    epsilon_high = np.maximum(epsilon_high, epsilon_low)
+    total = _klein_nishina_cumulative(np.ones_like(epsilon_min), k) - _klein_nishina_cumulative(epsilon_min, k)
+    probability = (_klein_nishina_cumulative(epsilon_high, k) - _klein_nishina_cumulative(epsilon_low, k)) / total
+    phi = np.zeros(n)
+    inscatter = np.zeros(n)  # sum over higher bins j of mu_C[j] p[j, i] phi[j]
+    for i in range(n - 1, -1, -1):
+        phi[i] = (source[i] + inscatter[i]) / (removal[i] - mu_compton[i] * probability[i, i])
+        if i:
+            inscatter[:i] += mu_compton[i] * probability[i, :i] * phi[i]
+    return bin_edges, phi
 
 
 def fine_energy_grid(edges: np.ndarray,
@@ -564,7 +791,8 @@ def compute_library(
     """Build the library without caching; also return diagnostics.
 
     Args:
-      config: uses num_groups, group_edges_kev, energy_min_kev, legendre_order, num_eta_table.
+      config: uses num_groups, group_edges_kev, group_edges_method, grouping_object_size_cm, energy_min_kev,
+        legendre_order, num_eta_table, angular_table_grid.
       spectrum: (energies keV [K], photon density per keV [K]); None -> default 125 kVp spectrum.
       backend: a loaded ``resolve_backend()`` object (None loads one).
       fine_bin_width_kev: maximum fine energy bin width (<= 0.5 keV for production).
@@ -579,7 +807,8 @@ def compute_library(
     backend = resolve_backend() if backend is None else backend
     spectrum_energies, spectrum_weights = _spectrum_or_default(spectrum, backend)
     spectrum_density = _Spectrum(spectrum_energies, spectrum_weights)
-    edges = make_group_edges(config, (spectrum_energies, spectrum_weights))
+    edges = make_group_edges(config, (spectrum_energies, spectrum_weights), backend,
+                             fine_bin_width_kev=fine_bin_width_kev)
     G = edges.size - 1
     L = int(config.legendre_order)
     table = sort_material_table(config, materials, (spectrum_energies, spectrum_weights), backend,
@@ -593,16 +822,11 @@ def compute_library(
     K = E.size
     # exact spectrum photons per fine bin [K]
     photons_per_bin = spectrum_density.cumulative_integral(bin_high) - spectrum_density.cumulative_integral(bin_low)
-    flat_fallback: list[int] = []
-    within_group_weight = np.empty(K)  # within-group spectrum weight (flat where the group has no photons)
-    for g in range(G):
-        in_group = fine_groups == g
-        total = photons_per_bin[in_group].sum()
-        if total <= 0:
-            flat_fallback.append(g)
-            within_group_weight[in_group] = (bin_high - bin_low)[in_group] / (bin_high - bin_low)[in_group].sum()
-        else:
-            within_group_weight[in_group] = photons_per_bin[in_group] / total
+    # within-group weight: the source spectrum, or the estimated total fluence for "scattered_fluence" (flat where a
+    # group has no weight)
+    within_group_weight, flat_fallback = _within_group_weights(
+        config, (spectrum_energies, spectrum_weights), backend, E, fine_groups, bin_low, bin_high, photons_per_bin, G,
+        fine_bin_width_kev)
     if flat_fallback:
         warnings.warn(f"zero spectrum in groups {flat_fallback}; flat within-group weight used", RuntimeWarning)
 
@@ -632,23 +856,28 @@ def compute_library(
     eta_reference, w_reference = eta_quadrature_in_q(_Q_BREAKPOINTS, gauss_legendre_nodes)
     legendre_reference = legendre_table(eta_reference, L)  # [L+1, Nr]
     N_eta = int(config.num_eta_table)
-    eta_grid = np.linspace(-1.0, 1.0, N_eta)
+    adaptive = config.angular_table_grid == "adaptive"
+    num_elements = len(elements)
 
     mu_s_l = np.zeros((M, G, G, L + 1))
     compton_below = np.zeros((M, G))
-    mu_s_eta = np.zeros((M, G, G, N_eta))
     rayleigh_l = np.zeros((M, G, L + 1))
-    rayleigh_eta = np.zeros((M, G, N_eta))
-    # Table kinematics: at fixed eta, E' lands in [edges[j+1], edges[j]) iff E lies in
-    # [E_b(edges[j+1], eta), E_b(edges[j], eta)) with E_b(e, eta) = 1 / (1/e - (1 - eta)/m_e)
-    # (+inf when 1/e <= (1 - eta)/m_e). Each fine bin contributes the fraction of its width inside
-    # that interval, so the tabulated transfer is continuous in eta (a midpoint indicator would
-    # give a staircase with 0.5 keV steps).
-    inv_b = 1.0 / edges[:, None] - (1.0 - eta_grid[None, :]) / m_e  # [G+1, N_eta]
-    E_b = np.where(inv_b > 0, 1.0 / np.where(inv_b > 0, inv_b, 1.0), np.inf)
+    # per fine energy and element: scale [M] of the raw angular shapes (sigma_x w_Z / quadrature norm)
+    compton_scales = np.zeros((K, num_elements, M))
+    rayleigh_scales = np.zeros((K, num_elements, M))
+    # adaptive table: the per-steradian shapes of the map materials on the reference quadrature [K, M_map, Nr]
+    if adaptive:
+        map_composition = material_composition(backend, material_table(ANGULAR_MAP_MATERIALS))
+        map_elements = sorted({Z for c in map_composition.values() for Z in c})
+        map_fractions = np.array([[map_composition[m].get(Z, 0.0) for Z in map_elements]
+                                  for m in ANGULAR_MAP_MATERIALS])  # [M_map, NZ_map]
+        map_sigma = {kind: {Z: backend.sigma(kind, Z, E) for Z in map_elements} for kind in ("compton", "rayleigh")}
+        compton_shapes = np.zeros((K, len(ANGULAR_MAP_MATERIALS), eta_reference.size))
+        rayleigh_shapes = np.zeros_like(compton_shapes)
     normalization_deviation = 0.0
     have_library_normalization = True
 
+    # pass 1: normalizations, Legendre moments (and the reference shapes of the angular map)
     for k in range(K):
         energy_k, g, weight_k = float(E[k]), int(fine_groups[k]), float(within_group_weight[k])
         # Compton eta pieces: kinematic group edges below Ek plus fixed q breaks.
@@ -662,8 +891,7 @@ def compute_library(
 
         compton_pieces = np.zeros((M, eta_compton.size))
         rayleigh_reference = np.zeros((M, eta_reference.size))
-        compton_table = np.zeros((M, N_eta))
-        rayleigh_table = np.zeros((M, N_eta))
+        element_shapes: dict[int, tuple] = {}  # Z -> raw shapes and norms on the reference quadrature (adaptive)
         for element_index, Z in enumerate(elements):
             compton_shape = backend.pdf_raw("compton", Z, energy_k, eta_reference)
             rayleigh_shape = backend.pdf_raw("rayleigh", Z, energy_k, eta_reference)
@@ -679,11 +907,25 @@ def compute_library(
             compton_scale = mass_fractions[:, element_index] * element_sigma["compton"][element_index, k] / compton_norm
             rayleigh_scale = (mass_fractions[:, element_index] * element_sigma["rayleigh"][element_index, k]
                               / rayleigh_norm)
+            compton_scales[k, element_index] = compton_scale
+            rayleigh_scales[k, element_index] = rayleigh_scale
             compton_shape_pieces = backend.pdf_raw("compton", Z, energy_k, eta_compton)
             compton_pieces += compton_scale[:, None] * compton_shape_pieces[None, :]
             rayleigh_reference += rayleigh_scale[:, None] * rayleigh_shape[None, :]
-            compton_table += compton_scale[:, None] * backend.pdf_raw("compton", Z, energy_k, eta_grid)[None, :]
-            rayleigh_table += rayleigh_scale[:, None] * backend.pdf_raw("rayleigh", Z, energy_k, eta_grid)[None, :]
+            if adaptive:
+                element_shapes[Z] = (compton_shape, compton_norm, rayleigh_shape, rayleigh_norm)
+        if adaptive:
+            for map_index, Z in enumerate(map_elements):
+                if Z not in element_shapes:
+                    shape_c = backend.pdf_raw("compton", Z, energy_k, eta_reference)
+                    shape_r = backend.pdf_raw("rayleigh", Z, energy_k, eta_reference)
+                    element_shapes[Z] = (shape_c, _TWO_PI * float(np.dot(w_reference, shape_c)), shape_r,
+                                         _TWO_PI * float(np.dot(w_reference, shape_r)))
+                shape_c, norm_c, shape_r, norm_r = element_shapes[Z]
+                compton_shapes[k] += (map_fractions[:, map_index] * map_sigma["compton"][Z][k] / norm_c)[:, None] \
+                    * shape_c[None, :]
+                rayleigh_shapes[k] += (map_fractions[:, map_index] * map_sigma["rayleigh"][Z][k] / norm_r)[:, None] \
+                    * shape_r[None, :]
 
         # Legendre moments: Compton binned by outgoing group (+1 shift; column 0 = below cutoff)
         contribution = (_TWO_PI * weight_k * (compton_pieces * w_compton[None, :])[:, None, :]
@@ -697,13 +939,16 @@ def compute_library(
         mu_s_l[:, g, g, :] += rayleigh_moments
         rayleigh_l[:, g, :] += rayleigh_moments
 
-        # Direct per-steradian tables
-        bin_low_k, bin_high_k = float(bin_low[k]), float(bin_high[k])
-        fraction = (np.clip(np.minimum(bin_high_k, E_b[g:G]) - np.maximum(bin_low_k, E_b[g + 1:G + 1]), 0.0, None)
-                    / (bin_high_k - bin_low_k))
-        mu_s_eta[:, g, g:, :] += weight_k * compton_table[:, None, :] * fraction[None, :, :]
-        mu_s_eta[:, g, g, :] += weight_k * rayleigh_table
-        rayleigh_eta[:, g, :] += weight_k * rayleigh_table
+    # node placement, then pass 2: the direct per-steradian tables at the nodes
+    eta_map = None
+    if adaptive:
+        eta_map = angular_map(np.sqrt(np.clip((1.0 - eta_reference) / 2.0, 0.0, 1.0)), compton_shapes, rayleigh_shapes,
+                              fine_groups, bin_low, bin_high, within_group_weight, edges)
+        eta_grid = angular_table_nodes(N_eta, torch.as_tensor(eta_map)).numpy()
+    else:
+        eta_grid = np.linspace(-1.0, 1.0, N_eta)
+    mu_s_eta, rayleigh_eta = _direct_transfer_table(eta_grid, backend, elements, E, fine_groups, bin_low, bin_high,
+                                                    within_group_weight, edges, compton_scales, rayleigh_scales)
 
     info = BuildInfo(
         backend=backend.name,
@@ -745,8 +990,180 @@ def compute_library(
         fine_group=torch.as_tensor(np.ascontiguousarray(fine_groups[keep]), dtype=torch.int64),
         materials=names,
         nominal_density=to_tensor(nominal),
+        eta_map=None if eta_map is None else to_tensor(eta_map),
     )
     return library, info
+
+
+def _direct_transfer_table(eta: np.ndarray, backend: "_XrayPhysicsBackend", elements: Sequence[int], E: np.ndarray,
+                           fine_groups: np.ndarray, bin_low: np.ndarray, bin_high: np.ndarray,
+                           within_group_weight: np.ndarray, edges: np.ndarray, compton_scales: np.ndarray,
+                           rayleigh_scales: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The per-steradian transfer at the cos-angles eta [n] (any order): (mu_s_eta [M, G, G, n], rayleigh_eta
+    [M, G, n]) in cm^2/g/sr, Compton with the exact fraction of every fine bin that lands in each outgoing group plus
+    within-group Rayleigh, from the raw backend shapes times the per-element scales [K, NZ, M] of pass 1 of
+    ``compute_library`` (fine energies E [K] of groups fine_groups, bins [bin_low, bin_high], within-group weights)."""
+    m_e = ELECTRON_REST_KEV
+    G = edges.size - 1
+    K, _, M = compton_scales.shape
+    n = eta.size
+    mu_s_eta = np.zeros((M, G, G, n))
+    rayleigh_eta = np.zeros((M, G, n))
+    # Table kinematics: at fixed eta, E' lands in [edges[j+1], edges[j]) iff E lies in
+    # [E_b(edges[j+1], eta), E_b(edges[j], eta)) with E_b(e, eta) = 1 / (1/e - (1 - eta)/m_e)
+    # (+inf when 1/e <= (1 - eta)/m_e). Each fine bin contributes the fraction of its width inside
+    # that interval, so the tabulated transfer is continuous in eta (a midpoint indicator would
+    # give a staircase with 0.5 keV steps).
+    inv_b = 1.0 / edges[:, None] - (1.0 - eta[None, :]) / m_e  # [G+1, n]
+    E_b = np.where(inv_b > 0, 1.0 / np.where(inv_b > 0, inv_b, 1.0), np.inf)
+    for k in range(K):
+        energy_k, g, weight_k = float(E[k]), int(fine_groups[k]), float(within_group_weight[k])
+        compton_table = np.zeros((M, n))
+        rayleigh_table = np.zeros((M, n))
+        for element_index, Z in enumerate(elements):
+            compton_table += compton_scales[k, element_index][:, None] * backend.pdf_raw("compton", Z, energy_k,
+                                                                                         eta)[None, :]
+            rayleigh_table += rayleigh_scales[k, element_index][:, None] * backend.pdf_raw("rayleigh", Z, energy_k,
+                                                                                           eta)[None, :]
+        bin_low_k, bin_high_k = float(bin_low[k]), float(bin_high[k])
+        fraction = (np.clip(np.minimum(bin_high_k, E_b[g:G]) - np.maximum(bin_low_k, E_b[g + 1:G + 1]), 0.0, None)
+                    / (bin_high_k - bin_low_k))
+        mu_s_eta[:, g, g:, :] += weight_k * compton_table[:, None, :] * fraction[None, :, :]
+        mu_s_eta[:, g, g, :] += weight_k * rayleigh_table
+        rayleigh_eta[:, g, :] += weight_k * rayleigh_table
+    return mu_s_eta, rayleigh_eta
+
+
+def _smooth(x: np.ndarray, width: int) -> np.ndarray:
+    """Moving average of x [n] over `width` samples (odd; the window shrinks at the ends, so a constant stays)."""
+    half = max(0, int(width) // 2)
+    if half == 0:
+        return x.copy()
+    padded = np.concatenate([[0.0], np.cumsum(x)])
+    index = np.arange(x.size)
+    lo, hi = np.maximum(index - half, 0), np.minimum(index + half + 1, x.size)
+    return (padded[hi] - padded[lo]) / (hi - lo)
+
+
+def angular_map(q_nodes: np.ndarray, compton_shapes: np.ndarray, rayleigh_shapes: np.ndarray, fine_groups: np.ndarray,
+                bin_low: np.ndarray, bin_high: np.ndarray, within_group_weight: np.ndarray, edges: np.ndarray, *,
+                num_knots: int = ANGULAR_MAP_KNOTS, num_reference: int = 20001, floor: float = 0.1,
+                negligible: float = 1.0e-6) -> np.ndarray:
+    """The node placement of an adaptive transfer table: the map u = h(eta) at the knots q_k = k / (num_knots - 1) of
+    q = sin(theta/2) = sqrt((1 - eta)/2), float64 [num_knots], strictly decreasing from 1 (eta = 1) to 0 (eta = -1)
+    (``MultigroupLibrary.eta_map``; the table node j sits at u = j / (N - 1)).
+
+    Inputs: q_nodes [Nr] ascending (the reference angular quadrature of the build, dense near q = 0),
+    compton_shapes / rayleigh_shapes [K, M, Nr] the per-material per-steradian Compton / Rayleigh cross sections of
+    every fine energy at those nodes (cm^2/g/sr, before the kinematic group fraction; the build passes those of
+    ``ANGULAR_MAP_MATERIALS``), the fine-energy bins (groups
+    fine_groups [K], edges bin_low / bin_high [K] keV, within-group weights [K]) and the group edges [G+1] keV.
+
+    1. Every transfer curve f_{m, g, g'}(q) (material m, source group g, destination group g' >= g; Compton with the
+       kinematic fraction of every fine bin, plus Rayleigh for g' = g) is evaluated on num_reference points uniform in
+       q, from cubic splines through the shapes at q_nodes (the reference grid resolves the MeV forward peaks, whose
+       width in q is about 5e-4 at 6 MeV).
+    2. Node density: rho(q) = max over the curves (those above `negligible` times the largest curve of the same m, g)
+       of sqrt(|f''(q)| / max f), the density that equalizes the error of linear interpolation relative to each
+       curve's maximum; smoothed over two knot intervals so that neighbouring node spacings change gradually.
+    3. Floor: the normalized density is mixed as (1 - floor) rho / int rho + floor 2q, so every region keeps at least
+       `floor` times the node density of a uniform table in eta (2q is that density in q), and h is strictly monotone.
+    4. h = 1 - (cumulative integral of the density from q = 0) / (total), sampled at the knots.
+    Between knots the map is linear in q, so linear interpolation between table nodes is linear in q there."""
+    from scipy.interpolate import CubicSpline
+
+    m_e = ELECTRON_REST_KEV
+    K, M, _ = compton_shapes.shape
+    G = edges.size - 1
+    q = np.linspace(0.0, 1.0, int(num_reference))
+    dq = q[1] - q[0]
+    eta = 1.0 - 2.0 * q * q
+    inv_b = 1.0 / edges[:, None] - (1.0 - eta[None, :]) / m_e  # [G+1, R]
+    E_b = np.where(inv_b > 0, 1.0 / np.where(inv_b > 0, inv_b, 1.0), np.inf)
+    density = np.zeros(q.size)
+    curves = np.zeros((M, G, q.size))  # the curves of the current source group
+
+    def finish(g: int) -> None:
+        block = curves[:, g:, :]  # [M, G - g, R]
+        peak = np.abs(block).max(axis=2)  # [M, G - g]
+        keep = peak > negligible * peak.max(axis=1, keepdims=True)
+        keep &= peak > 0
+        if keep.any():
+            selected = block[keep] / peak[keep][:, None]
+            second = np.abs(selected[:, :-2] - 2.0 * selected[:, 1:-1] + selected[:, 2:])
+            density[1:-1] = np.maximum(density[1:-1], np.sqrt(second.max(axis=0)) / dq)
+        curves[:] = 0.0
+
+    current = int(fine_groups[0]) if K else 0
+    for k in range(K):
+        g = int(fine_groups[k])
+        if g != current:
+            finish(current)
+            current = g
+        spline = CubicSpline(q_nodes, np.concatenate([compton_shapes[k], rayleigh_shapes[k]]), axis=1)
+        values = spline(q)  # [2M, R]
+        compton, rayleigh = values[:M], values[M:]
+        fraction = (np.clip(np.minimum(bin_high[k], E_b[g:G]) - np.maximum(bin_low[k], E_b[g + 1:G + 1]), 0.0, None)
+                    / (bin_high[k] - bin_low[k]))  # [G - g, R]
+        weight = float(within_group_weight[k])
+        curves[:, g:, :] += weight * compton[:, None, :] * fraction[None, :, :]
+        curves[:, g, :] += weight * rayleigh
+    if K:
+        finish(current)
+    density[0], density[-1] = density[1], density[-2]
+    knot_width = (q.size - 1) / (int(num_knots) - 1)
+    density = _smooth(_smooth(density, 2 * int(round(knot_width)) + 1), 2 * int(round(knot_width)) + 1)
+    total = float(np.sum(0.5 * (density[1:] + density[:-1])) * dq)
+    uniform = 2.0 * q  # node density in q of a table uniform in eta (unit integral over [0, 1])
+    mixed = (1.0 - floor) * density / total + floor * uniform if total > 0 else uniform
+    cumulative = np.concatenate([[0.0], np.cumsum(0.5 * (mixed[1:] + mixed[:-1]) * dq)])
+    knots = np.linspace(0.0, 1.0, int(num_knots))
+    u = 1.0 - np.interp(knots, q, cumulative) / cumulative[-1]
+    u[0], u[-1] = 1.0, 0.0
+    if not np.all(np.diff(u) < 0):
+        raise RuntimeError("angular map is not strictly monotone")
+    return u
+
+
+def transfer_at_eta(config: SolverConfig, eta: np.ndarray, spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+                    backend: "_XrayPhysicsBackend | None" = None, *, fine_bin_width_kev: float = 0.5,
+                    gauss_legendre_nodes: int = 32, materials: Optional[MaterialTable] = None) -> np.ndarray:
+    """The exact per-steradian transfer mu_s(eta) [M, G, G, n] (cm^2/g/sr; the quantity ``mu_s_eta`` tabulates,
+    without interpolation) of the library ``compute_library`` builds with the same arguments, at the cos-angles
+    eta [n]: for measuring the interpolation error of a table (tests, validation). Same cost per point as a table
+    node of the build."""
+    backend = resolve_backend() if backend is None else backend
+    spectrum_energies, spectrum_weights = _spectrum_or_default(spectrum, backend)
+    spectrum_density = _Spectrum(spectrum_energies, spectrum_weights)
+    edges = make_group_edges(config, (spectrum_energies, spectrum_weights), backend,
+                             fine_bin_width_kev=fine_bin_width_kev)
+    G = edges.size - 1
+    table = sort_material_table(config, materials, (spectrum_energies, spectrum_weights), backend,
+                                fine_bin_width_kev=fine_bin_width_kev)
+    names = tuple(n for n, _, _ in table)
+    E, fine_groups, bin_low, bin_high = fine_energy_grid(edges, fine_bin_width_kev)
+    photons_per_bin = spectrum_density.cumulative_integral(bin_high) - spectrum_density.cumulative_integral(bin_low)
+    within_group_weight, _ = _within_group_weights(config, (spectrum_energies, spectrum_weights), backend, E,
+                                                   fine_groups, bin_low, bin_high, photons_per_bin, G,
+                                                   fine_bin_width_kev)
+    composition = material_composition(backend, table)
+    elements = sorted({Z for c in composition.values() for Z in c})
+    mass_fractions = np.array([[composition[m].get(Z, 0.0) for Z in elements] for m in names])
+    eta_reference, w_reference = eta_quadrature_in_q(_Q_BREAKPOINTS, gauss_legendre_nodes)
+    compton_scales = np.zeros((E.size, len(elements), len(names)))
+    rayleigh_scales = np.zeros_like(compton_scales)
+    for element_index, Z in enumerate(elements):
+        sigma_compton, sigma_rayleigh = backend.sigma("compton", Z, E), backend.sigma("rayleigh", Z, E)
+        for k in range(E.size):
+            compton_norm = _TWO_PI * float(np.dot(w_reference, backend.pdf_raw("compton", Z, float(E[k]),
+                                                                                eta_reference)))
+            rayleigh_norm = _TWO_PI * float(np.dot(w_reference, backend.pdf_raw("rayleigh", Z, float(E[k]),
+                                                                                 eta_reference)))
+            compton_scales[k, element_index] = mass_fractions[:, element_index] * sigma_compton[k] / compton_norm
+            rayleigh_scales[k, element_index] = mass_fractions[:, element_index] * sigma_rayleigh[k] / rayleigh_norm
+    eta = np.asarray(eta, dtype=np.float64).ravel()
+    return _direct_transfer_table(eta, backend, elements, E, fine_groups, bin_low, bin_high, within_group_weight,
+                                  edges, compton_scales, rayleigh_scales)[0]
 
 
 def _cache_key(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], backend_name: str,
@@ -759,6 +1176,10 @@ def _cache_key(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], ba
         "energy_min_kev": float(config.energy_min_kev),
         "legendre_order": int(config.legendre_order),
         "num_eta_table": int(config.num_eta_table),
+        "angular_table_grid": str(config.angular_table_grid),
+        "group_edges_method": str(config.group_edges_method),
+        "grouping_object_size_cm": float(config.grouping_object_size_cm),
+        "grouping_medium": [list(m) for m in grouping_medium_densities(config)],
         # the on-disk key names of citrus <= 0.3.0 (renaming them would orphan every cached library)
         "de_kev": float(fine_bin_width_kev),
         "n_gl": int(gauss_legendre_nodes),
@@ -793,8 +1214,8 @@ def build_library(
       group_edges [G+1] desc, group_energy [G], spectrum_fraction [G], mu_t/mu_pe [M, G],
       mu_s_l [M, G, G, L+1], eta_grid [num_eta_table], mu_s_eta [M, G, G, num_eta_table],
       fine_energy [E], fine_mu_t [M, E], fine_weight [E], fine_group [E] (int64; E ~ (kVp - E_min) /
-      fine_bin_width_kev); float64 CPU tensors, per unit density (cm^2/g, cm^2/g/sr); plus materials (names) and
-      nominal_density [M].
+      fine_bin_width_kev); float64 CPU tensors, per unit density (cm^2/g, cm^2/g/sr); plus materials (names),
+      nominal_density [M] and eta_map [ANGULAR_MAP_KNOTS] (None for config.angular_table_grid "uniform").
 
     The cache file is ``<cache_dir>/mglib_<hash>.pt`` keyed by the build version, the relevant config
     fields, the spectrum arrays, the backend name, the numerical parameters and the SORTED material table (names,

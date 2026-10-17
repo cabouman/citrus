@@ -1,13 +1,13 @@
 """The material catalogue and the user-selected reference materials (version 0.5.0): every catalogue entry builds in the
-library; `SolverConfig.materials` selects the reference materials, the default set keeps the cache key and the library
-of version
-0.4.0 bit for bit; any set is sorted by nominal attenuation and has its own cache entry; the density model, the WLAB
-phantom, the data generator and the solver work on a reduced set (air, water, bone) and on an extended one (the seven
-plus titanium); unknown names, a single reference material and a set without water or bone for the WLAB phantom
-raise."""
+library; `SolverConfig.materials` selects the reference materials, the default set has one cache key and one library
+(the legacy options of version 0.6.0 reproduce the library of version 0.5.1 bit for bit); any set is sorted by
+nominal attenuation and has its own cache entry; the density model, the WLAB phantom, the data generator and the
+solver work on a reduced set (air, water, bone) and on an extended one (the seven plus titanium); unknown names, a
+single reference material and a set without water or bone for the WLAB phantom raise."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -18,7 +18,8 @@ import torch
 
 from citrus.citrus import DensityModel
 from citrus.scatter_solver.config import SolverConfig
-from citrus.scatter_solver.cross_sections import (BONE, MATERIAL_CATALOGUE, MATERIAL_TABLE, MATERIALS,
+from citrus.scatter_solver.cross_sections import (BONE, COMPOUND_NAMES, ELEMENT_DENSITIES, ELEMENT_NAMES,
+                                                  ELEMENT_SYMBOLS, MATERIAL_CATALOGUE, MATERIAL_TABLE, MATERIALS,
                                                   NOMINAL_DENSITIES, WATER, material_index,
                                                   material_table)
 from citrus.scatter_solver.detector import csi_response, no_grid
@@ -40,9 +41,16 @@ SMALL_BUILD = dict(fine_bin_width_kev=2.0, gauss_legendre_nodes=8)
 SMALL_SOLVER = replace(SMALL, num_polar=4, num_azimuthal=8, cone_num_polar=8, cone_num_azimuthal=16,
                        transport_cell_cm=4.0, source_iteration_tolerance=1e-4, max_source_iterations=40)
 GRID = Grid((10, 16, 20), 2.0)  # the WLAB problem of tests/test_materials.py
-# cache keys of version 0.4.0 (default seven materials): SolverConfig() at 0.5 keV / 32 nodes, SMALL at 2 keV / 8
-KEY_DEFAULT_V040 = "e552a2c1b51c1763c095"
-KEY_SMALL_V040 = "f265308331a0df47b4c0"
+# cache keys of version 0.6.0 (default seven materials): SolverConfig() at 0.5 keV / 32 nodes, SMALL at 2 keV / 8
+# (version 0.6.0 changed the build version and added the angular table grid, the group rule, the grouping object size
+# and the grouping medium to the key)
+KEY_DEFAULT_V060 = "5fada174f9a5ad6f6d10"
+KEY_SMALL_V060 = "4f0c551f679bcdf821c3"
+# the library options of versions <= 0.5 (uniform eta table, equal-fluence groups)
+LEGACY_LIBRARY = dict(angular_table_grid="uniform", group_edges_method="equal_fluence")
+# SHA-256 of the tensors of the SMALL build of version 0.5.1 (SMALL_BUILD, default seven materials; field name then the
+# float64 / int64 bytes, in field order): the legacy options reproduce it bit for bit
+SMALL_V051_SHA256 = "82733c2e779aa7a5667e7086b83f494685799dc010ad6aef2460778aac1f56a5"
 REFERENCE = Path(__file__).parent / "data" / "pre_quadrature_reference.json"
 
 
@@ -114,8 +122,8 @@ def test_catalogue_and_default_set():
 
 def test_material_names_are_checked():
     SolverConfig(materials=REDUCED).validate()
-    with pytest.raises(ValueError, match="unknown material name.*plutonium.*catalogue"):
-        SolverConfig(materials=("water", "plutonium")).validate()
+    with pytest.raises(ValueError, match="unknown material name.*unobtainium.*catalogue.*English name"):
+        SolverConfig(materials=("water", "unobtainium")).validate()
     with pytest.raises(ValueError, match="at least 2"):
         SolverConfig(materials=("water",)).validate()
     with pytest.raises(ValueError, match="duplicate"):
@@ -149,10 +157,34 @@ def test_wlab_phantom_by_name():
 
 # ---- library builds -------------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("name", list(MATERIAL_CATALOGUE))
+def test_every_catalogue_entry_parses(library_module):
+    """Every catalogue entry (the compounds and the 100 elements) has a positive density and a composition that
+    parses to mass fractions summing to 1; the elements follow the compounds, one per atomic number 1..100 (aluminium
+    and titanium among the compounds), with XrayPhysics' standard densities."""
+    backend = library_module.resolve_backend()
+    names = tuple(MATERIAL_CATALOGUE)
+    assert names[:len(COMPOUND_NAMES)] == COMPOUND_NAMES and len(set(names)) == len(names)
+    assert len(ELEMENT_NAMES) == len(ELEMENT_SYMBOLS) == len(ELEMENT_DENSITIES) == 100
+    assert set(ELEMENT_NAMES) <= set(names) and {"lead", "tungsten", "carbon"} <= set(names)
+    for name, (density, formula) in MATERIAL_CATALOGUE.items():
+        composition = library_module.parse_formula(formula, backend.atomic_mass)
+        assert density > 0 and sum(composition.values()) == pytest.approx(1.0, abs=1e-12), name
+    for Z, (name, symbol, density) in enumerate(zip(ELEMENT_NAMES, ELEMENT_SYMBOLS, ELEMENT_DENSITIES), start=1):
+        assert MATERIAL_CATALOGUE[name][1] == symbol
+        assert library_module.parse_formula(symbol, backend.atomic_mass) == {Z: 1.0}
+        assert density == pytest.approx(backend._xray_physics.massDensity(Z), rel=1e-5), name
+    assert MATERIAL_CATALOGUE["lead"] == (11.35, "Pb") and MATERIAL_CATALOGUE["tungsten"] == (19.3, "W")
+
+
+# the compounds and a sample of the elements (every 10th atomic number, lead and tungsten): one build each
+SAMPLE_ELEMENTS = tuple(ELEMENT_NAMES[Z - 1] for Z in range(10, 101, 10)) + ("lead", "tungsten")
+
+
+@pytest.mark.parametrize("name", list(COMPOUND_NAMES) + list(SAMPLE_ELEMENTS))
 def test_every_catalogue_material_builds(name, library_module):
-    """Each catalogue entry alone builds a library (small configuration): shapes, positive coefficients, the nominal
-    density, a composition whose mass fractions sum to 1."""
+    """Each compound and each sampled element alone builds a library (small configuration): shapes, positive
+    coefficients, the nominal density, a composition whose mass fractions sum to 1 (lead and tungsten have their K
+    edges at 88 and 69.5 keV, inside the 125 kVp spectrum)."""
     backend = library_module.resolve_backend()
     library, info = library_module.compute_library(SMALL, None, backend, materials=material_table((name,)),
                                                    **SMALL_BUILD)
@@ -165,25 +197,34 @@ def test_every_catalogue_material_builds(name, library_module):
 
 
 def test_default_set_keeps_the_cache_key_and_library(library_module, tmp_path, monkeypatch):
-    """The default reference materials give the cache keys of version 0.4.0 (existing caches are found) and the same
-    library bit
-    for bit, whether the table is None, the default set by name or the same set in another order (sorted by nominal
-    attenuation before the key and the build)."""
+    """The default reference materials give the cache keys of version 0.6.0 and the same library bit for bit, whether
+    the table is None, the default set by name or the same set in another order (sorted by nominal attenuation before
+    the key and the build); the options of version 0.5 (uniform table, equal-fluence groups) reproduce the library of
+    version 0.5.1 bit for bit."""
     backend = library_module.resolve_backend()
     spectrum = library_module._spectrum_or_default(None, backend)
     reverse = material_table(tuple(reversed(MATERIALS)))
     assert (library_module.sort_material_table(SMALL, reverse, spectrum, backend, fine_bin_width_kev=2.0)
             == material_table(MATERIALS) == library_module.default_material_table())
     key = library_module._cache_key
-    assert key(SolverConfig(), spectrum, backend.name, 0.5, 32) == KEY_DEFAULT_V040
-    assert key(SolverConfig(), spectrum, backend.name, 0.5, 32, material_table(MATERIALS)) == KEY_DEFAULT_V040
-    assert key(SMALL, spectrum, backend.name, 2.0, 8) == KEY_SMALL_V040
+    assert key(SolverConfig(), spectrum, backend.name, 0.5, 32) == KEY_DEFAULT_V060
+    assert key(SolverConfig(), spectrum, backend.name, 0.5, 32, material_table(MATERIALS)) == KEY_DEFAULT_V060
+    assert key(SMALL, spectrum, backend.name, 2.0, 8) == KEY_SMALL_V060
+    legacy, _ = library_module.compute_library(replace(SMALL, **LEGACY_LIBRARY), None, backend, **SMALL_BUILD)
+    digest = hashlib.sha256()
+    for field in legacy.__dataclass_fields__:
+        value = getattr(legacy, field)
+        if isinstance(value, torch.Tensor):
+            digest.update(field.encode())
+            digest.update(value.contiguous().numpy().tobytes())
+    assert legacy.eta_map is None and digest.hexdigest() == SMALL_V051_SHA256
     reference, _ = library_module.compute_library(SMALL, None, backend, **SMALL_BUILD)
     by_name = library_module.build_library(SMALL, None, cache_dir=str(tmp_path), materials=reverse, **SMALL_BUILD)
-    assert [p.name for p in tmp_path.glob("mglib_*.pt")] == [f"mglib_{KEY_SMALL_V040}.pt"]
+    assert [p.name for p in tmp_path.glob("mglib_*.pt")] == [f"mglib_{KEY_SMALL_V060}.pt"]
     for field in reference.__dataclass_fields__:
         a, b = getattr(reference, field), getattr(by_name, field)
         assert torch.equal(a, b) if isinstance(a, torch.Tensor) else a == b, field
+    assert reference.eta_map is not None and not torch.equal(reference.mu_s_eta, legacy.mu_s_eta)
     # build_solver_library(config) builds config.materials: the default set is the same cache entry
     from citrus.scatter_solver.scatter_solver import build_solver_library
 
@@ -193,8 +234,8 @@ def test_default_set_keeps_the_cache_key_and_library(library_module, tmp_path, m
     with monkeypatch.context() as patch:
         patch.setattr(library_module, "compute_library", cache_miss)
         assert library_module.build_library(SMALL, None, cache_dir=str(tmp_path), **SMALL_BUILD).materials == MATERIALS
-    if (Path(library_module.default_cache_dir()) / f"mglib_{KEY_DEFAULT_V040}.pt").is_file():
-        assert build_solver_library(SolverConfig()).materials == MATERIALS  # the cached library of version 0.4.0
+    if (Path(library_module.default_cache_dir()) / f"mglib_{KEY_DEFAULT_V060}.pt").is_file():
+        assert build_solver_library(SolverConfig()).materials == MATERIALS  # the cached default library
 
 
 def test_each_set_has_its_own_cache_entry(library_module, small_libraries, tmp_path):
@@ -205,7 +246,7 @@ def test_each_set_has_its_own_cache_entry(library_module, small_libraries, tmp_p
     b = build(SMALL, None, cache_dir=str(tmp_path), materials=material_table(REDUCED), **SMALL_BUILD)
     c = build(SMALL, None, cache_dir=str(tmp_path), **SMALL_BUILD)
     names = sorted(p.name for p in tmp_path.glob("mglib_*.pt"))
-    assert len(names) == 2 and f"mglib_{KEY_SMALL_V040}.pt" in names
+    assert len(names) == 2 and f"mglib_{KEY_SMALL_V060}.pt" in names
     assert a.materials == b.materials == REDUCED and c.materials == MATERIALS
     assert torch.equal(a.mu_s_eta, b.mu_s_eta)
     extended = small_libraries["extended"]
@@ -321,13 +362,14 @@ def test_synthesize_wlab_dataset_on_a_reduced_set(small_libraries):
 def test_regression_anchors_default_and_reduced_sets():
     """The real library built through SolverConfig.materials reproduces the regression anchor of version 0.1.0 on WLAB
     (tests/data/pre_quadrature_reference.json, 1 cm voxels in 1 cm cells) for the default seven (the library of
-    earlier versions) and for the reduced set air, water, bone (the WLAB phantom is water and bone only)."""
+    earlier versions: uniform eta table, equal-fluence groups) and for the reduced set air, water, bone (the WLAB
+    phantom is water and bone only)."""
     from citrus.utilities import wlab_solver
 
     set_memory_cap(4400.0)
     case = json.loads(REFERENCE.read_text())["cases"]["wlab_1p0cm_f1"]
     grid = wlab_grid(1.0)
     for names in (MATERIALS, REDUCED):
-        s = wlab_solver(1.0, config=replace(SolverConfig(), materials=names), device="cuda")
+        s = wlab_solver(1.0, config=replace(SolverConfig(), materials=names, **LEGACY_LIBRARY), device="cuda")
         assert s.library.materials == names
         _check_reference(s.solve_view(wlab_phantom(grid, materials=names, device="cuda"), grid, 0.3), case, 1e-5)

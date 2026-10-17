@@ -121,16 +121,64 @@ fluence satisfies the same LBTE with the **first-collision source** in place of 
    \mu_s^{g'\to g}\big(\mathbf r;\ \boldsymbol\Omega_{UC}(\mathbf r)\cdot\boldsymbol\Omega\big)\,
    \phi_{UC,g'}(\mathbf r),
 
-evaluated from the tabulated per-steradian transfer :math:`\mu_s^{g'\to g}(\eta)`, :math:`\eta = \cos\theta`, on a
-2001-point grid (no Legendre truncation: the first-collision source keeps the Rayleigh forward peak). Both are evaluated
+evaluated from the tabulated per-steradian transfer :math:`\mu_s^{g'\to g}(\eta)`, :math:`\eta = \cos\theta`
+(no Legendre truncation: the first-collision source keeps the Rayleigh and Compton forward peaks). Both are evaluated
 at the points of the quadrature grid, a few equal-weight points per transport cell (see "Transport and quadrature
 grids" below).
+
+The table has ``num_eta_table`` nodes (default 2001) and is interpolated linearly between the two nodes around
+:math:`\eta`. By default (``angular_table_grid = "adaptive"``) the nodes are not equally spaced in :math:`\eta`: they
+follow the curvature of the transfer. In the variable :math:`q = \sin(\theta/2) = \sqrt{(1-\eta)/2}`, in which the
+form factors and incoherent scattering functions are smooth, the node density is
+
+.. math::
+
+   \rho(q) \propto (1 - c)\,\frac{\hat\rho(q)}{\int \hat\rho\,dq} + c\, 2q, \qquad
+   \hat\rho(q) = \max_{m, g', g} \sqrt{\frac{|\partial_q^2 f_{m g' g}(q)|}{\max_q f_{m g' g}}},
+
+the density that gives linear interpolation the same error relative to the maximum of every transfer curve
+:math:`f_{m g' g}` (Compton with its kinematic group fractions plus Rayleigh, for the catalogue's water and cortical
+bone in the library's groups, so that every material set shares the nodes), smoothed, with a floor :math:`c = 0.1`
+of the density :math:`2q` of a table uniform in :math:`\eta`. Its normalized cumulative integral is the map
+:math:`u = h(\eta) \in [0, 1]`, decreasing from 1 at :math:`\eta = 1`, and node :math:`j` sits at
+:math:`u = j / (N - 1)`. The map is stored as 512 values at equally spaced :math:`q` and evaluated by linear
+interpolation, so a lookup stays index arithmetic: :math:`\eta \to q \to u` (one lookup in the small map table)
+:math:`\to u (N - 1)` and the two-row interpolation, linear in :math:`u`. The forward peaks narrow as
+:math:`1/E^2` in :math:`1 - \eta`; at MeV energies they are far narrower than the spacing of a uniform table, whose
+linear interpolation then spreads them over a whole cell, whereas the adaptive nodes resolve them.
+``angular_table_grid = "uniform"`` places the nodes equally in :math:`\eta` (the table of citrus 0.5).
 
 Multigroup and spherical-harmonic discretization
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Energy groups are ordered from high to low energy with equal source photon counts (default 6 groups over 10-125 keV);
-there is no upscatter, so transfers run from group :math:`g'` to :math:`g \ge g'`. The scattering kernel of the
+Energy groups are ordered from high to low energy (default 6 groups over 10 keV to the spectrum maximum); there is no
+upscatter, so transfers run from group :math:`g'` to :math:`g \ge g'`. The edges cut an estimate of the total photon
+fluence spectrum in the object, source plus scattered photons, into equal areas (``group_edges_method =
+"scattered_fluence"``, the default), because the groups must resolve the downscattered photons that carry the
+multiple-collision scatter. The estimate is a one-dimensional slowing-down balance in the object's medium with a
+leakage loss,
+
+.. math::
+
+   \phi(E) = \frac{S(E) + \int_{E' > E} \mu_C(E')\, p(E \mid E')\, \phi(E')\, dE'}
+   {\mu_t(E) - \mu_R(E) + 1/L},
+
+with :math:`S` the source spectrum, :math:`\mu_x(E) = \sum_m \bar\rho_m m_{x,m}(E)` the attenuation of the medium
+of mean densities :math:`\bar\rho_m` of the reference materials, :math:`p(E \mid E')` the Klein-Nishina energy
+distribution of a Compton photon,
+Rayleigh scattering left out (it does not change the energy), photons below ``energy_min_kev`` absorbed, solved by
+one sweep from the highest energy down. :math:`L` (``grouping_object_size_cm``, default 20 cm) is the characteristic
+chord length of the object: :math:`L \to 0` gives the source spectrum, :math:`L \to \infty` an infinite medium. The
+CITRUS loop measures both on the initial reconstruction, before it builds the library: :math:`L` as the mean chord
+:math:`4V/S` of the object (the voxels above the attenuation midway between air and water;
+``CitrusConfig.grouping_object_size = "auto"``) and :math:`\bar\rho` as the density model's densities averaged over
+those voxels (``SolverConfig.grouping_medium = "auto"``; a catalogue name or a mapping of densities sets a known
+medium instead). The balance is only a grouping heuristic. Under this rule the energies within each group are weighted
+by :math:`\phi(E)` for the group constants too (the other rules weight them by the source spectrum): the photons a
+group transports are the source photons in the upper groups and the scattered ones in the lower groups, where the
+source spectrum can be flat or empty. ``"equal_fluence"`` gives every group the same number of source
+photons (the rule of citrus 0.5), ``"log"`` spaces the edges geometrically; explicit edges (``group_edges_kev``)
+override the rule. The scattering kernel of the
 collided transport is expanded in Legendre polynomials to order :math:`L` (default 7),
 
 .. math::

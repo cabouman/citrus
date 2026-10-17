@@ -16,8 +16,24 @@ degrees.
 **Spectrum, groups and energy quadrature.** The default source is a W-anode 125 kV spectrum (11 degree take-off, 0.89
 mm Ti filter, 1 keV grid, ``default_spectrum_125kvp``); any two-column spectrum can be loaded with
 ``load_spectrum_txt``. Spectra are piecewise-linear densities integrated exactly, so characteristic lines are kept. The
-groups carry equal source photon counts. Each group is cut into bins of at most 0.5 keV, evaluated at the bin midpoints
-and weighted with the exact spectrum integral over the bin.
+group edges cut the estimated total fluence spectrum (source plus scattered photons) into equal areas. Each group is cut
+into bins of at most 0.5 keV, evaluated at the bin midpoints and weighted with the exact spectrum integral over the
+bin.
+
+**Group edges from the scattered fluence.** Equal source photon counts per group resolve the spectrum the source emits,
+but the groups also carry the collided photons, and the multiple-collision scatter consists of downscattered photons.
+At kV both spectra cover the same range; at MV the source has few photons in the hundreds of keV where most multiply
+scattered photons are, so equal source counts leave a single wide group there, whose group-averaged attenuation is too
+coarse. The edges therefore follow an estimate of the total fluence, which the groups have to resolve. A transport
+solution is not needed for a grouping: a slowing-down balance in energy alone, with Klein-Nishina downscatter, is
+cheap and places the edges where the photons are. Escape matters as much as absorption in an object of patient size,
+so the balance has a leakage term set by the object's mean chord, and its medium is the object's mean composition;
+the CITRUS loop measures both on the FDK volume and builds the library only after that (a lazy library in
+``ScatterSolver``), once per run and cached per size and medium. A known medium (an industrial part of one material)
+can be named instead. The same estimate weights the energies within each group: a group constant is an average over
+the photons the group carries, and in the lowest groups at MV these are scattered photons near the top of the group,
+not the flat or empty source spectrum there, whose weighting would give the group the photoelectric attenuation of its
+lowest energies and absorb the multiply scattered photons too early.
 
 **Compton kinematics.** For each fine energy the scattering-angle boundaries of every lower group edge are computed
 analytically and each piece is integrated with Gauss-Legendre nodes in :math:`q = \sin(\theta/2)`, which resolves the
@@ -29,6 +45,17 @@ below the lowest group edge stay in :math:`\mu_t` and are treated as absorbed.
 kinematic edge of the within-group Compton ramp, which a Legendre expansion of practical order does not reproduce. The
 first-collision source therefore uses the directly tabulated transfer; the truncated expansion serves only the
 multiple-collision source, where it conserves :math:`\mu_{s,0}` and the mean cosine exactly.
+
+**Adaptive angular nodes.** The forward peaks of the Rayleigh and Compton transfer narrow with energy. At kV a table
+uniform in :math:`\eta` resolves them; at MV they are far narrower than its spacing, and linear interpolation spreads
+an unresolved peak over a whole table cell, which overestimates the forward first-order scatter. More uniform nodes
+fix this only at a table size that no longer stays in the GPU cache. The nodes are instead placed where the transfer
+curves bend, by the density that equalizes the relative error of linear interpolation, with a floor that keeps every
+region of :math:`\eta` populated. The placement is a monotone map stored as a small table (512 values) at equally
+spaced :math:`q = \sin(\theta/2)`, the variable in which the peaks are smooth and which spreads the forward
+direction; a lookup stays index arithmetic (one extra lookup in a table that stays in the L1 cache), and the table
+keeps its size. The curves of the catalogue's water and cortical bone place the nodes for every library, so a
+material's rows do not depend on the material set. The uniform table remains an option.
 
 **Fine-energy attenuation.** The library also stores the total attenuation of every material at every fine energy
 (``fine_energy``, ``fine_mu_t``, ``fine_weight``, ``fine_group``). Since the optical depth at any energy is

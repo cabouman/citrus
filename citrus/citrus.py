@@ -111,7 +111,8 @@ from .scatter_solver.cross_sections import MultigroupLibrary
 from .scatter_solver.geometry import ConeGeometry, Grid
 from .scatter_solver.scatter_solver import MaterialFields, ScatterSolver
 from .scatter_solver.uncollided import present_materials
-from .utilities import attenuation_to_densities, attenuation_to_density, effective_energy
+from .utilities import (attenuation_to_densities, attenuation_to_density, effective_energy, grouping_medium_estimate,
+                        object_mask, object_size_cm)
 
 __all__ = [
     "CitrusState",
@@ -573,6 +574,16 @@ class CitrusConfig:
     resume_error_sinogram : keep MBIRTORCH's error sinogram between outer iterations (one sinogram, stored as -A X)
                      and resume from it instead of recomputing y_c - A X with a forward projection per call (module
                      docstring; equal to float rounding)
+    grouping_object_size : the object size (cm) for the energy groups of the solver's "scattered_fluence" rule
+                     (`SolverConfig.grouping_object_size_cm`): "auto" (default) measures it on the initial
+                     reconstruction (`utilities.object_size_cm` of the FDK volume, the mean chord 4 V / S of the
+                     object), a number (cm) sets it. With the solver's SolverConfig.grouping_medium "auto" the
+                     medium is measured on the FDK volume as well (`utilities.grouping_medium_estimate`: the mean
+                     densities of the reference materials over the object). Applied before the solver's library is
+                     built (a lazy solver, `ScatterSolver(None, ...)`, e.g. `utilities.wlab_solver`): the first
+                     scatter stage then builds the library for them (cached on disk per size and medium). A solver
+                     with a prebuilt library keeps its config (verbose prints a note). Ignored for the other group
+                     rules and explicit group edges
     """
 
     num_outer_iterations: int = 10
@@ -587,6 +598,7 @@ class CitrusConfig:
     scatter_every: int = 1
     primary_views_per_chunk: Optional[int] = None
     resume_error_sinogram: bool = True
+    grouping_object_size: Union[Literal["auto"], float] = "auto"
 
     def validate(self) -> None:
         if self.num_outer_iterations < 1:
@@ -605,6 +617,10 @@ class CitrusConfig:
             raise ValueError(f"primary_views_per_chunk must be None or an integer >= 1, got {chunk!r}")
         if not isinstance(self.resume_error_sinogram, (bool, np.bool_)):
             raise ValueError(f"resume_error_sinogram must be a bool, got {self.resume_error_sinogram!r}")
+        size = self.grouping_object_size
+        if not (size == "auto" or (isinstance(size, (int, float, np.floating, np.integer))
+                                   and not isinstance(size, bool) and float(size) > 0)):
+            raise ValueError(f"grouping_object_size must be 'auto' or a positive number (cm), got {size!r}")
 
 
 # =====================================================================================================
@@ -838,9 +854,11 @@ def _sync(device: torch.device) -> None:
 
 def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: ConeGeometry, config: CitrusConfig,
                 scatter_stage: Optional[ScatterStage], device: torch.device, *, regularization: Optional[dict],
-                init_recon: Optional[Tensor], model, callback, label: str) -> tuple[Tensor, dict]:
+                init_recon: Optional[Tensor], model, callback, label: str,
+                after_initialization: Optional[Callable[[Tensor, dict], None]] = None) -> tuple[Tensor, dict]:
     """The MBIR loop shared by citrus_recon and mbir_recon. scatter_stage(k, X_k, record) -> SPR [V, Rd, Cd] (or None
-    for no correction) is called before MBIR iteration k."""
+    for no correction) is called before MBIR iteration k; after_initialization(X_0, info) once after the initial volume
+    (FDK or init_recon), before the first scatter stage."""
     config.validate()
     weights = Y / float(I0)
     measured_line_integrals = -torch.log(Y.clamp_min(config.min_counts) / float(I0))
@@ -854,6 +872,8 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
     _sync(device)
     info: dict = {"records": [], "fdk_seconds": time.perf_counter() - t0, "init_recon": X.clone(), "model": model,
                   "config": asdict(config)}
+    if after_initialization is not None:
+        after_initialization(X, info)
     regularization = dict(regularization) if regularization is not None else None
     if regularization is not None:
         apply_regularization(model, regularization)
@@ -934,6 +954,45 @@ def _counts_and_angles(sinogram_counts, angles, device) -> tuple[Tensor, np.ndar
     return Y, angle_array
 
 
+def _apply_grouping_estimates(solver: ScatterSolver, X: Tensor, grid: Grid, config: CitrusConfig) -> dict:
+    """Before the solver's library is built: set its grouping_object_size_cm from config.grouping_object_size ("auto":
+    `object_size_cm` of X, the initial volume) and, when its grouping_medium is "auto", grouping_medium to the mean
+    densities of the reference materials over the object (`grouping_medium_estimate` of X), for the
+    "scattered_fluence" rule without explicit edges. Returns the info entries grouping_object_size_cm (None for
+    another rule), grouping_medium (the medium in the solver's config afterwards) and grouping_applied (whether this
+    call changed the config; False for a prebuilt library, whose config stays)."""
+    solver_config = solver.config
+    if solver_config.group_edges_method != "scattered_fluence" or solver_config.group_edges_kev is not None:
+        return {"grouping_object_size_cm": None, "grouping_medium": None, "grouping_applied": False}
+    current_size = float(solver_config.grouping_object_size_cm)
+    requested = config.grouping_object_size
+    size = float(requested) if requested != "auto" else None
+    medium = solver_config.grouping_medium
+    if requested == "auto" or medium == "auto":
+        mask = object_mask(X, solver, energy_kev=config.energy_kev)
+        if requested == "auto":
+            size = object_size_cm(X, grid, solver, energy_kev=config.energy_kev, default=current_size)
+        if medium == "auto":
+            medium = grouping_medium_estimate(X, solver, energy_kev=config.energy_kev, mask=mask) or "auto"
+    if solver.library_built:
+        if config.verbose and (size != current_size or medium != solver_config.grouping_medium):
+            print(f"[citrus] grouping object size {size:g} cm / medium {medium} not applied: the solver's library is "
+                  f"already built for {current_size:g} cm / {solver_config.grouping_medium}", flush=True)
+        return {"grouping_object_size_cm": current_size, "grouping_medium": solver_config.grouping_medium,
+                "grouping_applied": False}
+    solver.config = replace(solver_config, grouping_object_size_cm=size, grouping_medium=medium)
+    if config.verbose:
+        print(f"[citrus] energy groups for an object of {size:g} cm made of {_medium_text(medium)}", flush=True)
+    return {"grouping_object_size_cm": size, "grouping_medium": solver.config.grouping_medium,
+            "grouping_applied": True}
+
+
+def _medium_text(medium) -> str:
+    if isinstance(medium, str):
+        return medium
+    return " + ".join(f"{name} {density:.3g} g/cm^3" for name, density in medium)
+
+
 def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: Union[Sequence[float], np.ndarray],
                  grid: Grid, geometry: ConeGeometry, solver: ScatterSolver, config: Optional[CitrusConfig] = None,
                  *, regularization: Optional[dict] = None, init_recon: Optional[Tensor] = None, model=None,
@@ -965,6 +1024,12 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
       view_interpolated [V] bool array: True where the scatter is interpolated in angle (the skipped views at
                        config.scatter_view_stride > 1 with an interpolation order), False where the scatter step
                        computed it (and for the uncorrected skipped views of order None)
+      grouping_object_size_cm, grouping_medium  the object size (cm) and medium ((name, g/cm^3) pairs, or "auto"
+                       for an empty object mask) of the energy groups of the solver's library (CitrusConfig.
+                       grouping_object_size, SolverConfig.grouping_medium; None when the solver's group rule is not
+                       "scattered_fluence"); grouping_applied: whether citrus_recon set them (False for a prebuilt
+                       library); library_seconds: seconds to build (or load) a lazy solver's library in the first
+                       scatter stage
     The records of a scatter stage hold primary_seconds (seconds for the primaries of all views, `primary_signals`,
     included in scatter_seconds); with config.scatter_view_stride > 1 also interpolation_seconds (seconds per outer
     iteration spent on the angular interpolation, included in scatter_seconds). The densities never exist as an
@@ -978,7 +1043,9 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
     device = solver.device
     Y, angle_array = _counts_and_angles(sinogram_counts, angles, device)
     V = len(angle_array)
-    density_model = DensityModel.from_library(solver.library, config.energy_kev)
+    # the density model needs the library: made in the first scatter stage, after the object size is set
+    density_models: list[Optional[DensityModel]] = [None]
+    library_seconds: list[float] = [0.0]
     transport_grid = solver.transport_grid(grid)
     if model is None:
         model = make_cone_model(grid, geometry, angle_array, device=device)
@@ -1002,7 +1069,19 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
     # every view's last scatter estimate (interpolation order None keeps it on the skipped views)
     last_scatter: list[Optional[Tensor]] = [None]
 
+    def after_initialization(X: Tensor, info: dict) -> None:
+        info.update(_apply_grouping_estimates(solver, X, grid, config))
+
     def scatter_stage(k: int, X: Tensor, record: dict) -> Tensor:
+        if density_models[0] is None:
+            built = solver.library_built
+            t0 = time.perf_counter()
+            density_models[0] = DensityModel.from_library(solver.library, config.energy_kev)
+            library_seconds[0] = time.perf_counter() - t0
+            if config.verbose and not built:
+                print(f"[citrus] library built for grouping_object_size_cm = "
+                      f"{solver.config.grouping_object_size_cm:g} in {library_seconds[0]:.1f} s", flush=True)
+        density_model = density_models[0]
         transfer_seconds_before = state_store.transfer_seconds
         record["negative_fraction"] = density_model.negative_fraction(X)
         # shared by every view of this outer iteration; built material by material, no [M, R, C, S] volume
@@ -1045,7 +1124,8 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
     try:
         X, info = _outer_loop(Y, float(I0), angle_array, grid, geometry, config, scatter_stage, device,
                               regularization=regularization, init_recon=init_recon, model=model, callback=callback,
-                              label="citrus")
+                              label="citrus", after_initialization=after_initialization)
+        info["library_seconds"] = library_seconds[0]
         info["state"] = state_store.describe()
         info["computed_views"] = computed.copy()
         info["view_interpolated"] = view_interpolated

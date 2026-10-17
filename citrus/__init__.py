@@ -8,7 +8,7 @@
                             helpers
 """
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 from .citrus import (CitrusConfig, CitrusState, citrus_recon, citrus_step, mbir_recon)  # noqa: E402
 

@@ -50,6 +50,12 @@ spectrum-mean energy 63.03 keV of the default 125 kVp spectrum is listed for ori
 and polyethylene; it has no brain, blood, skin, cartilage or spongiosa, which come from the ICRU-44 and Woodard-White
 tables as cited, the ICRU-44 ones as tabulated by Hubbell and Seltzer, NISTIR 5632.)
 
+Elements: after these compounds (`COMPOUND_NAMES`) the catalogue holds every element Z = 1..100 of EPDL97 under its
+English (IUPAC) name, 'hydrogen' ... 'fermium' (`ELEMENT_NAMES`, e.g. 'lead' 11.35 and 'tungsten' 19.3 g/cm^3), with
+the element symbol as the composition (`ELEMENT_SYMBOLS`) and the standard density of XrayPhysics' element table
+(`ELEMENT_DENSITIES`: NIST's standard-state densities, gases at 20 C and 1 atm); aluminium and titanium are the
+entries above.
+
 REFERENCE materials. The library is built for a chosen subset of the catalogue, the reference materials of the density
 model (`config.SolverConfig.materials`, at least two names; default the seven `MATERIALS`):
 
@@ -71,6 +77,7 @@ of any M.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping, Optional, Sequence, Union
@@ -115,7 +122,37 @@ _CARTILAGE_WOODARD_WHITE = "0.096*H + 0.099*C + 0.022*N + 0.744*O + 0.005*Na + 0
 # (mass fraction 0.6 x 1.8 / (0.6 x 1.8 + 0.4 x 1.2) = 0.692, density 1.56 g/cm^3)
 _CARBON_FIBRE_EPOXY = "0.692*C + 0.308*C21H24O4"
 
-MATERIAL_CATALOGUE: Mapping[str, tuple[float, str]] = MappingProxyType({
+# Elements Z = 1..100 (every element of EPDL97 / XrayPhysics): IUPAC symbols, English (IUPAC) names, and the standard
+# densities of XrayPhysics' element table (`xrayPhysics().massDensity(Z)`, g/cm^3, to 6 significant digits; NIST's
+# standard-state densities as in Hubbell and Seltzer, NISTIR 5632, Table 1: gases at 20 C and 1 atm; tests compare them
+# with XrayPhysics)
+ELEMENT_SYMBOLS: tuple[str, ...] = tuple((
+    "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb "
+    "Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au "
+    "Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm"
+).split())
+ELEMENT_NAMES: tuple[str, ...] = tuple((
+    "hydrogen helium lithium beryllium boron carbon nitrogen oxygen fluorine neon sodium magnesium aluminium silicon "
+    "phosphorus sulfur chlorine argon potassium calcium scandium titanium vanadium chromium manganese iron cobalt "
+    "nickel copper zinc gallium germanium arsenic selenium bromine krypton rubidium strontium yttrium zirconium "
+    "niobium molybdenum technetium ruthenium rhodium palladium silver cadmium indium tin antimony tellurium iodine "
+    "xenon caesium barium lanthanum cerium praseodymium neodymium promethium samarium europium gadolinium terbium "
+    "dysprosium holmium erbium thulium ytterbium lutetium hafnium tantalum tungsten rhenium osmium iridium platinum "
+    "gold mercury thallium lead bismuth polonium astatine radon francium radium actinium thorium protactinium uranium "
+    "neptunium plutonium americium curium berkelium californium einsteinium fermium"
+).split())
+ELEMENT_DENSITIES: tuple[float, ...] = (
+    8.988e-05, 0.0001785, 0.534, 1.848, 2.37, 2.265, 0.0012506, 0.001429, 0.001696, 0.0008999, 0.971,
+    1.74, 2.6989, 2.33, 2.2, 2.07, 0.003214, 0.0017837, 0.862, 1.55, 2.989, 4.54, 6.11, 7.18, 7.44,
+    7.874, 8.9, 8.902, 8.96, 7.133, 5.904, 5.323, 5.73, 4.5, 0.00759, 0.003733, 1.532, 2.54, 4.469,
+    6.506, 8.57, 10.22, 11.5, 12.41, 12.41, 12.02, 10.5, 8.65, 7.31, 7.31, 6.691, 6.24, 4.93, 0.005887,
+    1.873, 3.5, 6.154, 6.657, 6.71, 6.9, 7.22, 7.46, 5.243, 7.9004, 8.229, 8.55, 8.795, 9.066, 9.321,
+    6.73, 9.849, 13.31, 16.654, 19.3, 21.02, 22.57, 22.42, 21.45, 19.32, 13.546, 11.72, 11.35, 9.747,
+    9.32, 9.0, 0.00973, 5.0, 5.0, 10.07, 11.72, 15.37, 18.95, 20.25, 19.84, 13.67, 13.51, 14.0, 14.0,
+    14.0, 14.0,
+)
+
+_COMPOUNDS: dict[str, tuple[float, str]] = {
     # name: (nominal density g/cm^3, XrayPhysics composition); the first seven are the default reference materials
     # `MATERIALS`
     "air": (0.0012, _AIR_XRAYPHYSICS),
@@ -135,7 +172,16 @@ MATERIAL_CATALOGUE: Mapping[str, tuple[float, str]] = MappingProxyType({
     "aluminium": (2.699, "Al"),
     "titanium": (4.54, "Ti"),
     "carbon_fibre": (1.56, _CARBON_FIBRE_EPOXY),
+}
+# the compounds and tissues first, then every element by its English name (aluminium and titanium are already entries
+# of the first part, with the same composition)
+MATERIAL_CATALOGUE: Mapping[str, tuple[float, str]] = MappingProxyType({
+    **_COMPOUNDS,
+    **{name: (density, symbol) for name, symbol, density in zip(ELEMENT_NAMES, ELEMENT_SYMBOLS, ELEMENT_DENSITIES)
+       if name not in _COMPOUNDS},
 })
+# the entries that are not single elements (the compounds, tissues and mixtures, plus aluminium and titanium)
+COMPOUND_NAMES: tuple[str, ...] = tuple(_COMPOUNDS)
 
 # The default reference materials, in library order = increasing attenuation at nominal density. Muscle is BELOW soft
 # tissue at
@@ -160,7 +206,8 @@ def check_material_names(names: Sequence[str], minimum: int = 2) -> tuple[str, .
     names = tuple(names)
     unknown = [n for n in names if not isinstance(n, str) or n not in MATERIAL_CATALOGUE]
     if unknown:
-        raise ValueError(f"unknown material name(s) {unknown}; the catalogue has {tuple(MATERIAL_CATALOGUE)}")
+        raise ValueError(f"unknown material name(s) {unknown}; the catalogue has {COMPOUND_NAMES} and every element "
+                         f"by its English name (e.g. 'lead', 'tungsten')")
     if len(set(names)) != len(names):
         raise ValueError(f"duplicate material names in {names}")
     if len(names) < minimum:
@@ -198,9 +245,15 @@ class MultigroupLibrary:
       mu_pe              [M, G]       photoelectric mass attenuation, cm^2/g
       mu_s_l             [M, G, G, L+1]  Legendre moments of the transfer, [m, g_in, g_out, l], cm^2/g,
                                       convention mu_s(Omega'->Omega) = sum_l (2l+1)/(4pi) mu_s_l P_l(eta)
-      eta_grid           [N_eta]      cos(scattering angle) grid, ascending from -1 to 1
+      eta_grid           [N_eta]      cos(scattering angle) of the table nodes, ascending from -1 to 1: equally
+                                      spaced (eta_map None) or placed by eta_map
       mu_s_eta           [M, G, G, N_eta]  per-steradian transfer d mu / d Omega (eta), cm^2/g/sr,
-                                      Compton + Rayleigh, [m, g_in, g_out, eta]
+                                      Compton + Rayleigh, [m, g_in, g_out, eta], at the nodes eta_grid
+      eta_map            [K] or None  the node placement of a NON-UNIFORM table (`angular_table_position`): the table
+                                      coordinate u = h(eta) in [0, 1] (node j at u = j / (N_eta - 1)) at the K knots
+                                      q_k = k / (K - 1) of q = sin(theta / 2) = sqrt((1 - eta) / 2), decreasing from
+                                      1 (q = 0, eta = 1) to 0 (q = 1, eta = -1); linear in q between knots. None: the
+                                      nodes are equally spaced in eta (a uniform table)
     Fine-energy attenuation table (E = number of fine energies: the build's energy quadrature, bins with
     zero spectrum weight dropped):
       fine_energy        [E]          keV, bin midpoints, ordered by group then ascending energy
@@ -234,6 +287,7 @@ class MultigroupLibrary:
     fine_group: Tensor
     materials: tuple[str, ...] = ()
     nominal_density: Optional[Tensor] = None
+    eta_map: Optional[Tensor] = None
 
     def __post_init__(self) -> None:
         M = int(self.mu_t.shape[0])
@@ -250,6 +304,8 @@ class MultigroupLibrary:
             self.nominal_density = torch.tensor(densities, dtype=torch.float64, device=self.mu_t.device)
         if tuple(self.nominal_density.shape) != (M,):
             raise ValueError(f"nominal_density must be [{M}], got {tuple(self.nominal_density.shape)}")
+        if self.eta_map is not None and (self.eta_map.dim() != 1 or self.eta_map.shape[0] < 2):
+            raise ValueError(f"eta_map must be [K] with K >= 2, got {tuple(self.eta_map.shape)}")
 
     # ---- derived ----------------------------------------------------------------------------
     @property
@@ -294,6 +350,7 @@ class MultigroupLibrary:
             fine_group=self.fine_group.to(device=device) if device is not None else self.fine_group,
             materials=self.materials,
             nominal_density=self.nominal_density.to(**keywords),
+            eta_map=None if self.eta_map is None else self.eta_map.to(**keywords),
         )
 
     def save(self, path: str) -> None:
@@ -303,8 +360,10 @@ class MultigroupLibrary:
     def load(path: str) -> "MultigroupLibrary":
         """Load a library written by `save`. Raises KeyError if the file lacks a field (a file written by an older
         version: no fine-energy table, no material names or no nominal densities); `cross_section_library.build_library`
-        then rebuilds its cache entry."""
+        then rebuilds its cache entry. A file without `eta_map` (citrus <= 0.5) holds a uniform table and loads with
+        eta_map None."""
         fields = torch.load(path)
+        fields.setdefault("eta_map", None)
         missing = [k for k in MultigroupLibrary.__dataclass_fields__ if k not in fields]
         if missing:
             raise KeyError(f"library file {path!r} lacks fields {missing} (written by an older version)")
@@ -457,17 +516,74 @@ def transfer_moments_volume(library: MultigroupLibrary, rho: Tensor) -> Tensor:
     return torch.einsum("mabl,mijk->ablijk", transfer, rho)
 
 
+# knots K of the map of an adaptive angular table (`cross_section_library.angular_map`): 512 values, which stay in
+# the L1 cache of the first-collision kernel
+ANGULAR_MAP_KNOTS = 512
+
+
+def angular_table_position(eta: Tensor, num_nodes: int, eta_map: Optional[Tensor] = None) -> tuple[Tensor, Tensor]:
+    """Interpolation position in the transfer table: (i0, w) with i0 [...] int64 in [0, N - 2] the lower node and
+    w [...] in [0, 1] the weight of node i0 + 1, for cos-angles eta [...] (clamped to [-1, 1]) and N = num_nodes.
+
+    Uniform table (eta_map None): pos = (eta + 1) / 2 (N - 1).
+    Adaptive table (eta_map [K], `MultigroupLibrary.eta_map`): q = sqrt(max((1 - eta) / 2, 0)) = sin(theta / 2),
+    p = q (K - 1), k0 = clamp(floor(p), 0, K - 2), a = clamp(p - k0, 0, 1),
+    u = eta_map[k0] + (eta_map[k0 + 1] - eta_map[k0]) a, pos = u (N - 1).
+    Then i0 = clamp(floor(pos), 0, N - 2) and w = clamp(pos - i0, 0, 1). Index arithmetic only (the map is one lookup
+    in a K-value table); the fused first-collision kernel (`kernels/uncollided_kernels.py`) performs the same
+    operations in the same order. Computed in the dtype of eta (eta_map is cast to it)."""
+    n = int(num_nodes)
+    eta = eta.clamp(-1.0, 1.0)
+    if eta_map is None:
+        pos = (eta + 1.0) / 2.0 * (n - 1)
+    else:
+        knots = eta_map.to(device=eta.device, dtype=eta.dtype)
+        K = knots.numel()
+        q = ((1.0 - eta) * 0.5).clamp_min(0.0).sqrt()
+        p = q * (K - 1)
+        k0 = p.floor().clamp(0.0, K - 2.0)
+        a = (p - k0).clamp(0.0, 1.0)
+        k0 = k0.long()
+        u0 = knots[k0]
+        u = u0 + (knots[k0 + 1] - u0) * a
+        pos = u * (n - 1)
+    i0 = pos.floor().long().clamp(0, n - 2)
+    w1 = (pos - i0.to(pos.dtype)).clamp(0.0, 1.0)
+    return i0, w1
+
+
+def angular_table_nodes(num_nodes: int, eta_map: Optional[Tensor] = None) -> Tensor:
+    """cos-angles eta_j [N] (float64, ascending, eta_0 = -1, eta_{N-1} = 1) of the nodes of a table with N = num_nodes
+    nodes: equally spaced for eta_map None, else node j at the table coordinate u_j = j / (N - 1) of the map,
+    eta_j = 1 - 2 q_j^2 with q_j the inverse of the piecewise-linear map u(q) of `angular_table_position` (the nodes
+    are where that function returns integer positions, up to rounding). Raises ValueError unless eta_map decreases
+    strictly."""
+    n = int(num_nodes)
+    if eta_map is None:
+        return torch.linspace(-1.0, 1.0, n, dtype=torch.float64)
+    u_knots = eta_map.detach().to("cpu", torch.float64)
+    K = u_knots.numel()
+    if not bool((u_knots[1:] < u_knots[:-1]).all()):
+        raise ValueError("eta_map must decrease strictly from the first knot (eta = 1) to the last (eta = -1)")
+    q_knots = torch.arange(K, dtype=torch.float64) / (K - 1)
+    u = torch.arange(n, dtype=torch.float64) / (n - 1)
+    ascending_u, ascending_q = u_knots.flip(0), q_knots.flip(0)  # u ascending, q descending
+    j = torch.searchsorted(ascending_u, u, right=True).clamp(1, K - 1)
+    u_low, u_high = ascending_u[j - 1], ascending_u[j]
+    q = ascending_q[j - 1] + (ascending_q[j] - ascending_q[j - 1]) * (u - u_low) / (u_high - u_low)
+    eta = 1.0 - 2.0 * q * q
+    eta[0], eta[-1] = -1.0, 1.0
+    return eta
+
+
 def transfer_eta_at(library: MultigroupLibrary, rho: Tensor, eta: Tensor) -> Tensor:
     """Per-steradian transfer evaluated at cos-angles eta for every voxel.
 
     rho: [M, ...spatial]; eta: [...spatial] broadcastable to rho[0]. Returns [G_in, G_out, ...spatial] (1/cm/sr).
-    Linear interpolation on library.eta_grid.
+    Linear interpolation between the two table nodes around eta (`angular_table_position`: linear in eta for a
+    uniform table, in the table coordinate u for an adaptive one).
     """
-    eta_grid = library.eta_grid.to(eta.device, eta.dtype)
-    n = eta_grid.numel()
-    pos = (eta.clamp(-1.0, 1.0) + 1.0) / 2.0 * (n - 1)
-    i0 = pos.floor().long().clamp(0, n - 2)
-    w1 = (pos - i0.to(pos.dtype)).clamp(0.0, 1.0)
+    i0, w1 = angular_table_position(eta, library.mu_s_eta.shape[-1], library.eta_map)
     table = library.mu_s_eta.to(eta.device, eta.dtype)  # [M, Gi, Go, N]
     flat0 = i0.reshape(-1)
     v0 = table[..., flat0]  # [M, Gi, Go, P]
@@ -484,11 +600,7 @@ def transfer_eta_at_pairs(library: MultigroupLibrary, pairs: MaterialPairs, eta:
     pairs: index / density [2, ...spatial]; eta: [...spatial] or [k, ...spatial] (the pairs broadcast over the leading
     direction axis). Returns [G_in, G_out, *eta.shape] (1/cm/sr). Peak memory that of a two-material basis for any M.
     """
-    eta_grid = library.eta_grid.to(eta.device, eta.dtype)
-    n = eta_grid.numel()
-    pos = (eta.clamp(-1.0, 1.0) + 1.0) / 2.0 * (n - 1)
-    i0 = pos.floor().long().clamp(0, n - 2)
-    w1 = (pos - i0.to(pos.dtype)).clamp(0.0, 1.0)
+    i0, w1 = angular_table_position(eta, library.mu_s_eta.shape[-1], library.eta_map)
     table = library.mu_s_eta.to(eta.device, eta.dtype)  # [M, Gi, Go, N]
     flat0 = i0.reshape(-1)
     w1f = w1.reshape(-1)
@@ -505,12 +617,26 @@ def transfer_eta_at_pairs(library: MultigroupLibrary, pairs: MaterialPairs, eta:
 
 # ---- synthetic library for tests ---------------------------------------------------------------------
 
+def synthetic_angular_map(num_knots: int = ANGULAR_MAP_KNOTS) -> Tensor:
+    """A fixed adaptive node placement for tests (`MultigroupLibrary.eta_map`, float64 [num_knots]):
+    u(q) = 1 - 0.6 log(1 + q / 0.02) / log(51) - 0.4 q^2 at q_k = k / (num_knots - 1), strictly decreasing from 1 to 0
+    (dense nodes near eta = 1, as for a forward peak). Not derived from a kernel."""
+    q = torch.arange(num_knots, dtype=torch.float64) / (num_knots - 1)
+    u = 1.0 - 0.6 * torch.log1p(q / 0.02) / math.log(51.0) - 0.4 * q * q
+    u[0], u[-1] = 1.0, 0.0
+    return u
+
+
 def synthetic_library(num_groups: int = 4, legendre_order: int = 5, num_eta: int = 401, num_fine_per_group: int = 4,
-                      fine_spread: float = 0.0, num_materials: int = 2) -> MultigroupLibrary:
+                      fine_spread: float = 0.0, num_materials: int = 2,
+                      angular_table_grid: str = "uniform") -> MultigroupLibrary:
     """Self-consistent fake library (isotropic + mildly forward-peaked transfer) for unit tests.
 
     The eta table and the Legendre moments are generated from the same analytic kernel, so
     tests of the moment/ordinate machinery hold exactly. Not physical.
+    angular_table_grid: "uniform" (default: num_eta nodes equally spaced in eta; the kernel, linear in eta, is then
+    interpolated exactly) or "adaptive" (the nodes of `synthetic_angular_map`, eta_map set; the kernel is evaluated at
+    those nodes and interpolated linearly in the table coordinate, which is not exact for a kernel linear in eta).
 
     Fine-energy table: each group is cut into `num_fine_per_group` = n equal bins of equal weight
     spectrum_fraction[g] / n, and fine_mu_t[m, e] = mu_t[m, g] (1 + fine_spread x_e) with x_e running linearly
@@ -532,7 +658,11 @@ def synthetic_library(num_groups: int = 4, legendre_order: int = 5, num_eta: int
     edges = torch.linspace(125.0, 10.0, G + 1, dtype=torch.float64)
     energy = 0.5 * (edges[:-1] + edges[1:])
     fraction = torch.ones(G, dtype=torch.float64) / G
-    eta = torch.linspace(-1.0, 1.0, num_eta, dtype=torch.float64)
+    if angular_table_grid not in ("uniform", "adaptive"):
+        raise ValueError(f"angular_table_grid must be 'uniform' or 'adaptive', got {angular_table_grid!r}")
+    eta_map = synthetic_angular_map() if angular_table_grid == "adaptive" else None
+    eta = angular_table_nodes(num_eta, eta_map) if eta_map is not None else torch.linspace(-1.0, 1.0, num_eta,
+                                                                                            dtype=torch.float64)
     # kernel per (material, g_in, g_out): a * (1 + b eta)/(4 pi) with b depending on the pair (|b|<1 keeps it positive)
     mu_s_eta = torch.zeros(2, G, G, num_eta, dtype=torch.float64)
     mu_s_l = torch.zeros(2, G, G, L + 1, dtype=torch.float64)
@@ -564,6 +694,7 @@ def synthetic_library(num_groups: int = 4, legendre_order: int = 5, num_eta: int
             mu_t=mu_t, mu_pe=mu_pe, mu_s_l=mu_s_l, eta_grid=eta, mu_s_eta=mu_s_eta,
             fine_energy=fine_energy, fine_mu_t=fine_mu_t, fine_weight=fine_weight, fine_group=fine_group,
             materials=("water", "bone"), nominal_density=torch.tensor([1.0, 1.85], dtype=torch.float64),
+            eta_map=eta_map,
         )
     if M < 2:
         raise ValueError("num_materials must be >= 2")
@@ -584,5 +715,5 @@ def synthetic_library(num_groups: int = 4, legendre_order: int = 5, num_eta: int
         group_edges=edges, group_energy=energy, spectrum_fraction=fraction,
         mu_t=blend(mu_t), mu_pe=blend(mu_pe), mu_s_l=blend(mu_s_l), eta_grid=eta, mu_s_eta=blend(mu_s_eta),
         fine_energy=fine_energy, fine_mu_t=blend(fine_mu_t), fine_weight=fine_weight, fine_group=fine_group,
-        materials=names, nominal_density=nominal,
+        materials=names, nominal_density=nominal, eta_map=eta_map,
     )

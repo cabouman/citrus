@@ -15,9 +15,13 @@ Kernel `_first_collision_kernel`, per program (block of BLOCK flattened voxels, 
     on the quadrature grid, and for libraries with M <= 2). It evaluates the voxel centers from the 1-D axis
     coordinates of the grid (x[cols], y[rows], z[slices]) and Omega_UC with IEEE sqrt / division (no [V, 3] Omega_UC
     tensor is formed);
-  - for each of its directions: eta, the fractional index on the uniform eta grid (exactly the arithmetic of
-    `cross_sections.transfer_eta_at`, with lo, hi = eta_grid[0], eta_grid[-1] = -1, 1: pos = (clamp(eta, lo, hi) - lo) /
-    (hi - lo) (N - 1), i0 = clamp(floor(pos), 0, N-2), w = clamp(pos - i0, 0, 1)); then for g' = 0..G-1 (unrolled) a
+  - for each of its directions: eta and its fractional index in the table, the arithmetic of
+    `cross_sections.angular_table_position`: for a uniform table (MAPPED False; lo, hi = eta_grid[0], eta_grid[-1] =
+    -1, 1) pos = (clamp(eta, lo, hi) - lo) / (hi - lo) (N - 1); for an adaptive table (MAPPED True) the map lookup
+    q = sqrt(max((1 - eta) / 2, 0)), p = q (KM - 1), k0 = clamp(floor(p), 0, KM - 2), a = clamp(p - k0, 0, 1),
+    u = map[k0] + (map[k0 + 1] - map[k0]) a, pos = u (N - 1) (map: `MultigroupLibrary.eta_map`, KM = 512 float32
+    values that stay in L1); then i0 = clamp(floor(pos), 0, N-2), w = clamp(pos - i0, 0, 1); then for g' = 0..G-1
+    (unrolled) a
     [GP, BLOCK] gather of the two table rows (all output groups at once) per material slot (two in pair mode; MT in
     dense mode, an unrolled loop that re-reads the slot densities from cache), mixed with rho, times phi_UC,g'(v),
     accumulated into acc [GP, BLOCK];
@@ -40,15 +44,16 @@ and warp counts tried; the kernel is bound by the table gathers, not by DRAM (do
 Numerics: float32 only (float64 and CPU tensors use the PyTorch path, which stays the reference). The result
 equals the PyTorch path up to float32 rounding of Omega_UC / eta and the summation order of the (identical) terms.
 Where a steep part of the table is hit (the real library's Rayleigh forward peak, eta -> 1), one float32 ulp of eta
-moves the interpolation point by ~1e-4 table cells, and BOTH float32 paths then deviate from a float64 evaluation (and
-from each other) by more than that rounding (tests/test_uncollided.py asserts 1e-5 between the paths on the synthetic
-tables and on the WLAB solver problems).
+moves the interpolation point (by ~1e-4 cells of a uniform table; near eta = 1 an ulp of eta is a step of q =
+sqrt((1 - eta) / 2) of up to 2e-4, several cells of an adaptive table there), and BOTH float32 paths then deviate from a
+float64 evaluation (and from each other) by more than that rounding (tests/test_uncollided.py asserts 1e-5 between the
+paths on the synthetic tables and on the WLAB solver problems).
 
 Availability: `triton_utilities.triton_available()` (shared probe, kill switch `CITRUS_DISABLE_TRITON=1`) and a
 per-device self-check of the kernel against the PyTorch path on a tiny random problem (rho = 0 voxels, directions
 parallel / antiparallel to Omega_UC; dense mode with 2 materials and with 7 materials mixed in most voxels, pair
-mode), cached per device; `backend="auto"` falls back to the PyTorch path on any
-failure.
+mode; each with a uniform and with an adaptive table), cached per device; `backend="auto"` falls back to the PyTorch
+path on any failure.
 """
 
 from __future__ import annotations
@@ -67,10 +72,9 @@ BLOCK_V = 64  # voxels per program (tile [GP, BLOCK_V], about 2 elements per thr
 NUM_WARPS = 8
 
 _SELF_CHECK: dict[str, tuple[bool, str]] = {}
-# prepared tables: id(library.mu_s_eta) -> (weak reference to it, {(device, versions): (tab, eta_lo, eta_hi)}); the
-# entry
-# is dropped when the library tensor is freed. (A WeakKeyDictionary would compare tensors with ==.)
-_TABLES: dict[int, tuple[weakref.ref, dict[tuple, tuple[Tensor, float, float]]]] = {}
+# prepared tables: id(library.mu_s_eta) -> (weak reference to it, {(device, versions): (tab, eta_lo, eta_hi, map)});
+# the entry is dropped when the library tensor is freed. (A WeakKeyDictionary would compare tensors with ==.)
+_TABLES: dict[int, tuple[weakref.ref, dict[tuple, tuple[Tensor, float, float, Optional[Tensor]]]]] = {}
 
 triton = triton_utilities.triton
 tl = triton_utilities.tl
@@ -118,13 +122,26 @@ def use_kernel(t: Tensor, backend: str) -> bool:
 def _self_check(device: torch.device) -> tuple[bool, str]:
     """Kernel vs the PyTorch path on a 5 x 7 x 6 grid, G = 4 (synthetic library), 6 directions including the
     directions parallel and antiparallel to Omega_UC of one voxel (eta = +-1 exactly), rho = 0 in some voxels; dense
-    mode (2 materials; 7 materials with up to 7 nonzero per voxel) and pair mode (7 materials, random pairs)."""
+    mode (2 materials; 7 materials with up to 7 nonzero per voxel) and pair mode (7 materials, random pairs), each with
+    a uniform table and with an adaptive one (`cross_sections.synthetic_angular_map`)."""
+    worst = 0.0
+    for grid_kind in ("uniform", "adaptive"):
+        ok, deviation = _self_check_table(device, grid_kind)
+        if not ok:
+            return False, f"self-check ({grid_kind} table): {deviation}"
+        worst = max(worst, float(deviation))
+    return True, (f"kernel matches the PyTorch path, dense (2 and 7 materials) and pair modes, uniform and adaptive "
+                  f"tables (max rel dev {worst:.1e})")
+
+
+def _self_check_table(device: torch.device, angular_table_grid: str) -> tuple[bool, object]:
+    """One table kind of `_self_check`: (True, max relative deviation) or (False, reason)."""
     from ..cross_sections import material_pairs, synthetic_library
     from ..geometry import ConeGeometry, Grid
     from ..uncollided import (_first_collision_source_torch, _first_collision_source_torch_pairs,
                               primary_directions_to_voxels)
 
-    library = synthetic_library(4, legendre_order=1, num_eta=201)
+    library = synthetic_library(4, legendre_order=1, num_eta=201, angular_table_grid=angular_table_grid)
     grid = Grid(shape=(5, 7, 6), delta_voxel=1.0, voxel_slice_aspect=0.8)
     geometry = ConeGeometry(source_iso_dist=20.0, source_detector_dist=30.0, num_det_rows=8, num_det_channels=8,
                             delta_det_row=1.0, delta_det_channel=1.0)
@@ -141,7 +158,7 @@ def _self_check(device: torch.device) -> tuple[bool, str]:
     reference = _first_collision_source_torch(library, rho, phi, grid, geometry, angle, directions, chunk=4)
     out = first_collision_source(library, rho, phi, grid, geometry, angle, directions)
     # pair mode: 7 materials, at most two nonzero per voxel, against the PyTorch pair path
-    lib7 = synthetic_library(4, legendre_order=1, num_eta=201, num_materials=7)
+    lib7 = synthetic_library(4, legendre_order=1, num_eta=201, num_materials=7, angular_table_grid=angular_table_grid)
     rho7 = torch.zeros(7, *grid.shape)
     sel = torch.randint(0, 7, (2,) + tuple(grid.shape), generator=generator)
     rho7.scatter_(0, sel, torch.rand((2,) + tuple(grid.shape), generator=generator) + 0.1)
@@ -158,11 +175,11 @@ def _self_check(device: torch.device) -> tuple[bool, str]:
     worst = 0.0
     for o, r in ((out, reference), (out7, reference7), (out7d, reference7d)):
         if o.shape != r.shape or not bool(torch.isfinite(o).all()):
-            return False, "self-check: wrong shape or non-finite output"
+            return False, "wrong shape or non-finite output"
         worst = max(worst, float((o - r).abs().max()) / max(float(r.abs().max()), 1e-30))
     if worst > SELF_CHECK_REL_TOL:
-        return False, f"self-check: kernel deviates from the PyTorch path by {worst:.2e} (rel)"
-    return True, f"kernel matches the PyTorch path, dense (2 and 7 materials) and pair modes (max rel dev {worst:.1e})"
+        return False, f"kernel deviates from the PyTorch path by {worst:.2e} (rel)"
+    return True, worst
 
 
 # ================================================================================================
@@ -173,14 +190,15 @@ if triton is not None:
 
     @triton.jit
     def _first_collision_kernel(rho_ptr, index_ptr, phi_ptr, x_axis_ptr, y_axis_ptr, z_axis_ptr, direction_ptr,
-                                table_ptr, out_ptr,
-                                V, C, S, K, N, r0x, r0y, r0z, eta_lo, eta_hi,
+                                table_ptr, map_ptr, out_ptr,
+                                V, C, S, K, N, KM, r0x, r0y, r0z, eta_lo, eta_hi,
                                 G: tl.constexpr, GP: tl.constexpr, KB: tl.constexpr, BLOCK: tl.constexpr,
-                                MT: tl.constexpr, PAIR: tl.constexpr):
+                                MT: tl.constexpr, PAIR: tl.constexpr, MAPPED: tl.constexpr):
         """Table row layout [G_in, MT, GP] (MT = materials of the table). Dense mode (PAIR False): rho_ptr holds the
         densities of all MT materials [MT, V] (slot m = material m at table offset m GP). Pair mode: rho_ptr the two
         slot densities, index_ptr the two slot material indices (int32 [2, V]); the slot offsets ia GP, ib GP are per
-        voxel."""
+        voxel. MAPPED: an adaptive table, positions through the KM-knot map map_ptr (float32 [KM]); else uniform in
+        eta (map_ptr unused)."""
         pid_v = tl.program_id(0)
         pid_k = tl.program_id(1)
         v = pid_v * BLOCK + tl.arange(0, BLOCK)
@@ -202,6 +220,7 @@ if triton is not None:
         gm = go < G
         smask = gm[:, None] & vm[None, :]
         nm1 = (N - 1).to(tl.float32)
+        km1 = (KM - 1).to(tl.float32)
         span = eta_hi - eta_lo
         ROW: tl.constexpr = G * MT * GP  # floats per eta row of the table
         if PAIR:
@@ -217,7 +236,17 @@ if triton is not None:
                 oz = tl.load(direction_ptr + 3 * k + 2)
                 eta = ux * ox + uy * oy + uz * oz
                 eta = tl.minimum(tl.maximum(eta, eta_lo), eta_hi)
-                pos = tl.div_rn(eta - eta_lo, span) * nm1
+                if MAPPED:
+                    q = tl.sqrt_rn(tl.maximum((1.0 - eta) * 0.5, 0.0))
+                    p = q * km1
+                    k0 = tl.minimum(tl.maximum(tl.floor(p), 0.0), km1 - 1.0)
+                    a = tl.minimum(tl.maximum(p - k0, 0.0), 1.0)
+                    k0i = k0.to(tl.int32)
+                    u0 = tl.load(map_ptr + k0i, mask=vm, other=0.0)
+                    u1 = tl.load(map_ptr + k0i + 1, mask=vm, other=0.0)
+                    pos = (u0 + (u1 - u0) * a) * nm1
+                else:
+                    pos = tl.div_rn(eta - eta_lo, span) * nm1
                 i0 = tl.floor(pos)
                 i0 = tl.minimum(tl.maximum(i0, 0.0), nm1 - 1.0)
                 w = tl.minimum(tl.maximum(pos - i0, 0.0), 1.0)[None, :]
@@ -257,17 +286,19 @@ def _next_pow2(n: int) -> int:
     return p
 
 
-def prepared_table(library, device: torch.device) -> tuple[Tensor, float, float]:
-    """Kernel layout of the eta table of `library` and the ends of its (uniform) eta grid.
+def prepared_table(library, device: torch.device) -> tuple[Tensor, float, float, Optional[Tensor]]:
+    """Kernel layout of the eta table of `library`, the ends of its eta grid and its node map.
 
     library.mu_s_eta [M, G_in, G_out, N] (any device/dtype) -> kernel_table [N, G_in, M, GP] float32 contiguous on
     `device`, GP = next power of two >= G, zero where g_out < g_in (no upscatter) or g_out >= G (padding); plus
-    (eta_lo, eta_hi) = (library.eta_grid[0], library.eta_grid[-1]) as Python floats. Cached per (source tensor,
+    (eta_lo, eta_hi) = (library.eta_grid[0], library.eta_grid[-1]) as Python floats and the map of an adaptive table,
+    library.eta_map [KM] as float32 contiguous on `device` (None for a uniform table). Cached per (source tensor,
     device, tensor versions), so the host reads the grid ends once per library and device.
     """
     source_table = library.mu_s_eta
+    eta_map = getattr(library, "eta_map", None)
     key = (str(torch.device(device)), int(source_table._version), int(library.eta_grid._version),
-           id(library.eta_grid))
+           id(library.eta_grid), None if eta_map is None else (id(eta_map), int(eta_map._version)))
     hit = _TABLES.get(id(source_table))
     if hit is not None and hit[0]() is source_table and key in hit[1]:
         return hit[1][key]
@@ -280,7 +311,8 @@ def prepared_table(library, device: torch.device) -> tuple[Tensor, float, float]
     kernel_table = torch.zeros(N, G, M, GP, device=device, dtype=torch.float32)
     kernel_table[..., :G] = t.permute(3, 1, 0, 2)
     eta_grid = library.eta_grid.detach().to("cpu", torch.float64)
-    entry = (kernel_table.contiguous(), float(eta_grid[0]), float(eta_grid[-1]))
+    kernel_map = None if eta_map is None else eta_map.detach().to(device=device, dtype=torch.float32).contiguous()
+    entry = (kernel_table.contiguous(), float(eta_grid[0]), float(eta_grid[-1]), kernel_map)
     table_id = id(source_table)
     if hit is None or hit[0]() is not source_table:
         _TABLES[table_id] = (weakref.ref(source_table, lambda _r, table_id=table_id: _TABLES.pop(table_id, None)), {})
@@ -319,7 +351,8 @@ def first_collision_source(library, rho: Tensor, phi_uncollided: Tensor, grid, g
     """Fused evaluation of `uncollided.first_collision_source_at_directions` (float32 CUDA only; no availability check
     here).
 
-    library: MultigroupLibrary (uses eta_grid [N], ascending and uniform, and mu_s_eta [M, G, G, N]);
+    library: MultigroupLibrary (uses mu_s_eta [M, G, G, N], the ends of eta_grid [N] and eta_map: a uniform table
+    for eta_map None, else an adaptive one, `cross_sections.angular_table_position`);
     rho: [M, rows, cols, slices]; pairs: the `cross_sections.MaterialPairs` of rho (pair mode: the kernel gathers the
     two table rows of each voxel by index) or None (dense mode: all M table rows per voxel, about M / 2 times the cost
     of the pair mode); phi_uncollided: [G, rows, cols, slices]
@@ -351,16 +384,17 @@ def first_collision_source(library, rho: Tensor, phi_uncollided: Tensor, grid, g
     out = torch.empty(K, G, *shape, device=device, dtype=dtype)
     if K == 0 or V == 0:
         return out
-    table, eta_lo, eta_hi = prepared_table(library, device)
+    table, eta_lo, eta_hi, kernel_map = prepared_table(library, device)
     x, y, z = grid.axis_coordinates(device, dtype)
     r0 = geometry.source_position(angle)
     num_voxel_blocks = -(-V // BLOCK_V)
     directions_per_program = _directions_per_program(K, num_voxel_blocks, device)
     _first_collision_kernel[(num_voxel_blocks, -(-K // directions_per_program))](
-        rho_flat, index_flat, phi_flat, x, y, z, directions, table, out, V, C, S, K, int(table.shape[0]),
+        rho_flat, index_flat, phi_flat, x, y, z, directions, table, table if kernel_map is None else kernel_map, out,
+        V, C, S, K, int(table.shape[0]), 2 if kernel_map is None else int(kernel_map.shape[0]),
         float(r0[0]), float(r0[1]), float(r0[2]), eta_lo, eta_hi,
         G=G, GP=_next_pow2(G), KB=directions_per_program, BLOCK=BLOCK_V, MT=int(table.shape[2]), PAIR=pairs is not None,
-        num_warps=NUM_WARPS)
+        MAPPED=kernel_map is not None, num_warps=NUM_WARPS)
     return out
 
 

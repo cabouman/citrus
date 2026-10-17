@@ -144,6 +144,40 @@ the fine box and the first-order quantities on q\ :sup:`3` points per cell (``qu
 traced (:doc:`method`, "Options and secondary components"; :doc:`conventions`, "Grids"). ``ViewResult`` also carries
 the scalar and planar fluences per group, the source-iteration history, per-stage timings and peak memory.
 
+Energy groups and the angular table
+-----------------------------------
+
+Two settings of ``SolverConfig`` shape the library (:doc:`method`, "Uncollided fluence and first-collision source" and
+"Multigroup and spherical-harmonic discretization"):
+
+* ``group_edges_method``: ``"scattered_fluence"`` (default; equal areas under the estimated source-plus-scattered
+  fluence of an object of chord ``grouping_object_size_cm``, default 20 cm, made of ``grouping_medium``),
+  ``"equal_fluence"`` (equal source photon counts) or ``"log"`` (geometric spacing). ``group_edges_kev`` overrides
+  the rule.
+* ``grouping_medium``: ``"auto"`` (default: measured on the object, water until then), a reference material's name
+  (``"aluminium"`` for an aluminium casting) or a mapping ``{"water": 0.9, "bone": 0.2}`` (g/cm^3) of reference
+  materials.
+* ``angular_table_grid``: ``"adaptive"`` (default; ``num_eta_table`` nodes placed by the curvature of the transfer) or
+  ``"uniform"``.
+
+.. code-block:: python
+
+   from dataclasses import replace
+   from citrus.scatter_solver.cross_section_library import load_spectrum_txt
+
+   config = replace(SolverConfig(), num_groups=12)                       # adaptive table, scattered-fluence groups
+   solver = wlab_solver(0.5, config=config, spectrum=load_spectrum_txt("spectrum_6mv.txt"), device="cuda")
+   legacy = replace(SolverConfig(), angular_table_grid="uniform", group_edges_method="equal_fluence")  # citrus 0.5
+
+``wlab_solver`` (and ``ScatterSolver(None, config, ...)``) returns a solver whose library is built on first use, so
+``citrus_recon`` can first measure the object: with ``CitrusConfig.grouping_object_size = "auto"`` (default) it sets
+``grouping_object_size_cm`` to the mean chord of the FDK volume (``citrus.utilities.object_size_cm``) and, for
+``grouping_medium = "auto"``, the medium to the object's mean densities (``grouping_medium_estimate``) before the
+first scatter stage builds the library (cached per size and medium); ``info["grouping_object_size_cm"]`` and
+``info["grouping_medium"]`` record them. A number in cm sets the size, a named medium skips its estimate; a solver
+given a prebuilt library keeps its config. ``synthesize_cone_beam_data`` takes both from the true object before its
+first solve.
+
 Reference materials
 -------------------
 
@@ -158,7 +192,7 @@ of the catalogue (:doc:`conventions`, "Materials"), in any order; the library so
    from citrus.utilities import attenuation_to_densities, wlab_phantom, wlab_solver
 
    solver = wlab_solver(1.0, config=replace(SolverConfig(), materials=("air", "water", "bone")), device="cuda")
-   rho = wlab_phantom(grid, materials=solver.library.materials, device="cuda")   # [3, R, C, S]
+   rho = wlab_phantom(grid, materials=solver.materials, device="cuda")            # [3, R, C, S]
    material_index(solver.library, "water")                                       # 1
    attenuation_to_densities(solver.library, X)                                   # the density model of the loop
 

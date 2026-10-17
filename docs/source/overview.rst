@@ -47,11 +47,13 @@ Package layout
 Scope of the solver
 -------------------
 
-* Photon energies of kV imaging (default 10-125 keV, 6 equal-fluence groups); Compton scattering (no Doppler
-  broadening) and Rayleigh scattering from EPDL97 via XrayPhysics; photoelectric absorption as local deposition.
-* Reference materials chosen from a catalogue of seventeen (``SolverConfig.materials``, :doc:`conventions`,
-  "Materials"); every voxel is a mixture of at most two of them, the two whose nominal attenuations bracket its
-  attenuation.
+* Photon energies from kV imaging to MV beams (default 10-125 keV in 6 groups whose edges follow the scattered
+  photons, any loaded spectrum); Compton scattering (no Doppler broadening) and Rayleigh scattering from EPDL97 via
+  XrayPhysics, with an angular table whose nodes follow the forward peaks; photoelectric absorption (and pair
+  production at MV) as local deposition.
+* Reference materials chosen from a catalogue of compounds, tissues and all elements (``SolverConfig.materials``,
+  :doc:`conventions`, "Materials"); every voxel is a mixture of at most two of them, the two whose nominal
+  attenuations bracket its attenuation.
 * A point source collimated to the flat panel; detector and anti-scatter-grid responses as lookup tables.
 * Float32 on CUDA (production; fused Triton kernels) and float64 / CPU (reference and tests).
 

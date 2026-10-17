@@ -305,6 +305,13 @@ class ScatterSolver:
     library        : MultigroupLibrary with legendre_order >= config.legendre_order (`build_solver_library(config)`,
                      built for the reference materials config.materials). The solver works with the library's materials
                      (`library.materials`, M of them) whatever config.materials says.
+                     None: a LAZY solver. The library is built (`build_solver_library(config, spectrum)`, cached on
+                     disk) when it is first needed (the `library` property: fields, uncollided fluence, primary, solve),
+                     so the configuration can still change before that: `solver.config = replace(solver.config, ...)`
+                     is allowed while `library_built` is False (citrus_recon sets grouping_object_size_cm from the
+                     FDK volume this way); once the library exists a different config raises.
+    spectrum       : (energies keV [K], photon density per keV [K]) of the lazy library (None: the default 125 kVp
+                     spectrum); ignored when a library is given.
     config         : SolverConfig (validated here). Used fields: legendre_order, num_polar, num_azimuthal,
                      transport_cell_cm, quadrature_point_spacing_cm, uncollided_trace_grid, source_iteration_tolerance,
                      max_source_iterations, cone_num_polar, cone_num_azimuthal, direction_chunk (directions per batch
@@ -313,7 +320,8 @@ class ScatterSolver:
                      `Projectors` implementation). None (default) is `SiddonProjectors()`: backend "auto", the fused
                      Triton ray tracer on float32 CUDA (PyTorch on CPU / float64). detector and grid_response are
                      required (they default to None only so that projectors can be omitted; pass them by keyword).
-    device, dtype  : computation device (default: the library's device) and dtype (default config.dtype).
+    device, dtype  : computation device (default: the library's device; the CPU for a lazy solver) and dtype (default
+                     config.dtype).
     first_collision_chunk : directions per batch inside uncollided.first_collision_source_at_directions (PyTorch
                      path).
     primary_samples_per_pixel_axis : sub-pixel sampling per axis n of the primary (n^2 sub-rays per pixel, the
@@ -325,21 +333,29 @@ class ScatterSolver:
     The attribute `L` is the Legendre order of the collided transport (config.legendre_order).
     """
 
-    def __init__(self, library: MultigroupLibrary, config: SolverConfig, geometry: ConeGeometry,
+    def __init__(self, library: Optional[MultigroupLibrary], config: SolverConfig, geometry: ConeGeometry,
                  projectors: Optional[Projectors] = None, detector: Optional[DetectorResponse] = None,
                  grid_response: Optional[GridResponse] = None, source: Optional[SourceModel] = None,
                  device: DeviceLike = None, dtype: Optional[torch.dtype] = None, *,
                  first_collision_chunk: int = 4, primary_samples_per_pixel_axis: Optional[int] = None,
-                 direction_context_cache_size: int = 8) -> None:
+                 direction_context_cache_size: int = 8, spectrum=None) -> None:
         if detector is None or grid_response is None:
             raise TypeError("ScatterSolver needs a detector and a grid_response")
         config.validate()
-        self.config = config
+        self._config = config
         self.L = int(config.legendre_order)
-        self.device = torch.device(device) if device is not None else library.mu_t.device
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            self.device = library.mu_t.device if library is not None else torch.device("cpu")
         self.dtype = dtype if dtype is not None else getattr(torch, config.dtype)
-        self.library = library.to(self.device, self.dtype)
-        self.transport_library = truncated_library(self.library, self.L)
+        self.spectrum = spectrum
+        self.library_cache_dir: Optional[str] = "default"  # where a lazy library is cached (`build_solver_library`)
+        self._library: Optional[MultigroupLibrary] = None
+        self._transport_library: Optional[MultigroupLibrary] = None
+        self._materials: Optional[tuple[str, ...]] = None
+        if library is not None:
+            self._set_library(library)
         self.geometry = geometry
         self.projectors = projectors if projectors is not None else SiddonProjectors()
         self.detector = detector
@@ -353,10 +369,72 @@ class ScatterSolver:
         self.direction_context_cache_size = max(0, int(direction_context_cache_size))
         self._direction_contexts: OrderedDict[tuple, DirectionSetContext] = OrderedDict()
 
+    # ---- library and configuration --------------------------------------------------------------
+    def _set_library(self, library: MultigroupLibrary) -> None:
+        self._library = library.to(self.device, self.dtype)
+        self._transport_library = truncated_library(self._library, self.L)
+
+    @property
+    def library_built(self) -> bool:
+        """True once the solver has its library (given to the constructor, or built on first use)."""
+        return self._library is not None
+
+    @property
+    def library(self) -> MultigroupLibrary:
+        """The cross-section library on the solver's device and dtype; a lazy solver builds it here on first use
+        (`build_solver_library(config, spectrum, library_cache_dir)`, cached on disk per configuration)."""
+        if self._library is None:
+            self._set_library(build_solver_library(self._config, self.spectrum, self.library_cache_dir))
+        return self._library
+
+    @property
+    def transport_library(self) -> MultigroupLibrary:
+        """The library of the collided transport (`truncated_library(library, L)`); builds a lazy library."""
+        if self._transport_library is None:
+            _ = self.library
+        return self._transport_library
+
+    @property
+    def config(self) -> SolverConfig:
+        return self._config
+
+    @config.setter
+    def config(self, config: SolverConfig) -> None:
+        """Replace the configuration (validated). Allowed while the library is not built (a lazy solver; the caches
+        are dropped); with a built library only an equal config is accepted (RuntimeError otherwise, since the library
+        was built for the old one)."""
+        config.validate()
+        if config == self._config:
+            return
+        if self._library is not None:
+            raise RuntimeError("the solver's library is already built for its configuration; the configuration can "
+                               "only change before the library is built (construct the solver with library=None)")
+        self._config = config
+        self.L = int(config.legendre_order)
+        self._materials = None
+        self.clear_caches()
+
+    @property
+    def materials(self) -> tuple[str, ...]:
+        """Names of the library's materials in library order (`library.materials`). A lazy solver gives the order of
+        config.materials after sorting by nominal attenuation (`cross_section_library.sort_material_table`, needs
+        XrayPhysics) without building the library."""
+        if self._library is not None:
+            return tuple(self._library.materials)
+        if self._materials is None:
+            from .cross_section_library import _spectrum_or_default, resolve_backend, sort_material_table
+
+            backend = resolve_backend()
+            table = sort_material_table(self._config, material_table(check_material_names(self._config.materials)),
+                                        _spectrum_or_default(self.spectrum, backend), backend)
+            self._materials = tuple(name for name, _, _ in table)
+        return self._materials
+
     # ---- small helpers -------------------------------------------------------------------------
     @property
     def num_groups(self) -> int:
-        return self.library.num_groups
+        """G: the library's groups (config.num_groups while a lazy library is not built)."""
+        return self._library.num_groups if self._library is not None else int(self._config.num_groups)
 
     def quadrature_points(self, grid_fine: Grid) -> int:
         """Effective quadrature points per axis per transport cell for this fine grid,

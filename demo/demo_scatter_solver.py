@@ -31,7 +31,7 @@ import torch  # noqa: E402
 
 from citrus.scatter_solver import (ScatterSolver, SolverConfig, build_solver_library, csi_response,  # noqa: E402
                                    focused_1d_grid, no_grid)
-from citrus.scatter_solver.cross_sections import MATERIAL_CATALOGUE, check_material_names  # noqa: E402
+from citrus.scatter_solver.cross_sections import COMPOUND_NAMES, check_material_names  # noqa: E402
 # noqa: E402
 from citrus.utilities import full_field_wlab_geometry, set_memory_cap, wlab_geometry, wlab_grid, wlab_phantom
 
@@ -51,7 +51,8 @@ def main() -> None:
     parser.add_argument("--memory-cap-mib", type=float, default=4400.0, help="PyTorch CUDA memory cap (0: none)")
     parser.add_argument("--materials", default=",".join(SolverConfig().materials),
                         help="reference materials of the library, comma-separated names from the catalogue "
-                             f"({', '.join(MATERIAL_CATALOGUE)}); at least two, water and bone among them (default: "
+                             f"({', '.join(COMPOUND_NAMES)} and every element by its English name, e.g. lead); at "
+                             "least two, water and bone among them (default: "
                              f"{','.join(SolverConfig().materials)})")
     parser.add_argument("--out", default=OUT_DIR)
     args = parser.parse_args()
