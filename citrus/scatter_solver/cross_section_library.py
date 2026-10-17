@@ -1,8 +1,9 @@
 """Build the multigroup cross-section library of the scatter solver.
 
-Fills a :class:`citrus.scatter_solver.cross_sections.MultigroupLibrary` for the basis materials (the seven-material
-table ``cross_sections.MATERIAL_TABLE`` by default: air, lung, adipose, water, muscle, soft tissue, cortical bone) from
-point-wise photon interaction data.
+Fills a :class:`citrus.scatter_solver.cross_sections.MultigroupLibrary` for the anchor materials of the density model
+(any subset of ``cross_sections.MATERIAL_CATALOGUE``, ``SolverConfig.materials``; by default the seven of
+``cross_sections.MATERIALS``: air, lung, adipose, water, muscle, soft tissue, cortical bone) from point-wise photon
+interaction data.
 
 Data: XrayPhysics (github.com/kylechampley/XrayPhysics, EPDL97 tables), loaded by ``resolve_backend()``.
 
@@ -47,9 +48,14 @@ Physics summary (all coefficients per unit density, cm^2/g):
     The uncollided fluence and the primary use it instead of the group-averaged ``mu_t`` (exact in
     energy: no within-group beam hardening error; docs/source/design_notes.rst, "Cross sections").
 
-Materials (``cross_sections.MATERIALS`` order = increasing attenuation at the nominal density, asserted at every fine
-energy by ``check_material_order``; nominal densities ``cross_sections.NOMINAL_DENSITIES``; formulas
-``MATERIAL_FORMULAS``):
+Materials. The compositions and nominal densities of every material the builder knows are in
+``cross_sections.MATERIAL_CATALOGUE`` (sources there); ``MATERIAL_FORMULAS`` maps each name to its composition. A
+library is built for a table of (name, nominal density, formula) entries, ``materials=`` (default: the seven default
+anchors; ``build_solver_library`` uses ``cross_sections.material_table(config.materials)``). The builder sorts the
+table by nominal attenuation at the spectrum-mean energy (``sort_material_table``; a table already in that order is
+unchanged) and asserts at every fine energy that the order holds (``check_material_order``: no two materials cross).
+The cache key holds the sorted table (names, nominal densities, formulas), so different sets never share a cache entry
+and the default set keeps the key of earlier versions. The default seven:
   * air     = XrayPhysics library string 'air' (78.084*N2 + 20.946*O2 + 0.9340*Ar + 0.0397*CO2, read as mass
               fractions of the compounds exactly as XrayPhysics' parser does), 0.0012 g/cm^3.
   * lung    = XrayPhysics 'lung', 0.26 g/cm^3 (the WLAB lung; XrayPhysics lists 0.25).
@@ -82,12 +88,13 @@ import numpy as np
 import torch
 
 from .config import SolverConfig
-from .cross_sections import ELECTRON_REST_KEV, MATERIAL_TABLE, MultigroupLibrary
+from .cross_sections import ELECTRON_REST_KEV, MATERIAL_CATALOGUE, MATERIALS, MultigroupLibrary, material_table
 
 __all__ = [
     "BuildInfo",
     "MATERIAL_FORMULAS",
     "default_material_table",
+    "sort_material_table",
     "check_material_order",
     "build_library",
     "default_cache_dir",
@@ -107,38 +114,17 @@ __all__ = [
 _BUILD_VERSION = "citrus-xsec-2"  # 2: the seven-material table; names, nominal densities and formulas in the key
 _TWO_PI = 2.0 * math.pi
 
-# Material definitions (formula strings in XrayPhysics syntax: 'a*F1 + b*F2' with a, b mass
-# fractions of the compounds F1, F2; a bare formula is a stoichiometric compound).
-_BONE_CORTICAL_XRAYPHYSICS = (
-    "0.047234*H + 0.144330*C + 0.041990*N + 0.446096*O + 0.002200*Mg + 0.104970*P + "
-    "0.003150*S + 0.209930*Ca + 0.000100*Zn"
-)
-# XrayPhysics library strings (xrayPhysics().get_material_library(), verbatim; the air terms are mass fractions of the
-# compounds, as XrayPhysics' parser reads them); ICRU-44 skeletal muscle and soft tissue mass fractions
-_AIR_XRAYPHYSICS = "78.084*N2 + 20.946*O2 + 0.9340*Ar + 0.0397*CO2"
-_LUNG_XRAYPHYSICS = (
-    "0.10132562304283013*H + 0.10235810831090612*C + 0.028663471831760927*N + 0.75742799115584314*O + "
-    "0.0018408652066471242*Na + 0.00073034326133282642*Mg + 0.00080037617680309744*P + 0.0022510579972587113*S + "
-    "0.0026612507878702989*Cl + 0.0019409122287475113*K"
-)
-_ADIPOSE_XRAYPHYSICS = (
-    "0.119477*H + 0.637240*C + 0.007970*N + 0.232333*O + 0.000500*Na + 0.000020*Mg + 0.000160*P + 0.000730*S + "
-    "0.001190*Cl + 0.000320*K + 0.000020*Ca + 0.000020*Fe + 0.000020*Zn"
-)
-_MUSCLE_ICRU44 = "0.102*H + 0.143*C + 0.034*N + 0.710*O + 0.001*Na + 0.002*P + 0.003*S + 0.001*Cl + 0.004*K"
-_SOFT_TISSUE_ICRU44 = "0.102*H + 0.143*C + 0.034*N + 0.708*O + 0.002*Na + 0.003*P + 0.003*S + 0.002*Cl + 0.003*K"
-MATERIAL_FORMULAS: dict[str, str] = {
-    "air": _AIR_XRAYPHYSICS, "lung": _LUNG_XRAYPHYSICS, "adipose": _ADIPOSE_XRAYPHYSICS, "water": "H2O",
-    "muscle": _MUSCLE_ICRU44, "soft_tissue": _SOFT_TISSUE_ICRU44, "bone": _BONE_CORTICAL_XRAYPHYSICS,
-}
+# Compositions (formula strings in XrayPhysics syntax: 'a*F1 + b*F2' with a, b mass fractions of the compounds F1, F2;
+# a bare formula is a stoichiometric compound) of every catalogue material, `cross_sections.MATERIAL_CATALOGUE`
+MATERIAL_FORMULAS: dict[str, str] = {name: formula for name, (_, formula) in MATERIAL_CATALOGUE.items()}
 
 MaterialTable = Sequence[tuple[str, float, str]]  # (name, nominal density g/cm^3, XrayPhysics formula) per material
 
 
 def default_material_table() -> tuple[tuple[str, float, str], ...]:
-    """The package's seven materials as (name, nominal density, formula): ``cross_sections.MATERIAL_TABLE`` with
-    ``MATERIAL_FORMULAS``."""
-    return tuple((n, float(d), MATERIAL_FORMULAS[n]) for n, d in MATERIAL_TABLE)
+    """The seven default anchors as (name, nominal density, formula): ``cross_sections.material_table(MATERIALS)``
+    (``cross_sections.MATERIAL_TABLE`` with ``MATERIAL_FORMULAS``)."""
+    return material_table(MATERIALS)
 
 
 def _material_table(materials: Optional[MaterialTable]) -> tuple[tuple[str, float, str], ...]:
@@ -300,8 +286,41 @@ def parse_formula(formula: str, atomic_mass: Callable[[int], float]) -> dict[int
 
 def material_composition(backend: _XrayPhysicsBackend,
                          materials: Optional[MaterialTable] = None) -> dict[str, dict[int, float]]:
-    """Element mass fractions per basis material (table order; default the seven-material table), keyed by name."""
+    """Element mass fractions per material (table order; default the seven default anchors), keyed by name."""
     return {n: parse_formula(f, backend.atomic_mass) for n, _, f in _material_table(materials)}
+
+
+def _mean_energy(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], fine_bin_width_kev: float) -> float:
+    """Spectrum-mean photon energy (keV) over the group structure of ``config`` on the fine energy quadrature of the
+    build: sum_e w_e E_e / sum_e w_e with w_e the exact spectrum integral over fine bin e, the effective energy of the
+    library's density model (``citrus.utilities.effective_energy``, 63.03 keV for the default 125 kVp spectrum)."""
+    edges = make_group_edges(config, spectrum)
+    E, _, bin_low, bin_high = fine_energy_grid(edges, fine_bin_width_kev)
+    density = _Spectrum(*spectrum)
+    photons = density.cumulative_integral(bin_high) - density.cumulative_integral(bin_low)
+    if not photons.sum() > 0:
+        raise ValueError("spectrum has no photons inside the group structure")
+    return float((photons * E).sum() / photons.sum())
+
+
+def sort_material_table(config: SolverConfig, materials: Optional[MaterialTable] = None,
+                        spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+                        backend: _XrayPhysicsBackend | None = None, *,
+                        fine_bin_width_kev: float = 0.5) -> tuple[tuple[str, float, str], ...]:
+    """The material table ((name, nominal density g/cm^3, formula) per material; None: the seven default anchors)
+    sorted by nominal attenuation rho^nom mu/rho(E_eff) at the spectrum-mean energy E_eff of the build
+    (``_mean_energy``; elemental total mass attenuation of the backend mixed by mass fraction; a stable sort, so a
+    table already in that order is returned as it is). Whether the order holds at every energy of the library is
+    checked by the build (``check_material_order``). Needs the backend (XrayPhysics)."""
+    table = _material_table(materials)
+    backend = resolve_backend() if backend is None else backend
+    spectrum_arrays = _spectrum_or_default(spectrum, backend)
+    energy = np.array([_mean_energy(config, spectrum_arrays, fine_bin_width_kev)])
+    composition = material_composition(backend, table)
+    attenuation = [density * sum(w * float(backend.sigma("total", Z, energy)[0]) for Z, w in composition[name].items())
+                   for name, density, _ in table]
+    order = sorted(range(len(table)), key=lambda i: attenuation[i])
+    return tuple(table[i] for i in order)
 
 
 def check_material_order(fine_mu_t: np.ndarray, nominal_density: np.ndarray, names=None) -> None:
@@ -548,9 +567,9 @@ def compute_library(
       backend: a loaded ``resolve_backend()`` object (None loads one).
       fine_bin_width_kev: maximum fine energy bin width (<= 0.5 keV for production).
       gauss_legendre_nodes: Gauss-Legendre nodes per angular piece (>= 32 for production).
-      materials: (name, nominal density g/cm^3, formula) per basis material, in order of increasing attenuation at
-        the nominal density (``check_material_order`` raises otherwise); None: the seven-material table
-        (``default_material_table``).
+      materials: (name, nominal density g/cm^3, formula) per material, in any order (sorted here by nominal attenuation
+        at the spectrum-mean energy, ``sort_material_table``; ``check_material_order`` raises if two materials cross
+        inside the library's energy range); None: the seven default anchors (``default_material_table``).
 
     Returns:
       (MultigroupLibrary with float64 CPU tensors, BuildInfo).
@@ -561,7 +580,8 @@ def compute_library(
     edges = make_group_edges(config, (spectrum_energies, spectrum_weights))
     G = edges.size - 1
     L = int(config.legendre_order)
-    table = _material_table(materials)
+    table = sort_material_table(config, materials, (spectrum_energies, spectrum_weights), backend,
+                                fine_bin_width_kev=fine_bin_width_kev)
     names = tuple(n for n, _, _ in table)
     M = len(names)
     m_e = ELECTRON_REST_KEV
@@ -763,7 +783,8 @@ def build_library(
     materials: Optional[MaterialTable] = None,
 ) -> MultigroupLibrary:
     """Build (or load from cache) the multigroup library for ``config`` and the material table ``materials`` (None:
-    the seven-material table, ``default_material_table``; else (name, nominal density, formula) per material).
+    the seven default anchors, ``default_material_table``; else (name, nominal density, formula) per material, e.g.
+    ``cross_sections.material_table(names)``, in any order: sorted by nominal attenuation, ``sort_material_table``).
 
     Shapes of the result (M materials, 7 by default; G = config.num_groups, L = config.legendre_order):
       group_edges [G+1] desc, group_energy [G], spectrum_fraction [G], mu_t/mu_pe [M, G],
@@ -773,8 +794,10 @@ def build_library(
       nominal_density [M].
 
     The cache file is ``<cache_dir>/mglib_<hash>.pt`` keyed by the build version, the relevant config
-    fields, the spectrum arrays, the backend name, the numerical parameters and the material table (names, nominal
-    densities, formulas; the two-material caches of citrus < 0.1.0 have other keys and are never loaded).
+    fields, the spectrum arrays, the backend name, the numerical parameters and the SORTED material table (names,
+    nominal densities, formulas: every set of materials has its own entry, any order of the same set the same one, and
+    the default seven keep the key of earlier versions; the two-material caches of citrus < 0.1.0 have other keys and
+    are never loaded).
     ``cache_dir="default"`` is `default_cache_dir()`; ``cache_dir=None`` disables the cache. A cache file that cannot be
     loaded as a complete library (e.g. one lacking the fine-energy table) is rebuilt and overwritten.
     """
@@ -782,21 +805,22 @@ def build_library(
         cache_dir = default_cache_dir()
     backend = resolve_backend()
     spectrum_arrays = _spectrum_or_default(spectrum, backend)
+    table = sort_material_table(config, materials, spectrum_arrays, backend, fine_bin_width_kev=fine_bin_width_kev)
     path = None
     if cache_dir is not None:
-        key = _cache_key(config, spectrum_arrays, backend.name, fine_bin_width_kev, gauss_legendre_nodes, materials)
+        key = _cache_key(config, spectrum_arrays, backend.name, fine_bin_width_kev, gauss_legendre_nodes, table)
         path = os.path.join(cache_dir, f"mglib_{key}.pt")
         if os.path.isfile(path):
             try:
                 library = MultigroupLibrary.load(path)
-                names = tuple(n for n, _, _ in _material_table(materials))
+                names = tuple(n for n, _, _ in table)
                 if tuple(library.materials) != names:
                     raise KeyError(f"cached materials {tuple(library.materials)} != {names}")
                 return library
             except (KeyError, TypeError, ValueError) as exc:
                 warnings.warn(f"rebuilding the library cache {path}: {exc}", RuntimeWarning)
     library, _ = compute_library(config, spectrum_arrays, backend, fine_bin_width_kev=fine_bin_width_kev,
-                                 gauss_legendre_nodes=gauss_legendre_nodes, materials=materials)
+                                 gauss_legendre_nodes=gauss_legendre_nodes, materials=table)
     if path is not None:
         os.makedirs(cache_dir, exist_ok=True)  # type: ignore[arg-type]
         tmp = path + ".tmp"

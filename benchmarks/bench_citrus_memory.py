@@ -2,7 +2,7 @@
 
     python benchmarks/bench_citrus_memory.py [--delta-voxel 0.125] [--transport-cell-cm 1.0] [--views 180]
         [--scatter-view-stride 8] [--outer-iterations 2]
-        [--primary-projector mbirtorch|siddon] [--resume-error-sinogram | --no-resume-error-sinogram]
+        [--resume-error-sinogram | --no-resume-error-sinogram]
         [--panel full|small] [--memory-cap-mib 0]
 
 Synthesizes scatter-free counts Y = I0 exp(-A X_true) of the WLAB phantom on the `--delta-voxel` grid (A the
@@ -11,9 +11,10 @@ MBIRTORCH projector; the memory and the time of the loop do not depend on the sc
 `--scatter-view-stride`-th view. The MBIR call is wrapped so that the peak memory is split into the scatter stage (from
 the start of the outer iteration to the MBIR call: densities, material fields, the scatter steps, the primaries, the
 correction) and the MBIR iteration. Prints one line per outer iteration (the first one includes the compilation of the
-kernels: read the later ones) and the persistent allocation between iterations. `--primary-projector` /
-`--resume-error-sinogram` set CitrusConfig.primary_projector and CitrusConfig.resume_error_sinogram (version 0.3.0;
-ignored by older versions, which always trace the Siddon primary and restart MBIR from the sinogram).
+kernels: read the later ones) and the persistent allocation between iterations. `--resume-error-sinogram` sets
+CitrusConfig.resume_error_sinogram (version 0.3.0; ignored by older versions, which restart MBIR from the sinogram).
+The primaries are MBIRTORCH projections of the material maps (versions 0.3.0 and 0.4.0 also offered the solver's
+Siddon primary, CitrusConfig.primary_projector; up to 0.2.0 it was the only one).
 """
 
 from __future__ import annotations
@@ -50,7 +51,6 @@ def main() -> None:
     parser.add_argument("--views", type=int, default=180)
     parser.add_argument("--scatter-view-stride", type=int, default=8, help="CitrusConfig.scatter_view_stride")
     parser.add_argument("--outer-iterations", type=int, default=2)
-    parser.add_argument("--primary-projector", default=None, choices=["mbirtorch", "siddon"])
     parser.add_argument("--resume-error-sinogram", default=None, action=argparse.BooleanOptionalAction)
     parser.add_argument("--panel", default="full", choices=["full", "small"])
     parser.add_argument("--memory-cap-mib", type=float, default=0.0, help="PyTorch allocator cap (MiB, 0: none)")
@@ -62,14 +62,13 @@ def main() -> None:
     solver = wlab_solver(args.delta_voxel, config=replace(SolverConfig(), transport_cell_cm=args.transport_cell_cm),
                          geometry=geometry, device=DEVICE)
     angles = view_angles(args.views, geometry)
-    X_true = densities_to_attenuation(solver.library, wlab_phantom(grid, device=DEVICE))
+    X_true = densities_to_attenuation(solver.library, wlab_phantom(grid, materials=solver.library.materials,
+                                                                   device=DEVICE))
     model = make_cone_model(grid, geometry, angles, device=DEVICE)
     I0 = 1.0e5
     Y = I0 * torch.exp(-forward_project(model, X_true))
     extra = {}
     fields = {f.name for f in dataclasses.fields(CitrusConfig)}
-    if args.primary_projector is not None and "primary_projector" in fields:
-        extra["primary_projector"] = args.primary_projector
     if args.resume_error_sinogram is not None and "resume_error_sinogram" in fields:
         extra["resume_error_sinogram"] = args.resume_error_sinogram
     config = CitrusConfig(num_outer_iterations=args.outer_iterations, scatter_view_stride=args.scatter_view_stride,
@@ -87,8 +86,10 @@ def main() -> None:
 
     citrus_module.mbir_iterations = wrapped
     per_view = X_true.numel() * 4 / MIB
+    num_materials = solver.library.num_materials
     print(f"citrus {citrus.__version__}: grid {grid.shape} = {X_true.numel() / 1e6:.1f} M voxels at "
-          f"{args.delta_voxel} cm ({per_view:.0f} MiB per fine map, {7 * per_view:.0f} MiB for seven), "
+          f"{args.delta_voxel} cm ({per_view:.0f} MiB per fine map, {num_materials * per_view:.0f} MiB for all "
+          f"{num_materials}), "
           f"{args.transport_cell_cm:g} cm cells, {args.views} views, panel {geometry.num_det_rows} x "
           f"{geometry.num_det_channels} ({Y.numel() * 4 / MIB:.0f} MiB per sinogram), stride "
           f"{args.scatter_view_stride}, config {extra}", flush=True)

@@ -1,5 +1,112 @@
 # Changelog
 
+## v0.5.0 — 2026-10-17
+
+The CITRUS loop always computes its primary with MBIRTORCH; a material catalogue and user-selectable anchor materials
+for the density model. **Breaking changes** (the Siddon primary option of the loop is removed); **the defaults are
+unchanged**: the default anchors give the cache key and the library of version 0.4.0 bit for bit, the WLAB regression
+anchors hold, `check_cuda.sh` reports every kernel matching, and the demo at its defaults gives CITRUS 0.0215 / 0.0259
+on the cached `wlab_180v_0p5cm_short_v2` data set as before.
+
+### The loop's primary is MBIRTORCH's per-material primary
+
+- **Removed** `CitrusConfig.primary_projector` (and its validation), `citrus.citrus.SiddonViewProjector`,
+  `citrus.citrus.PRIMARY_PROJECTORS` and `citrus_recon`'s `info["primary_projector"]`. The primary of every view in
+  the loop is always `primary_signals` with `recon.mbir_bridge.ViewChunkProjector`: MBIRTORCH's pixel-integrated
+  per-material line integrals, the same operator A as the reconstruction, through the solver's polychromatic
+  transmission. `primary_signals(solver, fields, angles, projector, ...)` takes a `ViewChunkProjector`; its default
+  chunk is max(1, V // (M' + 1)) views (the Siddon sub-pixel factor is gone). `CitrusConfig.primary_views_per_chunk`
+  stays. Passing `primary_projector=` to `CitrusConfig` now raises `TypeError`.
+- **Removed** the `primary_projector` argument of `utilities.synthesize_cone_beam_data` / `synthesize_wlab_dataset`:
+  the SPR's denominator is always the MBIRTORCH-based primary. **On-disk format unchanged**: the data-set meta keeps
+  `"primary_projector": "mbirtorch"` and `"data_format": 2`, so the data sets of versions 0.3.0 and 0.4.0 stay valid
+  and are reused; nothing had to be regenerated (the demo's default data set is still
+  `demo/input/wlab_180v_0p5cm_short_v2.npz`).
+- Demo `demo/demo_citrus.py`: **removed** `--primary-projector` (output suffix `_siddon`) and
+  `--truth-primary-projector` (cache suffix `_primary-siddon`; such data sets are no longer loaded); the summary JSON
+  drops `primary_projector` and `truth_primary_projector`. `benchmarks/bench_citrus_memory.py`: `--primary-projector`
+  removed.
+- **Kept**: the scatter solver's own primary (`ScatterSolver.primary`, `primary_path_lengths`,
+  `primary_from_path_lengths`, `scatter_image.primary_image`, `solve_view`'s primary and scatter fraction): the
+  standalone solver has no MBIRTORCH model. `tests/test_attenuation_path.py` keeps the cross-check of the two
+  operators (the loop's MBIRTORCH primary against the solver's Siddon primary per view: relative L2 < 5 % with the
+  synthetic library, < 1.5 % with the real one; median pixel < 0.2 %). The loop-against-loop test of the two options
+  in `tests/test_citrus_recon.py` is removed; the Siddon loop's demo numbers stay in the docs as history (0.0257 /
+  0.0305 on the default data set).
+
+### Material catalogue
+
+`cross_sections.MATERIAL_CATALOGUE` (read-only ordered mapping name -> (nominal density g/cm^3, XrayPhysics
+composition string)); every entry builds in the library (tested one by one). XrayPhysics' own material list
+(`xrayPhysics().get_material_library()`) supplies air, lung, adipose, cortical bone, PMMA and polyethylene; it has no
+ICRU-44 brain, blood, skin, cartilage or spongiosa, which are entered from the cited tables.
+
+| name | density | mu at 63 keV (1/cm) | composition source |
+|---|---|---|---|
+| `air` | 0.0012 | 0.00022 | XrayPhysics `air` |
+| `lung` | 0.26 | 0.0520 | XrayPhysics `lung` (WLAB lung density) |
+| `adipose` | 0.95 | 0.1846 | XrayPhysics `adipose_tissue` (ICRP) |
+| `water` | 1.0 | 0.2013 | H2O |
+| `muscle` | 1.05 | 0.2102 | ICRU Report 44, skeletal muscle |
+| `soft_tissue` | 1.06 | 0.2122 | ICRU Report 44, soft tissue |
+| `bone` | 1.85 | 0.5366 | XrayPhysics `bone_cortical` (ICRP cortical bone) |
+| `trabecular_bone` | 1.18 | 0.2697 | Woodard and White (1986), skeleton spongiosa (ICRU Report 46) |
+| `brain` | 1.04 | 0.2092 | ICRU Report 44, brain (grey / white matter) |
+| `blood` | 1.06 | 0.2130 | ICRU Report 44, whole blood |
+| `cartilage` | 1.10 | 0.2234 | Woodard and White (1986), cartilage (ICRU Report 46) |
+| `skin` | 1.09 | 0.2160 | ICRU Report 44, skin |
+| `pmma` | 1.18 | 0.2230 | XrayPhysics `PMMA` (C5H8O2) |
+| `polyethylene` | 0.94 | 0.1826 | XrayPhysics `Polyethylene` (C2H4) |
+| `aluminium` | 2.699 | 0.7034 | Al (NIST density) |
+| `titanium` | 4.54 | 3.0928 | Ti (NIST density) |
+| `carbon_fibre` | 1.56 | 0.2756 | carbon-fibre epoxy laminate (couch): 60 % fibre volume, 0.692 C + 0.308 C21H24O4 by mass |
+
+The formula strings of the seven default materials moved from `cross_section_library` to `cross_sections`
+(verbatim); `cross_section_library.MATERIAL_FORMULAS` now maps every catalogue name to its composition.
+`cross_sections.material_table(names)` gives the (name, nominal density, formula) table of catalogue names,
+`check_material_names(names, minimum=2)` checks them (unknown names list the catalogue), `material_index(library or
+names, name)` finds a row by name. `MATERIALS`, `MATERIAL_TABLE`, `NOMINAL_DENSITIES` are the default seven as
+before; `WATER = 3` and `BONE = 6` are kept as the rows of the DEFAULT set.
+
+### Anchor materials: `SolverConfig.materials`
+
+- **New** `SolverConfig.materials: tuple[str, ...]` (default `cross_sections.MATERIALS`, the seven in the present
+  order): catalogue names of the anchors of the density model, at least two, any order (`validate` checks them; a
+  list is stored as a tuple). `build_solver_library(config)` (and so `utilities.wlab_solver`) builds the library for
+  exactly that set; an explicit `materials=` table still overrides it.
+- **Sorted by attenuation.** `cross_section_library.sort_material_table(config, materials, spectrum, backend,
+  fine_bin_width_kev=)` sorts a table by nominal attenuation at the spectrum-mean energy of the build (63.03 keV);
+  `build_library` and `compute_library` use it, so any order of a set gives the same library, and the existing check
+  (`check_material_order`) refuses a set whose members cross inside 10-125 keV (e.g. skin with soft tissue).
+- **Cache key.** The key holds the sorted table (names, nominal densities, formulas): every set has its own cache
+  entry, any order of a set the same entry, and the default seven produce the key of version 0.4.0
+  (`mglib_e552a2c1b51c1763c095.pt` for `SolverConfig()`), so existing caches are reused; the library is bit-identical
+  (tested against the 0.4.0 keys and by building the default set by name and in reverse order).
+- **Density model.** `attenuation_to_densities` / `attenuation_to_density` / `DensityModel` (already general in M)
+  interpolate between whichever anchors bracket a voxel; below the lowest anchor that anchor alone of reduced density,
+  above the highest that anchor alone, denser (air and bone for the default set, as before).
+- **By name, not index.** `utilities.wlab_phantom(grid, ..., materials=None)` and `wlab_setup(..., materials=None)`
+  return rho [M, ...] for the given names (default the seven), with the phantom in the "water" and "bone" rows looked
+  up by name; a set without water or bone raises `ValueError` ("the WLAB phantom needs 'water' and 'bone' ...").
+  `synthesize_wlab_dataset` places the phantom in its library's rows (`materials=solver.library.materials`).
+- Demos: `demo/demo_citrus.py --materials air,water,bone` (comma-separated catalogue names; default the seven) sets
+  the anchors of the loop's density model; the truth solver of the data keeps the default seven (the phantom is water
+  and bone only, so every set runs on the same data and the data-set cache name does not change); the demo prints
+  the anchors with their nominal attenuations, the summary JSON records `materials`, the outputs of another set carry
+  `_materials-<names>`. `demo/demo_scatter_solver.py --materials` (water and bone required). The memory benchmark
+  reports the fine-map memory for the library's number of materials.
+- Measured (quick setting `--views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 --scatter-every 1`,
+  same data `wlab_36v_1cm_short_v2`, relative RMSE whole prism / core): default seven 0.0704 / 0.0862, `--materials
+  air,water,bone` 0.0696 / 0.0852 (FDK 0.309 / 0.345, no correction 0.289 / 0.355); the reduced set is slightly better
+  here because the WLAB truth is water and bone only (its lung and air inserts are water of reduced density, which the
+  reduced model reproduces as air / water mixtures, the seven-material model as lung / adipose and air / lung); scatter
+  stage 5.0 s instead of 5.1 s per outer iteration.
+- Tests: `tests/test_material_catalogue.py` (catalogue, name checks, the phantom by name, one library build per
+  catalogue entry, the default set's 0.4.0 cache keys and bit-identical library, one cache entry per set, the reduced
+  set's density model, solve_view on the reduced and the extended (seven plus titanium) sets against the default set,
+  the data generator on a reduced set, the WLAB regression anchor of `tests/data/pre_quadrature_reference.json` with
+  the default and the reduced real library).
+
 ## v0.4.0 — 2026-10-17
 
 Plain names. Every abbreviated identifier, file and module name, configuration field, command-line flag and

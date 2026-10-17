@@ -2,10 +2,14 @@
 
     python demo/demo_scatter_solver.py [--delta-voxel 1.0] [--transport-cell-cm 1.0] [--angle-deg 0]
                                        [--panel small|full] [--grid] [--device cuda] [--memory-cap-mib 4400]
+                                       [--materials air,lung,adipose,water,muscle,soft_tissue,bone]
 
-Builds the seven-material multigroup library from XrayPhysics (cached in $CITRUS_CACHE_DIR or ~/.cache/citrus; about
-16 s on the first run), rasterizes the WLAB phantom (30 x 20 x 40 cm water prism with lung, air and bone inserts, in
-the seven-material basis: its water and bone rows), solves one view with the default solver
+Builds the multigroup library of the anchor materials (``--materials``: comma-separated names of
+citrus.scatter_solver.cross_sections.MATERIAL_CATALOGUE, at least two, water and bone among them; default the seven
+air, lung, adipose, water, muscle, soft_tissue, bone) from XrayPhysics (cached in $CITRUS_CACHE_DIR or
+~/.cache/citrus; about 16 s on the first run for seven materials), rasterizes the WLAB phantom (30 x 20 x 40 cm water
+prism with lung, air and bone inserts, in the library's material basis: its water and bone rows; the result does not
+depend on the other anchors), solves one view with the default solver
 configuration (6 groups, P7, 8 x 16 sweep directions, 16 x 32 collapsed-cone directions), and plots the primary and
 scatter detector signals, the scatter fraction and central-row profiles to demo/output/scatter_solver_view.png.
 """
@@ -27,6 +31,7 @@ import torch  # noqa: E402
 
 from citrus.scatter_solver import (ScatterSolver, SolverConfig, build_solver_library, csi_response,  # noqa: E402
                                    focused_1d_grid, no_grid)
+from citrus.scatter_solver.cross_sections import MATERIAL_CATALOGUE, check_material_names  # noqa: E402
 # noqa: E402
 from citrus.utilities import full_field_wlab_geometry, set_memory_cap, wlab_geometry, wlab_grid, wlab_phantom
 
@@ -44,14 +49,24 @@ def main() -> None:
     parser.add_argument("--grid", action="store_true", help="add a focused 10:1 anti-scatter grid")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--memory-cap-mib", type=float, default=4400.0, help="PyTorch CUDA memory cap (0: none)")
+    parser.add_argument("--materials", default=",".join(SolverConfig().materials),
+                        help="anchor materials of the library, comma-separated names from the catalogue "
+                             f"({', '.join(MATERIAL_CATALOGUE)}); at least two, water and bone among them (default: "
+                             f"{','.join(SolverConfig().materials)})")
     parser.add_argument("--out", default=OUT_DIR)
     args = parser.parse_args()
+    try:
+        materials = check_material_names(tuple(name.strip() for name in args.materials.split(",") if name.strip()))
+    except ValueError as exc:
+        raise SystemExit(f"--materials: {exc}")
+    if "water" not in materials or "bone" not in materials:
+        raise SystemExit(f"--materials: the WLAB phantom needs water and bone among the materials, got {materials}")
 
     device = torch.device(args.device)
     if device.type == "cuda":
         set_memory_cap(args.memory_cap_mib)
     os.makedirs(args.out, exist_ok=True)
-    config = replace(SolverConfig(), transport_cell_cm=args.transport_cell_cm,
+    config = replace(SolverConfig(), transport_cell_cm=args.transport_cell_cm, materials=materials,
                      dtype="float32" if device.type == "cuda" else "float64")
     t0 = time.perf_counter()
     library = build_solver_library(config)
@@ -62,7 +77,7 @@ def main() -> None:
     grid = wlab_grid(args.delta_voxel)
     geometry = wlab_geometry() if args.panel == "small" else full_field_wlab_geometry()
     dtype = torch.float32 if device.type == "cuda" else torch.float64
-    rho = wlab_phantom(grid, device=device, dtype=dtype)
+    rho = wlab_phantom(grid, materials=library.materials, device=device, dtype=dtype)
     solver = ScatterSolver(library, config, geometry, detector=csi_response(0.06),
                            grid_response=focused_1d_grid() if args.grid else no_grid(), device=device, dtype=dtype)
     angle = math.radians(args.angle_deg)

@@ -8,7 +8,8 @@ Modules
     config                 SolverConfig: every discretization parameter
     geometry               Grid (transport and quadrature grids), ConeGeometry (MBIRTORCH conventions), conservative
                            resampling between grids
-    cross_sections         MultigroupLibrary container, per-voxel coefficients, synthetic test library
+    cross_sections         material catalogue (MATERIAL_CATALOGUE), MultigroupLibrary container, per-voxel
+                           coefficients, synthetic test library
     cross_section_library  library builder from XrayPhysics (EPDL97) data, cached on disk
     source, detector       point source with collimation; detector and anti-scatter-grid responses
     angular_quadrature     direction sets, real spherical harmonics, scattering-source operator

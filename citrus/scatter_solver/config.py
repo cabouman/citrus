@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Literal, Sequence
 
+from .cross_sections import MATERIALS, check_material_names
+
 
 @dataclass(frozen=True)
 class SolverConfig:
@@ -17,6 +19,14 @@ class SolverConfig:
       energy_min_kev    lowest group edge (keV); Compton photons scattered below it are absorbed
       legendre_order    Legendre order L of the scattering kernel (spherical harmonics up to degree L)
       num_eta_table     points of the tabulated per-steradian transfer in eta = cos(scattering angle)
+
+    Materials
+      materials         names of the ANCHOR materials of the density model, from `cross_sections.MATERIAL_CATALOGUE`
+                        (at least two, any order): the library is built for exactly this set (`build_solver_library`,
+                        `utilities.wlab_solver`; sorted by nominal attenuation, its cache key holds the set), and the
+                        density model interpolates between the two anchors whose nominal attenuations bracket a voxel
+                        (`citrus.utilities.attenuation_to_densities`). Default: the seven `cross_sections.MATERIALS`
+                        (air, lung, adipose, water, muscle, soft_tissue, bone), the library of earlier versions
 
     Angle (sweep quadrature: Gauss-Legendre in cos(theta) x equally spaced azimuths)
       num_polar         polar nodes (>= L + 1)
@@ -59,6 +69,9 @@ class SolverConfig:
     legendre_order: int = 7
     num_eta_table: int = 2001
 
+    # --- materials ----------------------------------------------------------------------------
+    materials: tuple[str, ...] = MATERIALS
+
     # --- angle --------------------------------------------------------------------------------
     num_polar: int = 8
     num_azimuthal: int = 16
@@ -79,6 +92,10 @@ class SolverConfig:
 
     # --- numerics -----------------------------------------------------------------------------
     dtype: Literal["float32", "float64"] = "float32"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.materials, str) and isinstance(self.materials, Sequence):
+            object.__setattr__(self, "materials", tuple(self.materials))  # hashable, compares equal to a tuple
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -106,6 +123,7 @@ class SolverConfig:
             raise ValueError("num_groups must be >= 1")
         if self.group_edges_kev is not None and len(self.group_edges_kev) != self.num_groups + 1:
             raise ValueError("group_edges_kev must have num_groups+1 entries")
+        check_material_names(self.materials)
         if not self.transport_cell_cm > 0:
             raise ValueError(f"transport_cell_cm must be > 0, got {self.transport_cell_cm}")
         if not self.quadrature_point_spacing_cm > 0:

@@ -274,17 +274,10 @@ def test_synthesize_cone_beam_data_generic():
     other = ConeGeometry(100.0, 150.0, 20, 24, 1.6, 1.6)
     with pytest.raises(ValueError, match="geometry"):
         synthesize_cone_beam_data(rho, grid, other, angles, solver)
-    # the SPR's primary: MBIRTORCH line integrals (default) or the solver's Siddon primary (citrus <= 0.2.0)
-    assert out["meta"]["primary_projector"] == "mbirtorch"
-    sid = synthesize_cone_beam_data(rho, grid, geometry, angles, solver, I0=1.0e4, noise=False,
-                                    primary_projector="siddon")
-    assert sid["meta"]["primary_projector"] == "siddon"
-    for v, a in enumerate(angles):
-        p = solver.solve_view(rho, grid, a).primary["planar_fluence"].sum(0).cpu().numpy()
-        np.testing.assert_allclose(sid["solver_primary"][v], p, rtol=1e-5)
-    np.testing.assert_allclose(sid["solver_scatter"], out["solver_scatter"], rtol=1e-4)
-    np.testing.assert_allclose(sid["P"], out["P"], rtol=1e-5)  # MBIRTORCH atomics
-    d = np.abs(out["solver_primary"] / sid["solver_primary"] - 1)
-    assert float(np.median(d)) < 0.01 and float(d.max()) > 0  # the two primary models differ at the edges only
-    with pytest.raises(ValueError, match="primary_projector"):
-        synthesize_cone_beam_data(rho, grid, geometry, angles, solver, primary_projector="leap")
+    # the SPR's primary is the loop's MBIRTORCH per-material primary (meta unchanged since citrus 0.3.0); it agrees
+    # with the solver's Siddon primary of solve_view (one ray per pixel center) except at the edges of the object
+    assert out["meta"]["primary_projector"] == "mbirtorch" and out["meta"]["data_format"] == 2
+    siddon = np.stack([solver.solve_view(rho, grid, a).primary["planar_fluence"].sum(0).cpu().numpy()
+                       for a in angles])
+    d = np.abs(out["solver_primary"] / siddon - 1)
+    assert float(np.median(d)) < 0.01 and float(d.max()) > 0

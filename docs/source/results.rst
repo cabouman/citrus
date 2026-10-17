@@ -46,15 +46,19 @@ The quick demo setting (``demo/demo_citrus.py --views 36 --delta-voxel 1 --outer
 --scatter-every 1``: 36 views over a short scan of 202.6 degrees, 1 cm grid, 10 outer iterations) shows the same
 ordering in about two minutes: relative RMSE 0.31 (FDK, Parker-weighted), 0.29 (no correction), 0.064 (CITRUS); over
 a full rotation (``--end-view-angle 360``) 0.32, 0.29 and 0.075 (measured with version 0.1.0 and the data-set format
-1 of citrus <= 0.2.0, SPR with the Siddon primary).
+1 of citrus <= 0.2.0, SPR with the Siddon primary). On the data-set format 2 of version 0.3.0 and later the same
+setting gives 0.309 / 0.345 (FDK), 0.289 / 0.355 (no correction) and 0.0704 / 0.0862 (CITRUS, whole prism / core),
+and 0.0696 / 0.0852 with the anchor materials air, water, bone (``--materials air,water,bone``, version 0.5.0; the
+WLAB truth is water and bone only, so the coarser anchor set loses nothing here).
 The demo's defaults (180 views over the short scan, 0.5 cm grid, 80 outer iterations with the scatter step on every
 8th view and at every 8th outer iteration, i.e. 10 scatter steps on 23 views each; data-set format 2, the SPR with the
-MBIRTORCH primary of the loop's default) reach a relative RMSE of 0.0215 over the prism and 0.0259 in the core (FDK
+MBIRTORCH primary of the loop) reach a relative RMSE of 0.0215 over the prism and 0.0259 in the core (FDK
 0.318 / 0.348, no correction 0.292 / 0.355) in 159 s of CITRUS on the RTX 3070 (8.6 s per scatter stage, 0.85 s per
-MBIR iteration, peak 1.64 GB allocated); synthesizing the data set takes 113 s once. With ``--primary-projector
-siddon`` on the same data: 0.0257 / 0.0305. On the format-1 data of version 0.2.0 (SPR with the Siddon primary) the
-Siddon loop gave 0.0242 / 0.0294 and the MBIRTORCH loop 0.0270 / 0.0305: the primary model that matches the data's
-wins (:doc:`method`, "CITRUS coupling"). Resuming MBIR from its error sinogram (the default) changes the
+MBIR iteration, peak 1.64 GB allocated); synthesizing the data set takes 113 s once. The loop computes its primary
+with MBIRTORCH's projector, the reconstruction's own operator; the Siddon loop of versions 0.3.0 and 0.4.0 on the same
+data gave 0.0257 / 0.0305, and on the format-1 data of version 0.2.0 (SPR with the Siddon primary) the Siddon loop
+gave 0.0242 / 0.0294 and the MBIRTORCH loop 0.0270 / 0.0305: the primary model that matches the data's wins
+(:doc:`method`, "CITRUS coupling"). Resuming MBIR from its error sinogram (the default) changes the
 reconstruction by 1.1e-6 (relative).
 
 Accuracy of the scatter model itself (inverse crime): the synthetic data and the reconstruction loop use the same

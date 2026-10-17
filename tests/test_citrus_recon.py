@@ -251,9 +251,8 @@ def test_sparse_views_interpolate_the_scatter_signal(tiny, monkeypatch):
     """The driver interpolates the scatter SIGNAL of the computed views and divides by the primary of every view
     (not the ratio): with a fake step (s_v = 2 + cos(angle)) and fake primaries of all views (`primary_signals`: 3 on
     the computed views, 5 on the skipped views), SPR_skipped = (M s_c) / 5 with M = interpolation_weights. The
-    primaries come from one `primary_signals` call per scatter stage with the projector of
-    CitrusConfig.primary_projector (MBIRTORCH's `ViewChunkProjector` or the `SiddonViewProjector`), never from the
-    step."""
+    primaries come from one `primary_signals` call per scatter stage with MBIRTORCH's `ViewChunkProjector`, never from
+    the step."""
     data, grid, geometry, solver, regularization = tiny
     angles = data["angles"]
     view_of = {float(a): v for v, a in enumerate(angles)}
@@ -284,13 +283,11 @@ def test_sparse_views_interpolate_the_scatter_signal(tiny, monkeypatch):
     monkeypatch.setattr(citrus_module, "citrus_view_step", fake_step)
     monkeypatch.setattr(citrus_module, "StateStore", FakeStore)
     monkeypatch.setattr(citrus_module, "primary_signals", fake_primaries)
-    for order, projector in ((1, "siddon"), (3, "siddon"), (3, "mbirtorch")):
+    for order in (1, 3):
         calls.clear()
-        config = CitrusConfig(num_outer_iterations=1, scatter_view_stride=4, scatter_view_interpolation_order=order,
-                              primary_projector=projector)
+        config = CitrusConfig(num_outer_iterations=1, scatter_view_stride=4, scatter_view_interpolation_order=order)
         _, info = citrus_recon(data["Y"], 1.0e5, angles, grid, geometry, solver, config, regularization=regularization)
-        assert calls == [{"siddon": "SiddonViewProjector", "mbirtorch": "ViewChunkProjector"}[projector]]
-        assert info["primary_projector"] == projector and "primary_seconds" in info["records"][1]
+        assert calls == ["ViewChunkProjector"] and "primary_seconds" in info["records"][1]
         M = citrus_module.interpolation_weights(angles, computed, order)
         expect = M @ np.array([signal[int(v)] for v in computed])
         spr = info["spr"][:, Rd // 2, Cd // 2].cpu().numpy()
@@ -302,13 +299,12 @@ def test_sparse_views_interpolate_the_scatter_signal(tiny, monkeypatch):
 def test_resume_error_sinogram_matches_restart(tiny):
     """CitrusConfig.resume_error_sinogram: the loop keeps MBIRTORCH's error sinogram between outer iterations
     (shifted by each new corrected sinogram) and gives the reconstruction of the restarted MBIR (a fresh y_c - A X
-    every iteration) to float rounding, with a scatter stage every 2nd iteration (the reused correction) and with the
-    Siddon primary; mbir_recon too."""
+    every iteration) to float rounding, with a scatter stage every 2nd iteration (the reused correction); mbir_recon
+    too."""
     data, grid, geometry, solver, regularization = tiny
     out = {}
     for resume in (True, False):
-        config = CitrusConfig(num_outer_iterations=4, scatter_every=2, primary_projector="siddon",
-                              resume_error_sinogram=resume)
+        config = CitrusConfig(num_outer_iterations=4, scatter_every=2, resume_error_sinogram=resume)
         out[resume], info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
                                          regularization=regularization)
         assert info["config"]["resume_error_sinogram"] is resume
@@ -318,24 +314,6 @@ def test_resume_error_sinogram_matches_restart(tiny):
                                     CitrusConfig(num_outer_iterations=3,
                                                  resume_error_sinogram=resume), regularization=regularization)
     assert float((out[True] - out[False]).norm() / out[False].norm()) < 1e-5
-
-
-@cuda
-def test_mbirtorch_primary_close_to_siddon_primary_in_the_loop(tiny):
-    """The loop's default primary (MBIRTORCH projections of the material maps) against the Siddon primary on the tiny
-    problem (2 cm voxels, 1.6 cm pixels): the scatter-to-primary ratios agree to 10 % (relative L2; the projectors
-    differ at the object's silhouette) and the reconstructions are close."""
-    data, grid, geometry, solver, regularization = tiny
-    result = {}
-    for projection in ("mbirtorch", "siddon"):
-        config = CitrusConfig(num_outer_iterations=2, primary_projector=projection)
-        X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
-                               regularization=regularization)
-        assert info["primary_projector"] == projection and "primary_seconds" in info["records"][1]
-        result[projection] = (X, info["spr"])
-    s_m, s_s = result["mbirtorch"][1], result["siddon"][1]
-    assert float((s_m - s_s).norm() / s_s.norm()) < 0.1
-    assert float((result["mbirtorch"][0] - result["siddon"][0]).norm() / result["siddon"][0].norm()) < 0.02
 
 
 @cuda

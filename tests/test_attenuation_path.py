@@ -2,7 +2,8 @@
 (`utilities.attenuation_to_density`, `DensityModel.material`), the solver's fields built from X
 (`ScatterSolver.material_fields_from_attenuation`) against the fields of the full density volume, the two-step primary
 (`scatter_image.primary_path_lengths` / `primary_from_path_lengths`) against the primary image of version 0.2.0, and the
-primaries of all views (`citrus.primary_signals`) with MBIRTORCH's projector against the Siddon primary."""
+primaries of all views (`citrus.primary_signals`, the loop's MBIRTORCH per-material primary) against the solver's
+Siddon primary (`ScatterSolver.primary`), the cross-check between the two operators."""
 
 from __future__ import annotations
 
@@ -12,8 +13,8 @@ from dataclasses import replace
 import pytest
 import torch
 
-from citrus.citrus import (CitrusConfig, CitrusState, DensityModel, SiddonViewProjector, citrus_step,
-                           citrus_view_step, primary_signals)
+from citrus.citrus import (CitrusConfig, CitrusState, DensityModel, citrus_step, citrus_view_step,
+                           primary_signals)
 from citrus.scatter_solver.config import SolverConfig
 from citrus.scatter_solver.cross_sections import group_transmission, synthetic_library
 from citrus.scatter_solver.detector import csi_response, detector_angle, focused_1d_grid, grid_angles, no_grid
@@ -223,12 +224,11 @@ def test_primary_from_path_lengths_equals_the_v020_primary(device, samples_per_p
 
 @cuda
 def test_primary_signals_mbirtorch_close_to_siddon():
-    """primary_signals over 12 views of the WLAB short scan (0.5 cm grid): the Siddon projector reproduces
-    ScatterSolver.primary per view bit for bit in any chunking; MBIRTORCH's pixel-averaged line integrals give the same
-    primary to 5 % (relative L2, measured 3.1 % with this synthetic library on the small panel; median pixel 8e-4: the
+    """primary_signals over 12 views of the WLAB short scan (0.5 cm grid), the loop's primary: MBIRTORCH's
+    pixel-averaged line integrals give the solver's Siddon primary (ScatterSolver.primary per view, one ray per pixel
+    center) to 5 % (relative L2, measured 3.1 % with this synthetic library on the small panel; median pixel 8e-4: the
     differences sit on the pixels whose rays graze a face of the prism, where a center ray and a pixel average
-    differ); MBIRTORCH chunks of 5 views (sub-models) equal one chunk to
-    float rounding."""
+    differ); MBIRTORCH chunks of 5 views (sub-models) equal one chunk to float rounding."""
     pytest.importorskip("mbirtorch")
     from citrus.recon.mbir_bridge import ViewChunkProjector, make_cone_model
 
@@ -240,20 +240,17 @@ def test_primary_signals_mbirtorch_close_to_siddon():
     X = densities_to_attenuation(s.library, wlab_phantom(GRID, device="cuda"))
     dm = DensityModel.from_library(s.library)
     fx = s.material_fields_from_attenuation(X, GRID, dm)
-    reference = torch.stack([s.primary(fx, float(a))["signal"] for a in angles])
-    sid = SiddonViewProjector(s, GRID, angles)
-    assert sid.chunks(5) == [(0, 5), (5, 10), (10, 12)]
-    for vpc in (None, 5, 12):
-        assert torch.equal(primary_signals(s, fx, angles, sid, vpc), reference), vpc
+    reference = torch.stack([s.primary(fx, float(a))["signal"] for a in angles])  # the solver's Siddon primary
     model = make_cone_model(GRID, geometry, angles, device="cuda")
     mb = ViewChunkProjector(GRID, geometry, angles, model=model, device="cuda")
+    assert mb.chunks(5) == [(0, 5), (5, 10), (10, 12)]
     assert mb.model_for(0, 12) is model and mb.model_for(0, 5) is mb.model_for(0, 5)
     full = mb.project(fx.fine_material(fx.fine_materials[0]))
     part = mb.project(fx.fine_material(fx.fine_materials[0]), 5, 10)
     assert _rel(part, full[5:10]) < 1e-5
     p1 = primary_signals(s, fx, angles, mb, 12)
     p5 = primary_signals(s, fx, angles, mb, 5)
-    assert _rel(p5, p1) < 1e-5
+    assert _rel(p5, p1) < 1e-5 and _rel(primary_signals(s, fx, angles, mb), p1) < 1e-5
     rel = (p1 - reference) / reference
     assert float((p1 - reference).norm() / reference.norm()) < 0.05
     assert float(rel.abs().median()) < 2e-3
@@ -276,7 +273,7 @@ def test_primary_signals_mbirtorch_close_to_siddon_real_library():
     angles = view_angles(36, geometry)
     X = densities_to_attenuation(s.library, wlab_phantom(GRID, device="cuda"))
     fx = s.material_fields_from_attenuation(X, GRID, DensityModel.from_library(s.library))
-    reference = primary_signals(s, fx, angles, SiddonViewProjector(s, GRID, angles))
+    reference = torch.stack([s.primary(fx, float(a))["signal"] for a in angles])  # the solver's Siddon primary
     mb = ViewChunkProjector(GRID, geometry, angles, model=make_cone_model(GRID, geometry, angles, device="cuda"),
                             device="cuda")
     p = primary_signals(s, fx, angles, mb)
@@ -288,12 +285,16 @@ def test_primary_signals_mbirtorch_close_to_siddon_real_library():
 # ---- configuration ----------------------------------------------------------------------------------------------
 
 def test_citrus_config_primary_and_resume_fields():
+    """The loop always uses the MBIRTORCH per-material primary: CitrusConfig has no primary_projector (removed in
+    version 0.5.0), only the chunking of the primary projections."""
     config = CitrusConfig()
-    assert config.primary_projector == "mbirtorch" and config.primary_views_per_chunk is None
+    assert config.primary_views_per_chunk is None and not hasattr(config, "primary_projector")
     assert config.resume_error_sinogram is True
     config.validate()
-    CitrusConfig(primary_projector="siddon", primary_views_per_chunk=3, resume_error_sinogram=False).validate()
-    for bad in (dict(primary_projector="leap"), dict(primary_views_per_chunk=0), dict(primary_views_per_chunk=2.5),
+    CitrusConfig(primary_views_per_chunk=3, resume_error_sinogram=False).validate()
+    with pytest.raises(TypeError):
+        CitrusConfig(primary_projector="siddon")
+    for bad in (dict(primary_views_per_chunk=0), dict(primary_views_per_chunk=2.5),
                 dict(primary_views_per_chunk=True), dict(resume_error_sinogram="yes")):
         with pytest.raises(ValueError):
             CitrusConfig(**bad).validate()

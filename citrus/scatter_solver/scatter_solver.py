@@ -4,7 +4,7 @@ image and primary image for one view.
 Pipeline of `ScatterSolver.solve_view(rho_fine, grid_fine, angle)` (docs/source/method.rst has the derivation; grids
 in docs/source/conventions.rst, "Grids"):
 
-    rho_fine [M, R, C, S]  densities (g/cm^3) on the fine (reconstruction) grid F; M = 7 basis materials
+    rho_fine [M, R, C, S]  densities (g/cm^3) on the fine (reconstruction) grid F; M = the library's materials
     grid_coarse        = Grid.covering(grid_fine, transport_cell_cm)    transport grid C (cubic cells, covers F)
     grid_quadrature    = grid_coarse.refine(q)                          quadrature grid Q, q = round(transport_cell_cm
                                                                         / quadrature_point_spacing_cm) bounded by the
@@ -56,7 +56,7 @@ which is resampled onto C and Q and dropped, so the largest fine-grid tensor is 
 7 GB at 256 M voxels). The fields keep X and the model instead of rho_fine; the primary (and the "fine" uncollided
 trace) then trace the materials one map at a time (`MaterialFields.fine_material`). The result equals
 `material_fields(density_model(X), grid_fine)` to float rounding (the resampling is the same matrix products on one
-material instead of seven).
+material instead of all M).
 """
 
 from __future__ import annotations
@@ -73,8 +73,8 @@ from torch import Tensor
 
 from .angular_quadrature import Quadrature, product_quadrature, scatter_source_moments
 from .config import SolverConfig
-from .cross_sections import (MaterialPairs, MultigroupLibrary, material_pairs_if_compact, mu_t_volume,
-                             transfer_moments_volume)
+from .cross_sections import (MaterialPairs, MultigroupLibrary, check_material_names, material_pairs_if_compact,
+                             material_table, mu_t_volume, transfer_moments_volume)
 from .detector import DetectorResponse, GridResponse
 from .geometry import ConeGeometry, Grid, resample_conservative
 from .ray_tracing import Projectors, SiddonProjectors
@@ -107,11 +107,16 @@ DeviceLike = Union[torch.device, str, None]
 def build_solver_library(config: SolverConfig, spectrum=None, cache_dir: Optional[str] = "default",
                          materials=None) -> MultigroupLibrary:
     """`cross_section_library.build_library(config, spectrum, cache_dir, materials=materials)` (spectrum None -> the
-    default 125 kVp spectrum; cache_dir "default" -> `cross_section_library.default_cache_dir()`, None -> no cache;
-    materials None -> the seven-material table, `cross_sections.MATERIAL_TABLE`). Needs XrayPhysics unless the
-    library is cached (about 16 s to build). float64 CPU tensors."""
+    default 125 kVp spectrum; cache_dir "default" -> `cross_section_library.default_cache_dir()`, None -> no cache).
+    materials None (default): the anchors of `config.materials` (at least two catalogue names, `SolverConfig.validate`)
+    as the table `cross_sections.material_table(config.materials)`; the default seven give the library and cache entry
+    of earlier versions. An explicit table (name, nominal density, formula) per material overrides config.materials.
+    The library's materials come out sorted by nominal attenuation (`library.materials`). Needs XrayPhysics (also to
+    sort the set and find the cache entry); about 16 s to build seven materials, then cached. float64 CPU tensors."""
     from .cross_section_library import build_library  # lazy: XrayPhysics only needed here
 
+    if materials is None:
+        materials = material_table(check_material_names(config.materials))
     return build_library(config, spectrum, cache_dir, materials=materials)
 
 
@@ -297,7 +302,9 @@ class ViewResult:
 class ScatterSolver:
     """Deterministic kV CBCT scatter solver (LBTE source iteration solver), one view at a time.
 
-    library        : MultigroupLibrary with legendre_order >= config.legendre_order (`build_solver_library(config)`).
+    library        : MultigroupLibrary with legendre_order >= config.legendre_order (`build_solver_library(config)`,
+                     built for the anchors config.materials). The solver works with the library's materials
+                     (`library.materials`, M of them) whatever config.materials says.
     config         : SolverConfig (validated here). Used fields: legendre_order, num_polar, num_azimuthal,
                      transport_cell_cm, quadrature_point_spacing_cm, uncollided_trace_grid, source_iteration_tolerance,
                      max_source_iterations, cone_num_polar, cone_num_azimuthal, direction_chunk (directions per batch
@@ -664,7 +671,7 @@ class ScatterSolver:
     def solve_view(self, rho_fine: Tensor, grid_fine: Grid, angle: float, keep_phi_total: bool = False) -> ViewResult:
         """Full solve for one view (module docstring).
 
-        rho_fine: [M, R, C, S] basis-material densities (g/cm^3; M = 7 for the package's library) on grid_fine (any
+        rho_fine: [M, R, C, S] basis-material densities (g/cm^3; M = the library's materials) on grid_fine (any
         voxel size: the transport grid covers it, `transport_grid`). angle: view angle (rad). keep_phi_total: also
         return the collided moments [G, (L+1)^2, 4, Rc, Cc, Sc]. Returns ViewResult. On CUDA the per-stage peak memory
         is measured by resetting the device's peak-memory statistics at the start of every stage.

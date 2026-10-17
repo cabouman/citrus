@@ -9,8 +9,8 @@ Package layout
     :func:`~citrus.citrus.mbir_recon` (the same MBIR loop without the solver, for comparison),
     :func:`~citrus.citrus.citrus_step` (one scatter step of one view; ``citrus_view_step`` from prebuilt fields) and its
     operators ``uncollided_operator``, ``first_collision_operator``, ``multiple_collision_operator``,
-    ``accumulator_update_operator``, ``project_scatter``; the primaries of all views (``primary_signals`` with
-    MBIRTORCH's or the Siddon projector); the density model (one material map at a time) and the compact per-view
+    ``accumulator_update_operator``, ``project_scatter``; the primaries of all views (``primary_signals``, MBIRTORCH
+    projections of the material maps); the density model (one material map at a time) and the compact per-view
     state storage.
 
 ``citrus.scatter_solver``
@@ -20,7 +20,8 @@ Package layout
     ============================= ================================================================================
     ``config``                    ``SolverConfig``: every discretization parameter
     ``geometry``                  ``Grid``, ``ConeGeometry`` (MBIRTORCH conventions)
-    ``cross_sections``            multigroup library container, per-voxel coefficients, a synthetic test library
+    ``cross_sections``            the material catalogue, the multigroup library container, per-voxel coefficients,
+                                  a synthetic test library
     ``cross_section_library``     the library builder from XrayPhysics (EPDL97) data, cached on disk
     ``source``, ``detector``      point source with collimation; detector and anti-scatter-grid responses
     ``angular_quadrature``        direction sets, real spherical harmonics, the scattering-source operator
@@ -48,9 +49,11 @@ Scope of the solver
 
 * Photon energies of kV imaging (default 10-125 keV, 6 equal-fluence groups); Compton scattering (no Doppler
   broadening) and Rayleigh scattering from EPDL97 via XrayPhysics; photoelectric absorption as local deposition.
-* Seven basis materials (air, lung, adipose, water, skeletal muscle, soft tissue, ICRP cortical bone); every voxel
-  is a mixture of at most two of them, the two whose nominal attenuations bracket its attenuation (the library, the
-  solver and the kernels are general in the number of materials).
+* Anchor materials chosen from a catalogue of seventeen (``SolverConfig.materials``; default the seven air, lung,
+  adipose, water, skeletal muscle, soft tissue, ICRP cortical bone; also trabecular bone, brain, blood, cartilage,
+  skin, PMMA, polyethylene, aluminium, titanium, carbon fibre); every voxel is a mixture of at most two of them, the
+  two whose nominal attenuations bracket its attenuation (the library, the solver and the kernels are general in the
+  number of materials).
 * A point source collimated to the flat panel; detector and anti-scatter-grid responses as lookup tables.
 * Float32 on CUDA (production; fused Triton kernels) and float64 / CPU (reference and tests).
 

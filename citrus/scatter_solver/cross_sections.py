@@ -16,47 +16,176 @@ the uncollided fluence and the primary image (docs/source/design_notes.rst, "Cro
 
 Materials
 ---------
-The basis is the seven-material table `MATERIAL_TABLE` (name, nominal density g/cm^3), in order of INCREASING
-attenuation at the nominal density at every energy of the library (10-125 keV; asserted when a library is built,
-`cross_section_library.check_material_order`):
+`MATERIAL_CATALOGUE` maps a material name to (nominal density g/cm^3, composition) for every material the library
+builder knows. The composition is an XrayPhysics material string (`cross_section_library.parse_formula`): a chemical
+formula ('H2O', a stoichiometric compound) or 'a*F1 + b*F2 + ...' with a, b the mass fractions of the elements or
+compounds F1, F2 (normalized to sum 1). The NOMINAL density is the density of the material as it occurs in the body or
+in the scanner (the pure-material points of the density model). Nominal attenuation mu = rho^nom mu/rho at the
+spectrum-mean energy 63.03 keV of the default 125 kVp spectrum is listed for orientation:
+
+    name             density  mu (1/cm)  composition source
+    air              0.0012   0.00022    XrayPhysics 'air' (dry air: N2, O2, Ar, CO2)
+    lung             0.26     0.0520     XrayPhysics 'lung' (density of the WLAB lung; XrayPhysics lists 0.25)
+    adipose          0.95     0.1846     XrayPhysics 'adipose_tissue' (ICRP adipose tissue; XrayPhysics lists 0.92)
+    water            1.0      0.2013     H2O
+    muscle           1.05     0.2102     ICRU Report 44 (1989), skeletal muscle
+    soft_tissue      1.06     0.2122     ICRU Report 44 (1989), soft tissue
+    bone             1.85     0.5366     XrayPhysics 'bone_cortical' (ICRP cortical bone)
+    trabecular_bone  1.18     0.2697     Woodard and White (1986) Br J Radiol 59:1209, skeleton spongiosa (ICRU
+                                         Report 46, 1992)
+    brain            1.04     0.2092     ICRU Report 44 (1989), brain (grey / white matter)
+    blood            1.06     0.2130     ICRU Report 44 (1989), whole blood
+    cartilage        1.10     0.2234     Woodard and White (1986), cartilage (ICRU Report 46, 1992)
+    skin             1.09     0.2160     ICRU Report 44 (1989), skin
+    pmma             1.18     0.2230     XrayPhysics 'PMMA' (C5H8O2, polymethyl methacrylate)
+    polyethylene     0.94     0.1826     XrayPhysics 'Polyethylene' (C2H4)
+    aluminium        2.699    0.7034     Al (NIST density)
+    titanium         4.54     3.0928     Ti (NIST density)
+    carbon_fibre     1.56     0.2756     carbon-fibre epoxy composite (treatment couch): 60 % fibre volume of carbon
+                                         fibre (C, 1.8 g/cm^3) in bisphenol-A epoxy (C21H24O4, 1.2 g/cm^3), i.e.
+                                         0.692 C + 0.308 C21H24O4 by mass at 1.56 g/cm^3 (a typical laminate, not a
+                                         reference composition)
+
+(XrayPhysics' material list, xrayPhysics().get_material_library(), supplies air, lung, adipose, cortical bone, PMMA
+and polyethylene; it has no brain, blood, skin, cartilage or spongiosa, which come from the ICRU-44 and Woodard-White
+tables as cited, the ICRU-44 ones as tabulated by Hubbell and Seltzer, NISTIR 5632.)
+
+ANCHOR materials. The library is built for a chosen subset of the catalogue, the anchors of the density model
+(`config.SolverConfig.materials`, at least two names; default the seven `MATERIALS`):
 
     air 0.0012, lung 0.26, adipose 0.95, water 1.0, muscle 1.05, soft tissue 1.06, cortical bone 1.85
 
-(compositions in `cross_section_library.MATERIAL_FORMULAS`). Density maps are rho [M, rows, cols, slices] with M = 7
-in this order; every coefficient is linear in rho. The density model (`citrus.utilities.attenuation_to_densities`)
-gives every voxel at most two nonzero materials, the two whose nominal attenuations bracket the voxel's attenuation;
-the first-collision source works on that compact pair representation (`MaterialPairs`, `material_pairs`) wherever its
-evaluation points have at most two nonzero materials (`material_pairs_if_compact`; block means of such a field can mix
-more, and are then evaluated densely over all M materials). The library, the solver and the kernels are general in M;
-`synthetic_library` builds test libraries of any M.
+The builder sorts the anchors by nominal attenuation (`cross_section_library.sort_material_table`) and asserts that
+the order is the same at every energy of the library (10-125 keV, `cross_section_library.check_material_order`: no
+two anchors cross), so `MultigroupLibrary.materials` is always in order of INCREASING attenuation at the nominal
+density. Density maps are rho [M, rows, cols, slices] with M = the number of anchors, in the library's order (look a
+row up by name: `material_index(library, "water")`); every coefficient is linear in rho. The density model
+(`citrus.utilities.attenuation_to_densities`) gives every voxel at most two nonzero materials, the two anchors whose
+nominal attenuations bracket the voxel's attenuation; the first-collision source works on that compact pair
+representation (`MaterialPairs`, `material_pairs`) wherever its evaluation points have at most two nonzero materials
+(`material_pairs_if_compact`; block means of such a field can mix more, and are then evaluated densely over all M
+materials). The library, the solver and the kernels are general in M; `synthetic_library` builds test libraries of
+any M.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from types import MappingProxyType
+from typing import Mapping, Optional, Sequence, Union
 
 import torch
 from torch import Tensor
 
-# (name, nominal density g/cm^3) in library order = increasing attenuation at nominal density. Muscle is BELOW soft
-# tissue at every energy (ICRU-44 muscle has the lower density and nearly the same composition: attenuation ratio
-# 0.986-0.991 over 10-125 keV).
-MATERIAL_TABLE: tuple[tuple[str, float], ...] = (
-    ("air", 0.0012), ("lung", 0.26), ("adipose", 0.95), ("water", 1.0), ("muscle", 1.05), ("soft_tissue", 1.06),
-    ("bone", 1.85),
+# ---- material catalogue (module docstring) ----------------------------------------------------------------------
+# XrayPhysics library strings (xrayPhysics().get_material_library(), verbatim; the air terms are mass fractions of the
+# compounds, as XrayPhysics' parser reads them)
+_AIR_XRAYPHYSICS = "78.084*N2 + 20.946*O2 + 0.9340*Ar + 0.0397*CO2"
+_LUNG_XRAYPHYSICS = (
+    "0.10132562304283013*H + 0.10235810831090612*C + 0.028663471831760927*N + 0.75742799115584314*O + "
+    "0.0018408652066471242*Na + 0.00073034326133282642*Mg + 0.00080037617680309744*P + 0.0022510579972587113*S + "
+    "0.0026612507878702989*Cl + 0.0019409122287475113*K"
 )
-MATERIALS: tuple[str, ...] = tuple(n for n, _ in MATERIAL_TABLE)
+_ADIPOSE_XRAYPHYSICS = (
+    "0.119477*H + 0.637240*C + 0.007970*N + 0.232333*O + 0.000500*Na + 0.000020*Mg + 0.000160*P + 0.000730*S + "
+    "0.001190*Cl + 0.000320*K + 0.000020*Ca + 0.000020*Fe + 0.000020*Zn"
+)
+_BONE_CORTICAL_XRAYPHYSICS = (
+    "0.047234*H + 0.144330*C + 0.041990*N + 0.446096*O + 0.002200*Mg + 0.104970*P + "
+    "0.003150*S + 0.209930*Ca + 0.000100*Zn"
+)
+_PMMA_XRAYPHYSICS = "C5O2H8"
+_POLYETHYLENE_XRAYPHYSICS = "C2H4"
+# ICRU Report 44 (1989) mass fractions (as tabulated in NISTIR 5632, Hubbell and Seltzer)
+_MUSCLE_ICRU44 = "0.102*H + 0.143*C + 0.034*N + 0.710*O + 0.001*Na + 0.002*P + 0.003*S + 0.001*Cl + 0.004*K"
+_SOFT_TISSUE_ICRU44 = "0.102*H + 0.143*C + 0.034*N + 0.708*O + 0.002*Na + 0.003*P + 0.003*S + 0.002*Cl + 0.003*K"
+_BRAIN_ICRU44 = "0.107*H + 0.145*C + 0.022*N + 0.712*O + 0.002*Na + 0.004*P + 0.002*S + 0.003*Cl + 0.003*K"
+_BLOOD_ICRU44 = (
+    "0.102*H + 0.110*C + 0.033*N + 0.745*O + 0.001*Na + 0.001*P + 0.002*S + 0.003*Cl + 0.002*K + 0.001*Fe"
+)
+_SKIN_ICRU44 = "0.100*H + 0.204*C + 0.042*N + 0.645*O + 0.002*Na + 0.001*P + 0.002*S + 0.003*Cl + 0.001*K"
+# Woodard and White (1986), Br J Radiol 59:1209-1219, mass fractions (also ICRU Report 46, 1992)
+_SPONGIOSA_WOODARD_WHITE = (
+    "0.085*H + 0.404*C + 0.028*N + 0.367*O + 0.001*Na + 0.001*Mg + 0.034*P + 0.002*S + 0.002*Cl + 0.001*K + "
+    "0.074*Ca + 0.001*Fe"
+)
+_CARTILAGE_WOODARD_WHITE = "0.096*H + 0.099*C + 0.022*N + 0.744*O + 0.005*Na + 0.022*P + 0.009*S + 0.003*Cl"
+# carbon-fibre epoxy laminate: 60 % fibre volume, carbon fibre 1.8 g/cm^3 in bisphenol-A epoxy C21H24O4 1.2 g/cm^3
+# (mass fraction 0.6 x 1.8 / (0.6 x 1.8 + 0.4 x 1.2) = 0.692, density 1.56 g/cm^3)
+_CARBON_FIBRE_EPOXY = "0.692*C + 0.308*C21H24O4"
+
+MATERIAL_CATALOGUE: Mapping[str, tuple[float, str]] = MappingProxyType({
+    # name: (nominal density g/cm^3, XrayPhysics composition); the first seven are the default anchors `MATERIALS`
+    "air": (0.0012, _AIR_XRAYPHYSICS),
+    "lung": (0.26, _LUNG_XRAYPHYSICS),
+    "adipose": (0.95, _ADIPOSE_XRAYPHYSICS),
+    "water": (1.0, "H2O"),
+    "muscle": (1.05, _MUSCLE_ICRU44),
+    "soft_tissue": (1.06, _SOFT_TISSUE_ICRU44),
+    "bone": (1.85, _BONE_CORTICAL_XRAYPHYSICS),
+    "trabecular_bone": (1.18, _SPONGIOSA_WOODARD_WHITE),
+    "brain": (1.04, _BRAIN_ICRU44),
+    "blood": (1.06, _BLOOD_ICRU44),
+    "cartilage": (1.10, _CARTILAGE_WOODARD_WHITE),
+    "skin": (1.09, _SKIN_ICRU44),
+    "pmma": (1.18, _PMMA_XRAYPHYSICS),
+    "polyethylene": (0.94, _POLYETHYLENE_XRAYPHYSICS),
+    "aluminium": (2.699, "Al"),
+    "titanium": (4.54, "Ti"),
+    "carbon_fibre": (1.56, _CARBON_FIBRE_EPOXY),
+})
+
+# The default anchors, in library order = increasing attenuation at nominal density. Muscle is BELOW soft tissue at
+# every energy (ICRU-44 muscle has the lower density and nearly the same composition: attenuation ratio 0.986-0.991
+# over 10-125 keV).
+MATERIALS: tuple[str, ...] = ("air", "lung", "adipose", "water", "muscle", "soft_tissue", "bone")
+MATERIAL_TABLE: tuple[tuple[str, float], ...] = tuple((n, MATERIAL_CATALOGUE[n][0]) for n in MATERIALS)
 NOMINAL_DENSITIES: tuple[float, ...] = tuple(float(d) for _, d in MATERIAL_TABLE)
-WATER, BONE = MATERIALS.index("water"), MATERIALS.index("bone")  # 3, 6
+# rows of water and bone in the DEFAULT anchors (3, 6); for any library use material_index(library, "water")
+WATER, BONE = MATERIALS.index("water"), MATERIALS.index("bone")
 ELECTRON_REST_KEV = 510.998950
+
+
+def check_material_names(names: Sequence[str], minimum: int = 2) -> tuple[str, ...]:
+    """The anchor names as a tuple after checking them: a sequence (not a single string) of at least `minimum`
+    distinct names of `MATERIAL_CATALOGUE`. Raises ValueError naming the problem (and the catalogue for an unknown
+    name)."""
+    if isinstance(names, str) or not isinstance(names, Sequence):
+        raise ValueError(f"materials must be a sequence of material names, e.g. ('air', 'water', 'bone'), got "
+                         f"{names!r}")
+    names = tuple(names)
+    unknown = [n for n in names if not isinstance(n, str) or n not in MATERIAL_CATALOGUE]
+    if unknown:
+        raise ValueError(f"unknown material name(s) {unknown}; the catalogue has {tuple(MATERIAL_CATALOGUE)}")
+    if len(set(names)) != len(names):
+        raise ValueError(f"duplicate material names in {names}")
+    if len(names) < minimum:
+        raise ValueError(f"the density model interpolates between at least {minimum} anchor materials, got {names}")
+    return names
+
+
+def material_table(names: Sequence[str] = MATERIALS) -> tuple[tuple[str, float, str], ...]:
+    """(name, nominal density g/cm^3, composition) of the catalogue materials `names`, in the given order (the library
+    builder sorts them by attenuation, `cross_section_library.sort_material_table`). Raises ValueError for an unknown
+    or repeated name (`check_material_names`; one name is allowed here)."""
+    return tuple((n, float(MATERIAL_CATALOGUE[n][0]), MATERIAL_CATALOGUE[n][1])
+                 for n in check_material_names(names, minimum=1))
+
+
+def material_index(materials: Union["MultigroupLibrary", Sequence[str]], name: str) -> int:
+    """Row of material `name` in a library (`library.materials`) or in a sequence of names. Raises ValueError naming
+    the available materials when it is absent (e.g. a WLAB phantom for a set of anchors without water or bone)."""
+    names = tuple(materials.materials if isinstance(materials, MultigroupLibrary) else materials)
+    if name not in names:
+        raise ValueError(f"material {name!r} is not among the materials {names}")
+    return names.index(name)
 
 
 @dataclass
 class MultigroupLibrary:
     """Per-unit-density (mass) multigroup coefficients for the basis materials.
 
-    Shapes (M = number of basis materials, 7 for the package's `MATERIAL_TABLE`; G = groups, L = Legendre order):
+    Shapes (M = number of anchor materials, 7 for the default `MATERIALS`; G = groups, L = Legendre order):
       group_edges        [G+1]        keV, descending
       group_energy       [G]          representative (spectrum-weighted mean) energy per group, keV
       spectrum_fraction  [G]          f_g, sums to 1 (source photons per steradian per group)
@@ -76,7 +205,9 @@ class MultigroupLibrary:
                                       is spectrum_fraction[g]
       fine_group         [E] int64    group index of each fine energy
     Materials:
-      materials          tuple of M names (library order = increasing attenuation at nominal density)
+      materials          tuple of M names (library order = increasing attenuation at nominal density; catalogue
+                         names, `MATERIAL_CATALOGUE`, for a library from `cross_section_library.build_library`; look
+                         a row up with `material_index(library, name)`)
       nominal_density    [M] g/cm^3: the density of each material as it occurs in the body (the pure-material points
                          of the density model, `citrus.utilities.attenuation_to_densities`)
     Left empty / None, `materials` and `nominal_density` are filled in from the number of materials: `MATERIALS` /

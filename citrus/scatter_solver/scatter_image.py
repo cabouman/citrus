@@ -69,7 +69,7 @@ the composition of two steps that can be fed separately: `primary_path_lengths` 
 line integrals [M', Rd n, Cd n] of the maps given, one material at a time if the caller wishes) and
 `primary_from_path_lengths` (the fine-energy transmission, the source and inverse-square factors and the detector and
 anti-scatter-grid responses). The CITRUS loop feeds the second with MBIRTORCH projections of the material maps of all
-views at once (`citrus.citrus`, CitrusConfig.primary_projector).
+views at once (`citrus.citrus.primary_signals`, the reconstruction's own operator).
 """
 
 from __future__ import annotations

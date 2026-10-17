@@ -85,12 +85,18 @@ Linear-discontinuous cell moments
 Materials
 ---------
 
-* Seven basis materials (``cross_sections.MATERIAL_TABLE``), in order of increasing attenuation at their nominal
-  densities: 0 air (0.0012 g/cm^3), 1 lung (0.26), 2 adipose (0.95), 3 water (1.0), 4 skeletal muscle (1.05),
-  5 soft tissue (1.06), 6 cortical bone (ICRP composition, 1.85); ``WATER = 3``, ``BONE = 6``.
-  Density maps ``rho: [7, rows, cols, slices]`` in g/cm^3. All coefficients are linear in rho:
-  ``mu_x[g] = sum_m rho[m] * library.mu_x[m, g]`` with per-unit-density (mass) coefficients; the library carries
-  ``materials`` (names) and ``nominal_density [M]``.
+* Material catalogue ``cross_sections.MATERIAL_CATALOGUE``: name -> (nominal density g/cm^3, composition) for air,
+  lung, adipose, water, muscle, soft_tissue, bone (cortical, ICRP), trabecular_bone, brain, blood, cartilage, skin,
+  pmma, polyethylene, aluminium, titanium and carbon_fibre (sources in the module docstring and :doc:`method`).
+* Anchor materials: the library is built for ``SolverConfig.materials`` (at least two catalogue names, any order),
+  sorted by increasing attenuation at the nominal density (the order must hold at every library energy). Default: the
+  seven ``cross_sections.MATERIALS``, in library order 0 air (0.0012 g/cm^3), 1 lung (0.26), 2 adipose (0.95), 3 water
+  (1.0), 4 skeletal muscle (1.05), 5 soft tissue (1.06), 6 cortical bone (ICRP composition, 1.85); ``WATER = 3`` and
+  ``BONE = 6`` are the rows of the DEFAULT set; for any library look a row up by name,
+  ``cross_sections.material_index(library, "water")`` (the WLAB phantom and the data generator do).
+* Density maps ``rho: [M, rows, cols, slices]`` in g/cm^3, M = ``library.num_materials``, rows in the order of
+  ``library.materials``. All coefficients are linear in rho: ``mu_x[g] = sum_m rho[m] * library.mu_x[m, g]`` with
+  per-unit-density (mass) coefficients; the library carries ``materials`` (names) and ``nominal_density [M]``.
 * At most two nonzero materials per voxel of ``rho_fine`` (the density model's output). The resampled ``rho_quadrature``
   can mix more materials at a point (a quadrature cell straddling a boundary): the first-collision source uses the
   compact pair representation ``MaterialPairs`` (``index [2, ...]`` int32, ``density [2, ...]``) when every point of

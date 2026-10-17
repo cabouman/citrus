@@ -80,6 +80,7 @@ python demo/demo_citrus.py --full    # the report study: 180 views over a full r
                                      # scatter step on every view at every iteration
 python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 --scatter-every 1
                                      # a quick run (~2 min)
+python demo/demo_citrus.py --materials air,water,bone   # three anchor materials in the density model
 ```
 
 The views are evenly spaced over `[start, end)` (`--start-view-angle`, `--end-view-angle` in degrees); the default
@@ -100,9 +101,13 @@ recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, CitrusConfig(n
 Tests: `dev_scripts/run_tests.sh` or `python -m pytest -q` (GPU, Triton, MBIRTORCH and XrayPhysics tests are skipped
 when unavailable).
 
-Version 0.4.0 spells out every abbreviated name of the package (functions, parameters, configuration fields, record
-keys, command-line flags, two module files); `CHANGELOG.md` has the complete old -> new table. Data sets, demo
-outputs and cached cross-section libraries of earlier versions are read unchanged.
+Version 0.5.0 adds a material catalogue (`citrus.scatter_solver.cross_sections.MATERIAL_CATALOGUE`: the seven
+default materials plus trabecular bone, brain, blood, cartilage, skin, PMMA, polyethylene, aluminium, titanium and
+carbon fibre) and lets you choose the anchor materials of the density model (`SolverConfig.materials`, demo flag
+`--materials air,water,bone`); the CITRUS loop always computes the primary with MBIRTORCH's projector (the Siddon
+option of `CitrusConfig.primary_projector` is gone). Version 0.4.0 spelled out every abbreviated name of the package;
+`CHANGELOG.md` has the complete old -> new table. Data sets, demo outputs and cached cross-section libraries of
+earlier versions are read unchanged.
 
 ## Citation
 
@@ -113,7 +118,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.4.0},
+  note = {Version 0.5.0},
   year = 2026
 }
 ```

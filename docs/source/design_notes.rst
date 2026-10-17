@@ -20,11 +20,15 @@ filter on a 1 keV grid (``default_spectrum_125kvp``); any two-column spectrum ca
 [10, 125] keV have edges 125, 85.0, 69.2, 59.6, 51.7, 42.4, 10 keV and spectrum-weighted group energies 98.0, 76.7,
 64.4, 56.1, 47.1, 36.0 keV.
 
-**Materials.** Seven materials (air, lung, adipose, water, muscle, soft tissue, cortical bone; the table of
-:doc:`method`, "CITRUS coupling"), among them water (H 0.1119, O 0.8881 by mass) and ICRP cortical bone (XrayPhysics
-``bone_cortical``, 1.85 g/cm^3). The seven-material library builds in about 16 s and is cached under a key that includes
-the material table; its water and bone rows equal those of a two-material library to 1e-13 (summation order only), and
-on the WLAB phantom (water and bone only) the seven-material solve equals the two-material solve bit for bit in float32.
+**Materials.** By default seven anchor materials (air, lung, adipose, water, muscle, soft tissue, cortical bone; the
+table of :doc:`method`, "CITRUS coupling"), among them water (H 0.1119, O 0.8881 by mass) and ICRP cortical bone
+(XrayPhysics ``bone_cortical``, 1.85 g/cm^3); ``SolverConfig.materials`` selects any set of at least two from the
+seventeen of the catalogue (``cross_sections.MATERIAL_CATALOGUE``). The seven-material library builds in about 16 s
+(three materials about 12 s) and is cached under a key that includes the sorted material table, so every set has its
+own entry and the default seven keep the entry of earlier versions; its water and bone rows equal those of a
+two-material library (or of any other set) to 1e-13 (summation order only), and on the WLAB phantom (water and bone
+only) the seven-material solve equals the two-material solve bit for bit in float32 (and the solve with the anchors
+air, water, bone or the seven plus titanium to float32 rounding).
 Narrow-group mass attenuation of water agrees with NIST XCOM to 0.1 % at 40-100 keV; the ICRP bone is 1.45 % below
 ICRU-44 bone at 60 keV (different composition).
 
@@ -237,9 +241,10 @@ solver's fields from X one material map at a time (``ScatterSolver.material_fiel
 q = 2) above X and the fields, and the primary projects the maps one at a time again. Measured with
 ``benchmarks/bench_citrus_memory.py`` on the 0.125 cm WLAB grid (12.3 M voxels, 47 MiB per map), 1 cm cells, 180 views,
 the scatter step on every 8th view, peak allocated memory (``torch.cuda.max_memory_allocated``) of the scatter stage
-of an outer iteration: 2521 / 2364 MiB in version 0.2.0 (outer iterations 2 / 3), 1891 / 1876 MiB now (Siddon or
-MBIRTORCH primary alike; the remainder is the per-view step on C and Q, about 0.6-0.7 GB, and the 23 accumulators,
-0.4 GB); the density stage alone went from a 1.56 GB transient plus 0.33 GB kept to 0.1 GB. The MBIR iteration
+of an outer iteration: 2521 / 2364 MiB in version 0.2.0 (outer iterations 2 / 3), 1891 / 1876 MiB in version 0.3.0
+(with the Siddon or the MBIRTORCH primary of that version alike; the remainder is the per-view step on C and Q,
+about 0.6-0.7 GB, and the 23 accumulators, 0.4 GB); the density stage alone went from a 1.56 GB transient plus
+0.33 GB kept to 0.1 GB. The MBIR iteration
 peaks at about 1.09 GB either way. On the 0.5 cm demo grid the fine maps are small (0.77 MB) and the whole demo run
 peaks at 1.62 GB (version 0.2.0) and 1.64 GB (version 0.3.0 defaults: the kept error sinogram, 19 MiB), well inside
 the demo's 4400 MiB allocator cap with the accumulators on the GPU.
@@ -249,9 +254,10 @@ views whose path lengths [M', V_chunk, Rd, Cd] stay within one sinogram (MBIRTOR
 angles: about 1 ms to build and 0.1 s for the first projection, cached), then the per-view transmission and
 responses (``ScatterSolver.primary_from_path_lengths``, about 5.6 ms per view on the full-field panel, mostly the
 per-view geometry and response factors). On the 0.5 cm grid with 180 views the primaries of a scatter stage take
-1.13 s with either projector (MBIRTORCH's projections 0.06 s of it), as the per-view Siddon primaries of version
-0.2.0 did; on the 0.125 cm grid the MBIRTORCH stage is 0.6 s slower than the Siddon one (13.5 s instead of 12.9 s
-per scatter stage with 23 computed views).
+1.13 s (MBIRTORCH's projections 0.06 s of it), as the per-view Siddon primaries of version 0.2.0 did; on the
+0.125 cm grid the MBIRTORCH stage was 0.6 s slower than the Siddon projector of versions 0.3.0 and 0.4.0 (13.5 s
+instead of 12.9 s per scatter stage with 23 computed views). Since version 0.5.0 the loop always uses MBIRTORCH's
+projector (the reconstruction's own operator).
 
 MBIR resume. MBIRTORCH's public ``recon`` recomputes the error sinogram with one forward projection per call;
 ``recon.mbir_bridge.mbir_iterations(..., error_sinogram=, return_checkpoint=True)`` replicates ``recon``'s preparation

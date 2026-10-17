@@ -18,12 +18,15 @@ Both demos write their figures to ``demo/output/`` (not tracked); the CITRUS dem
                                                    # 20 outer iterations, scatter step on every view at every iteration
    python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 --scatter-every 1
                                                    # a quick run (about 2 minutes)
+   python demo/demo_citrus.py --materials air,water,bone   # three anchor materials in the density model
 
-``demo_scatter_solver.py`` builds the seven-material library (about 16 s, then cached), rasterizes the WLAB phantom (a
-30 x 20 x 40 cm water prism with lung, air and bone inserts) and solves one view with the default configuration (6
-groups, Legendre order 7, 8 x 16 sweep directions, 16 x 32 collapsed-cone directions). It plots the primary and scatter
-detector signals, the scatter fraction and central-row profiles. Options: ``--delta-voxel``, ``--transport-cell-cm``,
-``--angle-deg``, ``--panel small|full``, ``--grid`` (focused anti-scatter grid).
+``demo_scatter_solver.py`` builds the library of the anchor materials (the seven defaults: about 16 s, then cached),
+rasterizes the WLAB phantom (a 30 x 20 x 40 cm water prism with lung, air and bone inserts) and solves one view with
+the default configuration (6 groups, Legendre order 7, 8 x 16 sweep directions, 16 x 32 collapsed-cone directions). It
+plots the primary and scatter detector signals, the scatter fraction and central-row profiles. Options:
+``--delta-voxel``, ``--transport-cell-cm``, ``--angle-deg``, ``--panel small|full``, ``--grid`` (focused anti-scatter
+grid), ``--materials`` (comma-separated catalogue names, water and bone among them; the result does not depend on the
+others, the phantom being water and bone only).
 
 ``demo_citrus.py`` synthesizes a cone-beam dataset (primary from MBIRTORCH's projector at the effective energy, scatter
 from the solver's scatter-to-primary ratio, Poisson noise), runs CITRUS and the uncorrected MBIR loop with the same
@@ -33,20 +36,30 @@ the relative RMSE per outer iteration and the estimated vs true scatter-to-prima
 any ratio to the voxel pitch), ``--outer-iterations`` (default 80), ``--I0``, ``--seed``, ``--no-noise``, ``--full``,
 ``--regenerate``, ``--truth-sweep``, ``--truth-cone``, ``--start-view-angle`` / ``--end-view-angle`` (degrees),
 ``--scatter-view-stride`` (default 8), ``--scatter-view-interpolation-order`` (``0``-``3`` or ``none``, default ``3``),
-``--scatter-every`` (default 8), ``--primary-projector`` (``mbirtorch``, default, or ``siddon``; output suffix
-``_siddon``), ``--no-resume-error-sinogram`` (restart MBIR from the sinogram every outer iteration; suffix
-``_restart``), ``--save-recon`` (also write the CITRUS volume as ``.npy``), ``--memory-cap-mib`` (default 4400). The
-summary JSON records the peak allocated GPU memory of the CITRUS run (whole run and per outer iteration). At the
-defaults (0.5 cm grid, 180 views, stride 8, every 8th iteration, 80 outer iterations, about 4 minutes plus about 2
-minutes to synthesize the data once) CITRUS reaches a relative RMSE of 0.0215 / 0.0259 (whole prism / core; 0.0257 /
-0.0305 with ``--primary-projector siddon`` on the same data, see :doc:`method`, "CITRUS coupling") with a peak of 1.64
-GB allocated.
+``--scatter-every`` (default 8), ``--materials`` (the anchor materials of the loop's density model, comma-separated
+catalogue names, at least two; default ``air,lung,adipose,water,muscle,soft_tissue,bone``; output suffix
+``_materials-<names>`` for another set), ``--no-resume-error-sinogram`` (restart MBIR from the sinogram every outer
+iteration; suffix ``_restart``), ``--save-recon`` (also write the CITRUS volume as ``.npy``), ``--memory-cap-mib``
+(default 4400). The demo prints the anchors in library order with their nominal attenuations; the summary JSON records
+them and the peak allocated GPU memory of the CITRUS run (whole run and per outer iteration). At the defaults (0.5 cm
+grid, 180 views, stride 8, every 8th iteration, 80 outer iterations, about 4 minutes plus about 2 minutes to synthesize
+the data once) CITRUS reaches a relative RMSE of 0.0215 / 0.0259 (whole prism / core; the Siddon primary in the loop
+of versions 0.3.0 and 0.4.0 gave 0.0257 / 0.0305 on the same data, see :doc:`method`, "CITRUS coupling") with a peak
+of 1.64 GB allocated. The loop's primary is always MBIRTORCH's per-material primary.
 
-Data sets: ``--truth-primary-projector`` (``mbirtorch``, default, or ``siddon``) sets the primary model of the data's
-scatter-to-primary ratio (below). The cache name ``demo/input/<tag>.npz`` carries the data-set format, ``_v2``
-(citrus >= 0.3.0: SPR with the MBIRTORCH primary, the loop's default), and ``_primary-siddon`` for the Siddon
-definition; the outputs carry the same tag. Files named ``..._v1...`` are data sets and results of citrus <= 0.2.0
-(SPR with the Siddon primary); the demo never loads them.
+Anchor materials: the truth solver of the data always uses the seven default anchors (the WLAB phantom is water and bone
+only), so ``--materials`` changes only the reconstruction loop and every set runs on the same data. At the quick setting
+(``--views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 --scatter-every 1``) the default seven give
+CITRUS 0.0704 / 0.0862 and ``--materials air,water,bone`` 0.0696 / 0.0852 (whole prism / core; FDK 0.309 / 0.345, no
+correction 0.289 / 0.355, the same for both): the reduced set is slightly better here because the WLAB truth is water
+and bone only (its lung and air inserts are water of reduced density, which the reduced model reproduces as air / water
+mixtures, the seven-material model as lung / adipose and air / lung); scatter stage 5.0 s instead of 5.1 s per outer
+iteration.
+
+Data sets: the cache name ``demo/input/<tag>.npz`` carries the data-set format, ``_v2`` (citrus >= 0.3.0: SPR with
+the MBIRTORCH primary, the loop's primary model); the outputs carry the same tag. Files named ``..._v1...`` are data
+sets and results of citrus <= 0.2.0 (SPR with the Siddon primary), ``..._v2_primary-siddon`` data sets were written by
+the Siddon option of citrus 0.3.0 and 0.4.0 (removed); the demo never loads them.
 
 Angular range: the views are evenly spaced over ``[start, end)`` (endpoint excluded, MBIRTORCH's angle convention).
 The default end is a short scan, start + 180 degrees + the in-plane fan angle of the panel,
@@ -77,21 +90,44 @@ The scatter solver
 
    grid, geometry, rho = wlab_setup(1.0, device="cuda")           # 1 cm grid, 100 x 75 panel, [7, R, C, S] densities
    config = SolverConfig()                                    # 1 cm transport cells, 2^3 first-collision points
-   library = build_solver_library(config)                         # cached on disk
+   library = build_solver_library(config)                         # the anchors config.materials, cached on disk
    solver = ScatterSolver(library, config, geometry, detector=csi_response(0.06), grid_response=no_grid(),
                           device="cuda", dtype=torch.float32)
    result = solver.solve_view(rho, grid, angle=0.0)
    result.scatter_signal, result.primary["signal"], result.scatter_fraction   # [rows, channels]
 
-``rho`` holds the densities (g/cm^3) of the seven basis materials (air, lung, adipose, water, muscle, soft tissue,
-cortical bone; ``cross_sections.MATERIALS``, at most two nonzero per voxel; the WLAB phantom uses the water and bone
-rows) on the fine grid (any voxel size). The transport runs on the grid of ``transport_cell_cm`` cells that covers the
+``rho`` holds the densities (g/cm^3) of the library's anchor materials (``library.materials``; by default the seven
+air, lung, adipose, water, muscle, soft tissue, cortical bone, ``cross_sections.MATERIALS``; at most two nonzero per
+voxel; the WLAB phantom uses the water and bone rows) on the fine grid (any voxel size). The transport runs on the
+grid of ``transport_cell_cm`` cells that covers the
 fine box; the uncollided fluence, the first-collision source and the first-order scatter emission on q\ :sup:`3` points
 per cell (q = round(cell / ``quadrature_point_spacing_cm``), points about 0.5 cm apart by default, at most round(cell /
 voxel): 8 points for 0.5 cm and smaller voxels in 1 cm cells, 64 in 2 cm cells, 1 for 1 cm voxels in 1 cm cells);
 ``uncollided_trace_grid`` ("quadrature", "coarse" or "fine") sets the grid through which the uncollided fluence is
 traced; only the primary image is computed on the fine grid (:doc:`conventions`, "Grids"). ``ViewResult`` also carries
 the scalar and planar fluences per group, the source-iteration history, per-stage timings and peak memory.
+
+Anchor materials. ``SolverConfig.materials`` names the materials of the library, the anchors of the density model,
+from the catalogue ``cross_sections.MATERIAL_CATALOGUE`` (:doc:`method`, "CITRUS coupling", has the compositions and
+sources): at least two, in any order. The library is built for exactly that set, sorted by nominal attenuation
+(``library.materials``), and cached under a key that includes the set (the default seven keep the cache entry of
+earlier versions; a set whose members cross in attenuation inside 10-125 keV is refused):
+
+.. code-block:: python
+
+   from dataclasses import replace
+   from citrus.scatter_solver.cross_sections import MATERIAL_CATALOGUE, MATERIALS, material_index
+   from citrus.utilities import wlab_phantom, wlab_solver
+
+   list(MATERIAL_CATALOGUE)                       # air, lung, ..., titanium, carbon_fibre: (density, composition)
+   config = replace(SolverConfig(), materials=("air", "water", "bone"))
+   solver = wlab_solver(1.0, config=config, device="cuda")                 # library of air, water and bone
+   rho = wlab_phantom(grid, materials=solver.library.materials, device="cuda")   # [3, R, C, S]
+   material_index(solver.library, "water")        # 1: rows by name, not by a fixed index
+   config = replace(SolverConfig(), materials=MATERIALS + ("titanium",))   # the seven plus titanium
+
+The WLAB phantom (and ``synthesize_wlab_dataset``) needs water and bone among the anchors and raises otherwise;
+``cross_sections.WATER`` / ``BONE`` (3, 6) are the rows of the default set only.
 
 CITRUS
 ------
@@ -109,9 +145,10 @@ CITRUS
 ``Y`` are the measured counts ``[views, rows, channels]`` with flat field ``I0``; ``grid`` / ``geometry`` describe the
 reconstruction grid and the scanner in MBIRTORCH conventions (:doc:`conventions`). ``info`` holds the per-iteration
 records (timings, accumulator change, scatter change), the final scatter-to-primary ratio and scatter-count estimate,
-and the frozen regularization. Each outer iteration converts the reconstruction into densities with the seven-material
-model (``citrus.utilities.attenuation_to_densities``, :doc:`method`, "CITRUS coupling"), one material map at a time so
-that the seven-material volume never exists on the reconstruction grid:
+and the frozen regularization. Each outer iteration converts the reconstruction into densities with the interpolating
+model between the library's anchors (``citrus.utilities.attenuation_to_densities``, :doc:`method`, "CITRUS
+coupling"), one material map at a time so that the volume of all M materials never exists on the reconstruction grid
+(the examples below are for the default seven):
 
 .. code-block:: python
 
@@ -131,18 +168,18 @@ Primary and MBIR resume (:doc:`method`, "CITRUS coupling"):
 
 .. code-block:: python
 
-   # MBIRTORCH primary, MBIR resumed (defaults)
+   # MBIR resumed (default)
    config = CitrusConfig(num_outer_iterations=10)
-   config = CitrusConfig(num_outer_iterations=10, primary_projector="siddon")    # the solver's Siddon primary per view
    config = CitrusConfig(num_outer_iterations=10, resume_error_sinogram=False)   # restart MBIR from the sinogram
-   # projection chunks (default: one sinogram)
+   # projection chunks of the primary (default: one sinogram)
    config = CitrusConfig(num_outer_iterations=10, primary_views_per_chunk=30)
 
-``primary_projector``: the primaries of all views come from one projection per material present, MBIRTORCH's
-(``"mbirtorch"``, default) or the solver's Siddon rays (``"siddon"``), then the solver's polychromatic transmission
-(``citrus.citrus.primary_signals``). ``resume_error_sinogram`` keeps MBIRTORCH's error sinogram between outer
-iterations (one sinogram of memory) instead of recomputing it with a forward projection: the same reconstruction to
-float rounding, 6-13 % less MBIR time on the 12 M-voxel WLAB grid (one forward projection less per iteration).
+The primaries of all views come from one MBIRTORCH projection per material present (the reconstruction's own
+operator), then the solver's polychromatic transmission (``citrus.citrus.primary_signals``); the solver's Siddon
+primary is used only by the standalone solver (``solve_view``). ``resume_error_sinogram`` keeps MBIRTORCH's error
+sinogram between outer iterations (one sinogram of memory) instead of recomputing it with a forward projection: the
+same reconstruction to float rounding, 6-13 % less MBIR time on the 12 M-voxel WLAB grid (one forward projection less
+per iteration).
 
 Sparse-view scatter: the scatter step can run on every n-th view only, with the other views' scatter interpolated
 in angle (:doc:`method`, "Sparse-view scatter"):
@@ -198,14 +235,17 @@ Synthetic data
 --------------
 
 ``citrus.utilities.synthesize_cone_beam_data(rho, grid, geometry, angles, solver, I0, noise, seed)`` generates cone-beam
-counts with scatter for any density volume ``rho [7, R, C, S]``: ``X_true`` (attenuation at the effective energy), line
+counts with scatter for any density volume ``rho [M, R, C, S]`` (the solver library's materials): ``X_true``
+(attenuation at the effective energy), line
 integrals, ``P``, ``S``, ``Y``, ``SPR``, the solver's primary and scatter images and metadata. The primary uses
 MBIRTORCH's own projector, the scatter is ``S = SPR P`` with the scatter-to-primary ratio of one fully converged solve
 of ``solver`` per view (so the scatter-to-primary ratio of the data equals that of the solver exactly). The SPR's
-primary follows ``primary_projector``: ``"mbirtorch"`` (default since 0.3.0, the loop's default primary model:
-MBIRTORCH's per-material line integrals through the solver's polychromatic transmission) or ``"siddon"`` (the solver's
-``solve_view`` primary, the definition up to 0.2.0); ``meta["primary_projector"]`` and ``meta["data_format"]`` (2)
-record it. The truth solver may use a finer angular discretization than the solver of the reconstruction loop.
+primary is the loop's primary model, MBIRTORCH's per-material line integrals through the solver's polychromatic
+transmission (since 0.3.0; ``meta["primary_projector"]`` = ``"mbirtorch"`` and ``meta["data_format"]`` = 2 record
+it, as in data sets of versions 0.3.0 and 0.4.0; the ``"siddon"`` option of those versions, the definition up to
+0.2.0, is removed). The truth solver may use a finer angular discretization than the solver of the reconstruction
+loop. ``synthesize_wlab_dataset`` puts the phantom in the water and bone rows of the library it builds (the anchors
+of ``config.materials``) or is given.
 ``synthesize_wlab_dataset(num_views, delta_voxel, I0, noise, seed, out_path, config=..., geometry=...,
 start_view_angle=0.0, end_view_angle=None)`` is the WLAB wrapper used by the CITRUS demo (``end_view_angle`` None: the
 short scan start + pi + fan angle, ``view_angles`` / ``fan_angle``; ``2 pi`` for a full rotation); ``save_dataset`` /

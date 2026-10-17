@@ -22,13 +22,14 @@ with vacuum boundaries and a point source at the focal spot :math:`\mathbf r_0`,
 and :math:`b` the collimation (1 for directions that hit the panel, else 0). Interactions: photoelectric absorption
 (local deposition), Compton scattering (Klein-Nishina kinematics with the incoherent scattering function, no Doppler
 broadening) and Rayleigh scattering (form factors), from EPDL97 via XrayPhysics. Every voxel is a mixture of the
-seven basis materials of the table below with densities :math:`\rho_m`, so every coefficient is linear in the
-densities: :math:`\mu_x(\mathbf r, E) = \sum_m \rho_m(\mathbf r)\, m_{x,m}(E)` with the mass coefficients
-:math:`m_{x,m}` of the cross-section library. The density model of the CITRUS coupling gives every voxel at most two
-nonzero materials. The first-collision source is evaluated on the quadrature grid (below) from resampled densities;
-where every quadrature point has at most two nonzero materials it gathers only their two table rows (the pair
-representation, ``cross_sections.material_pairs``: the cost of a two-material basis), otherwise all seven (about 3.5
-times the work per point, on far fewer points than the fine grid has).
+:math:`M` anchor materials of the library (by default the seven of the table below, any set of the material catalogue
+with ``SolverConfig.materials``) with densities :math:`\rho_m`, so every coefficient is linear in the densities:
+:math:`\mu_x(\mathbf r, E) = \sum_m \rho_m(\mathbf r)\, m_{x,m}(E)` with the mass coefficients :math:`m_{x,m}` of the
+cross-section library. The density model of the CITRUS coupling gives every voxel at most two nonzero materials. The
+first-collision source is evaluated on the quadrature grid (below) from resampled densities; where every quadrature
+point has at most two nonzero materials it gathers only their two table rows (the pair representation,
+``cross_sections.material_pairs``: the cost of a two-material basis), otherwise all :math:`M` (about 3.5 times the work
+per point for the default seven, on far fewer points than the fine grid has).
 
 Uncollided and collided fluence
 -------------------------------
@@ -239,16 +240,18 @@ per-pixel direction from the focal spot and the exact-in-energy transmission of 
 averaged over sub-pixel rays after the energy sum. The scatter fraction is :math:`S/(P+S)`. The primary is computed in
 two steps, the per-material line integrals :math:`P_m = \int \rho_m\,dl` (a projector) and the transmission with the
 responses (``scatter_image.primary_from_path_lengths``), so any projector can feed it: the solver's Siddon ray to the
-pixel centre (``primary_path_lengths``, the reference of ``solve_view``) or MBIRTORCH's pixel-averaged
-separable-footprint projector (the CITRUS loop's default, below).
+pixel centre (``primary_path_lengths``, the primary of ``solve_view`` and of the standalone solver) or MBIRTORCH's
+pixel-averaged separable-footprint projector (the primary of the CITRUS loop, below).
 
 CITRUS coupling
 ---------------
 
 MBIR reconstructs a monoenergetic attenuation map :math:`X` at an effective energy :math:`E_{eff}` (the spectrum mean,
-63.03 keV for the default 125 kVp spectrum). The solver needs the densities of its seven basis materials, each with a
-nominal density :math:`\rho_m^{nom}` (its density in the body) and a nominal attenuation
-:math:`\mu_m = \rho_m^{nom}\, m_m(E_{eff})`, :math:`m_m` the total mass attenuation coefficient:
+63.03 keV for the default 125 kVp spectrum). The solver needs the densities of the library's anchor materials, each
+with a nominal density :math:`\rho_m^{nom}` (its density in the body or the scanner) and a nominal attenuation
+:math:`\mu_m = \rho_m^{nom}\, m_m(E_{eff})`, :math:`m_m` the total mass attenuation coefficient. The anchors are chosen
+from the material catalogue (``cross_sections.MATERIAL_CATALOGUE``) with ``SolverConfig.materials``, at least two;
+the default is the seven materials of this table:
 
 .. list-table::
    :header-rows: 1
@@ -287,21 +290,79 @@ nominal density :math:`\rho_m^{nom}` (its density in the body) and a nominal att
      - 1.85
      - 0.5366
 
-The materials are listed in their fixed order of increasing nominal attenuation, which holds at every energy of the
-library (10-125 keV; the library builder asserts it; muscle lies below soft tissue at every energy, attenuation ratio
-0.986-0.991). The interpolating density model assigns each voxel the two consecutive materials whose nominal
-attenuations bracket :math:`X`:
+The catalogue adds ten materials that a chosen set can draw on:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 34 16 16
+
+   * - material
+     - composition
+     - :math:`\rho^{nom}` (g/cm³)
+     - :math:`\mu` at 63 keV (1/cm)
+   * - trabecular bone
+     - spongiosa, Woodard and White (1986) / ICRU-46
+     - 1.18
+     - 0.2697
+   * - brain
+     - ICRU-44 brain (grey / white matter)
+     - 1.04
+     - 0.2092
+   * - blood
+     - ICRU-44 whole blood
+     - 1.06
+     - 0.2130
+   * - cartilage
+     - Woodard and White (1986) / ICRU-46
+     - 1.10
+     - 0.2234
+   * - skin
+     - ICRU-44 skin
+     - 1.09
+     - 0.2160
+   * - PMMA
+     - XrayPhysics ``PMMA`` (C₅H₈O₂)
+     - 1.18
+     - 0.2230
+   * - polyethylene
+     - XrayPhysics ``Polyethylene`` (C₂H₄)
+     - 0.94
+     - 0.1826
+   * - aluminium
+     - Al
+     - 2.699
+     - 0.7034
+   * - titanium
+     - Ti
+     - 4.54
+     - 3.0928
+   * - carbon fibre
+     - carbon-fibre epoxy laminate (couch top): 60 % fibre volume, 0.692 C + 0.308 C₂₁H₂₄O₄ by mass
+     - 1.56
+     - 0.2756
+
+(names in the code: ``trabecular_bone``, ``brain``, ``blood``, ``cartilage``, ``skin``, ``pmma``, ``polyethylene``,
+``aluminium``, ``titanium``, ``carbon_fibre``; the seven defaults are ``air``, ``lung``, ``adipose``, ``water``,
+``muscle``, ``soft_tissue``, ``bone``.) The library builder sorts the chosen anchors by nominal attenuation and asserts
+that this order holds at every energy of the library (10-125 keV): two anchors whose attenuations cross somewhere in
+the spectrum (skin and soft tissue, for example) cannot be interpolated between and are refused. For the default
+seven the order is the table's (muscle lies below soft tissue at every energy, attenuation ratio 0.986-0.991). The
+interpolating density model assigns each voxel the two consecutive anchors whose nominal attenuations bracket
+:math:`X`:
 
 .. math::
 
    \mu_a \le X < \mu_b:\quad f = \frac{X - \mu_a}{\mu_b - \mu_a},\qquad
    \rho_a = (1 - f)\,\rho_a^{nom},\quad \rho_b = f\,\rho_b^{nom},
 
-below the first material (air) the first material alone with :math:`\rho = X / m_{air}`, above the last (cortical
-bone) the last alone with :math:`\rho = X / m_{bone}` (bone denser than 1.85 g/cm³); negative values are clamped to
-vacuum. Since :math:`\rho_a m_a + \rho_b m_b = (1 - f)\mu_a + f \mu_b = X`, the model is exact in attenuation at
-:math:`E_{eff}`; it returns the pure material at its own nominal attenuation (a water voxel is water, a cortical-bone
-voxel bone at 1.85 g/cm³) and at most two materials per voxel. Composition matters beyond :math:`E_{eff}`: the
+below the lowest anchor (air by default) that anchor alone with :math:`\rho = X / m_{air}` (reduced density), above
+the highest (cortical bone by default) that anchor alone with :math:`\rho = X / m_{bone}` (bone denser than
+1.85 g/cm³); negative values are clamped to vacuum. Since :math:`\rho_a m_a + \rho_b m_b = (1 - f)\mu_a + f \mu_b = X`,
+the model is exact in attenuation at :math:`E_{eff}`; it returns the pure anchor at its own nominal attenuation (a
+water voxel is water, a cortical-bone voxel bone at 1.85 g/cm³) and at most two materials per voxel. With fewer
+anchors the composition between them is coarser: with air, water and bone a lung voxel becomes an air / water mixture
+and a muscle voxel a water / bone mixture of the same attenuation at :math:`E_{eff}`. Composition matters beyond
+:math:`E_{eff}`: the
 solver's primary and scatter are polychromatic, and two voxels of equal :math:`X` but different composition attenuate
 the harder and softer parts of the spectrum differently. The two-material split of versions up to 0.0.3 (water of
 density :math:`X/m_w` below unit water, unit water *plus* bone above it) turned the WLAB cortical-bone insert into
@@ -332,20 +393,22 @@ polychromatic primary and MBIR's monoenergetic model, and it only rescales the n
 estimated once and frozen. The loop starts from the FDK reconstruction of the uncorrected data.
 
 Densities and primary of the loop. :math:`\rho_k` is the density model of :math:`X_k`, evaluated one material at a
-time (no seven-material volume on the reconstruction grid). The primaries :math:`p_v` of all views come from one pass
-per material present: its map is projected onto all views (in chunks of views whose path lengths stay within one
-sinogram) and the per-view transmission is formed from the stacked line integrals (``CitrusConfig.primary_projector``:
-"mbirtorch", the default, MBIRTORCH's pixel-averaged line integrals, the reconstruction's own operator; "siddon", the
-solver's ray to each pixel centre, as in ``solve_view``). The two agree to 0.9 % (relative L2 over the 180 views of
-the WLAB study; median pixel 0.05 %) except on the pixels whose ray grazes a face of the prism, where a centre ray and
-a pixel average differ by up to a factor 5 in transmission; the pixel-integrated primary is the physical model of a
-detector pixel, so it is the default. The synthetic data (``utilities.synthesize_cone_beam_data``, data-set format 2)
-define their scatter as :math:`\mathrm{SPR}\cdot P` with the SPR's primary from the same model as the loop's default;
-with the other model the correction is inconsistent with the data on the silhouette pixels (RMS 0.8 % of the corrected
-line integrals at the true densities, up to 0.87 on single pixels). On the demo's default data (format 2) CITRUS
-reaches 0.0215 / 0.0259 relative RMSE (whole prism / core) with the MBIRTORCH primary and 0.0257 / 0.0305 with the
-Siddon primary; on the format-1 data of version 0.2.0 (SPR with the Siddon primary) the two give 0.0270 / 0.0305 and
-0.0242 / 0.0294: the consistent primary wins by 0.003-0.004 either way.
+time (no :math:`M`-material volume on the reconstruction grid). The primaries :math:`p_v` of all views are the
+MBIRTORCH per-material primary: one pass per material present projects its map onto all views with MBIRTORCH's
+pixel-averaged separable-footprint projector, the reconstruction's own operator :math:`A` (in chunks of views whose
+path lengths stay within one sinogram), and the per-view polychromatic transmission is formed from the stacked line
+integrals. It agrees with the solver's Siddon primary (one ray to each pixel centre, the primary of ``solve_view``) to
+0.9 % (relative L2 over the 180 views of the WLAB study; median pixel 0.05 %) except on the pixels whose ray grazes a
+face of the prism, where a centre ray and a pixel average differ by up to a factor 5 in transmission; the
+pixel-integrated primary is the physical model of a detector pixel. The synthetic data
+(``utilities.synthesize_cone_beam_data``, data-set format 2) define their scatter as :math:`\mathrm{SPR}\cdot P` with
+the SPR's primary from the same model; with the Siddon primary in the SPR the correction is inconsistent with the data
+on the silhouette pixels (RMS 0.8 % of the corrected line integrals at the true densities, up to 0.87 on single
+pixels). Versions 0.3.0 and 0.4.0 also offered the Siddon primary in the loop (``CitrusConfig.primary_projector``,
+removed in 0.5.0). On the demo's default data (format 2) CITRUS reaches 0.0215 / 0.0259 relative RMSE (whole prism /
+core); the Siddon loop on the same data gave 0.0257 / 0.0305, and on the format-1 data of version 0.2.0 (SPR with the
+Siddon primary) the MBIRTORCH and Siddon loops gave 0.0270 / 0.0305 and 0.0242 / 0.0294: the primary consistent with
+the data won by 0.003-0.004 either way.
 
 MBIR resume. Between outer iterations the loop keeps MBIRTORCH's error sinogram :math:`e = y_c - A X` (as
 :math:`-AX`, one sinogram) and resumes MBIRTORCH's VCD engine from it instead of recomputing it with a forward

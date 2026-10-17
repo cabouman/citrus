@@ -11,6 +11,7 @@
         --scatter-every 1
                                                    # a quick run (about 2 minutes)
     python demo/demo_citrus.py --transport-cell-cm 0.5                  # 0.5 cm transport cells (default: 1 cm)
+    python demo/demo_citrus.py --materials air,water,bone               # three anchor materials in the density model
     python demo/demo_citrus.py --truth-sweep 16x32 --truth-cone 32x64   # truth finer than the loop's solver
 
 1. Data (citrus.utilities.synthesize_wlab_dataset, cached in demo/input/). The WLAB phantom (30 x 20 x 40 cm water
@@ -26,14 +27,15 @@
    - Ground-truth scatter: for every view, the LBTE scatter solver is run on the TRUE densities with a fully converged
      source iteration (``ScatterSolver.solve_view``, tolerance 1e-3), giving the solver's scatter planar fluence image
      s (ideal photon-counting detector, no anti-scatter grid); p is the solver's primary planar fluence image of the
-     true densities with the primary model of the loop's default: MBIRTORCH's pixel-averaged per-material line
-     integrals through the solver's polychromatic transmission (``--truth-primary-projector mbirtorch``, default;
-     ``siddon``: the solver's Siddon primary, one ray to each pixel centre, the definition of citrus <= 0.2.0). The
-     truth is stored as the per-pixel scatter-to-primary ratio SPR = s / p and applied to the MBIRTORCH primary counts:
-     S = SPR x P.
+     true densities with the primary model of the loop: MBIRTORCH's pixel-averaged per-material line integrals through
+     the solver's polychromatic transmission. The truth is stored as the per-pixel scatter-to-primary ratio
+     SPR = s / p and applied to the MBIRTORCH primary counts: S = SPR x P. The truth solver always uses the seven
+     default anchor materials (the phantom is water and bone only, so the data do not depend on ``--materials``, which
+     sets the loop's density model).
    - Cache names: ``demo/input/<tag>.npz`` with the data-set format in the tag, ``..._v2`` (citrus >= 0.3.0: SPR with
-     the MBIRTORCH primary), plus ``_primary-siddon`` for ``--truth-primary-projector siddon``. Data sets and outputs
-     named ``..._v1...`` are those of citrus <= 0.2.0 (SPR with the Siddon primary) and are never loaded.
+     the MBIRTORCH primary). Data sets and outputs named ``..._v1...`` are those of citrus <= 0.2.0 (SPR with the
+     solver's Siddon primary) and are never loaded; ``..._v2_primary-siddon`` data sets (the Siddon option of citrus
+     0.3.0 and 0.4.0) are not loaded either.
    - Measured counts: Y = Poisson(P + S) (``--no-noise``: Y = P + S).
    This is an intentional inverse crime for the scatter: the truth comes from the same solver (same physics, same
    discretization by default) that CITRUS uses for its correction, so the study measures how well the coupled loop
@@ -51,13 +53,16 @@
    default 3: Catmull-Rom; default stride 8); ``--scatter-every n`` runs the scatter step at every n-th outer iteration
    only and reuses the scatter-to-primary ratio in between (default 8). The output files carry ``_stride<n>`` and
    ``_every<n>`` suffixes for values other than 1 (``_stride<n>_order<k>`` for interpolation orders other than 3).
-   The primary signal of every view comes from MBIRTORCH projections of the material maps (CitrusConfig.
-   primary_projector "mbirtorch", the default; ``--primary-projector siddon``: the solver's Siddon primary per view,
-   output suffix ``_siddon``), and MBIR resumes from its error sinogram between outer iterations
-   (CitrusConfig.resume_error_sinogram; ``--no-resume-error-sinogram`` restarts it from the sinogram every iteration,
-   suffix ``_restart``; the reconstructions agree to float rounding). ``--save-recon`` also writes the CITRUS volume
-   (``citrus_<tag>_recon.npy``). The summary JSON records the peak allocated GPU memory of the CITRUS run
-   (``torch.cuda.max_memory_allocated``, MiB: whole run and largest outer iteration).
+   The primary signal of every view comes from MBIRTORCH projections of the material maps (the reconstruction's own
+   operator), and MBIR resumes from its error sinogram between outer iterations (CitrusConfig.resume_error_sinogram;
+   ``--no-resume-error-sinogram`` restarts it from the sinogram every iteration, suffix ``_restart``; the
+   reconstructions agree to float rounding). ``--materials`` (comma-separated names of
+   citrus.scatter_solver.cross_sections.MATERIAL_CATALOGUE, at least two; default the seven air, lung, adipose,
+   water, muscle, soft_tissue, bone) sets the anchor materials of the loop's density model (SolverConfig.materials;
+   the library is built once per set and cached; output suffix ``_materials-<names>`` for a set other than the
+   default). ``--save-recon`` also writes the CITRUS volume (``citrus_<tag>_recon.npy``). The summary JSON records
+   the anchor materials and the peak allocated GPU memory of the CITRUS run (``torch.cuda.max_memory_allocated``,
+   MiB: whole run and largest outer iteration).
 3. The same MBIR loop without scatter correction (citrus.mbir_recon), for comparison.
 Both reconstructions use the same frozen regularization (MBIRTORCH's automatic estimate on the scatter-free
 sinogram), the same FDK initialization, weights and partition sequence, so they differ only by the scatter
@@ -85,10 +90,11 @@ from citrus import CitrusConfig, citrus_recon, mbir_recon  # noqa: E402
 from citrus.citrus import estimate_regularization  # noqa: E402
 from citrus.recon.mbir_bridge import is_short_scan, make_cone_model, scan_range  # noqa: E402
 from citrus.scatter_solver.config import SolverConfig  # noqa: E402
+from citrus.scatter_solver.cross_sections import MATERIAL_CATALOGUE, check_material_names  # noqa: E402
 from citrus.scatter_solver.geometry import ConeGeometry, Grid  # noqa: E402
 from citrus.utilities import (full_field_wlab_geometry, load_dataset,  # noqa: E402
-                              plot_history, plot_profiles, plot_slices, set_memory_cap, synthesize_wlab_dataset,
-                              wlab_grid, wlab_solver)
+                              nominal_attenuation, plot_history, plot_profiles, plot_slices, set_memory_cap,
+                              synthesize_wlab_dataset, wlab_grid, wlab_solver)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -144,13 +150,10 @@ def main() -> None:
     parser.add_argument("--scatter-every", type=int, default=8,
                         help="scatter step at every n-th outer iteration only; the previous correction is reused in "
                              "between (default 8)")
-    parser.add_argument("--truth-primary-projector", default="mbirtorch", choices=["mbirtorch", "siddon"],
-                        help="primary model of the data's scatter-to-primary ratio: MBIRTORCH line integrals (default, "
-                             "the loop's default) or the solver's Siddon primary (citrus <= 0.2.0; cache suffix "
-                             "_primary-siddon)")
-    parser.add_argument("--primary-projector", default="mbirtorch", choices=["mbirtorch", "siddon"],
-                        help="primary signals of the scatter correction: MBIRTORCH projections of the material maps "
-                             "(default) or the solver's Siddon primary per view")
+    parser.add_argument("--materials", default=",".join(SolverConfig().materials),
+                        help="anchor materials of the loop's density model, comma-separated names from the catalogue "
+                             f"({', '.join(MATERIAL_CATALOGUE)}); at least two (default: "
+                             f"{','.join(SolverConfig().materials)})")
     parser.add_argument("--resume-error-sinogram", default=True, action=argparse.BooleanOptionalAction,
                         help="resume MBIR from its error sinogram between outer iterations (default) or restart it "
                              "from the sinogram (--no-resume-error-sinogram)")
@@ -171,20 +174,27 @@ def main() -> None:
         raise SystemExit("--scatter-view-stride must be >= 1")
     if args.scatter_every < 1:
         raise SystemExit("--scatter-every must be >= 1")
+    try:
+        materials = check_material_names(tuple(name.strip() for name in args.materials.split(",") if name.strip()))
+    except ValueError as exc:
+        raise SystemExit(f"--materials: {exc}")
     if not torch.cuda.is_available():
         raise SystemExit("this demo needs a CUDA GPU (MBIRTORCH and the scatter solver run on the GPU)")
     device = torch.device("cuda")
     set_memory_cap(args.memory_cap_mib)
     os.makedirs(args.input, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
-    loop_config = replace(SolverConfig(), transport_cell_cm=args.transport_cell_cm)
+    # the truth solver keeps the default anchors (the data do not depend on --materials); the loop uses --materials
+    base_config = replace(SolverConfig(), transport_cell_cm=args.transport_cell_cm)
+    loop_config = replace(base_config, materials=materials)
+    loop_config.validate()
     truth_polar, truth_azimuthal = (_counts(args.truth_sweep, "--truth-sweep") if args.truth_sweep
                                     else (loop_config.num_polar, loop_config.num_azimuthal))
     cone_polar, cone_azimuthal = (_counts(args.truth_cone, "--truth-cone") if args.truth_cone
                                   else (loop_config.cone_num_polar, loop_config.cone_num_azimuthal))
     if truth_polar % 2 or truth_azimuthal % 4:
         raise SystemExit("--truth-sweep: the polar count must be even and the azimuthal count divisible by 4")
-    truth_config = replace(loop_config, num_polar=truth_polar, num_azimuthal=truth_azimuthal, cone_num_polar=cone_polar,
+    truth_config = replace(base_config, num_polar=truth_polar, num_azimuthal=truth_azimuthal, cone_num_polar=cone_polar,
                            cone_num_azimuthal=cone_azimuthal)
     truth_config.validate()
     start = math.radians(args.start_view_angle)
@@ -202,11 +212,9 @@ def main() -> None:
            + ("_nonoise" if args.no_noise else ""))
     if args.transport_cell_cm != 1.0:
         tag += f"_cell{args.transport_cell_cm:g}".replace(".", "p")
-    if truth_config != loop_config:
+    if truth_config != base_config:
         tag += f"_truth{truth_polar}x{truth_azimuthal}_cone{cone_polar}x{cone_azimuthal}"
-    tag += "_v2"  # data-set format 2: SPR with the primary model of the loop's default (citrus >= 0.3.0)
-    if args.truth_primary_projector != "mbirtorch":
-        tag += f"_primary-{args.truth_primary_projector}"
+    tag += "_v2"  # data-set format 2: SPR with the primary model of the loop (citrus >= 0.3.0)
     start_time = time.perf_counter()
 
     # ---- 1. data ------------------------------------------------------------------------------------------------
@@ -219,7 +227,7 @@ def main() -> None:
         t0 = time.perf_counter()
         data = synthesize_wlab_dataset(args.views, args.delta_voxel, args.I0, not args.no_noise, args.seed, path,
                                        geometry=geometry, device=device, config=truth_config, start_view_angle=start,
-                                       end_view_angle=end, primary_projector=args.truth_primary_projector)
+                                       end_view_angle=end)
         print(f"data: synthesized {args.views} views in {time.perf_counter() - t0:.1f} s -> {path}.npz")
     geometry = ConeGeometry(**data["meta"]["geometry"])
     grid = wlab_grid(args.delta_voxel)
@@ -242,6 +250,9 @@ def main() -> None:
     print(f"truth solver: sweep {truth_polar}x{truth_azimuthal}, cone {cone_polar}x{cone_azimuthal}; "
           f"loop solver: sweep {loop_config.num_polar}x{loop_config.num_azimuthal}, "
           f"cone {loop_config.cone_num_polar}x{loop_config.cone_num_azimuthal}")
+    anchors = solver.library.materials  # sorted by nominal attenuation
+    print("anchor materials of the density model (nominal attenuation at E_eff, 1/cm): "
+          + ", ".join(f"{name} {mu:.4g}" for name, mu in zip(anchors, nominal_attenuation(solver.library).tolist())))
     model = make_cone_model(grid, geometry, angles, device=device)
     Y_device = torch.as_tensor(Y, device=device)
     regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=device) / I0),
@@ -258,10 +269,10 @@ def main() -> None:
     config = CitrusConfig(num_outer_iterations=args.outer_iterations, verbose=True,
                           scatter_view_stride=args.scatter_view_stride,
                           scatter_view_interpolation_order=interpolation_order, scatter_every=args.scatter_every,
-                          primary_projector=args.primary_projector, resume_error_sinogram=args.resume_error_sinogram)
+                          resume_error_sinogram=args.resume_error_sinogram)
     out_tag = tag
-    if args.primary_projector != "mbirtorch":
-        out_tag += f"_{args.primary_projector}"
+    if set(materials) != set(SolverConfig().materials):
+        out_tag += "_materials-" + "-".join(anchors)
     if not args.resume_error_sinogram:
         out_tag += "_restart"
     if args.scatter_view_stride > 1:
@@ -298,15 +309,13 @@ def main() -> None:
     summary = {
         "views": len(angles), "start_view_angle_deg": math.degrees(float(angles[0])), "scan_range_deg": span,
         "short_scan": bool(is_short_scan(angles)), "delta_voxel_cm": args.delta_voxel, "grid": list(grid.shape),
-        "transport_cell_cm": args.transport_cell_cm, "data_tag": tag,
-        "truth_primary_projector": data["meta"].get("primary_projector", "siddon"),
+        "transport_cell_cm": args.transport_cell_cm, "data_tag": tag, "materials": list(anchors),
         "quadrature_point_spacing_cm": loop_config.quadrature_point_spacing_cm,
         "quadrature_points_per_axis": loop_config.quadrature_points(max(grid.deltas)),
         "outer": args.outer_iterations,
         "truth_sweep": [truth_polar, truth_azimuthal], "truth_cone": [cone_polar, cone_azimuthal],
         "scatter_view_stride": args.scatter_view_stride, "scatter_view_interp_order": interpolation_order,
-        "scatter_every": args.scatter_every,
-        "primary_projector": args.primary_projector, "resume_error_sinogram": bool(args.resume_error_sinogram),
+        "scatter_every": args.scatter_every, "resume_error_sinogram": bool(args.resume_error_sinogram),
         "scatter_steps": int(sum(1 for r in records if r.get("scatter_refreshed", True))),
         "computed_views": [int(v) for v in citrus_info["computed_views"]],
         "regularization": regularization,
