@@ -4,7 +4,8 @@
     python docs/figures/make_pipeline_flowchart.py            # exports the existing .pptx to .png (PowerPoint, Windows)
     python docs/figures/make_pipeline_flowchart.py --rebuild  # regenerates the .pptx from this script first
 
-The slide is edited by hand in PowerPoint; the default run only re-exports it, so hand edits are never overwritten.
+The slide is edited by hand in PowerPoint and is not tracked by git (the exported PNG is); the default run only
+re-exports it, so hand edits are never overwritten.
 ``--rebuild`` discards them and regenerates the slide from the layout code below.
 """
 from __future__ import annotations

@@ -184,7 +184,6 @@ dmypy.json
 *.DS_Store
 
 
-# documentation assets (the pipeline flowchart ships with the docs; the slide is its editable source)
+# documentation images (logo, favicon, the pipeline flowchart), as in the MBIRTORCH repository; the PowerPoint
+# slide the flowchart is exported from stays untracked (docs/figures/citrus_pipeline.pptx)
 !docs/source/_static/*.png
-!docs/source/_static/*.svg
-!docs/figures/*.pptx
