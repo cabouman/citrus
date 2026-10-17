@@ -43,6 +43,13 @@ and is built from source:
    cd XrayPhysics
    pip install .
 
+With CMake 4 or newer, set ``CMAKE_POLICY_VERSION_MINIMUM=3.5`` in the environment first (XrayPhysics declares a
+minimum CMake version that CMake 4 no longer accepts; the ``pip install`` then fails with "Exactly one .egg-info should
+have been produced"), or install a CMake below 4. The compiler, CMake and git can come from conda when there is no root
+access: ``conda create -n citrus -c conda-forge python=3.11 git cmake make c-compiler cxx-compiler``;
+``dev_scripts/wsl_install_test.sh`` runs the complete installation and the tests that way (tested on Ubuntu under WSL 2
+with a CUDA GPU).
+
 On Windows this needs Visual Studio (C++ build tools) and CMake on ``PATH``; the build can also be done explicitly:
 
 .. code-block:: bat

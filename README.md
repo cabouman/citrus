@@ -108,7 +108,11 @@ Install PyTorch first if you need a specific CUDA build.
 
 - **XrayPhysics** (`physics` extra) builds the multigroup cross-section library (once; it is cached in
   `~/.cache/citrus` or `$CITRUS_CACHE_DIR`). It is a C++ library and needs a C++ toolchain and CMake: on Linux gcc or
-  clang, on Windows Visual Studio with the C++ build tools and CMake on `PATH`. **Without XrayPhysics the
+  clang, on Windows Visual Studio with the C++ build tools and CMake on `PATH`. With CMake 4 or newer set
+  `CMAKE_POLICY_VERSION_MINIMUM=3.5` in the environment before installing (XrayPhysics declares an older minimum
+  CMake version, which CMake 4 otherwise rejects), or use a CMake below 4. Without root access the toolchain can come
+  from conda: `conda create -n citrus -c conda-forge python=3.11 git cmake make c-compiler cxx-compiler`
+  (`dev_scripts/wsl_install_test.sh` runs the whole installation that way). **Without XrayPhysics the
   cross-section library cannot be built**, so the demos and real reconstructions need it (or a cached library); the
   test suite uses a synthetic library and skips the tests that need the real one.
 - **Triton** (`gpu` extra: `triton` on Linux, `triton-windows` on Windows) enables the fused kernels on CUDA. Without
