@@ -1,5 +1,3 @@
-<p align="center"><img src="docs/source/_static/citrus_logo.png" alt="CITRUS" width="480"></p>
-
 # citrus
 
 **CITRUS** (Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter) reconstructs cone-beam CT
