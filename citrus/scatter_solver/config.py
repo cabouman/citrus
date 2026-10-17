@@ -26,13 +26,14 @@ class SolverConfig:
       transport_cell_cm  edge length (cm) of the cubic transport cells: the transport grid C is the regular grid of this
                         spacing that covers the fine (reconstruction) box, centred on it (ceil(extent / cell) cells per
                         axis; the padding is empty space). Any ratio to the fine voxel size is allowed
-      fc_points_per_axis upper bound on q, the quadrature points per axis per transport cell for the first-collision
-                        source and the first-order scatter image (q^3 equal-weight points per cell on the midpoint
-                        lattice: the quadrature grid Q = C refined q times). The effective q is bounded by the data
-                        resolution, q = min(fc_points_per_axis, max(1, round(transport_cell_cm / largest fine voxel
-                        edge))) with Python's round (halves to even: a ratio of 2.5 gives 2), `quadrature_points`; so
-                        1 cm voxels in 1 cm cells give q = 1, 0.5 cm and smaller voxels the bound
-      fc_trace_grid     grid through which the uncollided fluence at the Q points is ray traced: "quadrature"
+      quadrature_point_spacing_cm target spacing (cm) of the quadrature points of the first-collision source and the
+                        first-order scatter image: q^3 equal-weight points per transport cell on the midpoint lattice
+                        (the quadrature grid Q = C refined q times) with q = max(1, round(transport_cell_cm /
+                        quadrature_point_spacing_cm)), bounded by the data resolution, q = min(q, max(1, round(
+                        transport_cell_cm / largest fine voxel edge))), Python's round (halves to even: a ratio of 2.5
+                        gives 2), `quadrature_points`. Default 0.5 cm: 1 cm cells -> q = 2, 2 cm cells -> 4, 0.5 cm
+                        cells -> 1; 1 cm voxels in 1 cm cells -> 1 (the data bound)
+      uncollided_trace_grid     grid through which the uncollided fluence at the Q points is ray traced: "quadrature"
                         (default: Q itself with rho_quad, material boundaries resolved at the Q spacing), "coarse"
                         (the transport grid C with the resampled densities: smears a boundary inside a cell, up to a
                         few percent of the scatter where rays run along it) or "fine" (the reconstruction grid; for
@@ -63,8 +64,8 @@ class SolverConfig:
 
     # --- space --------------------------------------------------------------------------------
     transport_cell_cm: float = 1.0
-    fc_points_per_axis: int = 2
-    fc_trace_grid: Literal["coarse", "quadrature", "fine"] = "quadrature"
+    quadrature_point_spacing_cm: float = 0.5
+    uncollided_trace_grid: Literal["coarse", "quadrature", "fine"] = "quadrature"
 
     # --- source iteration ---------------------------------------------------------------------
     si_tol: float = 1.0e-3
@@ -83,10 +84,14 @@ class SolverConfig:
 
     def quadrature_points(self, fine_voxel_cm: float) -> int:
         """Effective quadrature points per axis per transport cell for fine voxels whose largest edge is fine_voxel_cm:
-        min(fc_points_per_axis, max(1, round(transport_cell_cm / fine_voxel_cm))) (Python's round, halves to even), so
-        the quadrature spacing does not go much below the fine voxel size (1 cm voxels in 1 cm cells: 1; 0.5 cm: 2;
-        0.4 cm: round(2.5) = 2; 0.05 cm: the bound 2)."""
-        return min(int(self.fc_points_per_axis), max(1, round(float(self.transport_cell_cm) / float(fine_voxel_cm))))
+        q = min(max(1, round(transport_cell_cm / quadrature_point_spacing_cm)), max(1, round(transport_cell_cm /
+        fine_voxel_cm))) (Python's round, halves to even): the points are about quadrature_point_spacing_cm apart, and
+        their spacing does not go much below the fine voxel size. With the default 0.5 cm spacing: 1 cm cells give 2 (0.5 cm
+        and smaller voxels; 1 cm voxels: 1; 0.4 cm: round(2.5) = 2), 2 cm cells give 4 (voxels of 0.5 cm and less),
+        0.5 cm cells give 1."""
+        cell = float(self.transport_cell_cm)
+        target = max(1, round(cell / float(self.quadrature_point_spacing_cm)))
+        return min(target, max(1, round(cell / float(fine_voxel_cm))))
 
     def validate(self) -> None:
         L = self.legendre_order
@@ -102,10 +107,11 @@ class SolverConfig:
             raise ValueError("group_edges_kev must have num_groups+1 entries")
         if not self.transport_cell_cm > 0:
             raise ValueError(f"transport_cell_cm must be > 0, got {self.transport_cell_cm}")
-        if self.fc_points_per_axis < 1:
-            raise ValueError("fc_points_per_axis must be >= 1")
-        if self.fc_trace_grid not in ("coarse", "quadrature", "fine"):
-            raise ValueError(f"fc_trace_grid must be 'coarse', 'quadrature' or 'fine', got {self.fc_trace_grid!r}")
+        if not self.quadrature_point_spacing_cm > 0:
+            raise ValueError(f"quadrature_point_spacing_cm must be > 0, got {self.quadrature_point_spacing_cm}")
+        if self.uncollided_trace_grid not in ("coarse", "quadrature", "fine"):
+            raise ValueError(f"uncollided_trace_grid must be 'coarse', 'quadrature' or 'fine', "
+                             f"got {self.uncollided_trace_grid!r}")
         if self.si_max_iterations < 1 or self.si_tol <= 0:
             raise ValueError("need si_max_iterations >= 1 and si_tol > 0")
         if self.cone_num_polar < 1 or self.cone_num_azimuthal < 1:

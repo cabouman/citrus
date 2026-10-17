@@ -38,13 +38,17 @@ Grids
 The solver uses three grids (``geometry.Grid``):
 
 * **F**, the fine (reconstruction) grid: the densities ``rho_fine``; only the primary image and the resampling
-  below touch it.
+  below touch it. In the CITRUS loop the fine densities are never formed as a whole: the fields come from the
+  attenuation X on F one material map at a time (``ScatterSolver.material_fields_from_attenuation``;
+  ``MaterialFields.rho_fine`` is then None and ``MaterialFields.fine_material(m)`` evaluates a map on demand).
 * **C**, the transport grid, ``Grid.covering(F, transport_cell_cm)``: cubic cells of edge
   ``SolverConfig.transport_cell_cm``, ``ceil(extent / cell)`` cells per axis, centred on the box of F (symmetric
   padding with empty space); any ratio of cell to voxel size. Every scatter order is transported on C; the
   attenuation of the scatter image is traced on C.
-* **Q**, the quadrature grid, ``C.refine(q)`` with ``q = min(fc_points_per_axis, max(1, round(transport_cell_cm /
-  largest fine voxel edge)))`` (``SolverConfig.quadrature_points``; Python's round, halves to even): q^3 equal-weight points
+* **Q**, the quadrature grid, ``C.refine(q)`` with ``q = min(max(1, round(transport_cell_cm /
+  quadrature_point_spacing_cm)), max(1, round(transport_cell_cm / largest fine voxel edge)))``
+  (``SolverConfig.quadrature_points``; Python's round, halves to even; the default spacing 0.5 cm gives 2 points per
+  axis in 1 cm cells, 4 in 2 cm cells, 1 in 0.5 cm cells): q^3 equal-weight points
   per cell of C at local coordinates ``(2j + 1)/q - 1`` (the midpoint lattice). The uncollided fluence, the
   first-collision source and the first-order emission of the scatter image live on Q.
 * ``rho_coarse`` and ``rho_quad`` are conservative overlap resamplings of ``rho_fine``

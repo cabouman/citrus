@@ -8,11 +8,16 @@ outer iteration k, ONE scatter step per view and ONE warm-started MBIR iteration
     X_0      = FDK(-log(Y / I0))                                    (the uncorrected data; Parker-weighted for a
                                                                      short scan)
     for k = 0 .. N-1:
-        rho_k            = densities(X_k)                            seven-material interpolating model at E_eff
+        rho_k            = densities(X_k)                            seven-material interpolating model at E_eff,
+                                                                     resampled onto the transport and quadrature
+                                                                     grids material by material (never [7, R, C, S])
         for every view v:
             phi1          = G1(rho_k)                                uncollided fluence (quadrature grid Q)
             Phi_v         = G_step(rho_k, phi1, Phi_v)               ONE sweep of FC source + aged accumulator
-            s_v, p_v      = project_scatter(phi1, Phi_v), primary    scatter and primary signals of the view
+            s_v           = project_scatter(phi1, Phi_v)             scatter signal of the view
+        p                = primary(rho_k)                            primary signals of every view: MBIRTORCH
+                                                                     projections of the material maps (default) or
+                                                                     the solver's Siddon primary per view
         SPR_k            = s / p
         Y_c              = Y / (1 + SPR_k)                           scatter-corrected counts
         X_{k+1}          = one VCD iteration of MBIR on y_c = -log(Y_c / I0), warm-started at X_k,
@@ -24,6 +29,22 @@ converges together with the reconstruction ("age-ordered" source iteration: the 
 estimate was computed n - 1 outer iterations ago). The collided transport is the expensive part of a converged
 scatter solve; CITRUS spends one sweep per view per outer iteration instead of a full source iteration.
 
+Densities and primary (version 0.3.0): the loop never forms the seven-material density volume [7, R, C, S] on the
+reconstruction grid (7 GB at 256 M voxels). `ScatterSolver.material_fields_from_attenuation(X_k, grid, density)`
+evaluates one material's map at a time (`DensityModel.material`, bit for bit the row of the full model) and resamples
+it onto the transport and quadrature grids. The primary signal of every view (CitrusConfig.primary_projector):
+
+    "mbirtorch" (default)  path lengths P_m = A rho_m (g/cm^2) of the materials present with MBIRTORCH's projector
+                           over all views at once (one material map at a time, in chunks of views so that the path
+                           lengths [M', V_chunk, Rd, Cd] stay within one sinogram, `primary_signals`), then
+                           the solver's polychromatic transmission and detector / grid response per view
+                           (`ScatterSolver.primary_from_path_lengths`); pixel-averaged line integrals (separable
+                           footprint), the reconstruction's own operator; about 2.4 ms per view and material on the
+                           12 M-voxel grid instead of a Siddon trace per view
+    "siddon"               the solver's Siddon primary (`ScatterSolver.primary`: one ray to each pixel center per
+                           material present, the reference of `ScatterSolver.solve_view`), traced one material map
+                           at a time for every view in the same chunks (`SiddonViewProjector`)
+
 Scatter model -> correction: the solver gives per view the scatter and primary signals (s, p) of the current
 densities, so the correction is the multiplicative Y_c = Y p / (p + s) = Y / (1 + SPR(X)); it is independent of I0 and
 of any mismatch between the solver's polychromatic primary and MBIR's monoenergetic model, and it rescales the noise
@@ -34,8 +55,8 @@ Sparse-view scatter (CitrusConfig.scatter_view_stride n > 1): the scatter step r
 other view is interpolated in angle, per detector pixel, from the computed views' scatter signals (Catmull-Rom over
 the 4 nearest computed views by default, circular in angle for a full rotation, along the arc with the end views held
 for a short scan; orders 0-2 and None also exist;
-`interpolate_scatter`), its primary signal comes from the
-solver's primary projection (cheap: no transport), and the correction ratio s / p is formed on every view. The scatter
+`interpolate_scatter`), its primary signal comes from the primary projection of every view (`primary_signals`; cheap:
+no transport), and the correction ratio s / p is formed on every view. The scatter
 signal is interpolated, not the ratio: the scatter is smooth on the panel and in angle, the ratio carries the object's
 shadow edges, which move across the panel with the angle. Measured on WLAB (180 views, 0.5 cm grid, 20 outer
 iterations): stride 2 costs +0.0014 relative RMSE for 51 % of the scatter time, stride 4 +0.008 for 26 %; the penalty
@@ -56,11 +77,19 @@ cell mean (the aged accumulator re-enters the next sweep with zero slopes) in fl
 scale, 1/8 of float32 (17.6 MiB per view on a 0.5 cm WLAB grid with 1 cm transport cells). The reconstruction differs
 from exact float32 storage by ~6e-5 (relative), far below the reconstruction error.
 
+MBIR resume (CitrusConfig.resume_error_sinogram): MBIRTORCH's `recon` recomputes the error sinogram y_c - A X with
+one forward projection per call. With the switch on, the loop keeps it between outer iterations (as -A X, one
+sinogram) and resumes MBIRTORCH's engine from it (`recon.mbir_bridge.mbir_iterations(..., error_sinogram=)`); a new
+corrected sinogram only shifts it, e = y_c,new - A X. The reconstruction equals the restarted one to float rounding.
+
 Public API
 ----------
     citrus_recon(...)     the CITRUS reconstruction (returns the reconstruction and a dict of diagnostics)
     mbir_recon(...)       the same MBIR loop without the solver: no correction, or a fixed SPR correction
-    citrus_step(...)      one scatter step of one view over an explicit CitrusState
+    citrus_step(...)      one scatter step of one view over an explicit CitrusState (densities given)
+    citrus_view_step(...) the same from prebuilt MaterialFields, optionally without the primary (the loop's form)
+    primary_signals(...)  primary signals of all views from projections of the material maps (MBIRTORCH or Siddon,
+                          `SiddonViewProjector`)
     scatter_view_indices, angular_neighbors, full_rotation, interpolation_weights, interpolate_scatter
                           sparse-view scatter
     G1, G1to2, G_gt2, G_step, project_scatter   the per-view operators of the step
@@ -77,12 +106,13 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .recon.mbir_bridge import fdk, make_cone_model, mbir_iterations
+from .recon.mbir_bridge import ViewChunkProjector, fdk, make_cone_model, mbir_iterations
 from .scatter_solver.angular_quadrature import Quadrature
 from .scatter_solver.cross_sections import MultigroupLibrary
 from .scatter_solver.geometry import ConeGeometry, Grid
 from .scatter_solver.scatter_solver import MaterialFields, ScatterSolver
-from .utilities import attenuation_to_densities, effective_energy
+from .scatter_solver.uncollided import present_materials
+from .utilities import attenuation_to_densities, attenuation_to_density, effective_energy
 
 __all__ = [
     "CitrusState",
@@ -92,6 +122,10 @@ __all__ = [
     "G_step",
     "project_scatter",
     "citrus_step",
+    "citrus_view_step",
+    "primary_signals",
+    "SiddonViewProjector",
+    "PRIMARY_PROJECTORS",
     "DensityModel",
     "StateStore",
     "CitrusConfig",
@@ -141,8 +175,9 @@ def _fields(solver: ScatterSolver, rho: Tensor, grid: Grid, fields: Optional[Mat
 def G1(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float,
        fields: Optional[MaterialFields] = None) -> Tensor:
     """Uncollided fluence phi_uc [G, Rq, Cq, Sq] at the quadrature points (the voxel centers of the solver's
-    quadrature grid Q = transport grid refined fc_points_per_axis times, `ScatterSolver.uncollided`). rho [M, R, C, S]
-    on the fine grid (M = 7 basis materials)."""
+    quadrature grid Q = transport grid refined q = cell / quadrature_point_spacing_cm times,
+    `ScatterSolver.uncollided`). rho [M, R, C, S] on the fine grid (M = 7 basis materials), unused when fields are
+    given."""
     return solver.uncollided(_fields(solver, rho, grid, fields), angle)
 
 
@@ -225,15 +260,25 @@ def citrus_step(solver: ScatterSolver, state: CitrusState, rho: Tensor, grid: Gr
     accumulator. fields: precomputed `solver.material_fields(rho, grid)` (the densities are shared by every view of
     an outer iteration, so the caller may build them once); None builds them here.
     """
+    return citrus_view_step(solver, state, _fields(solver, rho, grid, fields), angle)
+
+
+def citrus_view_step(solver: ScatterSolver, state: CitrusState, fields: MaterialFields, angle: float, *,
+                     primary: bool = True) -> tuple[Tensor, Optional[Tensor], CitrusState]:
+    """`citrus_step` from prebuilt density fields: `solver.material_fields(rho, grid)` or, as in the CITRUS loop,
+    `solver.material_fields_from_attenuation(X, grid, density_model)` (no fine density volume). primary: also trace
+    the view's primary with the solver (`ScatterSolver.primary`, Siddon); False returns None in its place (the loop
+    computes the primaries of all views at once instead, `primary_signals`). Returns
+    (scatter_signal [Rd, Cd], primary_signal [Rd, Cd] or None, new state); the input state is not modified."""
     if state.angle is not None and abs(float(state.angle) - float(angle)) > 1e-12:
         raise ValueError(f"state belongs to angle {state.angle}, got {angle}")
-    fields = _fields(solver, rho, grid, fields)
+    grid = fields.grid_fine
     quad = state.cone_quad if state.cone_quad is not None else solver.cone_quadrature(grid, angle)
-    phi1 = G1(solver, rho, grid, angle, fields)
-    Phi_new = G_step(solver, rho, grid, angle, phi1, state.Phi_gt1, fields)  # phi2 + K Phi_gt1 in one sweep
-    scatter = project_scatter(solver, rho, grid, angle, phi1, Phi_new, fields, quad)["signal"]
+    phi1 = G1(solver, None, grid, angle, fields)
+    Phi_new = G_step(solver, None, grid, angle, phi1, state.Phi_gt1, fields)  # phi2 + K Phi_gt1 in one sweep
+    scatter = project_scatter(solver, None, grid, angle, phi1, Phi_new, fields, quad)["signal"]
     del phi1
-    primary = solver.primary(fields, angle)["signal"]
+    prim = solver.primary(fields, angle)["signal"] if primary else None
     new_norm = float(torch.linalg.vector_norm(Phi_new[:, 0, 0]))
     if state.Phi_gt1 is None:
         rel = 1.0 if new_norm > 0 else 0.0
@@ -242,7 +287,96 @@ def citrus_step(solver: ScatterSolver, state: CitrusState, rho: Tensor, grid: Gr
         rel = diff / new_norm if new_norm > 0 else 0.0
     new_state = CitrusState(angle=float(angle), Phi_gt1=Phi_new, cone_quad=quad, num_steps=state.num_steps + 1,
                             history=state.history + [rel])
-    return scatter, primary, new_state
+    return scatter, prim, new_state
+
+
+class SiddonViewProjector:
+    """The solver's Siddon primary path lengths (`ScatterSolver.primary_path_lengths`: one ray from the focal spot to
+    every (sub-)pixel center, the solver's projectors and primary_n_sub) with the interface of
+    `recon.mbir_bridge.ViewChunkProjector`: `project(volume, start, stop)` -> [stop - start, Rd n, Cd n] (g/cm^2 for a
+    density map), one view at a time; `chunks(n)`, `num_views`, `angles`. The projector of `primary_signals` for
+    CitrusConfig.primary_projector "siddon" (the same path lengths as `ScatterSolver.primary`)."""
+
+    def __init__(self, solver: ScatterSolver, grid: Grid, angles: Union[Sequence[float], np.ndarray]) -> None:
+        self.solver = solver
+        self.grid = grid
+        self.angles = np.asarray(angles, dtype=np.float64).reshape(-1)
+
+    @property
+    def num_views(self) -> int:
+        return int(self.angles.size)
+
+    def chunks(self, views_per_chunk: int) -> list[tuple[int, int]]:
+        n = max(1, int(views_per_chunk))
+        return [(a, min(a + n, self.num_views)) for a in range(0, self.num_views, n)]
+
+    def project(self, volume: Tensor, start: int = 0, stop: Optional[int] = None) -> Tensor:
+        stop = self.num_views if stop is None else int(stop)
+        return torch.stack([self.solver.primary_path_lengths(volume[None], self.grid, float(self.angles[v]))[0]
+                            for v in range(int(start), stop)])
+
+
+def primary_signals(solver: ScatterSolver, fields: MaterialFields, angles: Union[Sequence[float], np.ndarray],
+                    projector: Union[ViewChunkProjector, SiddonViewProjector], views_per_chunk: Optional[int] = None,
+                    out: Optional[Tensor] = None,
+                    quantity: Literal["signal", "planar_fluence"] = "signal") -> Tensor:
+    """Primary signals [V, Rd, Cd] of every view, one fine material map at a time:
+
+        P_m[v] = projector(rho_m)[v]   (g/cm^2; `projector.project` of the density map of material m,
+                                        `fields.fine_material`)
+        p[v]   = solver.primary_from_path_lengths(P[:, v], materials, angles[v])["signal"]
+
+    i.e. the solver's primary (fine-energy transmission, inverse square, source, detector and grid responses) on the
+    line integrals of `projector`: `recon.mbir_bridge.ViewChunkProjector` (MBIRTORCH's separable-footprint
+    pixel-averaged line integrals, all views of a chunk in one projection; CitrusConfig.primary_projector "mbirtorch")
+    or `SiddonViewProjector` (the solver's Siddon trace per view, equal to `ScatterSolver.primary` to float rounding;
+    "siddon"). Only the materials present are projected (`fields.fine_materials`, or
+    `uncollided.present_materials(rho_fine)`). The views are processed in chunks of consecutive views so that the
+    path lengths [M', V_chunk, Rd, Cd] (float32) and the projection being copied stay within one sinogram:
+    views_per_chunk None = max(1, V // (M' + 1)) (M' = number of materials projected; for the Siddon projector with
+    n_sub > 1 the sub-pixel panel is n_sub^2 times larger per view); each chunk evaluates the material maps once (cheap
+    next to the projections; MBIRTORCH uses a cached sub-model over the chunk's angles). With MBIRTORCH the solver's
+    sub-pixel sampling (primary_n_sub) does not apply: its projector already averages the line integral over the
+    pixel. angles [V] (rad) must be the projector's views. out: optional [V, Rd, Cd] tensor to fill. quantity:
+    "signal" (default, the detector signal, keV/cm^2) or "planar_fluence" (summed over the groups, photons/cm^2; the
+    denominator of the synthetic data's SPR, `utilities.synthesize_cone_beam_data`)."""
+    if quantity not in ("signal", "planar_fluence"):
+        raise ValueError(f"quantity must be 'signal' or 'planar_fluence', got {quantity!r}")
+    ang = np.asarray(angles, dtype=np.float64).reshape(-1)
+    V = ang.size
+    if projector.num_views != V or not np.allclose(projector.angles, ang, rtol=0.0, atol=1e-12):
+        raise ValueError("the projector's views must be the given angles")
+    if fields.fine_materials is not None:
+        mats = list(fields.fine_materials)
+    else:
+        present = present_materials(fields.rho_fine)
+        mats = list(range(fields.num_materials)) if present is None else present
+    Rd, Cd = solver.geom.num_det_rows, solver.geom.num_det_channels
+    if out is None:
+        out = torch.empty((V, Rd, Cd), device=solver.device, dtype=solver.dtype)
+    if views_per_chunk is None:
+        n_sub = 1
+        if isinstance(projector, SiddonViewProjector):
+            n_sub = int(solver.primary_n_sub) if solver.primary_n_sub is not None else int(
+                getattr(solver.projectors, "n_sub", 1) or 1)
+        vc = max(1, V // ((len(mats) + 1) * n_sub * n_sub))
+    else:
+        vc = max(1, int(views_per_chunk))
+    for start, stop in projector.chunks(vc):
+        path = None
+        for i, m in enumerate(mats):
+            rho_m = fields.fine_material(m)
+            proj = projector.project(rho_m, start, stop)  # [V_chunk, Rd n, Cd n]
+            del rho_m
+            if path is None:
+                path = torch.empty((len(mats),) + tuple(proj.shape), device=proj.device, dtype=torch.float32)
+            path[i] = proj
+            del proj
+        for v in range(start, stop):
+            img = solver.primary_from_path_lengths(path[:, v - start], mats, float(ang[v]))
+            out[v] = img["signal"] if quantity == "signal" else img["planar_fluence"].sum(0)
+        del path
+    return out
 
 
 # =====================================================================================================
@@ -255,11 +389,15 @@ class DensityModel:
     air, lung, adipose, water, muscle, soft tissue, cortical bone) for the solver: `utilities.attenuation_to_densities`
     (the interpolating seven-material model at E_eff: the two materials whose nominal attenuations bracket X, at most
     two per voxel, a pure-bone voxel stays pure bone) after clamping X at 0 (FDK undershoot, noise).
-    `last_negative_fraction` = fraction of voxels clamped in the last call."""
+    `last_negative_fraction` = fraction of voxels clamped in the last call (`__call__` or `negative_fraction`).
+    `material(X, m)` evaluates one material's map [R, C, S] (bit for bit the row m of the full model,
+    `utilities.attenuation_to_density`): the `scatter_solver.MaterialDensityModel` of
+    `ScatterSolver.material_fields_from_attenuation`, which never forms the [7, R, C, S] volume."""
 
     lib: MultigroupLibrary
     energy_kev: float
     last_negative_fraction: float = 0.0
+    slab_voxels: int = 1 << 22
 
     @classmethod
     def from_library(cls, lib: MultigroupLibrary, energy_kev: Optional[float] = None) -> "DensityModel":
@@ -267,8 +405,36 @@ class DensityModel:
         return cls(lib, effective_energy(lib) if energy_kev is None else float(energy_kev))
 
     def __call__(self, X: Tensor) -> Tensor:
+        """rho [M, ...] of X [...] (all materials at once)."""
         self.last_negative_fraction = float((X < 0).float().mean())
         return attenuation_to_densities(self.lib, X.clamp_min(0), self.energy_kev)
+
+    def _slabs(self, X: Tensor) -> list[slice]:
+        per = max(1, int(np.prod(X.shape[1:]))) if X.dim() > 1 else 1
+        n = max(1, int(self.slab_voxels) // per)
+        return [slice(i, i + n) for i in range(0, int(X.shape[0]) if X.dim() else 1, n)]
+
+    def material(self, X: Tensor, m: int) -> Tensor:
+        """The density map [...] (g/cm^3) of library material m of X [...] (1/cm): `__call__(X)[m]` bit for bit,
+        without the other materials. Evaluated slab by slab along the first axis (about `slab_voxels` voxels per slab,
+        `utilities.attenuation_to_density`) into the result, so that the only full-size temporary is the result
+        itself (the elementwise model gives the same values in any slab layout)."""
+        if X.dim() == 0:
+            return attenuation_to_density(self.lib, X, m, self.energy_kev)
+        out = torch.empty_like(X)
+        for sl in self._slabs(X):
+            out[sl] = attenuation_to_density(self.lib, X[sl], m, self.energy_kev)
+        return out
+
+    def negative_fraction(self, X: Tensor) -> float:
+        """Fraction of the voxels of X below 0 (clamped by the model); also stored in last_negative_fraction.
+        Counted slab by slab (no temporary of X's size)."""
+        if X.dim() == 0:
+            n = int(X < 0)
+        else:
+            n = sum(int(torch.count_nonzero(X[sl] < 0)) for sl in self._slabs(X))
+        self.last_negative_fraction = n / max(1, X.numel())
+        return self.last_negative_fraction
 
 
 # =====================================================================================================
@@ -384,8 +550,8 @@ class CitrusConfig:
     scatter_view_stride : n >= 1. 1 (default): the scatter step runs on every view. n > 1: only on every n-th view
                      (views 0, n, 2n, ...: uniform over the angular range, starting at view 0; `scatter_view_indices`);
                      the other views' scatter signal is interpolated in angle (scatter_view_interp_order) and
-                     divided by their solver primary. Only the computed views keep an accumulator (1/n of the state
-                     memory).
+                     divided by their primary (`primary_signals`, every view). Only the computed views keep an
+                     accumulator (1/n of the state memory).
     scatter_view_interp_order : the per-pixel interpolation in angle of the skipped views' scatter signal from the
                      computed views, circular in angle for a full rotation and along the arc for a short scan (the
                      views beyond the last computed view hold its value; ignored at stride 1; `angular_neighbors`):
@@ -404,6 +570,17 @@ class CitrusConfig:
                      between (n MBIR iterations per scatter step; the accumulators keep their age). For a fixed number
                      of scatter steps, spreading them over n times more outer iterations costs almost nothing (an MBIR
                      iteration is ~1 % of a scatter stage) and improves the reconstruction (module docstring).
+    primary_projector : the projector of every view's primary signal at a scatter stage (module docstring):
+                     "mbirtorch" (default): MBIRTORCH projections of the material maps over all views
+                     (`primary_signals` with `recon.mbir_bridge.ViewChunkProjector`: pixel-averaged line integrals,
+                     the reconstruction's own operator); "siddon": the solver's Siddon primary (`ScatterSolver.
+                     primary`, one ray per pixel center; `SiddonViewProjector`), as in versions up to 0.2.0
+    primary_views_per_chunk : views per chunk of `primary_signals`; None (default): max(1, V // (M' + 1)) with M'
+                     the materials present, so the per-material path lengths [M', chunk, Rd, Cd] and the projection
+                     being copied stay within one sinogram [V, Rd, Cd]
+    resume_error_sinogram : keep MBIRTORCH's error sinogram between outer iterations (one sinogram, stored as -A X)
+                     and resume from it instead of recomputing y_c - A X with a forward projection per call (module
+                     docstring; equal to float rounding)
     """
 
     num_outer: int = 10
@@ -416,6 +593,9 @@ class CitrusConfig:
     scatter_view_stride: int = 1
     scatter_view_interp_order: Literal[0, 1, 2, 3] | None = 3
     scatter_every: int = 1
+    primary_projector: Literal["mbirtorch", "siddon"] = "mbirtorch"
+    primary_views_per_chunk: Optional[int] = None
+    resume_error_sinogram: bool = True
 
     def validate(self) -> None:
         if self.num_outer < 1:
@@ -429,6 +609,13 @@ class CitrusConfig:
         every = self.scatter_every
         if isinstance(every, bool) or not isinstance(every, (int, np.integer)) or every < 1:
             raise ValueError(f"scatter_every must be an integer >= 1, got {every!r}")
+        if self.primary_projector not in PRIMARY_PROJECTORS:
+            raise ValueError(f"primary_projector must be one of {PRIMARY_PROJECTORS}, got {self.primary_projector!r}")
+        chunk = self.primary_views_per_chunk
+        if chunk is not None and (isinstance(chunk, bool) or not isinstance(chunk, (int, np.integer)) or chunk < 1):
+            raise ValueError(f"primary_views_per_chunk must be None or an integer >= 1, got {chunk!r}")
+        if not isinstance(self.resume_error_sinogram, (bool, np.bool_)):
+            raise ValueError(f"resume_error_sinogram must be a bool, got {self.resume_error_sinogram!r}")
 
 
 # =====================================================================================================
@@ -436,6 +623,7 @@ class CitrusConfig:
 # =====================================================================================================
 
 SCATTER_VIEW_INTERP_ORDERS = (None, 0, 1, 2, 3)
+PRIMARY_PROJECTORS = ("mbirtorch", "siddon")
 _TWO_PI = 2.0 * np.pi
 
 
@@ -679,6 +867,8 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
     spr: Optional[Tensor] = None
     S_prev: Optional[Tensor] = None
     S_hat = torch.zeros_like(Y)
+    resume = bool(config.resume_error_sinogram)
+    neg_AX: Optional[Tensor] = None  # resume: MBIRTORCH's error sinogram minus the corrected data, -A X (one sinogram)
     t_start = time.perf_counter()
     for k in range(config.num_outer):
         rec: dict = {"k": k + 1}
@@ -698,7 +888,17 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
         _sync(device)
         t1 = time.perf_counter()
         np.random.seed([int(config.base_seed), int(k)])
-        X, _ = mbir_iterations(model, y_c, X, first_iteration=k, weights=W)
+        if resume:
+            # e = y_c - A X: the kept -A X shifted by the current corrected data (A X is unchanged by the scatter
+            # stage); MBIRTORCH updates e and its init volume in place, so it gets a copy of X
+            err = None if neg_AX is None else neg_AX.add_(y_c)
+            neg_AX = None
+            X, _, ckpt = mbir_iterations(model, y_c, X.clone(), first_iteration=k, weights=W, error_sinogram=err,
+                                         return_checkpoint=True)
+            neg_AX = ckpt["error_sinogram"].sub_(y_c)
+            del err, ckpt
+        else:
+            X, _ = mbir_iterations(model, y_c, X, first_iteration=k, weights=W)
         _sync(device)
         t2 = time.perf_counter()
         S_hat = Y - Yc
@@ -757,12 +957,15 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
       scatter_counts   [V, Rd, Cd] the last scatter-count estimate Y - Y_c
       regularization   the frozen sigmas;  state: the accumulator storage (one slot per computed view);  init_recon,
                        model, seconds, fdk_seconds
+      primary_projector the projector of the primary signals (config.primary_projector)
       computed_views   [Vc] int array: the views with a scatter step (`scatter_view_indices`; every view at stride 1)
       view_interpolated [V] bool array: True where the scatter is interpolated in angle (the skipped views at
                        config.scatter_view_stride > 1 with an interpolation order), False where the scatter step
                        computed it (and for the uncorrected skipped views of order None)
-    With config.scatter_view_stride > 1 the records also hold t_skipped (seconds per outer iteration spent on the
-    angular interpolation and the skipped views' primaries, included in t_scatter). Every record holds
+    The records of a scatter stage hold t_primary (seconds for the primaries of all views, `primary_signals`, included
+    in t_scatter); with config.scatter_view_stride > 1 also t_skipped (seconds per outer iteration spent on the
+    angular interpolation, included in t_scatter). The densities never exist as a [7, R, C, S] volume:
+    `ScatterSolver.material_fields_from_attenuation` with the `DensityModel` (module docstring). Every record holds
     scatter_refreshed: True at the outer iterations with a scatter stage (all of them at config.scatter_every = 1),
     False where the previous ratio was reused (then t_scatter ~ 0 and the accumulator entries are absent).
     """
@@ -773,6 +976,12 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
     V = len(ang)
     density = DensityModel.from_library(solver.lib, config.energy_kev)
     coarse = solver.transport_grid(grid)
+    if model is None:
+        model = make_cone_model(grid, geometry, ang, device=device)
+    if config.primary_projector == "mbirtorch":
+        projector = ViewChunkProjector(grid, geometry, ang, model=model, device=device)
+    else:
+        projector = SiddonViewProjector(solver, grid, ang)
     full_shape = (solver.num_groups, (solver.L + 1) ** 2, 4) + tuple(coarse.shape)
     computed = scatter_view_indices(V, config.scatter_view_stride)
     sparse = len(computed) < V
@@ -792,15 +1001,15 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
 
     def scatter_stage(k: int, X: Tensor, rec: dict) -> Tensor:
         transfer0 = store.transfer_seconds
-        rho = density(X)
-        rec["negative_fraction"] = density.last_negative_fraction
-        fields = solver.material_fields(rho, grid)  # shared by every view of this outer iteration
+        rec["negative_fraction"] = density.negative_fraction(X)
+        # shared by every view of this outer iteration; built material by material, no [7, R, C, S] volume
+        fields = solver.material_fields_from_attenuation(X, grid, density)
         s_c = torch.empty((len(computed), Rd, Cd), device=device, dtype=torch.float32)
         p = torch.empty((V, Rd, Cd), device=device, dtype=torch.float32)
         hist = []
         for j, v in enumerate(computed):
             st = replace(shells[j], Phi_gt1=store.get(j))
-            s_c[j], p[v], new = citrus_step(solver, st, rho, grid, float(ang[v]), fields=fields)
+            s_c[j], _, new = citrus_view_step(solver, st, fields, float(ang[v]), primary=False)
             store.put(j, new.Phi_gt1)
             shells[j] = replace(new, Phi_gt1=None)
             hist.append(new.history[-1])
@@ -808,20 +1017,23 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
         rec["acc_change_mean"] = float(np.mean(hist))
         rec["acc_change_max"] = float(np.max(hist))
         rec["t_transfer"] = store.transfer_seconds - transfer0
+        _sync(device)
+        t0 = time.perf_counter()
+        primary_signals(solver, fields, ang, projector, config.primary_views_per_chunk, out=p)  # every view
+        _sync(device)
+        rec["t_primary"] = time.perf_counter() - t0
         if not sparse:
             s = s_c
         else:
             _sync(device)
             t0 = time.perf_counter()
-            # the scatter SIGNAL is interpolated in angle; the primary of every view comes from the solver (cheap)
+            # the scatter SIGNAL is interpolated in angle; the primary of every view is computed (primary_signals)
             s = interpolate_scatter(s_c, ang, computed, order, previous=s_last[0], weights=weights)
-            for v in skipped:
-                p[int(v)] = solver.primary(fields, float(ang[v]))["signal"]
             _sync(device)
             rec["t_skipped"] = time.perf_counter() - t0
         if sparse and order is None:
             s_last[0] = s
-        del fields, rho
+        del fields
         return s / p.clamp_min(tiny)
 
     try:
@@ -829,6 +1041,7 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
                               regularization=regularization, init_recon=init_recon, model=model, callback=callback,
                               label="citrus")
         info["state"] = store.describe()
+        info["primary_projector"] = config.primary_projector
         info["computed_views"] = computed.copy()
         info["view_interpolated"] = view_interpolated
     finally:

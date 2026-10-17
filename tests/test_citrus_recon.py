@@ -148,18 +148,22 @@ def test_citrus_with_true_scatter_is_fixed_spr_mbir(tiny, monkeypatch):
     coarse = solver.transport_grid(grid)
     shape = (solver.num_groups, (solver.L + 1) ** 2, 4) + tuple(coarse.shape)
 
-    def fake_step(solver_, state, rho, grid_, angle, fields=None):
+    def fake_step(solver_, state, fields, angle, *, primary=True):
         v = view_of[float(angle)]
+        assert not primary and fields.rho_fine is None and fields.attenuation is not None  # the loop's X path
         if state.Phi_gt1 is not None:  # the stored accumulator comes back (cell mean only)
             assert torch.allclose(state.Phi_gt1[:, :, 0], torch.full_like(state.Phi_gt1[:, :, 0],
                                                                           float(state.num_steps)), rtol=1e-3)
             assert float(state.Phi_gt1[:, :, 1:].abs().max()) == 0.0
         new = CitrusState(angle=float(angle), Phi_gt1=torch.full(shape, float(state.num_steps + 1), device=DEV),
                           num_steps=state.num_steps + 1, history=state.history + [0.5 ** state.num_steps])
-        p = torch.full_like(spr_true[v], 3.0)
-        return spr_true[v] * p, p, new
+        return spr_true[v] * 3.0, None, new
 
-    monkeypatch.setattr(citrus_mod, "citrus_step", fake_step)
+    def fake_primaries(solver_, fields, angles_, projector, views_per_chunk=None, out=None):
+        return out.fill_(3.0)
+
+    monkeypatch.setattr(citrus_mod, "citrus_view_step", fake_step)
+    monkeypatch.setattr(citrus_mod, "primary_signals", fake_primaries)
     cfg = CitrusConfig(num_outer=3)
     X_c, info = citrus_recon(data["Y"], 1.0e5, angles, grid, geom, solver, cfg, regularization=reg)
     X_o, _ = mbir_recon(data["Y"], 1.0e5, angles, grid, geom, cfg, spr=spr_true, regularization=reg)
@@ -234,45 +238,91 @@ def test_sparse_views_close_to_every_view(tiny):
 
 @cuda
 def test_sparse_views_interpolate_the_scatter_signal(tiny, monkeypatch):
-    """The driver interpolates the scatter SIGNAL of the computed views and divides by the solver primary of every
-    view (not the ratio): with a fake step (s_v = 2 + cos(angle), p = 3 on computed views) and a fake primary (5 on
-    the skipped views), SPR_skipped = (M s_c) / 5 with M = interpolation_weights."""
+    """The driver interpolates the scatter SIGNAL of the computed views and divides by the primary of every view
+    (not the ratio): with a fake step (s_v = 2 + cos(angle)) and fake primaries of all views (`primary_signals`: 3 on
+    the computed views, 5 on the skipped views), SPR_skipped = (M s_c) / 5 with M = interpolation_weights. The
+    primaries come from one `primary_signals` call per scatter stage with the projector of
+    CitrusConfig.primary_projector (MBIRTORCH's `ViewChunkProjector` or the `SiddonViewProjector`), never from the
+    step."""
     data, grid, geom, solver, reg = tiny
     angles = data["angles"]
     view_of = {float(a): v for v, a in enumerate(angles)}
     Rd, Cd = data["Y"].shape[1:]
     sig = {v: 2.0 + math.cos(float(a)) for v, a in enumerate(angles)}
-    primary_calls = []
+    computed = np.arange(0, 16, 4)
+    skipped = np.setdiff1d(np.arange(16), computed)
+    calls = []
 
-    def fake_step(solver_, state, rho, grid_, angle, fields=None):
+    def fake_step(solver_, state, fields, angle, *, primary=True):
+        assert not primary  # the loop never traces the primary inside the step
         v = view_of[float(angle)]
         new = CitrusState(angle=float(angle), Phi_gt1=None, num_steps=state.num_steps + 1,
                           history=state.history + [1.0])
-        return (torch.full((Rd, Cd), sig[v], device=DEV), torch.full((Rd, Cd), 3.0, device=DEV), new)
+        return (torch.full((Rd, Cd), sig[v], device=DEV), None, new)
 
     class FakeStore(StateStore):
         def put(self, i, Phi):
             pass
 
-    def fake_primary(fields, angle):
-        primary_calls.append(view_of[float(angle)])
-        return {"signal": torch.full((Rd, Cd), 5.0, device=DEV)}
+    def fake_primaries(solver_, fields, angles_, projector, views_per_chunk=None, out=None):
+        calls.append(type(projector).__name__)
+        assert projector.num_views == 16 and views_per_chunk is None
+        out.fill_(5.0)
+        out[torch.as_tensor(computed, device=out.device)] = 3.0
+        return out
 
-    monkeypatch.setattr(citrus_mod, "citrus_step", fake_step)
+    monkeypatch.setattr(citrus_mod, "citrus_view_step", fake_step)
     monkeypatch.setattr(citrus_mod, "StateStore", FakeStore)
-    monkeypatch.setattr(solver, "primary", fake_primary)
-    for order in (1, 3):
-        primary_calls.clear()
-        cfg = CitrusConfig(num_outer=1, scatter_view_stride=4, scatter_view_interp_order=order)
+    monkeypatch.setattr(citrus_mod, "primary_signals", fake_primaries)
+    for order, projector in ((1, "siddon"), (3, "siddon"), (3, "mbirtorch")):
+        calls.clear()
+        cfg = CitrusConfig(num_outer=1, scatter_view_stride=4, scatter_view_interp_order=order,
+                           primary_projector=projector)
         _, info = citrus_recon(data["Y"], 1.0e5, angles, grid, geom, solver, cfg, regularization=reg)
-        computed = np.arange(0, 16, 4)
-        skipped = np.setdiff1d(np.arange(16), computed)
-        assert sorted(primary_calls) == list(skipped)  # the solver primary only on the skipped views
+        assert calls == [{"siddon": "SiddonViewProjector", "mbirtorch": "ViewChunkProjector"}[projector]]
+        assert info["primary_projector"] == projector and "t_primary" in info["records"][1]
         M = citrus_mod.interpolation_weights(angles, computed, order)
         expect = M @ np.array([sig[int(v)] for v in computed])
         spr = info["spr"][:, Rd // 2, Cd // 2].cpu().numpy()
         np.testing.assert_allclose(spr[computed], expect[computed] / 3.0, rtol=1e-6)
         np.testing.assert_allclose(spr[skipped], expect[skipped] / 5.0, rtol=1e-6)
+
+
+@cuda
+def test_resume_error_sinogram_matches_restart(tiny):
+    """CitrusConfig.resume_error_sinogram: the loop keeps MBIRTORCH's error sinogram between outer iterations
+    (shifted by each new corrected sinogram) and gives the reconstruction of the restarted MBIR (a fresh y_c - A X
+    every iteration) to float rounding, with a scatter stage every 2nd iteration (the reused correction) and with the
+    Siddon primary; mbir_recon too."""
+    data, grid, geom, solver, reg = tiny
+    out = {}
+    for resume in (True, False):
+        cfg = CitrusConfig(num_outer=4, scatter_every=2, primary_projector="siddon", resume_error_sinogram=resume)
+        out[resume], info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geom, solver, cfg,
+                                         regularization=reg)
+        assert info["config"]["resume_error_sinogram"] is resume
+    assert float((out[True] - out[False]).norm() / out[False].norm()) < 1e-5
+    for resume in (True, False):
+        out[resume], _ = mbir_recon(data["Y"], 1.0e5, data["angles"], grid, geom,
+                                    CitrusConfig(num_outer=3, resume_error_sinogram=resume), regularization=reg)
+    assert float((out[True] - out[False]).norm() / out[False].norm()) < 1e-5
+
+
+@cuda
+def test_mbirtorch_primary_close_to_siddon_primary_in_the_loop(tiny):
+    """The loop's default primary (MBIRTORCH projections of the material maps) against the Siddon primary on the tiny
+    problem (2 cm voxels, 1.6 cm pixels): the scatter-to-primary ratios agree to 10 % (relative L2; the projectors
+    differ at the object's silhouette) and the reconstructions are close."""
+    data, grid, geom, solver, reg = tiny
+    res = {}
+    for proj in ("mbirtorch", "siddon"):
+        cfg = CitrusConfig(num_outer=2, primary_projector=proj)
+        X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geom, solver, cfg, regularization=reg)
+        assert info["primary_projector"] == proj and "t_primary" in info["records"][1]
+        res[proj] = (X, info["spr"])
+    s_m, s_s = res["mbirtorch"][1], res["siddon"][1]
+    assert float((s_m - s_s).norm() / s_s.norm()) < 0.1
+    assert float((res["mbirtorch"][0] - res["siddon"][0]).norm() / res["siddon"][0].norm()) < 0.02
 
 
 @cuda

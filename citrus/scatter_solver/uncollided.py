@@ -14,7 +14,10 @@ points per transport cell, docs/source/conventions.rst, "Grids"), with the densi
 The uncollided fluence is exact in energy within each group: upstream ray traces of the density maps (one per basis
 material present in the volume, `present_materials`) and the library's fine-energy attenuation table
 (`cross_sections.group_transmission`), not the group-averaged mu_t. The trace runs through any grid to the points of
-any other (`uncollided_fluence(..., points=)`): the solver traces through the transport grid C to the Q points.
+any other (`uncollided_fluence(..., points=)`): the solver traces through the quadrature grid Q by default
+(SolverConfig.uncollided_trace_grid). It is the composition of `uncollided_path_lengths` (the per-material upstream
+line integrals, which can be traced one material map at a time: the solver does so for fields built from the
+attenuation, `ScatterSolver.material_fields_from_attenuation`) and `uncollided_from_path_lengths`.
 
 Materials: rho is [M, R, C, S] for any number of basis materials M (7 for the package's table). Where every point has
 at most two nonzero materials, the first-collision source uses the compact pair representation
@@ -26,7 +29,7 @@ otherwise (resampled densities can mix more materials per point) and for M <= 2 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Sequence, Union
 
 import torch
 from torch import Tensor
@@ -105,18 +108,37 @@ def uncollided_fluence(lib: MultigroupLibrary, rho: Tensor, grid: Grid, geom: Co
     rho: [M, rows, cols, slices] g/cm^3 on grid. Returns phi_uc [G, *points.shape] in photons/cm^2 per source
     photon/sr (point values at the voxel centers of `points`).
     """
-    dev, dt = rho.device, rho.dtype
     if int(rho.shape[0]) != lib.num_materials:
         raise ValueError(f"rho has {int(rho.shape[0])} materials, the library {lib.num_materials}")
     pts = grid if points is None else points
     present = present_materials(rho)
     src = rho if present is None else rho[present]
-    r = pts.center_coordinates(dev, dt)
+    path = uncollided_path_lengths(projectors, src, grid, geom, angle, pts)  # [M', *pts.shape] g/cm^2
+    return uncollided_from_path_lengths(lib, path, present, pts, geom, angle, source)
+
+
+def uncollided_path_lengths(projectors: Projectors, rho: Tensor, grid: Grid, geom: ConeGeometry, angle: float,
+                            points: Optional[Grid] = None) -> Tensor:
+    """Upstream density line integrals P_m(r) = int_{r0}^{r} rho_m dl (g/cm^2) of the maps rho [M', R, C, S] on `grid`
+    (any subset of the materials, e.g. one map at a time) to the voxel centers of `points` (default: of `grid`):
+    `projectors.upstream_cumulative` when the points are the centers of `grid`, else `projectors.upstream_to_points`.
+    Returns [M', *points.shape]. Linear and channel by channel: tracing the materials one at a time and concatenating
+    gives the same path lengths."""
+    pts = grid if points is None else points
     if pts == grid:
-        path = projectors.upstream_cumulative(src, grid, geom, angle)  # [M', R, C, S] g/cm^2
-    else:
-        path = projectors.upstream_to_points(src, grid, geom, angle, r.reshape(-1, 3)).reshape(-1, *pts.shape)
-    trans = group_transmission(lib, path, materials=present)  # [G, R, C, S]
+        return projectors.upstream_cumulative(rho, grid, geom, angle)  # [M', R, C, S] g/cm^2
+    r = pts.center_coordinates(rho.device, rho.dtype)
+    return projectors.upstream_to_points(rho, grid, geom, angle, r.reshape(-1, 3)).reshape(-1, *pts.shape)
+
+
+def uncollided_from_path_lengths(lib: MultigroupLibrary, path: Tensor, materials: Optional[Sequence[int]],
+                                 points: Grid, geom: ConeGeometry, angle: float, source: SourceModel) -> Tensor:
+    """phi_UC,g(r) = b(Omega_UC(r)) / |r - r0|^2 sum_{E in g} w_E exp(-sum_m P_m(r) m_m(E)) at the voxel centers of
+    `points` from the upstream line integrals path [M', *points.shape] (g/cm^2; `uncollided_path_lengths`) of the
+    materials `materials` (library indices of the rows; None = all, in library order). Returns [G, *points.shape]."""
+    dev, dt = path.device, path.dtype
+    trans = group_transmission(lib, path, materials=materials)  # [G, R, C, S]
+    r = points.center_coordinates(dev, dt)
     r0 = torch.tensor(geom.source_position(angle), device=dev, dtype=dt)
     d = r - r0
     dist2 = (d * d).sum(-1)  # [R, C, S]

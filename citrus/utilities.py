@@ -34,6 +34,9 @@ At E_eff = 63.03 keV the nominal attenuations are 0.00022 (air), 0.0520 (lung), 
 (densities_to_attenuation(lib, attenuation_to_densities(lib, X)) == max(X, 0)), gives the pure material m at
 X = mu_m (a WLAB water voxel is pure water, a bone voxel pure bone at 1.85 g/cm^3) and at most two nonzero materials
 per voxel, the pair representation of the solver's first-collision source (`cross_sections.material_pairs`).
+`attenuation_to_density(lib, X, m)` evaluates ONE material's map, equal bit for bit to `attenuation_to_densities(lib,
+X)[m]` without forming the others: the CITRUS loop resamples the densities material by material and never holds the
+[M, R, C, S] fine-grid volume (`ScatterSolver.material_fields_from_attenuation`).
 m_m(E) are the library's fine-energy total mass attenuation coefficients (`lib.fine_mu_t`, cm^2/g), interpolated
 linearly in (log E, log m). (Up to citrus 0.0.3 the model was a two-material split, water of reduced density below
 mu_water and unit water PLUS bone above it: a pure-bone voxel came back as water 1.0 + bone 1.156 g/cm^3, the same
@@ -48,9 +51,13 @@ Synthetic cone-beam data
                 short scan end = start + pi + fan angle of the panel, `fan_angle`)
     l         = A X_true  (MBIRTORCH ConeBeamModel forward projection)   [V, Rd, Cd] line integrals
     P         = I0 exp(-l)                                               primary counts per pixel
-    SPR       = s_sol / p_sol per view (ScatterSolver.solve_view on rho_true, fully converged source iteration):
-                ratio of the solver's scatter and primary PLANAR fluence images (photon counting: no detector or grid
-                response unless the solver has one)
+    SPR       = s_sol / p_sol per view: s_sol the solver's scatter PLANAR fluence image (ScatterSolver.solve_view on
+                rho_true, fully converged source iteration; photon counting: no detector or grid response unless the
+                solver has one), p_sol its primary planar fluence image with the primary model of the CITRUS loop's
+                default (primary_projector "mbirtorch", data-set format 2, citrus >= 0.3.0): MBIRTORCH's
+                pixel-averaged per-material line integrals of rho_true through the solver's polychromatic
+                transmission (`citrus.citrus.primary_signals`); primary_projector "siddon": the solver's Siddon
+                primary of solve_view (one ray to each pixel centre), the definition of citrus <= 0.2.0
     S         = SPR P,   Y_mean = P + S,   Y = Poisson(Y_mean) (noise=True) or Y_mean
 
 Units. The solver's images are photons/cm^2 per source photon/sr; its primary carries the inverse-square and
@@ -105,6 +112,7 @@ __all__ = [
     "material_order",
     "densities_to_attenuation",
     "attenuation_to_densities",
+    "attenuation_to_density",
     "wlab_solver",
     "fan_angle",
     "view_angles",
@@ -324,6 +332,56 @@ def attenuation_to_densities(lib: MultigroupLibrary, X: Tensor, energy_kev: Opti
     return rho
 
 
+def attenuation_to_density(lib: MultigroupLibrary, X: Tensor, material: int,
+                           energy_kev: Optional[float] = None) -> Tensor:
+    """ONE material's density map of the interpolating model: rho_m [...] (g/cm^3, same shape, device and dtype as X
+    [...], 1/cm) equal bit for bit to `attenuation_to_densities(lib, X, energy_kev)[material]` (library index
+    `material`), without forming the maps of the other materials.
+
+    With the material in slot s of the bracketing order (`material_order`) and mu the nominal attenuations in that
+    order (ascending), the map is f rho^nom on mu[s-1] <= X < mu[s] (the upper end of the bracket [s-1, s],
+    f = (X - mu[s-1]) / (mu[s] - mu[s-1])), (1 - f) rho^nom on mu[s] <= X < mu[s+1] (f = (X - mu[s]) / (mu[s+1] -
+    mu[s])), X / m for the first material below mu[0] and for the last material from mu[M-1] on, and 0 elsewhere (X < 0
+    counts as 0). The scalars are 0-dim tensors on X's device in X's dtype and every voxel value is formed by the same
+    floating-point operations as in `attenuation_to_densities` (in place: x - y, then / span, * rho^nom, 1 - f as
+    -f + 1). Temporaries of X's shape: the result, one interpolation weight and two boolean masks, never [M, ...]
+    (`citrus.citrus.DensityModel.material` evaluates it slab by slab, so that only the result is a full map). The
+    bracket tests use X itself: every nominal attenuation is positive, so X >= mu[k] implies X > 0."""
+    M = lib.num_materials
+    mat = int(material)
+    if not 0 <= mat < M:
+        raise ValueError(f"material {material} outside the library's {M} materials {tuple(lib.materials)}")
+    order = material_order(lib)
+    s = order.index(mat)
+    perm = torch.as_tensor(order, device=X.device, dtype=torch.long)
+    m = _coeffs(lib, energy_kev, X)[perm]  # [M] mass attenuations in bracketing order
+    nom = nominal_densities(lib).to(device=X.device, dtype=X.dtype)[perm]
+    mu = nom * m  # nominal attenuations in bracketing order (ascending, positive)
+    out: Optional[Tensor] = None
+
+    def put(f: Tensor, inside: Tensor) -> None:  # out += f on `inside` (disjoint regions: x + 0 = x exactly)
+        nonlocal out
+        f.masked_fill_(~inside, 0.0)
+        if out is None:
+            out = f
+        else:
+            out.add_(f)
+
+    if s >= 1:  # upper end of the bracket [s-1, s]: f rho^nom
+        f = (X - mu[s - 1]).div_(mu[s] - mu[s - 1]).mul_(nom[s])
+        put(f, (X >= mu[s - 1]).logical_and_(X < mu[s]))
+        del f
+    if s <= M - 2:  # lower end of the bracket [s, s+1]: (1 - f) rho^nom
+        f = (X - mu[s]).div_(mu[s + 1] - mu[s]).neg_().add_(1.0).mul_(nom[s])
+        put(f, (X >= mu[s]).logical_and_(X < mu[s + 1]))
+        del f
+    if s == 0:  # below the first nominal attenuation: the first material alone (X < 0 -> 0)
+        put(X.clamp_min(0).div_(m[0]), X < mu[0])
+    if s == M - 1:  # from the last nominal attenuation on: the last material alone
+        put(X / m[M - 1], X >= mu[M - 1])
+    return out
+
+
 # =====================================================================================================
 # synthetic cone-beam data
 # =====================================================================================================
@@ -376,7 +434,8 @@ def view_angles(num_views: int, geometry: Optional[ConeGeometry] = None, start_v
 def synthesize_cone_beam_data(rho: Tensor, grid: Grid, geometry: ConeGeometry, angles, solver: ScatterSolver,
                               I0: float = 1.0e5, noise: bool = True, seed: int = 0, *,
                               energy_kev: Optional[float] = None, device=None,
-                              progress: Optional[Callable[[int, float], None]] = None) -> dict:
+                              progress: Optional[Callable[[int, float], None]] = None,
+                              primary_projector: str = "mbirtorch") -> dict:
     """Cone-beam counts with scatter for any density volume (module docstring, "Synthetic cone-beam data").
 
     rho [M, R, C, S] densities (g/cm^3) of the solver library's M = 7 basis materials on `grid` (the reconstruction
@@ -384,7 +443,9 @@ def synthesize_cone_beam_data(rho: Tensor, grid: Grid, geometry: ConeGeometry, a
     (rad); solver: the ScatterSolver that defines the scatter truth (one fully converged solve_view per view);
     I0: flat-field counts per pixel; noise: Poisson(Y_mean) with torch.Generator(seed), else Y = Y_mean;
     energy_kev: E_eff (None: the spectrum mean of the solver's library). progress(view_index, seconds) is called after
-    every solved view.
+    every solved view. primary_projector: the primary model of the SPR's denominator, "mbirtorch" (default: the
+    CITRUS loop's default, CitrusConfig.primary_projector) or "siddon" (the solver's solve_view primary, the
+    definition up to citrus 0.2.0); recorded in meta["primary_projector"].
 
     Returns a dict of numpy arrays (float32 unless noted): X_true [R, C, S] (1/cm), rho_true [M, R, C, S], angles [V]
     (float64), line_integrals, P, S, Y, Y_mean, SPR [V, Rd, Cd], solver_primary, solver_scatter [V, Rd, Cd] (planar
@@ -397,6 +458,8 @@ def synthesize_cone_beam_data(rho: Tensor, grid: Grid, geometry: ConeGeometry, a
 
     if solver.geom != geometry:
         raise ValueError("the solver's geometry must be the scan geometry")
+    if primary_projector not in ("mbirtorch", "siddon"):
+        raise ValueError(f"primary_projector must be 'mbirtorch' or 'siddon', got {primary_projector!r}")
     t_all = time.perf_counter()
     dev = torch.device(device) if device is not None else solver.device
     lib = solver.lib
@@ -436,6 +499,14 @@ def synthesize_cone_beam_data(rho: Tensor, grid: Grid, geometry: ConeGeometry, a
         if progress is not None:
             progress(v, view_seconds[v])
     t_solver = time.perf_counter() - t0
+    if primary_projector == "mbirtorch":  # the primary model of the loop's default (MBIRTORCH line integrals)
+        from .citrus import primary_signals
+        from .recon.mbir_bridge import ViewChunkProjector
+
+        fields = solver.material_fields(rho, grid)
+        projector = ViewChunkProjector(grid, geometry, angles, model=model, device=dev)
+        p_sol = primary_signals(solver, fields, angles, projector, quantity="planar_fluence").to(dev, torch.float32)
+        del fields, projector
     empty = solver.material_fields(torch.zeros_like(rho), grid)
     phi_air = solver.primary(empty, 0.0)["planar_fluence"].sum(0)
     del empty
@@ -457,6 +528,7 @@ def synthesize_cone_beam_data(rho: Tensor, grid: Grid, geometry: ConeGeometry, a
     meta = {
         "description": "synthetic cone-beam data with scatter, citrus.utilities.synthesize_cone_beam_data",
         "num_views": int(V), "I0": float(I0), "noise": bool(noise), "seed": int(seed), "energy_kev": E,
+        "primary_projector": primary_projector, "data_format": 2,
         "materials": list(lib.materials), "nominal_density": [float(d) for d in lib.nominal_density],
         "mass_attenuation": {n: float(v) for n, v in zip(lib.materials, m)},
         "angle_range_rad": [float(angles[0]), float(angles[-1])] if len(angles) else [],
@@ -488,14 +560,15 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
                             lib: Optional[MultigroupLibrary] = None, device=None, start_view_angle: float = 0.0,
                             end_view_angle: Optional[float] = None,
                             progress: Optional[Callable[[int, float], None]] = None,
-                            geom: Optional[ConeGeometry] = None) -> dict:
+                            geom: Optional[ConeGeometry] = None, primary_projector: str = "mbirtorch") -> dict:
     """`synthesize_cone_beam_data` for the WLAB phantom on `wlab_grid(delta_voxel)` (0.5 cm: 40 x 60 x 80 voxels),
     num_views angles evenly spaced over [start_view_angle, end_view_angle) (`view_angles`; default end: the short scan
     start + pi + fan angle of the panel, 202.6 degrees for the full-field panel; end = start + 2 pi for a full
     rotation), the solver `wlab_solver(delta_voxel, config=config, lib=lib, geom=geom)` (default: SolverConfig() with
     1 cm transport cells, the full-field geometry `full_field_wlab_geometry()`, ideal counting detector, no grid).
-    meta also records delta_voxel, start_view_angle and end_view_angle. out_path: if given, the data are written with
-    `save_dataset` (<out_path>.npz and <out_path>.json)."""
+    meta also records delta_voxel, start_view_angle and end_view_angle. primary_projector: the primary model of the
+    SPR (`synthesize_cone_beam_data`). out_path: if given, the data are written with `save_dataset` (<out_path>.npz and
+    <out_path>.json)."""
     dev = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     geom = full_field_wlab_geometry() if geom is None else geom
     grid = wlab_grid(delta_voxel)
@@ -504,7 +577,7 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
     angles = view_angles(num_views, geom, start_view_angle, end_view_angle)
     end = float(start_view_angle) + math.pi + fan_angle(geom) if end_view_angle is None else float(end_view_angle)
     out = synthesize_cone_beam_data(rho, grid, geom, angles, solver, I0, noise, seed, energy_kev=energy_kev,
-                                    device=dev, progress=progress)
+                                    device=dev, progress=progress, primary_projector=primary_projector)
     out["meta"].update(description="synthetic WLAB scatter dataset, citrus.utilities.synthesize_wlab_dataset",
                        delta_voxel=float(delta_voxel), start_view_angle=float(start_view_angle),
                        end_view_angle=end, short_scan=bool(end - float(start_view_angle) < 2.0 * math.pi - 1e-9))

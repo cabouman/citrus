@@ -1,5 +1,87 @@
 # Changelog
 
+## v0.3.0 — 2026-10-17
+
+Densities from the attenuation one material at a time, MBIRTORCH primaries in the CITRUS loop, MBIR resumed from its
+error sinogram, quadrature points by spacing. **Breaking changes** (configuration names); the loop's default primary
+changes the demo result (below).
+
+- **No seven-material fine volume in the loop.** `utilities.attenuation_to_density(lib, X, m)` evaluates ONE
+  material's map of the interpolating model, bit for bit the row m of `attenuation_to_densities` (in place, two
+  boolean masks and one weight as temporaries); `DensityModel.material(X, m)` evaluates it slab by slab
+  (`DensityModel.slab_voxels`, default 4 M voxels) so the result is the only full-size map;
+  `DensityModel.negative_fraction(X)`. `ScatterSolver.material_fields_from_attenuation(X, grid_fine, density_model)`
+  builds the `MaterialFields` material by material (map -> resampled onto C and Q -> dropped; absent materials skipped,
+  one host synchronization per material), equal to `material_fields(density_model(X), grid_fine)` (bit for bit on
+  WLAB in the tests that compare them, float rounding in general). `MaterialFields.rho_fine` may be None; new fields
+  `attenuation`, `density_model` (any `scatter_solver.MaterialDensityModel`: `.material(X, m)`), `fine_materials`
+  (materials present) and `fine_material(m)`, `num_materials`. The "fine" uncollided trace and the primary trace such
+  fields one map at a time. `citrus_recon` uses this path; `citrus_step(solver, state, rho, grid, ...)` and every
+  rho-based path (`material_fields`, `solve_view`, the phantom, the tests) are unchanged and bit-identical.
+  Peak allocated memory of a scatter stage on the 0.125 cm WLAB grid (12.3 M voxels, 1 cm cells, 180 views, stride
+  8; `benchmarks/bench_citrus_memory.py`): 2521 / 2364 MiB -> 1891 / 1876 MiB (outer iterations 2 / 3); the density
+  stage itself 1.56 GB transient + 0.33 GB kept -> 0.1 GB transient.
+- **Two-step primary.** `scatter_image.primary_path_lengths(projectors, rho, grid, geom, angle, n_sub)` (per-material
+  line integrals [M', Rd n, Cd n]) and `primary_from_path_lengths(lib, path, materials, geom, angle, source, detector,
+  grid_response)` (fine-energy transmission, sub-pixel average, source, inverse square, detector and grid
+  responses); `primary_subpixel_geometry`. `primary_image` is their composition and equals version 0.2.0 bit for bit
+  (tested against a verbatim copy). `ScatterSolver.primary_path_lengths` / `primary_from_path_lengths`;
+  `uncollided.uncollided_path_lengths` / `uncollided_from_path_lengths` likewise.
+- **Primaries of all views in the loop.** `citrus.primary_signals(solver, fields, angles, projector,
+  views_per_chunk=None)`: one projection per material present onto all views, in chunks of views whose path lengths
+  stay within one sinogram (default max(1, V // (M' + 1)) views), then `primary_from_path_lengths` per view.
+  Projectors: `recon.mbir_bridge.ViewChunkProjector` (MBIRTORCH's pixel-averaged separable-footprint line
+  integrals; sub-models over the angles of a chunk, about 1 ms to build, cached) and `citrus.SiddonViewProjector`
+  (the solver's Siddon rays, equal to `ScatterSolver.primary` bit for bit). New `CitrusConfig.primary_projector`
+  ("mbirtorch", **default**, or "siddon") and `CitrusConfig.primary_views_per_chunk` (None). The loop computes every
+  view's primary this way (the sparse-view path no longer traces the skipped views separately);
+  `citrus_view_step(solver, state, fields, angle, primary=True)` is the step from prebuilt fields (the loop calls it
+  with primary=False); records carry `t_primary`, info `primary_projector`.
+  MBIRTORCH vs Siddon primary on the WLAB study (0.5 cm, 180 views, short scan, true densities): relative L2 0.9 %,
+  RMS of the per-pixel relative difference 3.9 %, median 0.05 %, 99th percentile 3 %, maximum 5x (factor 6 in
+  transmission) on the pixels whose ray grazes a face of the prism (a centre ray against a pixel average).
+  The pixel-integrated primary is the physical model of a detector pixel, hence the default.
+- **Synthetic data consistent with the loop's primary (data-set format 2).** `synthesize_cone_beam_data` /
+  `synthesize_wlab_dataset(..., primary_projector="mbirtorch")`: the SPR's denominator is the solver's primary on
+  MBIRTORCH's per-material line integrals of the true densities (`primary_signals(..., quantity="planar_fluence")`,
+  new `quantity` argument); "siddon" keeps the definition of version 0.2.0. meta records `primary_projector` and
+  `data_format` (2). Demo: `--truth-primary-projector`; cache and output names carry `_v2` (and `_primary-siddon`
+  for the Siddon definition), so data sets of version 0.2.0 are never reused; the old data sets and outputs in
+  `demo/input` and `demo/output` are renamed `..._v1...` (format 1: SPR with the Siddon primary). With the old
+  definition the MBIRTORCH primary was inconsistent with the data on the silhouette pixels (RMS 0.8 % of the corrected
+  line integrals at the true densities, up to 0.87 on single pixels).
+  Demo defaults on the new data (`python demo/demo_citrus.py`, synthesis 113 s once, CITRUS 159 s): relative RMSE FDK
+  0.318 / 0.348, no correction 0.292 / 0.355, CITRUS 0.0215 / 0.0259 (whole prism / core; version 0.2.0 on its
+  format-1 data: 0.0242 / 0.0294); with `--primary-projector siddon` on the same data 0.0257 / 0.0305 (on the format-1
+  data the MBIRTORCH loop gave 0.0270 / 0.0305 and the Siddon loop 0.0242 / 0.0294).
+- **MBIR resume.** `recon.mbir_bridge.mbir_iterations(..., error_sinogram=None, hessian=None,
+  return_checkpoint=False)`: with any of them it replicates MBIRTORCH 0.1.2's `recon` (`initialize_recon`, then
+  `_vcd_recon` with `init_error_sinogram` / `fm_hessian` / `return_checkpoint`, which `recon` does not forward) and
+  returns the checkpoint {'error_sinogram', 'fm_hessian'}. `CitrusConfig.resume_error_sinogram` (**default True**):
+  the loop keeps -A X between outer iterations (one sinogram) and resumes from e = y_c - A X; equal to the restarted
+  MBIR to 1.1e-6 (relative L2, demo after 80 iterations); MBIR iteration on the 12 M-voxel grid 0.63 / 1.02 s instead
+  of 0.73 / 1.09 s; peak +18 MiB on the demo (one sinogram, 19 MiB). The Hessian is recomputed (keeping it would hold
+  a reconstruction-sized volume).
+- **Quadrature points by spacing.** `SolverConfig.fc_points_per_axis` is removed; `SolverConfig.
+  quadrature_point_spacing_cm` (default 0.5): q = max(1, round(transport_cell_cm / spacing)), bounded as before by
+  max(1, round(transport_cell_cm / largest fine voxel edge)). Unchanged for 1 cm cells (q = 2 at 0.5 cm voxels, 1 at
+  1 cm); 2 cm cells now get q = 4 (was 2), 0.5 cm cells q = 1. Study (WLAB 0.5 cm, converged, AP / lateral, rel. L2
+  of the scatter signal): 2 cm cells q = 1 / 2 against q = 4 1.1 % / 0.59 % and 0.40 % / 0.22 % (0.19 / 0.20 /
+  0.35 s per view); 1 cm cells q = 1 against 2 0.25 % / 0.09 %; the cell size itself costs more (2 cm against 1 cm
+  cells: 3.6 % / 9.5 %).
+- **Renamed (plain words).** `SolverConfig.fc_trace_grid` -> `uncollided_trace_grid` (values unchanged); benchmark
+  flags `--fc-points` -> `--quadrature-spacing` (cm), `--fc-trace` -> `--uncollided-trace`; the demo's summary JSON
+  keys `fc_points_per_axis` -> `quadrature_points_per_axis` (plus `quadrature_point_spacing_cm`).
+- Demo (`demo/demo_citrus.py`): `--primary-projector`, `--resume-error-sinogram / --no-resume-error-sinogram`,
+  `--save-recon`; output suffixes `_siddon`, `_restart`; the summary records `primary_projector`,
+  `resume_error_sinogram` and the CITRUS run's peak allocated GPU memory (1636 MiB at the defaults; 1624 MiB in
+  version 0.2.0) and per-iteration times. `benchmarks/bench_citrus_memory.py` (peak memory and time per outer
+  iteration, split into scatter stage and MBIR).
+- Tests: `tests/test_attenuation_path.py` (per-material density bit for bit, fields from X against fields from rho,
+  their peak memory, the two-step primary against version 0.2.0, MBIRTORCH against Siddon primaries, chunking,
+  configuration), resume tests in `tests/test_mbir_bridge.py` and `tests/test_citrus_recon.py`, the MBIRTORCH
+  primary in the loop, the spacing rule in `tests/test_quadrature_grid.py`.
+
 ## v0.2.0 — 2026-10-17
 
 First-order quantities on a quadrature grid of the transport cells (Acuros CTS, Maslowski et al. 2018, Med Phys

@@ -6,7 +6,7 @@ Requirements
 
 * Python >= 3.11, PyTorch (CUDA build for GPU use), NumPy, SciPy, Matplotlib.
 * `MBIRTORCH <https://github.com/cabouman/mbirtorch>`_ for the reconstruction side (``citrus_recon``,
-  ``mbir_recon``, the demos; installed as a dependency, verified with mbirtorch 0.0.2).
+  ``mbir_recon``, the demos; installed as a dependency, verified with mbirtorch 0.1.2).
 * `XrayPhysics <https://github.com/kylechampley/XrayPhysics>`_ to build the cross-section library (once; the library
   is cached on disk).
 * Optional: Triton (``triton`` on Linux, ``triton-windows`` on Windows) for the fused GPU kernels.

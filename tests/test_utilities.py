@@ -222,6 +222,7 @@ def test_smoke_dataset_2cm(real_lib, tmp_path):
     assert np.allclose(out["P"], 1.0e5 * np.exp(-out["line_integrals"]), rtol=1e-5)
     assert np.allclose(out["S"], out["SPR"] * out["P"], rtol=1e-5)
     assert np.allclose(out["SPR"], out["solver_scatter"] / out["solver_primary"], rtol=1e-5)
+    assert out["meta"]["primary_projector"] == "mbirtorch" and out["meta"]["data_format"] == 2
     # plausible WLAB scatter: SPR behind the phantom of order 1 (no grid)
     assert 0.3 < _shadow_median_spr(out) < 1.5
     assert (out["SPR"] > 0).all() and out["meta"]["si_iterations"]["all_converged"]
@@ -270,3 +271,16 @@ def test_synthesize_cone_beam_data_generic():
     other = ConeGeometry(100.0, 150.0, 20, 24, 1.6, 1.6)
     with pytest.raises(ValueError, match="geometry"):
         synthesize_cone_beam_data(rho, grid, other, angles, solver)
+    # the SPR's primary: MBIRTORCH line integrals (default) or the solver's Siddon primary (citrus <= 0.2.0)
+    assert out["meta"]["primary_projector"] == "mbirtorch"
+    sid = synthesize_cone_beam_data(rho, grid, geom, angles, solver, I0=1.0e4, noise=False, primary_projector="siddon")
+    assert sid["meta"]["primary_projector"] == "siddon"
+    for v, a in enumerate(angles):
+        p = solver.solve_view(rho, grid, a).primary["planar_fluence"].sum(0).cpu().numpy()
+        np.testing.assert_allclose(sid["solver_primary"][v], p, rtol=1e-5)
+    np.testing.assert_allclose(sid["solver_scatter"], out["solver_scatter"], rtol=1e-4)
+    np.testing.assert_allclose(sid["P"], out["P"], rtol=1e-5)  # MBIRTORCH atomics
+    d = np.abs(out["solver_primary"] / sid["solver_primary"] - 1)
+    assert float(np.median(d)) < 0.01 and float(d.max()) > 0  # the two primary models differ at the edges only
+    with pytest.raises(ValueError, match="primary_projector"):
+        synthesize_cone_beam_data(rho, grid, geom, angles, solver, primary_projector="leap")

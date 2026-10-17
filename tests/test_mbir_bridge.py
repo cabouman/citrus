@@ -138,6 +138,43 @@ def test_fdk_and_single_iteration_recipe():
     assert model.get_params("sigma_y") == sig["sigma_y"] and model.get_params("sigma_x") == sig["sigma_x"]
 
 
+def test_resume_from_error_sinogram_equals_restart():
+    """mbir_iterations resumed from a kept error sinogram (MBIRTORCH's _vcd_recon with init_error_sinogram, the
+    preparation of `recon` replicated) runs the same iterations as the plain warm-started recipe: the same partitions
+    for the same seeds, the same volume to float rounding, a checkpoint error sinogram equal to y - A x (the carried
+    sinogram drifts by rounding only), and the same result when the data change between calls (e shifted by
+    y_new - y_old, as the CITRUS loop does); the Hessian of a checkpoint can be passed back."""
+    grid = wlab_grid(1.0)
+    angles = np.linspace(0, 2 * np.pi, 60, endpoint=False)
+    model = make_cone_model(grid, GEOM, angles, device=DEV)
+    x, y, z = grid.axis_coordinates(DEV)
+    obj = ((x[None, :, None].abs() < 6) & (y[:, None, None].abs() < 5) & (z[None, None, :].abs() < 5)).float() * 0.2
+    sino = forward_project(model, obj)
+    sinos = [sino, sino * 1.01, sino * 1.01, sino * 0.995]  # the data change between calls
+    x0 = fdk(model, sino)
+    freeze_regularization(model)
+    xa, xb = x0.clone(), x0.clone()
+    e = None
+    hess = None
+    for k, s in enumerate(sinos):
+        np.random.seed([0, k])
+        xa, da = mbir_iterations(model, s, xa, first_iteration=k)
+        if e is not None:
+            e.add_(s - sinos[k - 1])  # A x unchanged: e = s - A x
+        np.random.seed([0, k])
+        xin = xb.clone()
+        xb, db, ck = mbir_iterations(model, s, xin, first_iteration=k, error_sinogram=e, hessian=hess,
+                                     return_checkpoint=True)
+        assert db["recon_params"]["partition_sequence"] == da["recon_params"]["partition_sequence"]
+        assert db["recon_params"]["num_iterations"] == 1
+        e, hess = ck["error_sinogram"], ck["fm_hessian"]
+        assert float((xb - xa).norm() / xa.norm()) < 1e-5, k
+        resid = s - forward_project(model, xb)
+        assert float((e - resid).norm() / resid.norm()) < 1e-4, k
+    with pytest.raises(ValueError, match="init_recon"):
+        mbir_iterations(model, sino, None, first_iteration=0, error_sinogram=e)
+
+
 def test_scan_range_and_short_scan_detection():
     from citrus.recon.mbir_bridge import is_short_scan, scan_range
     from citrus.utilities import fan_angle, full_field_wlab_geometry, view_angles

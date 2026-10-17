@@ -7,8 +7,10 @@ Package layout
 ``citrus.citrus``
     The CITRUS algorithm: :func:`~citrus.citrus.citrus_recon` (the coupled reconstruction loop),
     :func:`~citrus.citrus.mbir_recon` (the same MBIR loop without the solver, for comparison),
-    :func:`~citrus.citrus.citrus_step` (one scatter step of one view) and its operators ``G1``, ``G1to2``,
-    ``G_gt2``, ``G_step``, ``project_scatter``; the density model and the compact per-view state storage.
+    :func:`~citrus.citrus.citrus_step` (one scatter step of one view; ``citrus_view_step`` from prebuilt fields) and its
+    operators ``G1``, ``G1to2``, ``G_gt2``, ``G_step``, ``project_scatter``; the primaries of all views
+    (``primary_signals`` with MBIRTORCH's or the Siddon projector); the density model (one material map at a time) and
+    the compact per-view state storage.
 
 ``citrus.scatter_solver``
     The LBTE source iteration solver. :class:`~citrus.scatter_solver.scatter_solver.ScatterSolver` assembles the

@@ -97,12 +97,14 @@ Scatter image
 **Quadrature points.** All scatter orders are transported on the transport grid C (cubic cells of
 ``transport_cell_cm``, covering the fine box; :doc:`conventions`, "Grids"). The uncollided fluence, the first-collision
 source (sweep and cone directions), its sampling correction and restriction, and the first-order emission and its
-projection use the :math:`q^3` points per cell of the quadrature grid Q (``fc_points_per_axis``, default 2, bounded
+projection use the :math:`q^3` points per cell of the quadrature grid Q (q = round(cell /
+``quadrature_point_spacing_cm``), default spacing 0.5 cm: 2 points per axis in 1 cm cells, 4 in 2 cm cells; bounded
 by round(cell / largest fine voxel edge) so that the points are not much denser than the data), with the
 densities resampled conservatively from the fine grid and the downstream attenuation traced on C plus its first-order
 variation inside the cell (Acuros CTS, Maslowski et al. 2018, Section 2.B). Only the primary image and the resampling
 touch the fine grid. Against the q = 2 sub-points of version 0.1.0 (the f^3 fine voxel centres, which q = cell / voxel
-with ``fc_trace_grid = "fine"`` reproduces to float rounding: 2e-7 on WLAB at 0.5 cm, bit for bit at 1 cm), on WLAB
+with ``uncollided_trace_grid = "fine"`` reproduces to float rounding: 2e-7 on WLAB at 0.5 cm, bit for bit at 1 cm), on
+WLAB
 with 0.5 cm voxels in 1 cm cells (converged solve, AP / lateral view, rel. L2 of the scatter signal against q = 3):
 q = 1 0.93 % / 0.20 %, q = 2 0.20 % / 0.02 %; CITRUS step 120 / 300 / 790 ms for q = 1 / 2 / 3 (q = 3 measured
 before the resolution bound, which now limits 0.5 cm voxels to q = 2). The earlier
@@ -110,8 +112,19 @@ fine-grid first-order pass agreed with 0.5 cm points in 1 cm cells to 0.26 % RMS
 1.0 % (max 3.1 %). Any voxel / cell ratio works: 0.4 cm voxels (ratio 2.5) give the 0.5 cm scatter image to 0.34 %
 (the rasterized phantoms differ: the primary by 0.2 %).
 
+Spacing instead of count (version 0.3.0): the points per axis follow the cell size at a fixed target spacing, so larger
+cells keep the first-order resolution. Measured (converged solves, WLAB 0.5 cm voxels, AP / lateral, relative L2 of
+the scatter signal; the reference is the largest q with the fine trace, here identical to the quadrature trace):
+2 cm cells q = 1 / 2 against q = 4: 1.1 % / 0.59 % and 0.40 % / 0.22 %, 0.19 / 0.20 / 0.35 s per view for
+q = 1 / 2 / 4; 1 cm cells q = 1 against q = 2: 0.25 % / 0.09 % (0.40 / 0.59 s); 1 cm cells on the 0.25 cm grid, q =
+1 / 2 against q = 3: 0.20 % / 0.08 % and 0.05 % / 0.06 % (0.41 / 0.58 / 1.08 s). The q error is small next to the
+cell size itself: the converged image with 2 cm cells (q = 4) differs from the one with 1 cm cells (q = 2) by 3.6 %
+(AP) and 9.5 % (lateral). A coarser spacing (1 cm: q = 2 in 2 cm cells) would save 40 % of a 2 cm-cell solve for
+0.2-0.4 %, but would drop 1 cm cells to q = 1; the default stays 0.5 cm.
+
 **Uncollided trace.** The uncollided fluence at the Q points is traced from the focal spot through C
-(``fc_trace_grid = "coarse"``), through Q ("quadrature", default) or through the fine grid ("fine"); the stage costs
+(``uncollided_trace_grid = "coarse"``), through Q ("quadrature", default) or through the fine grid ("fine"); the stage
+costs
 about 7 ms per view in every case (the fine-energy transmission dominates; the fine trace at 0.125 cm takes 11 ms). On
 WLAB with 0.5 cm voxels in 1 cm cells the phantom's boundaries lie on cell faces and the three agree to 4e-8. With the
 cells shifted by half a cell against the object (a 21 cm instead of 20 cm box along y), rays that run along a face
@@ -216,6 +229,41 @@ Version 0.2.0: 323 ms at 0.5 cm, 308 ms at 0.25 cm and 317 ms at 0.125 cm (160 x
 two views' accumulators). What remains on the fine grid: the primary (6 ms per view at 0.5 cm, 8-10 ms at 0.125 cm)
 and, once per outer iteration rather than per view, the density model and the resampling onto C and Q (2 ms at
 0.5 cm, 7 ms at 0.125 cm).
+
+Fine-grid memory of the loop (version 0.3.0). Up to version 0.2.0 every scatter stage formed the seven-material density
+volume [7, R, C, S] on the reconstruction grid (7 GB at 0.5 mm voxels, 256 M voxels) and the density model's own
+temporaries (about 4.5 GB more: an [M, ...] nominal-attenuation table, int64 bracket indices); the loop now builds the
+solver's fields from X one material map at a time (``ScatterSolver.material_fields_from_attenuation``,
+``DensityModel.material`` slab by slab): peak about one map plus the resampling intermediates (2.2 maps measured at
+q = 2) above X and the fields, and the primary projects the maps one at a time again. Measured with
+``benchmarks/bench_citrus_memory.py`` on the 0.125 cm WLAB grid (12.3 M voxels, 47 MiB per map), 1 cm cells, 180 views,
+the scatter step on every 8th view, peak allocated memory (``torch.cuda.max_memory_allocated``) of the scatter stage
+of an outer iteration: 2521 / 2364 MiB in version 0.2.0 (outer iterations 2 / 3), 1891 / 1876 MiB now (Siddon or
+MBIRTORCH primary alike; the remainder is the per-view step on C and Q, about 0.6-0.7 GB, and the 23 accumulators,
+0.4 GB); the density stage alone went from a 1.56 GB transient plus 0.33 GB kept to 0.1 GB. The MBIR iteration
+peaks at about 1.09 GB either way. On the 0.5 cm demo grid the fine maps are small (0.77 MB) and the whole demo run
+peaks at 1.62 GB (version 0.2.0) and 1.64 GB (version 0.3.0 defaults: the kept error sinogram, 19 MiB), well inside
+the demo's 4400 MiB allocator cap with the accumulators on the GPU.
+
+Primaries of all views (``citrus.primary_signals``). One projection per material present onto all views, in chunks of
+views whose path lengths [M', V_chunk, Rd, Cd] stay within one sinogram (MBIRTORCH sub-models over the chunk's
+angles: about 1 ms to build and 0.1 s for the first projection, cached), then the per-view transmission and
+responses (``ScatterSolver.primary_from_path_lengths``, about 5.6 ms per view on the full-field panel, mostly the
+per-view geometry and response factors). On the 0.5 cm grid with 180 views the primaries of a scatter stage take
+1.13 s with either projector (MBIRTORCH's projections 0.06 s of it), as the per-view Siddon primaries of version
+0.2.0 did; on the 0.125 cm grid the MBIRTORCH stage is 0.6 s slower than the Siddon one (13.5 s instead of 12.9 s
+per scatter stage with 23 computed views).
+
+MBIR resume. MBIRTORCH's public ``recon`` recomputes the error sinogram with one forward projection per call;
+``recon.mbir_bridge.mbir_iterations(..., error_sinogram=, return_checkpoint=True)`` replicates ``recon``'s preparation
+(``initialize_recon``) and calls its engine ``_vcd_recon`` with the kept error sinogram. The loop keeps it between
+outer iterations as -A X (one sinogram; e = y_c - A X is re-formed by adding the new corrected sinogram), so the
+steady-state footprint grows by exactly one sinogram (19 MiB on the WLAB panel; measured +18 MiB on the demo's
+peak). The MBIR iteration on the 12 M-voxel grid takes 0.63 / 1.02 s instead of 0.73 / 1.09 s (outer iterations 3 /
+4); on the 0.5 cm demo grid the saving is within the timing noise (0.85 s per iteration either way). The
+reconstruction equals the restarted one to 1.1e-6 (relative L2 after the 80 outer iterations of the demo). The
+forward-model Hessian could be kept as well (a back projection less per iteration), but it is a reconstruction-sized
+volume, so the loop recomputes it.
 
 The per-view accumulator is :math:`G (L+1)^2 \cdot 4` values per cell: 141 MiB in float32 on the 0.5 cm WLAB grid
 with 1 cm cells (24.7 GiB for 180 views). It is stored compactly (LD cell mean, scaled float16: 17.6 MiB per view,

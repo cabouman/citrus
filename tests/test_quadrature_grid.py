@@ -34,7 +34,7 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 # the problem of tests/test_scatter_solver.py: 2 cm WLAB grid, 4 cm transport cells, q = 2 (Q is the 2 cm grid)
 GRID = Grid((10, 16, 20), 2.0)
 CFG = SolverConfig(num_groups=4, legendre_order=3, num_polar=4, num_azimuthal=8, cone_num_polar=8,
-                   cone_num_azimuthal=16, transport_cell_cm=4.0, fc_points_per_axis=2, si_tol=1e-4,
+                   cone_num_azimuthal=16, transport_cell_cm=4.0, quadrature_point_spacing_cm=2.0, si_tol=1e-4,
                    si_max_iterations=40, direction_chunk=8)
 
 
@@ -152,7 +152,7 @@ def test_material_fields_on_quadrature_grid():
     rho_coarse and rho_quad conserve every material, no [G, ...] field on the fine grid, and the pair representation
     is used exactly when every quadrature point has at most two nonzero materials."""
     grid = Grid((34, 50, 67), 0.3)
-    cfg = replace(CFG, transport_cell_cm=1.0)
+    cfg = replace(CFG, transport_cell_cm=1.0, quadrature_point_spacing_cm=0.5)
     s = _solver(cfg, device="cpu", dtype=F64)
     rho = torch.zeros(7, *grid.shape, dtype=F64)
     gen = torch.Generator().manual_seed(3)
@@ -172,15 +172,19 @@ def test_material_fields_on_quadrature_grid():
     assert f2.pairs_quad is not None and torch.equal(f2.pairs_quad.dense(), f2.rho_quad)
 
 
-@pytest.mark.parametrize("cell, voxel, bound, q", [
-    (1.0, 1.0, 2, 1), (1.0, 0.5, 2, 2), (1.0, 0.4, 2, 2), (1.0, 0.05, 2, 2), (1.0, 0.25, 4, 4), (1.0, 0.3, 4, 3),
-    (1.0, 0.4, 4, 2), (1.0, 0.6, 4, 2), (1.0, 2.0, 2, 1), (4.0, 2.0, 2, 2), (4.0, 2.0, 1, 1), (3.0, 2.0, 2, 2),
+@pytest.mark.parametrize("cell, voxel, spacing, q", [
+    (1.0, 1.0, 0.5, 1), (1.0, 0.5, 0.5, 2), (1.0, 0.4, 0.5, 2), (1.0, 0.05, 0.5, 2), (1.0, 0.25, 0.25, 4),
+    (1.0, 0.3, 0.25, 3), (1.0, 0.4, 0.25, 2), (1.0, 0.6, 0.25, 2), (1.0, 2.0, 0.5, 1), (4.0, 2.0, 2.0, 2),
+    (4.0, 2.0, 4.0, 1), (3.0, 2.0, 1.5, 2), (2.0, 0.5, 0.5, 4), (2.0, 0.25, 0.5, 4), (2.0, 1.0, 0.5, 2),
+    (0.5, 0.25, 0.5, 1), (0.5, 0.125, 0.5, 1), (1.0, 0.1, 0.4, 2), (1.0, 0.1, 0.3, 3), (3.0, 0.5, 0.5, 6),
 ])
-def test_quadrature_points_rule(cell, voxel, bound, q):
-    """The effective q = min(fc_points_per_axis, max(1, round(cell / largest voxel edge))) (Python's round: 2.5 -> 2,
-    1.5 -> 2): the quadrature spacing does not go much below the fine voxel size."""
-    cfg = replace(SolverConfig(), transport_cell_cm=cell, fc_points_per_axis=bound)
+def test_quadrature_points_rule(cell, voxel, spacing, q):
+    """The effective q = min(max(1, round(cell / quadrature_point_spacing_cm)), max(1, round(cell / largest voxel
+    edge))) (Python's round: 2.5 -> 2, 1.5 -> 2): points about quadrature_point_spacing_cm apart (default 0.5 cm: 1 cm
+    cells -> 2, 2 cm cells -> 4, 0.5 cm cells -> 1), never much closer than the fine voxels."""
+    cfg = replace(SolverConfig(), transport_cell_cm=cell, quadrature_point_spacing_cm=spacing)
     assert cfg.quadrature_points(voxel) == q
+    assert SolverConfig().quadrature_point_spacing_cm == 0.5
 
 
 def test_quadrature_points_in_fields():
@@ -188,15 +192,16 @@ def test_quadrature_points_in_fields():
     q = 1 and with an upper bound above the resolution (clamped to round(cell / voxel)) converge to finite,
     non-negative images; invalid values are rejected."""
     rho = wlab_phantom(GRID, device=DEV)
-    for bound, q in ((1, 1), (4, 2)):  # 4 cm cells on the 2 cm grid: at most 2 points per axis
-        s = _solver(replace(CFG, fc_points_per_axis=bound))
+    for spacing, q in ((4.0, 1), (1.0, 2)):  # 4 cm cells on the 2 cm grid: at most 2 points per axis
+        s = _solver(replace(CFG, quadrature_point_spacing_cm=spacing))
         f = s.material_fields(rho, GRID)
         assert f.q == q == s.quadrature_points(GRID) and f.grid_quad == f.grid_coarse.refine(q)
         r = s.solve_view(rho, GRID, 0.4)
         assert r.si.converged and bool(torch.isfinite(r.scatter_signal).all()) and float(r.scatter_signal.min()) >= 0
     aniso = Grid((10, 16, 20), 1.0, voxel_slice_aspect=2.0)  # 1 x 1 x 2 cm voxels in 4 cm cells: q = 2, not 4
-    assert _solver(replace(CFG, fc_points_per_axis=4)).quadrature_points(aniso) == 2
-    for bad in (dict(fc_points_per_axis=0), dict(transport_cell_cm=-1.0), dict(fc_trace_grid="medium")):
+    assert _solver(replace(CFG, quadrature_point_spacing_cm=1.0)).quadrature_points(aniso) == 2
+    for bad in (dict(quadrature_point_spacing_cm=0.0), dict(quadrature_point_spacing_cm=-0.5),
+                dict(transport_cell_cm=-1.0), dict(uncollided_trace_grid="medium")):
         with pytest.raises(ValueError):
             replace(CFG, **bad).validate()
 
@@ -209,7 +214,8 @@ def test_quadrature_points_converge():
     rho = wlab_phantom(grid, device=DEV)
     img = {}
     for q in (1, 2, 3, 4):
-        s = _solver(replace(CFG, transport_cell_cm=8.0, fc_points_per_axis=q, fc_trace_grid="fine"))
+        s = _solver(replace(CFG, transport_cell_cm=8.0, quadrature_point_spacing_cm=8.0 / q,
+                            uncollided_trace_grid="fine"))
         assert s.quadrature_points(grid) == q
         img[q] = s.solve_view(rho, grid, 0.4).scatter_signal
     d1, d2, d3 = (_rel_l2(img[q], img[4]) for q in (1, 2, 3))
@@ -222,7 +228,7 @@ def test_trace_grids_synthetic():
     rho = wlab_phantom(GRID, device=DEV)
     img = {}
     for trace in ("coarse", "quadrature", "fine"):
-        img[trace] = _solver(replace(CFG, fc_trace_grid=trace)).solve_view(rho, GRID, 0.4).scatter_signal
+        img[trace] = _solver(replace(CFG, uncollided_trace_grid=trace)).solve_view(rho, GRID, 0.4).scatter_signal
     assert _rel_l2(img["quadrature"], img["fine"]) < 1e-6
     assert 1e-4 < _rel_l2(img["coarse"], img["fine"]) < 0.05
 
@@ -315,7 +321,7 @@ def test_reproduces_pre_quadrature_solver(device, dtype, tol):
     (tests/data/pre_quadrature_reference.json: 8 x 8 block means of the signals, sums, SI count, generated with it) to
     float rounding: the only change on this path is the overlap resampling onto C (the block mean up to rounding)."""
     case = json.loads(REFERENCE.read_text())["cases"][f"synthetic_{device}"]
-    s = _solver(replace(CFG, fc_trace_grid="fine"), device=device, dtype=dtype)
+    s = _solver(replace(CFG, uncollided_trace_grid="fine"), device=device, dtype=dtype)
     _check_reference(s.solve_view(wlab_phantom(GRID, device=device, dtype=dtype), GRID, 0.4), case, tol)
 
 
@@ -333,7 +339,7 @@ def test_reproduces_pre_quadrature_solver_wlab():
         rho = wlab_phantom(grid, device="cuda")
         case = cases[f"wlab_{str(dv).replace('.', 'p')}cm_f{q}"]
         for trace in ("fine", "quadrature", "coarse"):
-            s = wlab_solver(dv, config=replace(SolverConfig(), fc_trace_grid=trace), device="cuda")
+            s = wlab_solver(dv, config=replace(SolverConfig(), uncollided_trace_grid=trace), device="cuda")
             assert s.quadrature_points(grid) == q
             _check_reference(s.solve_view(rho, grid, 0.3), case, 1e-5)
 
@@ -351,7 +357,8 @@ def test_quadrature_points_and_ratios_wlab():
     rho025 = wlab_phantom(g025, device="cuda")
     img = {}
     for q in (1, 2, 3):
-        s = wlab_solver(0.25, config=replace(SolverConfig(), fc_points_per_axis=q), lib=lib, device="cuda")
+        s = wlab_solver(0.25, config=replace(SolverConfig(), quadrature_point_spacing_cm=1.0 / q), lib=lib,
+                        device="cuda")
         assert s.quadrature_points(g025) == q
         img[q] = s.solve_view(rho025, g025, 0.3).scatter_signal
     d1, d2 = _rel_l2(img[1], img[3]), _rel_l2(img[2], img[3])

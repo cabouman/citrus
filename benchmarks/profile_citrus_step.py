@@ -1,14 +1,15 @@
 """Per-stage profile of one CITRUS step per view (citrus.citrus.citrus_step).
 
     python benchmarks/profile_citrus_step.py [--panel full|small] [--views 12] [--cone 16x32]
-        [--voxel 0.5] [--cell 1.0] [--fc-points q] [--fc-trace quadrature|coarse|fine] [--memory-cap 4400]
+        [--voxel 0.5] [--cell 1.0] [--quadrature-spacing cm] [--uncollided-trace quadrature|coarse|fine]
+        [--memory-cap 4400]
 
 Synthesizes nothing: uses the WLAB phantom on the `--voxel` grid (default 0.5 cm; any pitch that tiles the prism, e.g.
 0.25, 0.125, 0.4 cm) with `--cell` cm transport cells (SolverConfig.transport_cell_cm, default 1), the first-collision
-quadrature points per axis `--fc-points` (an upper bound: the effective q is at most round(cell / voxel)) and trace
-grid `--fc-trace` (SolverConfig fc_points_per_axis, fc_trace_grid; defaults: the SolverConfig defaults), the
-full-field (150 x 184) or the small (100 x 75) panel, and `--views` of 180 equally spaced angles (every 180/views-th). Pass 1 builds every view's
-accumulator (one citrus_step each); pass 2 is timed: first the plain `citrus_step` (synchronized around the call),
+quadrature point spacing `--quadrature-spacing` (cm; q = round(cell / spacing), at most round(cell / voxel)) and the
+uncollided trace grid `--uncollided-trace` (SolverConfig quadrature_point_spacing_cm, uncollided_trace_grid; defaults:
+the SolverConfig defaults), the full-field (150 x 184) or the small (100 x 75) panel, and `--views` of 180 equally
+spaced angles (every 180/views-th). Pass 1 builds every view's accumulator (one citrus_step each); pass 2 is timed: first the plain `citrus_step` (synchronized around the call),
 then the same step taken apart with torch.cuda.synchronize around every stage, with the scatter-image inner stages
 (FC source at the cone directions, downstream attenuation, sub-point emission, oblique projection, accumulation) and
 the sweep's FC-source evaluations timed by wrapping those functions. Prints a per-view table (ms).
@@ -86,11 +87,11 @@ def main() -> None:
     ap.add_argument("--cone", default="16x32")
     ap.add_argument("--voxel", type=float, default=0.5, help="fine voxel size (cm)")
     ap.add_argument("--cell", type=float, default=None, help="transport cell edge in cm (default: SolverConfig's)")
-    ap.add_argument("--fc-points", type=int, default=None,
-                    help="SolverConfig.fc_points_per_axis: an upper bound; the effective q never exceeds "
-                         "round(cell / voxel), so values above it have no effect")
-    ap.add_argument("--fc-trace", default=None, choices=["quadrature", "coarse", "fine"],
-                    help="SolverConfig.fc_trace_grid")
+    ap.add_argument("--quadrature-spacing", type=float, default=None,
+                    help="SolverConfig.quadrature_point_spacing_cm: target spacing of the quadrature points (cm); q = "
+                         "round(cell / spacing), never above round(cell / voxel)")
+    ap.add_argument("--uncollided-trace", default=None, choices=["quadrature", "coarse", "fine"],
+                    help="SolverConfig.uncollided_trace_grid")
     ap.add_argument("--memory-cap", type=float, default=4400.0, help="PyTorch allocator cap (MiB)")
     args = ap.parse_args()
     set_memory_cap(args.memory_cap)
@@ -100,10 +101,10 @@ def main() -> None:
     extra = {}
     if args.cell is not None:
         extra["transport_cell_cm"] = args.cell
-    if args.fc_points is not None:
-        extra["fc_points_per_axis"] = args.fc_points
-    if args.fc_trace is not None:
-        extra["fc_trace_grid"] = args.fc_trace
+    if args.quadrature_spacing is not None:
+        extra["quadrature_point_spacing_cm"] = args.quadrature_spacing
+    if args.uncollided_trace is not None:
+        extra["uncollided_trace_grid"] = args.uncollided_trace
     cfg = replace(SolverConfig(), cone_num_polar=cp, cone_num_azimuthal=ca, **extra)
     solver = wlab_solver(args.voxel, config=cfg, geom=geom, device=DEV)
     lib = solver.lib
@@ -118,7 +119,7 @@ def main() -> None:
     print(f"grid {grid.shape} at {args.voxel} cm, transport grid {f0.grid_coarse.shape} of "
           f"{cfg.transport_cell_cm:g} cm "
           f"cells, quadrature grid {f0.grid_quad.shape} (q = {f0.q}), uncollided trace through the "
-          f"{cfg.fc_trace_grid} grid")
+          f"{cfg.uncollided_trace_grid} grid")
     print(f"panel {args.panel} {geom.num_det_rows} x {geom.num_det_channels}; cone {cp} x {ca}: K = {quad.omega.shape[0]} "
           f"directions in the set, {ctx0.num_directions} panel-facing, covering polar angle "
           f"{np.degrees(cap):.1f} deg at view 0 (max over views "

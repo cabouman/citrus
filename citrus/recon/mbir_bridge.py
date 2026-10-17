@@ -1,7 +1,7 @@
 """Bridge between the scatter solver's geometry (Grid, ConeGeometry) and MBIRTORCH's ConeBeamModel.
 
 MBIRTORCH and CITRUS use the same frames (docs/source/conventions.rst adopts MBIRTORCH's verbatim), so the bridge is
-a parameter copy; verified against mbirtorch 0.0.2 `cone_beam.py` (tests/test_mbir_bridge.py):
+a parameter copy; verified against mbirtorch 0.1.2 `cone_beam.py` (tests/test_mbir_bridge.py):
 
     recon [rows, cols, slices], col -> x, row -> y, slice -> z, voxel centers at (index - (n - 1)/2) * pitch
     (+ recon_slice_offset along z); view frame x_v = cos(a) x - sin(a) y, y_v = sin(a) x + cos(a) y;
@@ -20,10 +20,26 @@ use_ror_mask=False by default (all voxels projected and updated).
 Device handling: MBIRTORCH accepts torch tensors (any device) and places them as float32 on the model device with
 `torch.as_tensor` (no copy when they already are float32 on that device). All functions here return torch tensors on
 the model device (`output_sharded=True` on a single-device model), never numpy.
+
+Projections in chunks of views (`ViewChunkProjector`): a ConeBeamModel projects a volume onto ALL its views at once.
+To project onto a subset of consecutive views (e.g. the CITRUS loop's per-material primary path lengths, which must
+not grow to [M', V, Rd, Cd]), a sub-model over those angles is built with `make_cone_model` (measured on the WLAB
+grids: about 1 ms to build, 0.1 s for its first projection, which compiles; then the same time per view as the full
+model). The projections of a sub-model equal the matching views of the full model to float rounding (~1e-5 absolute
+in line integrals of order 10).
+
+Resuming MBIR (`mbir_iterations(..., error_sinogram=e, return_checkpoint=True)`): MBIRTORCH's public `recon` (0.1.2)
+recomputes the error sinogram e = y - A x_init on every call (one forward projection) and does not forward the
+`init_error_sinogram` / `return_checkpoint` arguments of its engine `_vcd_recon`. With them, `mbir_iterations`
+replicates `recon` (the same `initialize_recon` call: partitions, partition sequence from `first_iteration`, input
+checks, regularization; then `_vcd_recon` under torch.no_grad, `close_log_file` and the same recon_dict) and passes a
+caller-kept error sinogram consistent with init_recon (trusted, not checked; MBIRTORCH updates it in place, and
+init_recon too). Without those arguments the plain `recon` path runs.
 """
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Optional, Sequence, Union
 
 import numpy as np
@@ -42,6 +58,7 @@ __all__ = [
     "short_scan_weights",
     "mbir_iterations",
     "freeze_regularization",
+    "ViewChunkProjector",
     "mbirtorch_version",
 ]
 
@@ -194,7 +211,8 @@ def fdk(model, sinogram: Tensor, filter_name: str = "ramp", *, geom: Optional[Co
 
 def mbir_iterations(model, sinogram: Tensor, init_recon: Union[Tensor, np.ndarray], first_iteration: int,
                     num_iterations: int = 1, weights: Optional[Tensor] = None,
-                    stop_threshold_change_pct: float = 0.0) -> tuple[Tensor, dict]:
+                    stop_threshold_change_pct: float = 0.0, *, error_sinogram: Optional[Tensor] = None,
+                    hessian: Optional[Tensor] = None, return_checkpoint: bool = False):
     """`num_iterations` warm-started VCD iterations from `init_recon` at schedule position `first_iteration`
     (the recipe verified in tests/test_mbir_bridge.py):
 
@@ -211,6 +229,15 @@ def mbir_iterations(model, sinogram: Tensor, init_recon: Union[Tensor, np.ndarra
 
     sinogram, weights: [views, rows, channels] line integrals and weights (None = 1). Returns (recon [R, C, S]
     torch on the model device, recon_dict with recon_params['partition_sequence'], ['num_iterations'], ...).
+
+    Resume (module docstring): error_sinogram [views, rows, channels] = sinogram - A init_recon, kept by the caller
+    from an earlier call (its checkpoint), skips the initializing forward projection; MBIRTORCH trusts the pair and
+    updates BOTH error_sinogram and init_recon in place (pass a copy of init_recon to keep it). hessian: the
+    forward-model Hessian diagonal of an earlier call with the same weights and model (None: computed, one back
+    projection). return_checkpoint: also return {'error_sinogram': e = sinogram - A recon, 'fm_hessian': ...}, the
+    loop's own device tensors (no copy), as a third element. Any of the three switches runs MBIRTORCH's engine as
+    `recon` would (same partitions and partition sequence for the same numpy RNG state, same regularization), so a
+    resumed call equals the plain one up to the float rounding of the carried error sinogram.
     """
     k = int(first_iteration)
     n = int(num_iterations)
@@ -218,11 +245,51 @@ def mbir_iterations(model, sinogram: Tensor, init_recon: Union[Tensor, np.ndarra
         raise ValueError("need first_iteration >= 0 and num_iterations >= 1")
     if isinstance(init_recon, Tensor):
         init_recon = init_recon.detach()
-    with torch.no_grad():
-        recon, recon_dict = model.recon(sinogram, weights=weights, init_recon=init_recon, max_iterations=k + n,
-                                        first_iteration=k, stop_threshold_change_pct=stop_threshold_change_pct,
-                                        logfile_path=None, print_logs=False, output_sharded=True)
+    if error_sinogram is None and hessian is None and not return_checkpoint:
+        with torch.no_grad():
+            recon, recon_dict = model.recon(sinogram, weights=weights, init_recon=init_recon, max_iterations=k + n,
+                                            first_iteration=k, stop_threshold_change_pct=stop_threshold_change_pct,
+                                            logfile_path=None, print_logs=False, output_sharded=True)
+        return recon, recon_dict
+    if error_sinogram is not None and init_recon is None:
+        raise ValueError("error_sinogram needs init_recon (the pair must be consistent)")
+    recon, recon_dict, checkpoint = _vcd_recon_resumable(model, sinogram, weights, init_recon, k + n, k,
+                                                         stop_threshold_change_pct, error_sinogram, hessian)
+    if return_checkpoint:
+        return recon, recon_dict, checkpoint
     return recon, recon_dict
+
+
+def _vcd_recon_resumable(model, sinogram, weights, init_recon, max_iterations: int, first_iteration: int,
+                         stop_threshold_change_pct: float, error_sinogram, hessian):
+    """MBIRTORCH 0.1.2 `TomographyModel.recon` (tomography_model.py) step by step, with `_vcd_recon`'s
+    init_error_sinogram / fm_hessian / return_checkpoint arguments, which `recon` does not forward. Returns (recon
+    [R, C, S] on the model device, recon_dict as `recon` builds it, checkpoint {'error_sinogram', 'fm_hessian'})."""
+    import datetime
+
+    from mbirtorch import _sharding
+    from mbirtorch._utils import recon_param_names
+
+    _sharding.reject_shards('recon', init_recon=init_recon)
+    (sinogram, weights, init_recon, partitions, partition_sequence, granularity,
+     regularization_params) = model.initialize_recon(sinogram, weights, init_recon, max_iterations, first_iteration,
+                                                     logfile_path=None, print_logs=False, rng=None)
+    with torch.no_grad():
+        recon, loss_vectors, checkpoint = model._vcd_recon(
+            sinogram, partitions, partition_sequence, stop_threshold_change_pct, weights=weights,
+            init_recon=init_recon, first_iteration=first_iteration, init_error_sinogram=error_sinogram,
+            fm_hessian=hessian, return_checkpoint=True, rng=None)
+    partition_sequence = [int(val) for val in partition_sequence]
+    fm_rmse = [float(val) for val in loss_vectors[0]]
+    recon_params = dict(zip(recon_param_names,
+                            [len(fm_rmse), granularity, partition_sequence, fm_rmse, [0], regularization_params,
+                             [100 * float(val) for val in loss_vectors[2]], [float(val) for val in loss_vectors[3]],
+                             [[float(v) for v in row] for row in loss_vectors[4]]]))
+    for h in list(model.logger.handlers):
+        h.flush()
+    model.close_log_file()
+    recon_dict = model.get_recon_dict(recon_params, notes=f"Reconstruction completed: {datetime.datetime.now()}\n\n")
+    return recon, recon_dict, checkpoint
 
 
 def freeze_regularization(model) -> dict[str, float]:
@@ -231,3 +298,54 @@ def freeze_regularization(model) -> dict[str, float]:
     model.set_params(auto_regularize_flag=False)
     names = ["sigma_y", "sigma_x", "sigma_prox"]
     return {k: float(v) for k, v in zip(names, model.get_params(names))}
+
+
+class ViewChunkProjector:
+    """MBIRTORCH forward projections of volumes on `grid` onto the views of a scan (`geom`, `angles` [V] rad), in
+    chunks of consecutive views (module docstring): `project(volume, start, stop)` -> [stop - start, Rd, Cd] line
+    integrals (value x cm). The views [0, V) use `model` when it is given (the reconstruction's own ConeBeamModel over
+    all angles); any other range uses a sub-model over angles[start:stop] (`make_cone_model`, built on first use and
+    kept in an LRU of `max_models` entries). `chunks(n)` lists the (start, stop) ranges of n views each."""
+
+    def __init__(self, grid: Grid, geom: ConeGeometry, angles, *, model=None, device: DeviceLike = None,
+                 max_models: int = 8) -> None:
+        self.grid = grid
+        self.geom = geom
+        self.angles = _angles_array(angles)
+        self.model = model
+        self.device = device
+        self.max_models = max(1, int(max_models))
+        self._models: "OrderedDict[tuple[int, int], object]" = OrderedDict()
+
+    @property
+    def num_views(self) -> int:
+        return int(self.angles.size)
+
+    def chunks(self, views_per_chunk: int) -> list[tuple[int, int]]:
+        """[(start, stop), ...] covering [0, V) in runs of `views_per_chunk` views (the last one shorter)."""
+        n = max(1, int(views_per_chunk))
+        return [(a, min(a + n, self.num_views)) for a in range(0, self.num_views, n)]
+
+    def model_for(self, start: int, stop: int):
+        """The ConeBeamModel of the views [start, stop)."""
+        start, stop = int(start), int(stop)
+        if not 0 <= start < stop <= self.num_views:
+            raise ValueError(f"view range [{start}, {stop}) outside [0, {self.num_views})")
+        if (start, stop) == (0, self.num_views) and self.model is not None:
+            return self.model
+        key = (start, stop)
+        m = self._models.get(key)
+        if m is None:
+            m = make_cone_model(self.grid, self.geom, self.angles[start:stop], device=self.device)
+            self._models[key] = m
+            while len(self._models) > self.max_models:
+                self._models.popitem(last=False)
+        else:
+            self._models.move_to_end(key)
+        return m
+
+    def project(self, volume: Tensor, start: int = 0, stop: Optional[int] = None) -> Tensor:
+        """Forward projection of volume [R, C, S] onto the views [start, stop) (default all): [stop - start, Rd, Cd]
+        float32 on the model device."""
+        stop = self.num_views if stop is None else int(stop)
+        return forward_project(self.model_for(start, stop), volume)

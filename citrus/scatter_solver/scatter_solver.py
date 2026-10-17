@@ -6,14 +6,16 @@ in docs/source/conventions.rst, "Grids"):
 
     rho_fine [M, R, C, S]  fine (reconstruction) grid F; M = 7 basis materials
     grid_coarse = Grid.covering(grid_fine, transport_cell_cm)          transport grid C (cubic cells, covers F)
-    grid_quad   = grid_coarse.refine(q)                                quadrature grid Q, q = fc_points_per_axis
-                                                                       bounded by the data resolution
+    grid_quad   = grid_coarse.refine(q)                                quadrature grid Q, q = round(transport_cell_cm /
+                                                                       quadrature_point_spacing_cm) bounded by the data
+                                                                       resolution
     rho_coarse, rho_quad = conservative overlap resampling of rho_fine onto C and Q (`geometry.resample_conservative`)
     pairs_quad  = material_pairs_if_compact(rho_quad)                  pair or dense first-collision evaluation
     mu_t_coarse, mu_s_l_coarse from rho_coarse                        linear in rho: = averaged mu
-    phi_uc         = uncollided_fluence at the Q points, traced through rho_quad on Q (fc_trace_grid "quadrature",
-                     the default), rho_coarse on C ("coarse") or rho_fine on F ("fine"); exact in energy: line integrals of the density maps of the materials
-                     present + the fine-energy table (sum_{E in g} w_E exp(-sum_m m_m(E) P_m))
+    phi_uc         = uncollided_fluence at the Q points, traced through rho_quad on Q (uncollided_trace_grid
+                     "quadrature", the default), rho_coarse on C ("coarse") or rho_fine on F ("fine"); exact in
+                     energy: line integrals of the density maps of the materials present + the fine-energy table
+                     (sum_{E in g} w_E exp(-sum_m m_m(E) P_m))
     S_FC(Omega_m)  = restrict_fc_to_ld_moments(corrected fc_source_at_directions(lib, rho_quad, ..., Omega_m), q)
                      exact eta table on Q, l = 0 and l = 1 conservative sampling correction
                      (uncollided.fc_sampling_correction)
@@ -39,6 +41,15 @@ at the sweep and cone directions, its sampling correction and restriction, the f
 projection) live on Q: q^3 points per transport cell whatever the fine voxel size (Acuros CTS, Maslowski et al. 2018,
 Med Phys 45:1899, Section 2.B). Only the primary image (one projection per material present) and the resampling of
 the densities touch the fine grid F.
+
+Densities from the attenuation (`ScatterSolver.material_fields_from_attenuation(X, grid_fine, density_model)`): the
+CITRUS loop has the attenuation X [R, C, S] (1/cm) on F, not the densities. The fields are then built material by
+material: the density model evaluates ONE material's map rho_m = density_model.material(X, m) [R, C, S] at a time,
+which is resampled onto C and Q and dropped, so the largest fine-grid tensor is one material map (never [M, R, C, S],
+7 GB at 256 M voxels). The fields keep X and the model instead of rho_fine; the primary (and the "fine" uncollided
+trace) then trace the materials one map at a time (`MaterialFields.fine_material`). The result equals
+`material_fields(density_model(X), grid_fine)` to float rounding (the resampling is the same matrix products on one
+material instead of seven).
 """
 
 from __future__ import annotations
@@ -47,7 +58,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Iterator, Optional, Sequence, Union
+from typing import Iterator, Optional, Protocol, Sequence, Union
 
 import numpy as np
 import torch
@@ -61,17 +72,19 @@ from .detector import DetectorResponse, GridResponse
 from .geometry import ConeGeometry, Grid, resample_conservative
 from .ray_tracing import Projectors, SiddonProjectors
 from .scatter_image import (DirectionSetContext, combined_scatter_image, make_direction_context, panel_direction_set,
-                            primary_image, scatter_fraction)
+                            primary_from_path_lengths, primary_image, primary_path_lengths, scatter_fraction)
 from .source import SourceModel
 from .source_iteration import SIResult, scatter_moments, scatter_source_fn, source_iteration
 from .transport_sweep import SourceFn, SweepContext, make_sweep_context, sweep
 from .uncollided import (DENSE, FCSamplingCorrection, fc_sampling_correction, fc_source_at_directions,
-                         restrict_fc_to_ld_moments, uncollided_fluence)
+                         restrict_fc_to_ld_moments, uncollided_fluence,
+                         uncollided_from_path_lengths, uncollided_path_lengths)
 
 __all__ = [
     "truncated_library",
     "build_solver_library",
     "coarsen_density",
+    "MaterialDensityModel",
     "MaterialFields",
     "ViewResult",
     "ScatterSolver",
@@ -117,17 +130,31 @@ def coarsen_density(rho_fine: Tensor, grid_fine: Grid, grid_coarse: Grid) -> Ten
 # per-density fields
 # =====================================================================================================
 
+class MaterialDensityModel(Protocol):
+    """What `ScatterSolver.material_fields_from_attenuation` needs of a density model: `material(X, m)` maps the
+    attenuation X [R, C, S] (1/cm) to the density map of library material m, [R, C, S] (g/cm^3), on X's device
+    (e.g. `citrus.citrus.DensityModel`, `utilities.attenuation_to_density`)."""
+
+    def material(self, X: Tensor, m: int) -> Tensor:
+        ...
+
+
 @dataclass(frozen=True, eq=False)
 class MaterialFields:
-    """Everything that depends on the densities only (not on the view). Built by `ScatterSolver.material_fields`.
+    """Everything that depends on the densities only (not on the view). Built by `ScatterSolver.material_fields`
+    (from the fine densities) or `ScatterSolver.material_fields_from_attenuation` (from the attenuation X and a
+    density model, material by material).
 
     grid_fine     fine (reconstruction) grid F
     grid_coarse   transport grid C = Grid.covering(grid_fine, config.transport_cell_cm) (cubic cells, centred on F)
     grid_quad     quadrature grid Q = grid_coarse.refine(q)
     q             effective quadrature points per axis per transport cell (`ScatterSolver.quadrature_points`:
-                  config.fc_points_per_axis bounded by round(transport_cell_cm / largest fine voxel edge))
+                  round(transport_cell_cm / config.quadrature_point_spacing_cm) bounded by round(transport_cell_cm /
+                  largest fine voxel edge))
     rho_fine      [M, R, C, S]        g/cm^3 (M = the library's basis materials); used by the primary (and the
-                                      "fine" uncollided trace) only
+                                      "fine" uncollided trace) only. None when the fields were built from the
+                                      attenuation: then `attenuation` and `density_model` give the fine maps one
+                                      material at a time (`fine_material`)
     rho_coarse    [M, Rc, Cc, Sc]     cell averages on C (conservative overlap resampling, `coarsen_density`)
     rho_quad      [M, Rq, Cq, Sq]     averages over the Q cells (the density each quadrature point represents)
     mu_t_coarse   [G, Rc, Cc, Sc]     group total attenuation on C: sweep and the downstream attenuation of the
@@ -137,7 +164,12 @@ class MaterialFields:
                   quadrature point has at most two nonzero materials (always when Q equals a fine grid obeying the
                   density model's convention); None otherwise: the first-collision source then evaluates all M
                   materials (`fc_pairs`)
-    No [G, ...] field lives on the fine grid.
+    attenuation   [R, C, S]           X (1/cm) on F, or None (fields built from rho_fine)
+    density_model the `MaterialDensityModel` of X, or None
+    fine_materials library indices of the materials with a nonzero fine map (in library order; at least one), set by
+                  `material_fields_from_attenuation`; None for fields built from rho_fine (the primary then finds
+                  them with `uncollided.present_materials`)
+    No [G, ...] field lives on the fine grid; fields built from the attenuation hold no [M, ...] fine field either.
     """
 
     grid_fine: Grid
@@ -150,11 +182,28 @@ class MaterialFields:
     mu_t_coarse: Tensor
     mu_s_l_coarse: Tensor
     pairs_quad: Optional[MaterialPairs] = None
+    attenuation: Optional[Tensor] = None
+    density_model: Optional[MaterialDensityModel] = None
+    fine_materials: Optional[tuple[int, ...]] = None
 
     @property
     def fc_pairs(self):
         """The `pairs` argument of the first-collision functions: pairs_quad, or `uncollided.DENSE` when it is None."""
         return DENSE if self.pairs_quad is None else self.pairs_quad
+
+    @property
+    def num_materials(self) -> int:
+        return int(self.rho_coarse.shape[0])
+
+    def fine_material(self, m: int) -> Tensor:
+        """The fine density map of library material m, [R, C, S] (g/cm^3): rho_fine[m], or (fields built from the
+        attenuation) density_model.material(attenuation, m), evaluated on demand on the dtype of rho_coarse (one map
+        of the fine grid; the caller drops it after use)."""
+        if self.rho_fine is not None:
+            return self.rho_fine[m]
+        if self.attenuation is None or self.density_model is None:
+            raise ValueError("MaterialFields without rho_fine need attenuation and density_model")
+        return self.density_model.material(self.attenuation, int(m)).to(self.rho_coarse.dtype)
 
 
 # =====================================================================================================
@@ -240,7 +289,8 @@ class ScatterSolver:
 
     lib            : MultigroupLibrary with legendre_order >= config.legendre_order (`build_solver_library(config)`).
     config         : SolverConfig (validated here). Used fields: legendre_order, num_polar, num_azimuthal,
-                     transport_cell_cm, fc_points_per_axis, fc_trace_grid, si_tol, si_max_iterations, cone_num_polar,
+                     transport_cell_cm, quadrature_point_spacing_cm, uncollided_trace_grid, si_tol, si_max_iterations,
+                     cone_num_polar,
                      cone_num_azimuthal,
                      direction_chunk (directions per batch in the scatter image AND directions per octant per sweep
                      chunk), dtype (when `dtype` is None).
@@ -292,7 +342,8 @@ class ScatterSolver:
 
     def quadrature_points(self, grid_fine: Grid) -> int:
         """Effective quadrature points per axis per transport cell for this fine grid,
-        `config.quadrature_points(max(grid_fine.deltas))` (fc_points_per_axis bounded by the data resolution)."""
+        `config.quadrature_points(max(grid_fine.deltas))` (round(cell / quadrature_point_spacing_cm) bounded by the data
+        resolution)."""
         return self.config.quadrature_points(max(grid_fine.deltas))
 
     def transport_grid(self, grid_fine: Grid) -> Grid:
@@ -384,15 +435,64 @@ class ScatterSolver:
             pairs_quad=material_pairs_if_compact(rho_q),
         )
 
+    def material_fields_from_attenuation(self, X: Tensor, grid_fine: Grid,
+                                         density_model: MaterialDensityModel) -> MaterialFields:
+        """The `MaterialFields` of the densities density_model(X), built material by material: X [R, C, S] (1/cm,
+        the attenuation on grid_fine) and density_model.material(X, m) -> [R, C, S] g/cm^3 (`MaterialDensityModel`,
+        e.g. `citrus.citrus.DensityModel`). For every library material m the fine map is evaluated, tested for a
+        nonzero value (one host synchronization per material: an absent material is neither resampled nor traced),
+        resampled onto the transport grid C and the quadrature grid Q (`coarsen_density`) into rho_coarse [M, Rc, Cc,
+        Sc] and rho_quad [M, Rq, Cq, Sq], and dropped; then mu_t_coarse, mu_s_l_coarse and pairs_quad as in
+        `material_fields`. The largest fine-grid tensors are X and one material map (plus the density model's own
+        temporaries of that size), never [M, R, C, S]. The fields keep X and the model (rho_fine is None), so the
+        primary and the "fine" uncollided trace evaluate the fine maps again one at a time
+        (`MaterialFields.fine_material`). Equals `material_fields(rho, grid_fine)` with rho the stacked maps to float
+        rounding (identical resampling matrices, applied per material)."""
+        if tuple(X.shape) != tuple(grid_fine.shape):
+            raise ValueError(f"X shape {tuple(X.shape)} != grid shape {grid_fine.shape}")
+        X = X.to(device=self.device, dtype=self.dtype)
+        M = self.lib.num_materials
+        coarse = self.transport_grid(grid_fine)
+        q = self.quadrature_points(grid_fine)
+        quad = coarse.refine(q)
+        rho_c = torch.zeros((M,) + tuple(coarse.shape), device=self.device, dtype=self.dtype)
+        rho_q = rho_c if quad == coarse else torch.zeros((M,) + tuple(quad.shape), device=self.device,
+                                                         dtype=self.dtype)
+        present = []
+        for m in range(M):
+            r = density_model.material(X, m).to(device=self.device, dtype=self.dtype)
+            if tuple(r.shape) != tuple(grid_fine.shape):
+                raise ValueError(f"density_model.material returned {tuple(r.shape)}, expected {grid_fine.shape}")
+            if bool(r.ne(0).any()):
+                present.append(m)
+                rho_c[m] = coarsen_density(r, grid_fine, coarse)
+                if quad != coarse:
+                    rho_q[m] = coarsen_density(r, grid_fine, quad)
+            del r
+        return MaterialFields(
+            grid_fine=grid_fine, grid_coarse=coarse, grid_quad=quad, q=q, rho_fine=None, rho_coarse=rho_c,
+            rho_quad=rho_q, mu_t_coarse=mu_t_volume(self.lib_transport, rho_c),
+            mu_s_l_coarse=transfer_moments_volume(self.lib_transport, rho_c),
+            pairs_quad=material_pairs_if_compact(rho_q), attenuation=X, density_model=density_model,
+            fine_materials=tuple(present) if present else (0,),
+        )
+
     def uncollided(self, fields: MaterialFields, angle: float) -> Tensor:
         """Uncollided fluence phi_uc [G, Rq, Cq, Sq] at the quadrature points (the voxel centers of fields.grid_quad),
-        ray traced from the focal spot (one ray per point) through Q itself (rho_quad; config.fc_trace_grid
+        ray traced from the focal spot (one ray per point) through Q itself (rho_quad; config.uncollided_trace_grid
         "quadrature", the default: material boundaries resolved at the Q spacing), through the transport grid C
         (rho_coarse, "coarse": a boundary inside a cell is smeared over it) or through the fine grid F (rho_fine,
         "fine"). The cost of all three is dominated by the fine-energy transmission, about the same."""
-        if self.config.fc_trace_grid == "fine":
+        if self.config.uncollided_trace_grid == "fine":
+            if fields.rho_fine is None:  # fields from the attenuation: trace the fine maps one at a time
+                mats = list(fields.fine_materials)
+                path = torch.cat([uncollided_path_lengths(self.projectors, fields.fine_material(m)[None],
+                                                          fields.grid_fine, self.geom, angle, fields.grid_quad)
+                                  for m in mats])
+                return uncollided_from_path_lengths(self.lib, path, mats, fields.grid_quad, self.geom, angle,
+                                                    self.source)
             rho, grid = fields.rho_fine, fields.grid_fine
-        elif self.config.fc_trace_grid == "quadrature":
+        elif self.config.uncollided_trace_grid == "quadrature":
             rho, grid = fields.rho_quad, fields.grid_quad
         else:
             rho, grid = fields.rho_coarse, fields.grid_coarse
@@ -489,9 +589,30 @@ class ScatterSolver:
             grid_coarse=fields.grid_coarse)
 
     def primary(self, fields: MaterialFields, angle: float) -> dict[str, Tensor]:
-        """Primary image (exact in energy, on the fine grid)."""
-        return primary_image(self.lib, fields.rho_fine, fields.grid_fine, self.geom, angle, self.source,
-                             self.projectors, self.detector, self.grid_response, n_sub=self.primary_n_sub)
+        """Primary image of a view (exact in energy, Siddon on the fine grid; `scatter_image.primary_image`). For
+        fields built from the attenuation (rho_fine None) the materials present are traced one fine map at a time
+        (`primary_path_lengths` per material, then `primary_from_path_lengths`): the same image to float rounding."""
+        if fields.rho_fine is not None:
+            return primary_image(self.lib, fields.rho_fine, fields.grid_fine, self.geom, angle, self.source,
+                                 self.projectors, self.detector, self.grid_response, n_sub=self.primary_n_sub)
+        mats = list(fields.fine_materials)
+        path = torch.cat([self.primary_path_lengths(fields.fine_material(m)[None], fields.grid_fine, angle)
+                          for m in mats])
+        return self.primary_from_path_lengths(path, mats, angle)
+
+    def primary_path_lengths(self, rho: Tensor, grid_fine: Grid, angle: float) -> Tensor:
+        """`scatter_image.primary_path_lengths` with the solver's projectors and sub-pixel sampling: density maps
+        rho [M', R, C, S] -> line integrals [M', Rd n, Cd n] (g/cm^2)."""
+        return primary_path_lengths(self.projectors, rho.to(self.device, self.dtype), grid_fine, self.geom, angle,
+                                    self.primary_n_sub)
+
+    def primary_from_path_lengths(self, path: Tensor, materials: Optional[Sequence[int]],
+                                  angle: float) -> dict[str, Tensor]:
+        """`scatter_image.primary_from_path_lengths` with the solver's library, geometry, source, detector and grid
+        response: per-material line integrals path [M', Rd n, Cd n] (g/cm^2) of the materials `materials` (library
+        indices; None = all) -> the primary image dict of the view at `angle`."""
+        return primary_from_path_lengths(self.lib, path.to(self.device, self.dtype), materials, self.geom, angle,
+                                         self.source, self.detector, self.grid_response)
 
     # ---- timing ----------------------------------------------------------------------------------
     @contextmanager

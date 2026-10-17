@@ -172,8 +172,9 @@ def test_grid_lowers_scatter_fraction(rho, base_result):
 
 def test_config_validation():
     SolverConfig().validate()
-    for bad in (dict(num_polar=7), dict(num_azimuthal=14), dict(transport_cell_cm=0.0), dict(fc_points_per_axis=0),
-                dict(fc_trace_grid="medium"), dict(si_tol=0.0),
+    for bad in (dict(num_polar=7), dict(num_azimuthal=14), dict(transport_cell_cm=0.0),
+                dict(quadrature_point_spacing_cm=0.0),
+                dict(uncollided_trace_grid="medium"), dict(si_tol=0.0),
                 dict(direction_chunk=0), dict(dtype="float16"), dict(group_edges_kev=(100.0, 10.0))):
         with pytest.raises(ValueError):
             replace(SolverConfig(), **bad).validate()
@@ -306,7 +307,7 @@ def test_transport_cells(rho4, factor):
     coarser transport grids change it by a bounded amount."""
     from citrus.scatter_solver.scatter_image import scatter_image_from_source
 
-    cfg = replace(CFG, transport_cell_cm=2.0 * factor, fc_points_per_axis=factor, fc_trace_grid="fine")
+    cfg = replace(CFG, transport_cell_cm=2.0 * factor, quadrature_point_spacing_cm=2.0, uncollided_trace_grid="fine")
     s = make_solver(cfg)
     r = s.solve_view(rho4, GRID4, 0.0)
     assert r.si.converged
@@ -318,7 +319,7 @@ def test_transport_cells(rho4, factor):
     f = s.material_fields(rho4, GRID4)
     first = s.scatter_image(f, 0.0, s.uncollided(f, 0.0), _zero_mc(s, f))
     # the single-grid image of the FC source on the fine grid, attenuated with the fine mu_t
-    s1 = make_solver(replace(cfg, transport_cell_cm=2.0, fc_points_per_axis=1))
+    s1 = make_solver(replace(cfg, transport_cell_cm=2.0, quadrature_point_spacing_cm=2.0))
     f1 = s1.material_fields(rho4, GRID4)
     phi_uc = s1.uncollided(f1, 0.0)
     fine = scatter_image_from_source(

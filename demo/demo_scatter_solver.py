@@ -71,7 +71,7 @@ def main() -> None:
     seconds = time.perf_counter() - t0
     print(f"grid {grid.shape} at {grid.delta_voxel} cm, transport grid {solver.transport_grid(grid).shape} "
           f"({config.transport_cell_cm:g} cm cells, {solver.quadrature_points(grid)} first-collision points per "
-          f"axis), "
+          f"axis at {config.quadrature_point_spacing_cm:g} cm target spacing), "
           f"panel {geom.num_det_rows} x {geom.num_det_channels}, device {dev}")
     print(f"solve_view: {seconds:.2f} s, {res.si.num_iterations} source iterations "
           f"(converged {res.si.converged}, last change {res.si.history[-1]:.1e})")

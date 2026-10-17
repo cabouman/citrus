@@ -18,7 +18,7 @@ FDK of the uncorrected data (initialization)                 0.317          \-  
 MBIR, no scatter correction                                  0.294          -41 %       0
 MBIR with the true SPR (Y / (1 + SPR_true))                  0.014          0.0 %       0
 one converged scatter estimate from the FDK volume, frozen   0.165          -23 %       5 (once)
-CITRUS, seven-material density model (version 0.1.0)        0.039          +0.6 %      63
+CITRUS, seven-material density model (version 0.1.0)         0.039          +0.6 %      63
 CITRUS (one scatter step per view per outer iteration)       0.043          -1.3 %      50-60
 converged scatter solve of every view in every outer         0.043          -1.2 %      99
 iteration
@@ -45,11 +45,17 @@ Findings:
 The quick demo setting (``demo/demo_citrus.py --views 36 --delta-voxel 1 --outer 10 --scatter-view-stride 1
 --scatter-every 1``: 36 views over a short scan of 202.6 degrees, 1 cm grid, 10 outer iterations) shows the same
 ordering in about two minutes: relative RMSE 0.31 (FDK, Parker-weighted), 0.29 (no correction), 0.064 (CITRUS); over
-a full rotation (``--end-view-angle 360``) 0.32, 0.29 and 0.075.
+a full rotation (``--end-view-angle 360``) 0.32, 0.29 and 0.075 (measured with version 0.1.0 and the data-set format
+1 of citrus <= 0.2.0, SPR with the Siddon primary).
 The demo's defaults (180 views over the short scan, 0.5 cm grid, 80 outer iterations with the scatter step on every
-8th view and at every 8th outer iteration, i.e. 10 scatter steps on 23 views each) reach a relative RMSE of 0.024 over
-the prism and 0.029 in the core (FDK 0.32, no correction 0.29) in 226 s on the RTX 3070 (8.4 s per scatter stage,
-0.8 s per MBIR iteration).
+8th view and at every 8th outer iteration, i.e. 10 scatter steps on 23 views each; data-set format 2, the SPR with the
+MBIRTORCH primary of the loop's default) reach a relative RMSE of 0.0215 over the prism and 0.0259 in the core (FDK
+0.318 / 0.348, no correction 0.292 / 0.355) in 159 s of CITRUS on the RTX 3070 (8.6 s per scatter stage, 0.85 s per
+MBIR iteration, peak 1.64 GB allocated); synthesizing the data set takes 113 s once. With ``--primary-projector
+siddon`` on the same data: 0.0257 / 0.0305. On the format-1 data of version 0.2.0 (SPR with the Siddon primary) the
+Siddon loop gave 0.0242 / 0.0294 and the MBIRTORCH loop 0.0270 / 0.0305: the primary model that matches the data's
+wins (:doc:`method`, "CITRUS coupling"). Resuming MBIR from its error sinogram (the default) changes the
+reconstruction by 1.1e-6 (relative).
 
 Accuracy of the scatter model itself (inverse crime): the synthetic data and the reconstruction loop use the same
 solver, so the remaining discretization error of the solver (per-pixel ray effects of a finite collapsed-cone set,

@@ -64,14 +64,19 @@ Primary
 `primary_image` is exact in energy: it projects the density maps of the materials present (g/cm^2) and sums the
 transmission over the
 library's fine-energy table within each group (`cross_sections.group_transmission`), per sub-ray before the pixel
-average, instead of exp(-int mu_t,g dl) with group-averaged mu_t (within-group beam hardening, -1.4 % at WLAB).
+average, instead of exp(-int mu_t,g dl) with group-averaged mu_t (within-group beam hardening, -1.4 % at WLAB). It is
+the composition of two steps that can be fed separately: `primary_path_lengths` (the projector: per-material density
+line integrals [M', Rd n, Cd n] of the maps given, one material at a time if the caller wishes) and
+`primary_from_path_lengths` (the fine-energy transmission, the source and inverse-square factors and the detector and
+anti-scatter-grid responses). The CITRUS loop feeds the second with MBIRTORCH projections of the material maps of all
+views at once (`citrus.citrus`, CitrusConfig.primary_projector).
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Sequence, Union
 
 import torch
 from torch import Tensor
@@ -97,6 +102,9 @@ __all__ = [
     "box_blur_rows_cols",
     "panel_height_field",
     "coarsen_mu_t",
+    "primary_subpixel_geometry",
+    "primary_path_lengths",
+    "primary_from_path_lengths",
     "primary_image",
     "scatter_fraction",
 ]
@@ -801,52 +809,68 @@ def combined_scatter_image(lib: MultigroupLibrary, rho_quad: Tensor, phi_uc_quad
 # primary
 # =====================================================================================================
 
-def primary_image(lib: MultigroupLibrary, rho: Tensor, grid: Grid, geom: ConeGeometry, angle: float,
-                  source: SourceModel, projectors: Projectors, detector: DetectorResponse,
-                  grid_response: GridResponse, n_sub: Optional[int] = None) -> dict[str, Tensor]:
-    """Primary image, per group at the pixels, exact in energy:
+def primary_subpixel_geometry(geom: ConeGeometry, n_sub: int) -> ConeGeometry:
+    """The panel of n_sub times finer pixels on which `primary_path_lengths` traces the n_sub^2 sub-rays of every
+    pixel: sub-pixel (i, j) of pixel (r, c) is pixel (r n + i, c n + j) of the returned geometry (same panel, same
+    offsets). n_sub = 1 returns geom itself."""
+    n = int(n_sub)
+    if n < 1:
+        raise ValueError("n_sub must be >= 1")
+    if n == 1:
+        return geom
+    return replace(geom, num_det_rows=geom.num_det_rows * n, num_det_channels=geom.num_det_channels * n,
+                   delta_det_row=geom.delta_det_row / n, delta_det_channel=geom.delta_det_channel / n)
 
-        fluence_g(u)        = b(Omega_p) / |r_D - r_0|^2 T_g(u)                                photons/cm^2
-        T_g(u)              = < sum_{E in g} w_E exp(-sum_m P_m m_m(E)) >_pixel
-        planar_fluence_g(u) = cos(theta0(u)) fluence_g(u)                                     photons/cm^2
-        signal_g(u)         = planar_fluence_g(u) G_g(theta1, theta2) D_g(theta0)            keV/cm^2
 
-    P_m = int_{r_0}^{r_D} rho_m dl: line integrals of the density maps (g/cm^2; one projection per material PRESENT,
-    `projectors.primary_project(rho[present])`, `uncollided.present_materials`), w_E / m_m(E) the library's fine-energy table (lib.fine_weight,
-    lib.fine_mu_t; `cross_sections.group_transmission`). fluence_g is the fine-energy sum within group g, so the
-    per-group detector and grid responses (at lib.group_energy) apply, and fluence.sum(0) /
-    planar_fluence.sum(0) is the exact polychromatic primary (up to the fine quadrature; the group-averaged
-    exp(-int mu_t,g dl) ignores within-group beam hardening).
-    theta0(u) = angle between Omega_p and the inward panel normal (per incident photon responses, module docstring).
-
-    with Omega_p the direction focal spot -> pixel center. The grid angles come from `grid_angles` for the
-    primary direction (theta1 = 0 when the grid is focused at the focal spot; theta2 = -atan(u/SDD)).
-    n_sub: sub-pixel sampling per axis (None: the projector's own `n_sub` attribute, 1 if it has none). With
-    n > 1 the density line integrals are traced to the n x n midpoint lattice of sub-pixel centers (a panel of
-    n-times finer pixels), the fine-energy transmission is formed per sub-ray and THEN averaged over the pixel
-    (<.>_pixel above: the exact pixel-averaged transmission, no -log(mean(exp)) per group); the 1/r^2 and b
-    factors are evaluated at the pixel center.
-    rho [M, rows, cols, slices]. Returns dict with fluence [G, Rd, Cd], planar_fluence [G, Rd, Cd],
-    signal_per_group [G, Rd, Cd], signal [Rd, Cd].
-    """
-    dev, dt = rho.device, rho.dtype
+def _primary_n_sub(projectors: Projectors, n_sub: Optional[int]) -> int:
     n = int(n_sub) if n_sub is not None else int(getattr(projectors, "n_sub", 1) or 1)
     if n < 1:
         raise ValueError("n_sub must be >= 1")
-    Rd, Cd = geom.num_det_rows, geom.num_det_channels
-    geom_sub = geom if n == 1 else replace(geom, num_det_rows=Rd * n, num_det_channels=Cd * n,
-                                           delta_det_row=geom.delta_det_row / n,
-                                           delta_det_channel=geom.delta_det_channel / n)
-    # sub-pixel (i, j) of pixel (r, c) is pixel (r n + i, c n + j) of geom_sub: same panel, same offsets
-    if int(rho.shape[0]) != lib.num_materials:
-        raise ValueError(f"rho has {int(rho.shape[0])} materials, the library {lib.num_materials}")
-    present = present_materials(rho)
-    src = rho if present is None else rho[present]
+    return n
+
+
+def primary_path_lengths(projectors: Projectors, rho: Tensor, grid: Grid, geom: ConeGeometry, angle: float,
+                         n_sub: Optional[int] = None) -> Tensor:
+    """Primary density line integrals P_m = int_{r_0}^{r_D} rho_m dl (g/cm^2) from the focal spot to the pixel (or
+    sub-pixel) centers: rho [M', R, C, S] (g/cm^3; any subset of the materials, e.g. one map at a time, or the maps
+    of the materials present) on `grid` -> [M', Rd n, Cd n] on the sub-pixel panel `primary_subpixel_geometry(geom,
+    n)`. n_sub: sub-pixel sampling per axis (None: the projector's own `n_sub` attribute, 1 if it has none); the
+    projector's own sub-sampling is switched off (the sub-rays are traced as pixels of the finer panel and the pixel
+    average is taken AFTER the fine-energy transmission, by `primary_from_path_lengths`). The projector is linear and
+    acts channel by channel, so tracing the materials one at a time and concatenating gives the same path lengths."""
+    n = _primary_n_sub(projectors, n_sub)
+    geom_sub = primary_subpixel_geometry(geom, n)
     if getattr(projectors, "n_sub", None) is not None:  # disable the projector's own sub-sampling
-        path = projectors.primary_project(src, grid, geom_sub, angle, n_sub=1)  # [M', Rd n, Cd n] g/cm^2
-    else:
-        path = projectors.primary_project(src, grid, geom_sub, angle)
-    trans = group_transmission(lib, path, materials=present)  # [G, Rd n, Cd n]
+        return projectors.primary_project(rho, grid, geom_sub, angle, n_sub=1)  # [M', Rd n, Cd n] g/cm^2
+    return projectors.primary_project(rho, grid, geom_sub, angle)
+
+
+def primary_from_path_lengths(lib: MultigroupLibrary, path: Tensor, materials: Optional[Sequence[int]],
+                              geom: ConeGeometry, angle: float, source: SourceModel, detector: DetectorResponse,
+                              grid_response: GridResponse) -> dict[str, Tensor]:
+    """Primary image of one view from its per-material density line integrals (the second half of `primary_image`):
+
+        T_g(u)              = < sum_{E in g} w_E exp(-sum_m P_m m_m(E)) >_pixel        (`group_transmission`)
+        fluence_g(u)        = b(Omega_p) / |r_D - r_0|^2 T_g(u)                          photons/cm^2
+        planar_fluence_g(u) = cos(theta0(u)) fluence_g(u)                               photons/cm^2
+        signal_g(u)         = planar_fluence_g(u) G_g(theta1, theta2) D_g(theta0)      keV/cm^2
+
+    path: [M', Rd n, Cd n] line integrals P_m (g/cm^2) on the panel refined n times per axis (n >= 1 inferred from the
+    shape, `primary_subpixel_geometry`; the transmission is averaged over the n x n sub-pixels of every pixel), from
+    any projector: `primary_path_lengths` (Siddon, one ray to each (sub-)pixel center) or a pixel-averaged projector
+    such as MBIRTORCH's (`citrus.citrus.mbirtorch_primary_signals`, n = 1). materials: library indices of the rows of
+    path (None = all materials in library order; an absent material contributes nothing, so the rows of the materials
+    present suffice). The 1/r^2 and b factors and the responses are evaluated at the pixel centers, the grid angles
+    from `grid_angles` for the primary direction (theta1 = 0 when the grid is focused at the focal spot;
+    theta2 = -atan(u/SDD)), theta0(u) the angle between Omega_p and the inward panel normal. Returns dict with fluence
+    [G, Rd, Cd], planar_fluence [G, Rd, Cd], signal_per_group [G, Rd, Cd], signal [Rd, Cd], in the dtype and on the
+    device of path."""
+    dev, dt = path.device, path.dtype
+    Rd, Cd = geom.num_det_rows, geom.num_det_channels
+    n = int(path.shape[1]) // Rd if path.dim() == 3 else 0
+    if n < 1 or tuple(path.shape[1:]) != (Rd * n, Cd * n):
+        raise ValueError(f"path must be [M', {Rd} n, {Cd} n] (n >= 1 sub-pixels per axis), got {tuple(path.shape)}")
+    trans = group_transmission(lib, path, materials=materials)  # [G, Rd n, Cd n]
     if n > 1:
         trans = trans.reshape(-1, Rd, n, Cd, n).mean(dim=(2, 4))
     pix = geom.pixel_centers(angle, dev, dt)
@@ -864,6 +888,45 @@ def primary_image(lib: MultigroupLibrary, rho: Tensor, grid: Grid, geom: ConeGeo
     g_resp = grid_response.at(e_g, th1, th2)
     spg = planar * g_resp * d_resp
     return {"fluence": fluence, "planar_fluence": planar, "signal_per_group": spg, "signal": spg.sum(0)}
+
+
+def primary_image(lib: MultigroupLibrary, rho: Tensor, grid: Grid, geom: ConeGeometry, angle: float,
+                  source: SourceModel, projectors: Projectors, detector: DetectorResponse,
+                  grid_response: GridResponse, n_sub: Optional[int] = None) -> dict[str, Tensor]:
+    """Primary image, per group at the pixels, exact in energy:
+
+        fluence_g(u)        = b(Omega_p) / |r_D - r_0|^2 T_g(u)                                photons/cm^2
+        T_g(u)              = < sum_{E in g} w_E exp(-sum_m P_m m_m(E)) >_pixel
+        planar_fluence_g(u) = cos(theta0(u)) fluence_g(u)                                     photons/cm^2
+        signal_g(u)         = planar_fluence_g(u) G_g(theta1, theta2) D_g(theta0)            keV/cm^2
+
+    P_m = int_{r_0}^{r_D} rho_m dl: line integrals of the density maps (g/cm^2; one projection per material PRESENT,
+    `projectors.primary_project(rho[present])`, `uncollided.present_materials`), w_E / m_m(E) the library's fine-energy
+    table (lib.fine_weight, lib.fine_mu_t; `cross_sections.group_transmission`). fluence_g is the fine-energy sum
+    within group g, so the per-group detector and grid responses (at lib.group_energy) apply, and fluence.sum(0) /
+    planar_fluence.sum(0) is the exact polychromatic primary (up to the fine quadrature; the group-averaged
+    exp(-int mu_t,g dl) ignores within-group beam hardening).
+    theta0(u) = angle between Omega_p and the inward panel normal (per incident photon responses, module docstring).
+
+    with Omega_p the direction focal spot -> pixel center. The grid angles come from `grid_angles` for the
+    primary direction (theta1 = 0 when the grid is focused at the focal spot; theta2 = -atan(u/SDD)).
+    n_sub: sub-pixel sampling per axis (None: the projector's own `n_sub` attribute, 1 if it has none). With
+    n > 1 the density line integrals are traced to the n x n midpoint lattice of sub-pixel centers (a panel of
+    n-times finer pixels), the fine-energy transmission is formed per sub-ray and THEN averaged over the pixel
+    (<.>_pixel above: the exact pixel-averaged transmission, no -log(mean(exp)) per group); the 1/r^2 and b
+    factors are evaluated at the pixel center.
+    Equals `primary_from_path_lengths(lib, primary_path_lengths(projectors, rho[present], grid, geom, angle, n_sub),
+    present, geom, angle, source, detector, grid_response)`.
+    rho [M, rows, cols, slices]. Returns dict with fluence [G, Rd, Cd], planar_fluence [G, Rd, Cd],
+    signal_per_group [G, Rd, Cd], signal [Rd, Cd].
+    """
+    _primary_n_sub(projectors, n_sub)
+    if int(rho.shape[0]) != lib.num_materials:
+        raise ValueError(f"rho has {int(rho.shape[0])} materials, the library {lib.num_materials}")
+    present = present_materials(rho)
+    src = rho if present is None else rho[present]
+    path = primary_path_lengths(projectors, src, grid, geom, angle, n_sub)  # [M', Rd n, Cd n] g/cm^2
+    return primary_from_path_lengths(lib, path, present, geom, angle, source, detector, grid_response)
 
 
 def scatter_fraction(scatter_signal: Tensor, primary_signal: Tensor) -> Tensor:

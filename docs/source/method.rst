@@ -59,13 +59,37 @@ Grids. Following Acuros CTS (Maslowski et al. 2018, Med. Phys. 45:1899, Section 
 every step of the scatter solve: the transport grid C of cubic cells of edge ``transport_cell_cm`` (default 1 cm)
 covering the reconstruction box, whatever the reconstruction voxel size (:doc:`conventions`, "Grids"). The
 first-collision source is integrated over each cell with :math:`q^3` equal-weight points on the midpoint lattice
-(the quadrature grid Q = C refined :math:`q` times; :math:`q` = ``fc_points_per_axis``, default 2, bounded by the
-data resolution: at most round(cell / fine voxel), so 1 cm voxels in 1 cm cells use :math:`q = 1`), with the densities
+(the quadrature grid Q = C refined :math:`q` times; :math:`q` = round(cell / ``quadrature_point_spacing_cm``), points
+about 0.5 cm apart by default: 2 per axis in 1 cm cells, 4 in 2 cm cells, 1 in 0.5 cm cells; bounded by the data
+resolution: at most round(cell / fine voxel), so 1 cm voxels in 1 cm cells use :math:`q = 1`), with the densities
 of each point the exact average of the fine densities over its :math:`(\Delta_C/q)^3` sub-cell (conservative overlap
 resampling, mass conserving for any ratio of voxel to cell size). :math:`\phi_{UC}` is evaluated at the Q points by
-tracing the resampled density maps from the focal spot through Q (``fc_trace_grid = "quadrature"``, default; "coarse"
-traces through C, which smears a material boundary inside a cell, "fine" through the reconstruction grid). The cost of every first-order step is :math:`q^3` points per cell,
-independent of the fine grid; only the primary image is computed on the fine grid.
+tracing the resampled density maps from the focal spot through Q (``uncollided_trace_grid = "quadrature"``, default;
+"coarse" traces through C, which smears a material boundary inside a cell, "fine" through the reconstruction grid).
+The cost of every first-order step is :math:`q^3` points per cell, independent of the fine grid; only the primary
+image is computed on the fine grid. In the CITRUS loop the densities themselves never exist on the fine grid as a
+whole: the density model of the reconstruction :math:`X` (below) is evaluated one material map at a time, each map
+resampled onto C and Q and dropped (``ScatterSolver.material_fields_from_attenuation``), and the primary projects the
+maps one at a time again.
+
+Quadrature point spacing (WLAB, 0.5 cm voxels, converged solves, relative L2 difference of the detector scatter
+signal, AP / lateral view; ``uncollided_trace_grid`` "quadrature" against the "fine" trace at the largest
+:math:`q`, which equals it here because Q is then the reconstruction grid):
+
+=====================  ===================  =======================  =================
+cells                  q (spacing)          difference               time per view
+=====================  ===================  =======================  =================
+2 cm                   1 (2 cm)             1.1 % / 0.59 %           0.19 / 0.21 s
+2 cm                   2 (1 cm)             0.40 % / 0.22 %          0.20 / 0.22 s
+2 cm                   4 (0.5 cm, default)  reference                0.35 / 0.36 s
+1 cm                   1 (1 cm)             0.25 % / 0.09 %          0.40 / 0.44 s
+1 cm                   2 (0.5 cm, default)  reference                0.59 / 0.61 s
+1 cm, 0.25 cm voxels   1 / 2 vs 3           0.20 % / 0.08 %,         0.41 / 0.58 vs
+                                            0.05 % / 0.06 %          1.08 s
+=====================  ===================  =======================  =================
+
+The cell size itself matters far more than the points per cell: the converged scatter image with 2 cm cells (q = 4)
+differs from the one with 1 cm cells (q = 2) by 3.6 % (AP) and 9.5 % (lateral).
 
 Multigroup and spherical-harmonic discretization
 ------------------------------------------------
@@ -210,7 +234,11 @@ The detector and grid responses are per incident photon: the signal of group :ma
 with :math:`\theta_0` the angle to the panel normal, :math:`D` the detector response (keV deposited per photon) and
 :math:`G` the anti-scatter-grid transmission at the grid angles. The primary image uses the same rule with the
 per-pixel direction from the focal spot and the exact-in-energy transmission of the density line integrals,
-averaged over sub-pixel rays after the energy sum. The scatter fraction is :math:`S/(P+S)`.
+averaged over sub-pixel rays after the energy sum. The scatter fraction is :math:`S/(P+S)`. The primary is computed in
+two steps, the per-material line integrals :math:`P_m = \int \rho_m\,dl` (a projector) and the transmission with the
+responses (``scatter_image.primary_from_path_lengths``), so any projector can feed it: the solver's Siddon ray to the
+pixel centre (``primary_path_lengths``, the reference of ``solve_view``) or MBIRTORCH's pixel-averaged
+separable-footprint projector (the CITRUS loop's default, below).
 
 CITRUS coupling
 ---------------
@@ -287,7 +315,7 @@ in every outer iteration :math:`k` the step
 
    \phi_{UC} = G_1(\rho_k), \qquad \Phi_v \leftarrow \phi^{(1)}(\rho_k) + K(\rho_k)\,\Phi_v
    \quad(\text{one sweep of the summed sources}), \qquad
-   s_v, p_v = \text{scatter and primary images of } (\phi_{UC}, \Phi_v).
+   s_v = \text{scatter image of } (\phi_{UC}, \Phi_v), \qquad p_v = \text{primary image of } \rho_k.
 
 With the densities held fixed, :math:`N` steps give :math:`\Phi^{(N)} = \sum_{n=1}^{N} K^{n-1}\phi^{(1)}`, exactly the
 source iteration truncated after :math:`N` sweeps (tested), so the scatter estimate converges together with the
@@ -300,6 +328,27 @@ polychromatic primary and MBIR's monoenergetic model, and it only rescales the n
 :math:`W = Y/I_0` of the measured counts are the exact weights of :math:`y_c = -\log(Y_c/I_0)`. One warm-started MBIR
 (VCD) iteration at partition-schedule position :math:`k` on :math:`y_c` gives :math:`X_{k+1}`; the regularization is
 estimated once and frozen. The loop starts from the FDK reconstruction of the uncorrected data.
+
+Densities and primary of the loop. :math:`\rho_k` is the density model of :math:`X_k`, evaluated one material at a
+time (no seven-material volume on the reconstruction grid). The primaries :math:`p_v` of all views come from one pass
+per material present: its map is projected onto all views (in chunks of views whose path lengths stay within one
+sinogram) and the per-view transmission is formed from the stacked line integrals (``CitrusConfig.primary_projector``:
+"mbirtorch", the default, MBIRTORCH's pixel-averaged line integrals, the reconstruction's own operator; "siddon", the
+solver's ray to each pixel centre, as in ``solve_view``). The two agree to 0.9 % (relative L2 over the 180 views of
+the WLAB study; median pixel 0.05 %) except on the pixels whose ray grazes a face of the prism, where a centre ray and
+a pixel average differ by up to a factor 5 in transmission; the pixel-integrated primary is the physical model of a
+detector pixel, so it is the default. The synthetic data (``utilities.synthesize_cone_beam_data``, data-set format 2)
+define their scatter as :math:`\mathrm{SPR}\cdot P` with the SPR's primary from the same model as the loop's default;
+with the other model the correction is inconsistent with the data on the silhouette pixels (RMS 0.8 % of the corrected
+line integrals at the true densities, up to 0.87 on single pixels). On the demo's default data (format 2) CITRUS
+reaches 0.0215 / 0.0259 relative RMSE (whole prism / core) with the MBIRTORCH primary and 0.0257 / 0.0305 with the
+Siddon primary; on the format-1 data of version 0.2.0 (SPR with the Siddon primary) the two give 0.0270 / 0.0305 and
+0.0242 / 0.0294: the consistent primary wins by 0.003-0.004 either way.
+
+MBIR resume. Between outer iterations the loop keeps MBIRTORCH's error sinogram :math:`e = y_c - A X` (as
+:math:`-AX`, one sinogram) and resumes MBIRTORCH's VCD engine from it instead of recomputing it with a forward
+projection; a new corrected sinogram only shifts it (``CitrusConfig.resume_error_sinogram``, default on; the
+reconstruction equals the restarted one to float rounding, 1e-6 relative).
 
 Short scans. The views are evenly spaced over :math:`[\beta_s, \beta_e)`; the default range of the synthetic data is a
 short scan, :math:`\beta_e = \beta_s + \pi + 2\gamma_m` with :math:`2\gamma_m = 2\arctan(N_c \Delta_c / (2\,
@@ -323,8 +372,8 @@ computed views,
    s_v = \max\Big(0,\ \sum_{j\in\mathcal C} w_{vj}\, s_j\Big), \qquad
    \mathrm{SPR}_v = s_v / p_v,
 
-with :math:`p_v` the solver's primary image of view :math:`v` (a ray trace of the current densities, no transport, so
-cheap) and weights :math:`w_{vj}` that are circular in angle (period :math:`2\pi`) for a full rotation; for a short
+with :math:`p_v` the primary image of view :math:`v` (a projection of the current densities, no transport, so
+cheap; computed for every view) and weights :math:`w_{vj}` that are circular in angle (period :math:`2\pi`) for a full rotation; for a short
 scan they run along the arc (the views beyond the last computed view keep its value; the cubic's ghost nodes at the
 ends are linear extrapolations). With :math:`t\in[0,1)` the
 fractional position of the view between its two bracketing computed views :math:`j_0, j_1`

@@ -7,7 +7,7 @@
                             data, plotting helpers
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .citrus import (CitrusConfig, CitrusState, citrus_recon, citrus_step, mbir_recon)  # noqa: E402
 
