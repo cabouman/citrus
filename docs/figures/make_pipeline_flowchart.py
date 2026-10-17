@@ -164,7 +164,7 @@ def build() -> str:
 
     # row A: material densities; schedule note
     dens = add_box(slide, 3.5, 1.0, 5.2, 1.05,
-                   "Material densities ρ(Xₖ)\neach voxel a mixture of the two anchor materials\n"
+                   "Material densities ρ(Xₖ)\neach voxel a mixture of the two reference materials\n"
                    "whose attenuations bracket its value", "density")
     add_box(slide, 9.0, 1.0, 3.75, 1.05,
             "Schedule\nscatter step at every n-th outer iteration;\nscatter on every m-th view, the others\n"
@@ -244,7 +244,8 @@ def build() -> str:
 
     # caption
     add_label(slide, 0.35, 6.75, 9.5, 0.5,
-              "CITRUS: Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter.  With X held fixed, "
+              "CITRUS: Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter.  "
+              "With X held fixed, "
               "N outer iterations reproduce N source\niterations of the transport solver, so the scatter estimate "
               "converges together with the reconstruction for one sweep per view per outer iteration.",
               color="404040", size=9, italic=True)

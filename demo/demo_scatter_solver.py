@@ -4,12 +4,12 @@
                                        [--panel small|full] [--grid] [--device cuda] [--memory-cap-mib 4400]
                                        [--materials air,lung,adipose,water,muscle,soft_tissue,bone]
 
-Builds the multigroup library of the anchor materials (``--materials``: comma-separated names of
+Builds the multigroup library of the reference materials (``--materials``: comma-separated names of
 citrus.scatter_solver.cross_sections.MATERIAL_CATALOGUE, at least two, water and bone among them; default the seven
 air, lung, adipose, water, muscle, soft_tissue, bone) from XrayPhysics (cached in $CITRUS_CACHE_DIR or
 ~/.cache/citrus; about 16 s on the first run for seven materials), rasterizes the WLAB phantom (30 x 20 x 40 cm water
 prism with lung, air and bone inserts, in the library's material basis: its water and bone rows; the result does not
-depend on the other anchors), solves one view with the default solver
+depend on the other reference materials), solves one view with the default solver
 configuration (6 groups, P7, 8 x 16 sweep directions, 16 x 32 collapsed-cone directions), and plots the primary and
 scatter detector signals, the scatter fraction and central-row profiles to demo/output/scatter_solver_view.png.
 """
@@ -50,7 +50,7 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--memory-cap-mib", type=float, default=4400.0, help="PyTorch CUDA memory cap (0: none)")
     parser.add_argument("--materials", default=",".join(SolverConfig().materials),
-                        help="anchor materials of the library, comma-separated names from the catalogue "
+                        help="reference materials of the library, comma-separated names from the catalogue "
                              f"({', '.join(MATERIAL_CATALOGUE)}); at least two, water and bone among them (default: "
                              f"{','.join(SolverConfig().materials)})")
     parser.add_argument("--out", default=OUT_DIR)

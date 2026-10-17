@@ -8,7 +8,7 @@ outer iteration k, ONE scatter step per view and ONE warm-started MBIR iteration
     X_0      = FDK(-log(Y / I0))                                    (the uncorrected data; Parker-weighted for a
                                                                      short scan)
     for k = 0 .. N-1:
-        rho_k            = densities(X_k)                            interpolating model between the library's anchor
+        rho_k            = densities(X_k)                            interpolating model between the library's reference
                                                                      materials at E_eff, resampled onto the transport
                                                                      and quadrature grids material by material (never
                                                                      [M, R, C, S])
@@ -38,7 +38,7 @@ estimate was computed n - 1 outer iterations ago). The collided transport is the
 scatter solve; CITRUS spends one sweep per view per outer iteration instead of a full source iteration.
 
 Densities and primary (versions 0.3.0 and 0.5.0): the loop never forms the density volume [M, R, C, S] of the M
-anchor materials on the reconstruction grid (7 GB at 256 M voxels for the default seven).
+reference materials on the reconstruction grid (7 GB at 256 M voxels for the default seven).
 `ScatterSolver.material_fields_from_attenuation(X_k, grid, density)` evaluates one material's map at a time
 (`DensityModel.material`, bit for bit the row of the full model) and resamples it onto the transport and quadrature
 grids. The primary signal of every view is the MBIRTORCH per-material primary: the path lengths P_m = A rho_m
@@ -377,11 +377,13 @@ def primary_signals(solver: ScatterSolver, fields: MaterialFields, angles: Union
 
 @dataclass
 class DensityModel:
-    """X (1/cm, MBIR's monoenergetic attenuation at E_eff) -> rho [M, ...] (g/cm^3, the library's M anchor materials,
+    """X (1/cm, MBIR's monoenergetic attenuation at E_eff) -> rho [M, ...] (g/cm^3, the library's M reference materials,
     `library.materials`: by default air, lung, adipose, water, muscle, soft tissue, cortical bone; any set chosen with
     `SolverConfig.materials`) for the solver: `utilities.attenuation_to_densities` (the interpolating model at E_eff:
-    the two anchors whose nominal attenuations bracket X, at most two per voxel, a pure-bone voxel stays pure bone;
-    below the lowest anchor that anchor alone of reduced density, above the highest that anchor alone, denser) after
+    the two reference materials whose nominal attenuations bracket X, at most two per voxel, a pure-bone voxel stays
+    pure bone;
+    below the lowest reference material that reference material alone of reduced density, above the highest that
+    reference material alone, denser) after
     clamping X at 0 (FDK undershoot, noise). `last_negative_fraction` = fraction of voxels clamped in the last call
     (`__call__` or `negative_fraction`). `material(X, m)` evaluates one material's map [R, C, S] (bit for bit the row
     m of the full model, `utilities.attenuation_to_density`): the `scatter_solver.MaterialDensityModel` of
@@ -394,7 +396,7 @@ class DensityModel:
 
     @classmethod
     def from_library(cls, library: MultigroupLibrary, energy_kev: Optional[float] = None) -> "DensityModel":
-        """The model of `library` (its anchor materials `library.materials` and their nominal densities): E_eff =
+        """The model of `library` (its reference materials `library.materials` and their nominal densities): E_eff =
         energy_kev, or the spectrum-mean energy of the library (63.03 keV for the default spectrum)."""
         return cls(library, effective_energy(library) if energy_kev is None else float(energy_kev))
 

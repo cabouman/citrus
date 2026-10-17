@@ -21,10 +21,11 @@ class SolverConfig:
       num_eta_table     points of the tabulated per-steradian transfer in eta = cos(scattering angle)
 
     Materials
-      materials         names of the ANCHOR materials of the density model, from `cross_sections.MATERIAL_CATALOGUE`
+      materials         names of the REFERENCE materials of the density model, from `cross_sections.MATERIAL_CATALOGUE`
                         (at least two, any order): the library is built for exactly this set (`build_solver_library`,
                         `utilities.wlab_solver`; sorted by nominal attenuation, its cache key holds the set), and the
-                        density model interpolates between the two anchors whose nominal attenuations bracket a voxel
+                        density model interpolates between the two reference materials whose nominal attenuations
+                        bracket a voxel
                         (`citrus.utilities.attenuation_to_densities`). Default: the seven `cross_sections.MATERIALS`
                         (air, lung, adipose, water, muscle, soft_tissue, bone), the library of earlier versions
 

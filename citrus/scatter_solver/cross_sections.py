@@ -50,17 +50,22 @@ spectrum-mean energy 63.03 keV of the default 125 kVp spectrum is listed for ori
 and polyethylene; it has no brain, blood, skin, cartilage or spongiosa, which come from the ICRU-44 and Woodard-White
 tables as cited, the ICRU-44 ones as tabulated by Hubbell and Seltzer, NISTIR 5632.)
 
-ANCHOR materials. The library is built for a chosen subset of the catalogue, the anchors of the density model
+REFERENCE materials. The library is built for a chosen subset of the catalogue, the reference materials of the density
+model
 (`config.SolverConfig.materials`, at least two names; default the seven `MATERIALS`):
 
     air 0.0012, lung 0.26, adipose 0.95, water 1.0, muscle 1.05, soft tissue 1.06, cortical bone 1.85
 
-The builder sorts the anchors by nominal attenuation (`cross_section_library.sort_material_table`) and asserts that
+The builder sorts the reference materials by nominal attenuation (`cross_section_library.sort_material_table`) and
+asserts that
 the order is the same at every energy of the library (10-125 keV, `cross_section_library.check_material_order`: no
-two anchors cross), so `MultigroupLibrary.materials` is always in order of INCREASING attenuation at the nominal
-density. Density maps are rho [M, rows, cols, slices] with M = the number of anchors, in the library's order (look a
+two reference materials cross), so `MultigroupLibrary.materials` is always in order of INCREASING attenuation at the
+nominal
+density. Density maps are rho [M, rows, cols, slices] with M = the number of reference materials, in the library's
+order (look a
 row up by name: `material_index(library, "water")`); every coefficient is linear in rho. The density model
-(`citrus.utilities.attenuation_to_densities`) gives every voxel at most two nonzero materials, the two anchors whose
+(`citrus.utilities.attenuation_to_densities`) gives every voxel at most two nonzero materials, the two reference
+materials whose
 nominal attenuations bracket the voxel's attenuation; the first-collision source works on that compact pair
 representation (`MaterialPairs`, `material_pairs`) wherever its evaluation points have at most two nonzero materials
 (`material_pairs_if_compact`; block means of such a field can mix more, and are then evaluated densely over all M
@@ -115,7 +120,8 @@ _CARTILAGE_WOODARD_WHITE = "0.096*H + 0.099*C + 0.022*N + 0.744*O + 0.005*Na + 0
 _CARBON_FIBRE_EPOXY = "0.692*C + 0.308*C21H24O4"
 
 MATERIAL_CATALOGUE: Mapping[str, tuple[float, str]] = MappingProxyType({
-    # name: (nominal density g/cm^3, XrayPhysics composition); the first seven are the default anchors `MATERIALS`
+    # name: (nominal density g/cm^3, XrayPhysics composition); the first seven are the default reference materials
+    # `MATERIALS`
     "air": (0.0012, _AIR_XRAYPHYSICS),
     "lung": (0.26, _LUNG_XRAYPHYSICS),
     "adipose": (0.95, _ADIPOSE_XRAYPHYSICS),
@@ -135,19 +141,21 @@ MATERIAL_CATALOGUE: Mapping[str, tuple[float, str]] = MappingProxyType({
     "carbon_fibre": (1.56, _CARBON_FIBRE_EPOXY),
 })
 
-# The default anchors, in library order = increasing attenuation at nominal density. Muscle is BELOW soft tissue at
+# The default reference materials, in library order = increasing attenuation at nominal density. Muscle is BELOW soft
+# tissue at
 # every energy (ICRU-44 muscle has the lower density and nearly the same composition: attenuation ratio 0.986-0.991
 # over 10-125 keV).
 MATERIALS: tuple[str, ...] = ("air", "lung", "adipose", "water", "muscle", "soft_tissue", "bone")
 MATERIAL_TABLE: tuple[tuple[str, float], ...] = tuple((n, MATERIAL_CATALOGUE[n][0]) for n in MATERIALS)
 NOMINAL_DENSITIES: tuple[float, ...] = tuple(float(d) for _, d in MATERIAL_TABLE)
-# rows of water and bone in the DEFAULT anchors (3, 6); for any library use material_index(library, "water")
+# rows of water and bone in the DEFAULT reference materials (3, 6); for any library use material_index(library, "water")
 WATER, BONE = MATERIALS.index("water"), MATERIALS.index("bone")
 ELECTRON_REST_KEV = 510.998950
 
 
 def check_material_names(names: Sequence[str], minimum: int = 2) -> tuple[str, ...]:
-    """The anchor names as a tuple after checking them: a sequence (not a single string) of at least `minimum`
+    """The reference material names as a tuple after checking them: a sequence (not a single string) of at least
+    `minimum`
     distinct names of `MATERIAL_CATALOGUE`. Raises ValueError naming the problem (and the catalogue for an unknown
     name)."""
     if isinstance(names, str) or not isinstance(names, Sequence):
@@ -160,7 +168,7 @@ def check_material_names(names: Sequence[str], minimum: int = 2) -> tuple[str, .
     if len(set(names)) != len(names):
         raise ValueError(f"duplicate material names in {names}")
     if len(names) < minimum:
-        raise ValueError(f"the density model interpolates between at least {minimum} anchor materials, got {names}")
+        raise ValueError(f"the density model interpolates between at least {minimum} reference materials, got {names}")
     return names
 
 
@@ -174,7 +182,8 @@ def material_table(names: Sequence[str] = MATERIALS) -> tuple[tuple[str, float, 
 
 def material_index(materials: Union["MultigroupLibrary", Sequence[str]], name: str) -> int:
     """Row of material `name` in a library (`library.materials`) or in a sequence of names. Raises ValueError naming
-    the available materials when it is absent (e.g. a WLAB phantom for a set of anchors without water or bone)."""
+    the available materials when it is absent (e.g. a WLAB phantom for a set of reference materials without water or
+    bone)."""
     names = tuple(materials.materials if isinstance(materials, MultigroupLibrary) else materials)
     if name not in names:
         raise ValueError(f"material {name!r} is not among the materials {names}")
@@ -185,7 +194,7 @@ def material_index(materials: Union["MultigroupLibrary", Sequence[str]], name: s
 class MultigroupLibrary:
     """Per-unit-density (mass) multigroup coefficients for the basis materials.
 
-    Shapes (M = number of anchor materials, 7 for the default `MATERIALS`; G = groups, L = Legendre order):
+    Shapes (M = number of reference materials, 7 for the default `MATERIALS`; G = groups, L = Legendre order):
       group_edges        [G+1]        keV, descending
       group_energy       [G]          representative (spectrum-weighted mean) energy per group, keV
       spectrum_fraction  [G]          f_g, sums to 1 (source photons per steradian per group)

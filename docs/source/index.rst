@@ -71,7 +71,7 @@ How it works
    iteration's higher-order scatter, divides the measured data by one plus the scatter-to-primary ratio and runs one
    or more warm-started MBIR iterations on the result.
 
-Each outer iteration :math:`k` turns the reconstruction :math:`X_k` into densities of the anchor materials, resamples
+Each outer iteration :math:`k` turns the reconstruction :math:`X_k` into densities of the reference materials, resamples
 them onto the transport cells, and updates the per-view collided fluence :math:`\Phi_v` with one transport sweep
 :math:`G_k` applied to the newest first-collision term :math:`\phi_1` and to the previous accumulator:
 
@@ -98,7 +98,7 @@ The reconstruction side is `MBIRTORCH <https://github.com/cabouman/mbirtorch>`_:
 forward projections, the FDK initialization and the vectorized coordinate descent iterations, warm-started and resumed
 from their error sinogram between scatter updates. The photon interaction data come from
 `XrayPhysics <https://github.com/kylechampley/XrayPhysics>`_ (EPDL97), from which the multigroup cross-section
-library of the chosen anchor materials is built once and cached.
+library of the chosen reference materials is built once and cached.
 
 Documentation
 -------------

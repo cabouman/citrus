@@ -48,8 +48,8 @@ ordering in about two minutes: relative RMSE 0.31 (FDK, Parker-weighted), 0.29 (
 a full rotation (``--end-view-angle 360``) 0.32, 0.29 and 0.075 (measured with version 0.1.0 and the data-set format
 1 of citrus <= 0.2.0, SPR with the Siddon primary). On the data-set format 2 of version 0.3.0 and later the same
 setting gives 0.309 / 0.345 (FDK), 0.289 / 0.355 (no correction) and 0.0704 / 0.0862 (CITRUS, whole prism / core),
-and 0.0696 / 0.0852 with the anchor materials air, water, bone (``--materials air,water,bone``, version 0.5.0; the
-WLAB truth is water and bone only, so the coarser anchor set loses nothing here).
+and 0.0696 / 0.0852 with the reference materials air, water, bone (``--materials air,water,bone``, version 0.5.0; the
+WLAB truth is water and bone only, so the coarser reference set loses nothing here).
 The demo's defaults (180 views over the short scan, 0.5 cm grid, 80 outer iterations with the scatter step on every
 8th view and at every 8th outer iteration, i.e. 10 scatter steps on 23 views each; data-set format 2, the SPR with the
 MBIRTORCH primary of the loop) reach a relative RMSE of 0.0215 over the prism and 0.0259 in the core (FDK

@@ -3,7 +3,7 @@
     citrus.citrus           the CITRUS algorithm (citrus_recon, mbir_recon, citrus_step and the per-view operators)
     citrus.scatter_solver   the LBTE source iteration scatter solver (ScatterSolver)
     citrus.recon            MBIRTORCH bridge and synthetic WLAB data
-    citrus.utilities        WLAB phantom and geometry, the density model between the anchor materials (seven by
+    citrus.utilities        WLAB phantom and geometry, the density model between the reference materials (seven by
                             default, any set from the material catalogue), view angles, synthetic data, plotting
                             helpers
 """

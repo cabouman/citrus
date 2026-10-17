@@ -2,10 +2,10 @@
 
 ## v0.5.0 — 2026-10-17
 
-The CITRUS loop always computes its primary with MBIRTORCH; a material catalogue and user-selectable anchor materials
+The CITRUS loop always computes its primary with MBIRTORCH; a material catalogue and user-selectable reference materials
 for the density model. **Breaking changes** (the Siddon primary option of the loop is removed); **the defaults are
-unchanged**: the default anchors give the cache key and the library of version 0.4.0 bit for bit, the WLAB regression
-anchors hold, `check_cuda.sh` reports every kernel matching, and the demo at its defaults gives CITRUS 0.0215 / 0.0259
+unchanged**: the default reference materials give the cache key and the library of version 0.4.0 bit for bit, the WLAB regression
+reference materials hold, `check_cuda.sh` reports every kernel matching, and the demo at its defaults gives CITRUS 0.0215 / 0.0259
 on the cached `wlab_180v_0p5cm_short_v2` data set as before.
 
 ### The loop's primary is MBIRTORCH's per-material primary
@@ -68,10 +68,10 @@ The formula strings of the seven default materials moved from `cross_section_lib
 names, name)` finds a row by name. `MATERIALS`, `MATERIAL_TABLE`, `NOMINAL_DENSITIES` are the default seven as
 before; `WATER = 3` and `BONE = 6` are kept as the rows of the DEFAULT set.
 
-### Anchor materials: `SolverConfig.materials`
+### Reference materials: `SolverConfig.materials`
 
 - **New** `SolverConfig.materials: tuple[str, ...]` (default `cross_sections.MATERIALS`, the seven in the present
-  order): catalogue names of the anchors of the density model, at least two, any order (`validate` checks them; a
+  order): catalogue names of the reference materials of the density model, at least two, any order (`validate` checks them; a
   list is stored as a tuple). `build_solver_library(config)` (and so `utilities.wlab_solver`) builds the library for
   exactly that set; an explicit `materials=` table still overrides it.
 - **Sorted by attenuation.** `cross_section_library.sort_material_table(config, materials, spectrum, backend,
@@ -83,16 +83,16 @@ before; `WATER = 3` and `BONE = 6` are kept as the rows of the DEFAULT set.
   (`mglib_e552a2c1b51c1763c095.pt` for `SolverConfig()`), so existing caches are reused; the library is bit-identical
   (tested against the 0.4.0 keys and by building the default set by name and in reverse order).
 - **Density model.** `attenuation_to_densities` / `attenuation_to_density` / `DensityModel` (already general in M)
-  interpolate between whichever anchors bracket a voxel; below the lowest anchor that anchor alone of reduced density,
-  above the highest that anchor alone, denser (air and bone for the default set, as before).
+  interpolate between whichever reference materials bracket a voxel; below the lowest reference material that reference material alone of reduced density,
+  above the highest that reference material alone, denser (air and bone for the default set, as before).
 - **By name, not index.** `utilities.wlab_phantom(grid, ..., materials=None)` and `wlab_setup(..., materials=None)`
   return rho [M, ...] for the given names (default the seven), with the phantom in the "water" and "bone" rows looked
   up by name; a set without water or bone raises `ValueError` ("the WLAB phantom needs 'water' and 'bone' ...").
   `synthesize_wlab_dataset` places the phantom in its library's rows (`materials=solver.library.materials`).
 - Demos: `demo/demo_citrus.py --materials air,water,bone` (comma-separated catalogue names; default the seven) sets
-  the anchors of the loop's density model; the truth solver of the data keeps the default seven (the phantom is water
+  the reference materials of the loop's density model; the truth solver of the data keeps the default seven (the phantom is water
   and bone only, so every set runs on the same data and the data-set cache name does not change); the demo prints
-  the anchors with their nominal attenuations, the summary JSON records `materials`, the outputs of another set carry
+  the reference materials with their nominal attenuations, the summary JSON records `materials`, the outputs of another set carry
   `_materials-<names>`. `demo/demo_scatter_solver.py --materials` (water and bone required). The memory benchmark
   reports the fine-map memory for the library's number of materials.
 - Measured (quick setting `--views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 --scatter-every 1`,

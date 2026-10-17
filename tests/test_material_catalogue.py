@@ -1,8 +1,10 @@
-"""The material catalogue and the user-selected anchor materials (version 0.5.0): every catalogue entry builds in the
-library; `SolverConfig.materials` selects the anchors, the default set keeps the cache key and the library of version
+"""The material catalogue and the user-selected reference materials (version 0.5.0): every catalogue entry builds in the
+library; `SolverConfig.materials` selects the reference materials, the default set keeps the cache key and the library
+of version
 0.4.0 bit for bit; any set is sorted by nominal attenuation and has its own cache entry; the density model, the WLAB
 phantom, the data generator and the solver work on a reduced set (air, water, bone) and on an extended one (the seven
-plus titanium); unknown names, a single anchor and a set without water or bone for the WLAB phantom raise."""
+plus titanium); unknown names, a single reference material and a set without water or bone for the WLAB phantom
+raise."""
 
 from __future__ import annotations
 
@@ -163,7 +165,8 @@ def test_every_catalogue_material_builds(name, library_module):
 
 
 def test_default_set_keeps_the_cache_key_and_library(library_module, tmp_path, monkeypatch):
-    """The default anchors give the cache keys of version 0.4.0 (existing caches are found) and the same library bit
+    """The default reference materials give the cache keys of version 0.4.0 (existing caches are found) and the same
+    library bit
     for bit, whether the table is None, the default set by name or the same set in another order (sorted by nominal
     attenuation before the key and the build)."""
     backend = library_module.resolve_backend()
@@ -224,7 +227,8 @@ def test_each_set_has_its_own_cache_entry(library_module, small_libraries, tmp_p
 # ---- density model on a reduced set ----------------------------------------------------------------------------
 
 def test_reduced_set_density_model(small_libraries, device):
-    """Anchors air, water, bone: a water voxel is water, a bone voxel bone, a value between water and bone a water /
+    """Reference materials air, water, bone: a water voxel is water, a bone voxel bone, a value between water and bone
+    a water /
     bone mixture of the same attenuation, between air and water an air / water mixture; below air air of reduced
     density, above bone bone of higher density; X < 0 gives zero; DensityModel (from the library) does the same, one
     material at a time bit for bit."""
@@ -267,7 +271,8 @@ def test_reduced_set_density_model(small_libraries, device):
 @pytest.mark.parametrize("set_name", ["reduced", "extended"])
 def test_solve_view_on_other_sets_equals_default(set_name, small_libraries):
     """WLAB (water and bone only) solved with the reduced (air, water, bone) and the extended (seven plus titanium)
-    anchors equals the default-set solve to float32 rounding (the water and bone rows agree to summation order); a
+    reference materials equals the default-set solve to float32 rounding (the water and bone rows agree to summation
+    order); a
     titanium rod in the extended set changes the solution and stays finite."""
     set_memory_cap(4400.0)
     library = small_libraries[set_name]

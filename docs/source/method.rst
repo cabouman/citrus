@@ -22,7 +22,7 @@ with vacuum boundaries and a point source at the focal spot :math:`\mathbf r_0`,
 and :math:`b` the collimation (1 for directions that hit the panel, else 0). Interactions: photoelectric absorption
 (local deposition), Compton scattering (Klein-Nishina kinematics with the incoherent scattering function, no Doppler
 broadening) and Rayleigh scattering (form factors), from EPDL97 via XrayPhysics. Every voxel is a mixture of the
-:math:`M` anchor materials of the library (by default the seven of the table below, any set of the material catalogue
+:math:`M` reference materials of the library (by default the seven of the table below, any set of the material catalogue
 with ``SolverConfig.materials``) with densities :math:`\rho_m`, so every coefficient is linear in the densities:
 :math:`\mu_x(\mathbf r, E) = \sum_m \rho_m(\mathbf r)\, m_{x,m}(E)` with the mass coefficients :math:`m_{x,m}` of the
 cross-section library. The density model of the CITRUS coupling gives every voxel at most two nonzero materials. The
@@ -247,9 +247,9 @@ CITRUS coupling
 ---------------
 
 MBIR reconstructs a monoenergetic attenuation map :math:`X` at an effective energy :math:`E_{eff}` (the spectrum mean,
-63.03 keV for the default 125 kVp spectrum). The solver needs the densities of the library's anchor materials, each
+63.03 keV for the default 125 kVp spectrum). The solver needs the densities of the library's reference materials, each
 with a nominal density :math:`\rho_m^{nom}` (its density in the body or the scanner) and a nominal attenuation
-:math:`\mu_m = \rho_m^{nom}\, m_m(E_{eff})`, :math:`m_m` the total mass attenuation coefficient. The anchors are chosen
+:math:`\mu_m = \rho_m^{nom}\, m_m(E_{eff})`, :math:`m_m` the total mass attenuation coefficient. The reference materials are chosen
 from the material catalogue (``cross_sections.MATERIAL_CATALOGUE``) with ``SolverConfig.materials``, at least two;
 the default is the seven materials of this table:
 
@@ -343,11 +343,11 @@ The catalogue adds ten materials that a chosen set can draw on:
 
 (names in the code: ``trabecular_bone``, ``brain``, ``blood``, ``cartilage``, ``skin``, ``pmma``, ``polyethylene``,
 ``aluminium``, ``titanium``, ``carbon_fibre``; the seven defaults are ``air``, ``lung``, ``adipose``, ``water``,
-``muscle``, ``soft_tissue``, ``bone``.) The library builder sorts the chosen anchors by nominal attenuation and asserts
-that this order holds at every energy of the library (10-125 keV): two anchors whose attenuations cross somewhere in
+``muscle``, ``soft_tissue``, ``bone``.) The library builder sorts the chosen reference materials by nominal attenuation and asserts
+that this order holds at every energy of the library (10-125 keV): two reference materials whose attenuations cross somewhere in
 the spectrum (skin and soft tissue, for example) cannot be interpolated between and are refused. For the default
 seven the order is the table's (muscle lies below soft tissue at every energy, attenuation ratio 0.986-0.991). The
-interpolating density model assigns each voxel the two consecutive anchors whose nominal attenuations bracket
+interpolating density model assigns each voxel the two consecutive reference materials whose nominal attenuations bracket
 :math:`X`:
 
 .. math::
@@ -355,12 +355,12 @@ interpolating density model assigns each voxel the two consecutive anchors whose
    \mu_a \le X < \mu_b:\quad f = \frac{X - \mu_a}{\mu_b - \mu_a},\qquad
    \rho_a = (1 - f)\,\rho_a^{nom},\quad \rho_b = f\,\rho_b^{nom},
 
-below the lowest anchor (air by default) that anchor alone with :math:`\rho = X / m_{air}` (reduced density), above
-the highest (cortical bone by default) that anchor alone with :math:`\rho = X / m_{bone}` (bone denser than
+below the lowest reference material (air by default) that reference material alone with :math:`\rho = X / m_{air}` (reduced density), above
+the highest (cortical bone by default) that reference material alone with :math:`\rho = X / m_{bone}` (bone denser than
 1.85 g/cm³); negative values are clamped to vacuum. Since :math:`\rho_a m_a + \rho_b m_b = (1 - f)\mu_a + f \mu_b = X`,
-the model is exact in attenuation at :math:`E_{eff}`; it returns the pure anchor at its own nominal attenuation (a
+the model is exact in attenuation at :math:`E_{eff}`; it returns the pure reference material at its own nominal attenuation (a
 water voxel is water, a cortical-bone voxel bone at 1.85 g/cm³) and at most two materials per voxel. With fewer
-anchors the composition between them is coarser: with air, water and bone a lung voxel becomes an air / water mixture
+reference materials the composition between them is coarser: with air, water and bone a lung voxel becomes an air / water mixture
 and a muscle voxel a water / bone mixture of the same attenuation at :math:`E_{eff}`. Composition matters beyond
 :math:`E_{eff}`: the
 solver's primary and scatter are polychromatic, and two voxels of equal :math:`X` but different composition attenuate

@@ -20,14 +20,14 @@ filter on a 1 keV grid (``default_spectrum_125kvp``); any two-column spectrum ca
 [10, 125] keV have edges 125, 85.0, 69.2, 59.6, 51.7, 42.4, 10 keV and spectrum-weighted group energies 98.0, 76.7,
 64.4, 56.1, 47.1, 36.0 keV.
 
-**Materials.** By default seven anchor materials (air, lung, adipose, water, muscle, soft tissue, cortical bone; the
+**Materials.** By default seven reference materials (air, lung, adipose, water, muscle, soft tissue, cortical bone; the
 table of :doc:`method`, "CITRUS coupling"), among them water (H 0.1119, O 0.8881 by mass) and ICRP cortical bone
 (XrayPhysics ``bone_cortical``, 1.85 g/cm^3); ``SolverConfig.materials`` selects any set of at least two from the
 seventeen of the catalogue (``cross_sections.MATERIAL_CATALOGUE``). The seven-material library builds in about 16 s
 (three materials about 12 s) and is cached under a key that includes the sorted material table, so every set has its
 own entry and the default seven keep the entry of earlier versions; its water and bone rows equal those of a
 two-material library (or of any other set) to 1e-13 (summation order only), and on the WLAB phantom (water and bone
-only) the seven-material solve equals the two-material solve bit for bit in float32 (and the solve with the anchors
+only) the seven-material solve equals the two-material solve bit for bit in float32 (and the solve with the reference materials
 air, water, bone or the seven plus titanium to float32 rounding).
 Narrow-group mass attenuation of water agrees with NIST XCOM to 0.1 % at 40-100 keV; the ICRP bone is 1.45 % below
 ICRU-44 bone at 60 keV (different composition).

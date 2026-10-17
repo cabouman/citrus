@@ -1,6 +1,6 @@
 """Build the multigroup cross-section library of the scatter solver.
 
-Fills a :class:`citrus.scatter_solver.cross_sections.MultigroupLibrary` for the anchor materials of the density model
+Fills a :class:`citrus.scatter_solver.cross_sections.MultigroupLibrary` for the reference materials of the density model
 (any subset of ``cross_sections.MATERIAL_CATALOGUE``, ``SolverConfig.materials``; by default the seven of
 ``cross_sections.MATERIALS``: air, lung, adipose, water, muscle, soft tissue, cortical bone) from point-wise photon
 interaction data.
@@ -51,7 +51,8 @@ Physics summary (all coefficients per unit density, cm^2/g):
 Materials. The compositions and nominal densities of every material the builder knows are in
 ``cross_sections.MATERIAL_CATALOGUE`` (sources there); ``MATERIAL_FORMULAS`` maps each name to its composition. A
 library is built for a table of (name, nominal density, formula) entries, ``materials=`` (default: the seven default
-anchors; ``build_solver_library`` uses ``cross_sections.material_table(config.materials)``). The builder sorts the
+reference materials; ``build_solver_library`` uses ``cross_sections.material_table(config.materials)``). The builder
+sorts the
 table by nominal attenuation at the spectrum-mean energy (``sort_material_table``; a table already in that order is
 unchanged) and asserts at every fine energy that the order holds (``check_material_order``: no two materials cross).
 The cache key holds the sorted table (names, nominal densities, formulas), so different sets never share a cache entry
@@ -122,7 +123,8 @@ MaterialTable = Sequence[tuple[str, float, str]]  # (name, nominal density g/cm^
 
 
 def default_material_table() -> tuple[tuple[str, float, str], ...]:
-    """The seven default anchors as (name, nominal density, formula): ``cross_sections.material_table(MATERIALS)``
+    """The seven default reference materials as (name, nominal density, formula):
+    ``cross_sections.material_table(MATERIALS)``
     (``cross_sections.MATERIAL_TABLE`` with ``MATERIAL_FORMULAS``)."""
     return material_table(MATERIALS)
 
@@ -286,7 +288,8 @@ def parse_formula(formula: str, atomic_mass: Callable[[int], float]) -> dict[int
 
 def material_composition(backend: _XrayPhysicsBackend,
                          materials: Optional[MaterialTable] = None) -> dict[str, dict[int, float]]:
-    """Element mass fractions per material (table order; default the seven default anchors), keyed by name."""
+    """Element mass fractions per material (table order; default the seven default reference materials), keyed by
+    name."""
     return {n: parse_formula(f, backend.atomic_mass) for n, _, f in _material_table(materials)}
 
 
@@ -307,7 +310,8 @@ def sort_material_table(config: SolverConfig, materials: Optional[MaterialTable]
                         spectrum: tuple[np.ndarray, np.ndarray] | None = None,
                         backend: _XrayPhysicsBackend | None = None, *,
                         fine_bin_width_kev: float = 0.5) -> tuple[tuple[str, float, str], ...]:
-    """The material table ((name, nominal density g/cm^3, formula) per material; None: the seven default anchors)
+    """The material table ((name, nominal density g/cm^3, formula) per material; None: the seven default reference
+    materials)
     sorted by nominal attenuation rho^nom mu/rho(E_eff) at the spectrum-mean energy E_eff of the build
     (``_mean_energy``; elemental total mass attenuation of the backend mixed by mass fraction; a stable sort, so a
     table already in that order is returned as it is). Whether the order holds at every energy of the library is
@@ -569,7 +573,7 @@ def compute_library(
       gauss_legendre_nodes: Gauss-Legendre nodes per angular piece (>= 32 for production).
       materials: (name, nominal density g/cm^3, formula) per material, in any order (sorted here by nominal attenuation
         at the spectrum-mean energy, ``sort_material_table``; ``check_material_order`` raises if two materials cross
-        inside the library's energy range); None: the seven default anchors (``default_material_table``).
+        inside the library's energy range); None: the seven default reference materials (``default_material_table``).
 
     Returns:
       (MultigroupLibrary with float64 CPU tensors, BuildInfo).
@@ -783,7 +787,8 @@ def build_library(
     materials: Optional[MaterialTable] = None,
 ) -> MultigroupLibrary:
     """Build (or load from cache) the multigroup library for ``config`` and the material table ``materials`` (None:
-    the seven default anchors, ``default_material_table``; else (name, nominal density, formula) per material, e.g.
+    the seven default reference materials, ``default_material_table``; else (name, nominal density, formula) per
+    material, e.g.
     ``cross_sections.material_table(names)``, in any order: sorted by nominal attenuation, ``sort_material_table``).
 
     Shapes of the result (M materials, 7 by default; G = config.num_groups, L = config.legendre_order):

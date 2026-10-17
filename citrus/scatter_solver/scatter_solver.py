@@ -108,7 +108,8 @@ def build_solver_library(config: SolverConfig, spectrum=None, cache_dir: Optiona
                          materials=None) -> MultigroupLibrary:
     """`cross_section_library.build_library(config, spectrum, cache_dir, materials=materials)` (spectrum None -> the
     default 125 kVp spectrum; cache_dir "default" -> `cross_section_library.default_cache_dir()`, None -> no cache).
-    materials None (default): the anchors of `config.materials` (at least two catalogue names, `SolverConfig.validate`)
+    materials None (default): the reference materials of `config.materials` (at least two catalogue names,
+    `SolverConfig.validate`)
     as the table `cross_sections.material_table(config.materials)`; the default seven give the library and cache entry
     of earlier versions. An explicit table (name, nominal density, formula) per material overrides config.materials.
     The library's materials come out sorted by nominal attenuation (`library.materials`). Needs XrayPhysics (also to
@@ -303,7 +304,7 @@ class ScatterSolver:
     """Deterministic kV CBCT scatter solver (LBTE source iteration solver), one view at a time.
 
     library        : MultigroupLibrary with legendre_order >= config.legendre_order (`build_solver_library(config)`,
-                     built for the anchors config.materials). The solver works with the library's materials
+                     built for the reference materials config.materials). The solver works with the library's materials
                      (`library.materials`, M of them) whatever config.materials says.
     config         : SolverConfig (validated here). Used fields: legendre_order, num_polar, num_azimuthal,
                      transport_cell_cm, quadrature_point_spacing_cm, uncollided_trace_grid, source_iteration_tolerance,

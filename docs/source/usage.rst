@@ -18,9 +18,9 @@ Both demos write their figures to ``demo/output/`` (not tracked); the CITRUS dem
                                                    # 20 outer iterations, scatter step on every view at every iteration
    python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 --scatter-every 1
                                                    # a quick run (about 2 minutes)
-   python demo/demo_citrus.py --materials air,water,bone   # three anchor materials in the density model
+   python demo/demo_citrus.py --materials air,water,bone   # three reference materials in the density model
 
-``demo_scatter_solver.py`` builds the library of the anchor materials (the seven defaults: about 16 s, then cached),
+``demo_scatter_solver.py`` builds the library of the reference materials (the seven defaults: about 16 s, then cached),
 rasterizes the WLAB phantom (a 30 x 20 x 40 cm water prism with lung, air and bone inserts) and solves one view with
 the default configuration (6 groups, Legendre order 7, 8 x 16 sweep directions, 16 x 32 collapsed-cone directions). It
 plots the primary and scatter detector signals, the scatter fraction and central-row profiles. Options:
@@ -36,18 +36,18 @@ the relative RMSE per outer iteration and the estimated vs true scatter-to-prima
 any ratio to the voxel pitch), ``--outer-iterations`` (default 80), ``--I0``, ``--seed``, ``--no-noise``, ``--full``,
 ``--regenerate``, ``--truth-sweep``, ``--truth-cone``, ``--start-view-angle`` / ``--end-view-angle`` (degrees),
 ``--scatter-view-stride`` (default 8), ``--scatter-view-interpolation-order`` (``0``-``3`` or ``none``, default ``3``),
-``--scatter-every`` (default 8), ``--materials`` (the anchor materials of the loop's density model, comma-separated
+``--scatter-every`` (default 8), ``--materials`` (the reference materials of the loop's density model, comma-separated
 catalogue names, at least two; default ``air,lung,adipose,water,muscle,soft_tissue,bone``; output suffix
 ``_materials-<names>`` for another set), ``--no-resume-error-sinogram`` (restart MBIR from the sinogram every outer
 iteration; suffix ``_restart``), ``--save-recon`` (also write the CITRUS volume as ``.npy``), ``--memory-cap-mib``
-(default 4400). The demo prints the anchors in library order with their nominal attenuations; the summary JSON records
+(default 4400). The demo prints the reference materials in library order with their nominal attenuations; the summary JSON records
 them and the peak allocated GPU memory of the CITRUS run (whole run and per outer iteration). At the defaults (0.5 cm
 grid, 180 views, stride 8, every 8th iteration, 80 outer iterations, about 4 minutes plus about 2 minutes to synthesize
 the data once) CITRUS reaches a relative RMSE of 0.0215 / 0.0259 (whole prism / core; the Siddon primary in the loop
 of versions 0.3.0 and 0.4.0 gave 0.0257 / 0.0305 on the same data, see :doc:`method`, "CITRUS coupling") with a peak
 of 1.64 GB allocated. The loop's primary is always MBIRTORCH's per-material primary.
 
-Anchor materials: the truth solver of the data always uses the seven default anchors (the WLAB phantom is water and bone
+Reference materials: the truth solver of the data always uses the seven default reference materials (the WLAB phantom is water and bone
 only), so ``--materials`` changes only the reconstruction loop and every set runs on the same data. At the quick setting
 (``--views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 --scatter-every 1``) the default seven give
 CITRUS 0.0704 / 0.0862 and ``--materials air,water,bone`` 0.0696 / 0.0852 (whole prism / core; FDK 0.309 / 0.345, no
@@ -90,13 +90,13 @@ The scatter solver
 
    grid, geometry, rho = wlab_setup(1.0, device="cuda")           # 1 cm grid, 100 x 75 panel, [7, R, C, S] densities
    config = SolverConfig()                                    # 1 cm transport cells, 2^3 first-collision points
-   library = build_solver_library(config)                         # the anchors config.materials, cached on disk
+   library = build_solver_library(config)                         # the reference materials config.materials, cached on disk
    solver = ScatterSolver(library, config, geometry, detector=csi_response(0.06), grid_response=no_grid(),
                           device="cuda", dtype=torch.float32)
    result = solver.solve_view(rho, grid, angle=0.0)
    result.scatter_signal, result.primary["signal"], result.scatter_fraction   # [rows, channels]
 
-``rho`` holds the densities (g/cm^3) of the library's anchor materials (``library.materials``; by default the seven
+``rho`` holds the densities (g/cm^3) of the library's reference materials (``library.materials``; by default the seven
 air, lung, adipose, water, muscle, soft tissue, cortical bone, ``cross_sections.MATERIALS``; at most two nonzero per
 voxel; the WLAB phantom uses the water and bone rows) on the fine grid (any voxel size). The transport runs on the
 grid of ``transport_cell_cm`` cells that covers the
@@ -107,7 +107,7 @@ voxel): 8 points for 0.5 cm and smaller voxels in 1 cm cells, 64 in 2 cm cells, 
 traced; only the primary image is computed on the fine grid (:doc:`conventions`, "Grids"). ``ViewResult`` also carries
 the scalar and planar fluences per group, the source-iteration history, per-stage timings and peak memory.
 
-Anchor materials. ``SolverConfig.materials`` names the materials of the library, the anchors of the density model,
+Reference materials. ``SolverConfig.materials`` names the materials of the library, the reference materials of the density model,
 from the catalogue ``cross_sections.MATERIAL_CATALOGUE`` (:doc:`method`, "CITRUS coupling", has the compositions and
 sources): at least two, in any order. The library is built for exactly that set, sorted by nominal attenuation
 (``library.materials``), and cached under a key that includes the set (the default seven keep the cache entry of
@@ -126,7 +126,7 @@ earlier versions; a set whose members cross in attenuation inside 10-125 keV is 
    material_index(solver.library, "water")        # 1: rows by name, not by a fixed index
    config = replace(SolverConfig(), materials=MATERIALS + ("titanium",))   # the seven plus titanium
 
-The WLAB phantom (and ``synthesize_wlab_dataset``) needs water and bone among the anchors and raises otherwise;
+The WLAB phantom (and ``synthesize_wlab_dataset``) needs water and bone among the reference materials and raises otherwise;
 ``cross_sections.WATER`` / ``BONE`` (3, 6) are the rows of the default set only.
 
 CITRUS
@@ -146,7 +146,7 @@ CITRUS
 reconstruction grid and the scanner in MBIRTORCH conventions (:doc:`conventions`). ``info`` holds the per-iteration
 records (timings, accumulator change, scatter change), the final scatter-to-primary ratio and scatter-count estimate,
 and the frozen regularization. Each outer iteration converts the reconstruction into densities with the interpolating
-model between the library's anchors (``citrus.utilities.attenuation_to_densities``, :doc:`method`, "CITRUS
+model between the library's reference materials (``citrus.utilities.attenuation_to_densities``, :doc:`method`, "CITRUS
 coupling"), one material map at a time so that the volume of all M materials never exists on the reconstruction grid
 (the examples below are for the default seven):
 
@@ -244,7 +244,7 @@ primary is the loop's primary model, MBIRTORCH's per-material line integrals thr
 transmission (since 0.3.0; ``meta["primary_projector"]`` = ``"mbirtorch"`` and ``meta["data_format"]`` = 2 record
 it, as in data sets of versions 0.3.0 and 0.4.0; the ``"siddon"`` option of those versions, the definition up to
 0.2.0, is removed). The truth solver may use a finer angular discretization than the solver of the reconstruction
-loop. ``synthesize_wlab_dataset`` puts the phantom in the water and bone rows of the library it builds (the anchors
+loop. ``synthesize_wlab_dataset`` puts the phantom in the water and bone rows of the library it builds (the reference materials
 of ``config.materials``) or is given.
 ``synthesize_wlab_dataset(num_views, delta_voxel, I0, noise, seed, out_path, config=..., geometry=...,
 start_view_angle=0.0, end_view_angle=None)`` is the WLAB wrapper used by the CITRUS demo (``end_view_angle`` None: the

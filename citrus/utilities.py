@@ -7,7 +7,8 @@ A 20 x 30 x 40 cm^3 water prism (1.0 g/cm^3) with full-length (40 cm along z) in
 0.26 g/cm^3), air (2 x 2 cm^2, 1.205e-3 g/cm^3) and bone (2 x 2 cm^2, 1.85 g/cm^3). The phantom is given in the
 material basis of a library (rho [M, ...], `library.materials`; default the seven `cross_sections.MATERIALS`) but uses
 only two of its rows, looked up by name: lung and air are modeled as water of the stated density (the "water" row),
-bone as cortical bone (the "bone" row); a set of anchors without water or bone cannot hold it. Orientation (source on
+bone as cortical bone (the "bone" row); a set of reference materials without water or bone cannot hold it. Orientation
+(source on
 +y at angle 0): 30 cm along x (cols), 20 cm along y (rows, the source-detector axis at angle 0), 40 cm along z (slices),
 centered at the isocenter. Default insert centers: lung at (x, y) = (-5, 0), air at (+3, 0), bone at (+7, 0) cm (keyword
 arguments of `wlab_phantom`). Outside the prism the density is 0 (vacuum).
@@ -16,25 +17,29 @@ Attenuation <-> density model
 -----------------------------
 MBIR reconstructs ONE monoenergetic attenuation map X (1/cm) at an effective energy E_eff (the spectrum mean, 63.03 keV
 for the default 125 kVp spectrum); the scatter solver needs the densities rho [M, ...] (g/cm^3) of its library's M
-ANCHOR materials (`library.materials`, chosen from `cross_sections.MATERIAL_CATALOGUE` with `SolverConfig.materials`;
+REFERENCE materials (`library.materials`, chosen from `cross_sections.MATERIAL_CATALOGUE` with `SolverConfig.materials`;
 default M = 7: air, lung, adipose, water, muscle, soft tissue, cortical bone, `cross_sections.MATERIALS`).
 
     forward  X = sum_m rho_m m_m(E_eff)                                     (exact, linear)
 
-The inverse is the interpolating model between the anchors. Every anchor m has a NOMINAL density rho_m^nom
-(`library.nominal_density`) and a nominal attenuation mu_m = rho_m^nom m_m(E_eff); the anchors are taken in the fixed
+The inverse is the interpolating model between the reference materials. Every reference material m has a NOMINAL
+density rho_m^nom
+(`library.nominal_density`) and a nominal attenuation mu_m = rho_m^nom m_m(E_eff); the reference materials are taken in
+the fixed
 library order, in which mu_m increases at every library energy (the builder sorts them; `material_order` checks it).
 For each voxel:
 
-    mu_a <= X < mu_b (consecutive anchors a, b):   f = (X - mu_a) / (mu_b - mu_a),
+    mu_a <= X < mu_b (consecutive reference materials a, b):   f = (X - mu_a) / (mu_b - mu_a),
                                                     rho_a = (1 - f) rho_a^nom,   rho_b = f rho_b^nom
-    X < mu_first (air by default):   the lowest anchor alone, density X / m_first (reduced density)
-    X >= mu_last (bone by default):  the highest anchor alone, density X / m_last (denser than nominal)
+    X < mu_first (air by default):   the lowest reference material alone, density X / m_first (reduced density)
+    X >= mu_last (bone by default):  the highest reference material alone, density X / m_last (denser than nominal)
     X < 0 clamps to 0.
 
-At E_eff = 63.03 keV the nominal attenuations of the default anchors are 0.00022 (air), 0.0520 (lung), 0.1846
+At E_eff = 63.03 keV the nominal attenuations of the default reference materials are 0.00022 (air), 0.0520 (lung),
+0.1846
 (adipose), 0.2013 (water), 0.2102 (muscle), 0.2122 (soft tissue), 0.5366 (bone) /cm (the other catalogue materials:
-`cross_sections` module docstring). With the anchors air, water, bone a voxel between water and bone becomes a
+`cross_sections` module docstring). With the reference materials air, water, bone a voxel between water and bone
+becomes a
 water / bone mixture, one between air and water an air / water mixture (lung tissue is then water of reduced density
 mixed with air). The model is exact in attenuation at E_eff
 (densities_to_attenuation(library, attenuation_to_densities(library, X)) == max(X, 0)), gives the pure material m at
@@ -161,7 +166,7 @@ def wlab_phantom(grid: Grid, *, lung_center: tuple[float, float] = (-5.0, 0.0),
 
     grid must cover the 30 x 20 x 40 cm prism (centered at the isocenter). Insert centers are (x, y) in cm (module
     docstring). materials: the material names of the library the densities are for (`library.materials`; None: the
-    seven default anchors `cross_sections.MATERIALS`). Returns rho [M, rows, cols, slices] in g/cm^3, M =
+    seven default reference materials `cross_sections.MATERIALS`). Returns rho [M, rows, cols, slices] in g/cm^3, M =
     len(materials): the "water" row (`cross_sections.material_index(materials, "water")`, 3 for the default set) holds
     the water prism and the lung and air inserts (water of reduced density), the "bone" row (6 for the default set) the
     bone insert; the other rows are zero. Raises ValueError if water or bone is not among the materials.
@@ -289,7 +294,8 @@ def nominal_densities(library: MultigroupLibrary) -> Tensor:
 
 def nominal_attenuation(library: MultigroupLibrary, energy_kev: Optional[float] = None) -> Tensor:
     """[M] attenuation (1/cm, float64 CPU) of each material at its nominal density at `energy_kev` (None: E_eff);
-    0.00022, 0.0520, 0.1846, 0.2013, 0.2102, 0.2122, 0.5366 /cm for the seven default anchors at 63.03 keV."""
+    0.00022, 0.0520, 0.1846, 0.2013, 0.2102, 0.2122, 0.5366 /cm for the seven default reference materials at 63.03
+    keV."""
     e = effective_energy(library) if energy_kev is None else float(energy_kev)
     return nominal_densities(library) * mass_attenuation_at(library, e)
 
@@ -313,7 +319,7 @@ def _mass_attenuation_coefficients(library: MultigroupLibrary, energy_kev: Optio
 
 def densities_to_attenuation(library: MultigroupLibrary, rho: Tensor, energy_kev: Optional[float] = None) -> Tensor:
     """X = sum_m rho[m] m_m(E) (1/cm). rho [M, ...] g/cm^3 (M = the library's materials, `library.materials`; 7 for
-    the default anchors) -> X [...], same device/dtype. energy_kev None: `effective_energy(library)`."""
+    the default reference materials) -> X [...], same device/dtype. energy_kev None: `effective_energy(library)`."""
     M = library.num_materials
     if rho.shape[0] != M:
         raise ValueError(f"rho must be [{M}, ...] for the library's materials {tuple(library.materials)}, got "
@@ -327,10 +333,12 @@ def densities_to_attenuation(library: MultigroupLibrary, rho: Tensor, energy_kev
 
 def attenuation_to_densities(library: MultigroupLibrary, X: Tensor, energy_kev: Optional[float] = None) -> Tensor:
     """The interpolating density model (module docstring): rho [M, ...] (g/cm^3, same device/dtype) of X [...] (1/cm)
-    at the energy (None: E_eff), M = the library's anchor materials (`library.materials`, any set of at least two).
-    The two anchors whose nominal attenuations bracket X get (1 - f) rho_a^nom and f rho_b^nom,
-    f = (X - mu_a) / (mu_b - mu_a); below the lowest anchor that anchor alone at X / m_first, above the highest that
-    anchor alone at X / m_last; X < 0 gives 0. Exact in attenuation, at most two nonzero materials per voxel."""
+    at the energy (None: E_eff), M = the library's reference materials (`library.materials`, any set of at least two).
+    The two reference materials whose nominal attenuations bracket X get (1 - f) rho_a^nom and f rho_b^nom,
+    f = (X - mu_a) / (mu_b - mu_a); below the lowest reference material that reference material alone at X / m_first,
+    above the highest that
+    reference material alone at X / m_last; X < 0 gives 0. Exact in attenuation, at most two nonzero materials per
+    voxel."""
     M = library.num_materials
     order = material_order(library)
     num_dims = X.dim()
@@ -423,10 +431,11 @@ def wlab_solver(delta_voxel: float, *, config: Optional[SolverConfig] = None,
                 cache_dir: Optional[str] = "default") -> ScatterSolver:
     """ScatterSolver for the WLAB data: the given config (default SolverConfig(): 1 cm transport cells,
     `SolverConfig.transport_cell_cm`, whatever the fine voxel size `delta_voxel`, which only names the grid the solver
-    will be used with), the real library for the anchors config.materials (build_solver_library, cached in
+    will be used with), the real library for the reference materials config.materials (build_solver_library, cached in
     `cache_dir`; "default" is $CITRUS_CACHE_DIR or ~/.cache/citrus; needs XrayPhysics) unless `library` is given, the
     full-field WLAB geometry (default), an ideal counting detector and no grid, float32. The WLAB phantom for this
-    solver is `wlab_phantom(grid, materials=solver.library.materials)` (water and bone must be among the anchors)."""
+    solver is `wlab_phantom(grid, materials=solver.library.materials)` (water and bone must be among the reference
+    materials)."""
     config = config if config is not None else SolverConfig()
     library = library if library is not None else build_solver_library(config, cache_dir=cache_dir)
     device = (torch.device(device) if device is not None
@@ -611,7 +620,8 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
     start + pi + fan angle of the panel, 202.6 degrees for the full-field panel; end = start + 2 pi for a full
     rotation), the solver `wlab_solver(delta_voxel, config=config, library=library, geometry=geometry)` (default:
     SolverConfig() with 1 cm transport cells, the full-field geometry `full_field_wlab_geometry()`, ideal counting
-    detector, no grid). The library's materials follow config.materials (the anchors of `SolverConfig.materials`;
+    detector, no grid). The library's materials follow config.materials (the reference materials of
+    `SolverConfig.materials`;
     default the seven of `cross_sections.MATERIALS`) unless `library` is given; the phantom is placed in the library's
     water and bone rows (`wlab_phantom(materials=library.materials)`, which needs both in the set). meta also records
     delta_voxel, start_view_angle and end_view_angle. out_path: if given, the data are written with `save_dataset`

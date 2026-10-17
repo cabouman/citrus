@@ -80,7 +80,7 @@ python demo/demo_citrus.py --full    # the report study: 180 views over a full r
                                      # scatter step on every view at every iteration
 python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 --scatter-every 1
                                      # a quick run (~2 min)
-python demo/demo_citrus.py --materials air,water,bone   # three anchor materials in the density model
+python demo/demo_citrus.py --materials air,water,bone   # three reference materials in the density model
 ```
 
 The views are evenly spaced over `[start, end)` (`--start-view-angle`, `--end-view-angle` in degrees); the default
@@ -103,7 +103,7 @@ when unavailable).
 
 Version 0.5.0 adds a material catalogue (`citrus.scatter_solver.cross_sections.MATERIAL_CATALOGUE`: the seven
 default materials plus trabecular bone, brain, blood, cartilage, skin, PMMA, polyethylene, aluminium, titanium and
-carbon fibre) and lets you choose the anchor materials of the density model (`SolverConfig.materials`, demo flag
+carbon fibre) and lets you choose the reference materials of the density model (`SolverConfig.materials`, demo flag
 `--materials air,water,bone`); the CITRUS loop always computes the primary with MBIRTORCH's projector (the Siddon
 option of `CitrusConfig.primary_projector` is gone). Version 0.4.0 spelled out every abbreviated name of the package;
 `CHANGELOG.md` has the complete old -> new table. Data sets, demo outputs and cached cross-section libraries of

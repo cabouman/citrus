@@ -11,7 +11,7 @@
         --scatter-every 1
                                                    # a quick run (about 2 minutes)
     python demo/demo_citrus.py --transport-cell-cm 0.5                  # 0.5 cm transport cells (default: 1 cm)
-    python demo/demo_citrus.py --materials air,water,bone               # three anchor materials in the density model
+    python demo/demo_citrus.py --materials air,water,bone               # three reference materials in the density model
     python demo/demo_citrus.py --truth-sweep 16x32 --truth-cone 32x64   # truth finer than the loop's solver
 
 1. Data (citrus.utilities.synthesize_wlab_dataset, cached in demo/input/). The WLAB phantom (30 x 20 x 40 cm water
@@ -30,7 +30,8 @@
      true densities with the primary model of the loop: MBIRTORCH's pixel-averaged per-material line integrals through
      the solver's polychromatic transmission. The truth is stored as the per-pixel scatter-to-primary ratio
      SPR = s / p and applied to the MBIRTORCH primary counts: S = SPR x P. The truth solver always uses the seven
-     default anchor materials (the phantom is water and bone only, so the data do not depend on ``--materials``, which
+     default reference materials (the phantom is water and bone only, so the data do not depend on ``--materials``,
+     which
      sets the loop's density model).
    - Cache names: ``demo/input/<tag>.npz`` with the data-set format in the tag, ``..._v2`` (citrus >= 0.3.0: SPR with
      the MBIRTORCH primary). Data sets and outputs named ``..._v1...`` are those of citrus <= 0.2.0 (SPR with the
@@ -58,10 +59,10 @@
    ``--no-resume-error-sinogram`` restarts it from the sinogram every iteration, suffix ``_restart``; the
    reconstructions agree to float rounding). ``--materials`` (comma-separated names of
    citrus.scatter_solver.cross_sections.MATERIAL_CATALOGUE, at least two; default the seven air, lung, adipose,
-   water, muscle, soft_tissue, bone) sets the anchor materials of the loop's density model (SolverConfig.materials;
+   water, muscle, soft_tissue, bone) sets the reference materials of the loop's density model (SolverConfig.materials;
    the library is built once per set and cached; output suffix ``_materials-<names>`` for a set other than the
    default). ``--save-recon`` also writes the CITRUS volume (``citrus_<tag>_recon.npy``). The summary JSON records
-   the anchor materials and the peak allocated GPU memory of the CITRUS run (``torch.cuda.max_memory_allocated``,
+   the reference materials and the peak allocated GPU memory of the CITRUS run (``torch.cuda.max_memory_allocated``,
    MiB: whole run and largest outer iteration).
 3. The same MBIR loop without scatter correction (citrus.mbir_recon), for comparison.
 Both reconstructions use the same frozen regularization (MBIRTORCH's automatic estimate on the scatter-free
@@ -151,7 +152,8 @@ def main() -> None:
                         help="scatter step at every n-th outer iteration only; the previous correction is reused in "
                              "between (default 8)")
     parser.add_argument("--materials", default=",".join(SolverConfig().materials),
-                        help="anchor materials of the loop's density model, comma-separated names from the catalogue "
+                        help="reference materials of the loop's density model, comma-separated names from the "
+                             "catalogue "
                              f"({', '.join(MATERIAL_CATALOGUE)}); at least two (default: "
                              f"{','.join(SolverConfig().materials)})")
     parser.add_argument("--resume-error-sinogram", default=True, action=argparse.BooleanOptionalAction,
@@ -184,7 +186,8 @@ def main() -> None:
     set_memory_cap(args.memory_cap_mib)
     os.makedirs(args.input, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
-    # the truth solver keeps the default anchors (the data do not depend on --materials); the loop uses --materials
+    # the truth solver keeps the default reference materials (the data do not depend on --materials); the loop uses
+    # --materials
     base_config = replace(SolverConfig(), transport_cell_cm=args.transport_cell_cm)
     loop_config = replace(base_config, materials=materials)
     loop_config.validate()
@@ -250,9 +253,10 @@ def main() -> None:
     print(f"truth solver: sweep {truth_polar}x{truth_azimuthal}, cone {cone_polar}x{cone_azimuthal}; "
           f"loop solver: sweep {loop_config.num_polar}x{loop_config.num_azimuthal}, "
           f"cone {loop_config.cone_num_polar}x{loop_config.cone_num_azimuthal}")
-    anchors = solver.library.materials  # sorted by nominal attenuation
-    print("anchor materials of the density model (nominal attenuation at E_eff, 1/cm): "
-          + ", ".join(f"{name} {mu:.4g}" for name, mu in zip(anchors, nominal_attenuation(solver.library).tolist())))
+    reference_materials = solver.library.materials  # sorted by nominal attenuation
+    print("reference materials of the density model (nominal attenuation at E_eff, 1/cm): "
+          + ", ".join(f"{name} {mu:.4g}" for name, mu
+                      in zip(reference_materials, nominal_attenuation(solver.library).tolist())))
     model = make_cone_model(grid, geometry, angles, device=device)
     Y_device = torch.as_tensor(Y, device=device)
     regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=device) / I0),
@@ -272,7 +276,7 @@ def main() -> None:
                           resume_error_sinogram=args.resume_error_sinogram)
     out_tag = tag
     if set(materials) != set(SolverConfig().materials):
-        out_tag += "_materials-" + "-".join(anchors)
+        out_tag += "_materials-" + "-".join(reference_materials)
     if not args.resume_error_sinogram:
         out_tag += "_restart"
     if args.scatter_view_stride > 1:
@@ -309,7 +313,7 @@ def main() -> None:
     summary = {
         "views": len(angles), "start_view_angle_deg": math.degrees(float(angles[0])), "scan_range_deg": span,
         "short_scan": bool(is_short_scan(angles)), "delta_voxel_cm": args.delta_voxel, "grid": list(grid.shape),
-        "transport_cell_cm": args.transport_cell_cm, "data_tag": tag, "materials": list(anchors),
+        "transport_cell_cm": args.transport_cell_cm, "data_tag": tag, "materials": list(reference_materials),
         "quadrature_point_spacing_cm": loop_config.quadrature_point_spacing_cm,
         "quadrature_points_per_axis": loop_config.quadrature_points(max(grid.deltas)),
         "outer": args.outer_iterations,
