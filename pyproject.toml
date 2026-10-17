@@ -23,7 +23,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
-docs = ["sphinx", "sphinx_book_theme", "sphinx-copybutton", "sphinxext-opengraph"]
+docs = ["sphinx", "sphinx_book_theme", "sphinx-copybutton", "sphinxext-opengraph", "sphinx_design"]
 # XrayPhysics builds the cross-section library (C++ library: needs a C++ toolchain and CMake)
 physics = ["xrayphysics @ git+https://github.com/kylechampley/XrayPhysics"]
 # fused GPU kernels (optional: PyTorch paths are used without Triton)

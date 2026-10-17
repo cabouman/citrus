@@ -2,6 +2,7 @@ sphinx
 sphinx_book_theme
 sphinx-copybutton
 sphinxext-opengraph
+sphinx_design
 numpy
 scipy
 matplotlib

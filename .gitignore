@@ -183,3 +183,8 @@ dmypy.json
 # Mac
 *.DS_Store
 
+
+# documentation assets (the pipeline flowchart ships with the docs; the slide is its editable source)
+!docs/source/_static/*.png
+!docs/source/_static/*.svg
+!docs/figures/*.pptx

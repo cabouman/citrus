@@ -28,7 +28,7 @@ extensions = [
     "sphinx.ext.mathjax",
     "sphinx.ext.viewcode",
 ]
-for optional in ("sphinx_copybutton", "sphinxext.opengraph"):
+for optional in ("sphinx_copybutton", "sphinxext.opengraph", "sphinx_design"):
     try:
         __import__(optional)
         extensions.append(optional)
@@ -45,6 +45,13 @@ napoleon_numpy_docstring = True
 
 templates_path = []
 exclude_patterns = ["_build", "build"]
+html_static_path = ["_static"]
+
+# The logo: drop docs/source/_static/citrus_logo.png (and optionally citrus_logo_dark.png for the dark theme) into
+# place and it is picked up; until then the theme shows the project name.
+_static = os.path.join(os.path.dirname(__file__), "_static")
+_logo = os.path.join(_static, "citrus_logo.png")
+_logo_dark = os.path.join(_static, "citrus_logo_dark.png")
 
 try:
     import sphinx_book_theme  # noqa: F401
@@ -53,11 +60,22 @@ try:
     html_theme_options = {
         "repository_url": "https://github.com/cabouman/citrus",
         "use_repository_button": True,
+        "use_download_button": False,
+        "home_page_in_toc": True,
+        "show_toc_level": 2,
+        "logo": {"text": "CITRUS"},
     }
+    if os.path.exists(_logo):
+        html_logo = "_static/citrus_logo.png"
+        html_theme_options["logo"] = {"image_light": "_static/citrus_logo.png",
+                                      "image_dark": "_static/citrus_logo_dark.png" if os.path.exists(_logo_dark)
+                                      else "_static/citrus_logo.png"}
 except ImportError:
     html_theme = "alabaster"
-html_title = "citrus"
+html_title = "CITRUS"
+html_short_title = "CITRUS"
 ogp_site_url = "https://purduecitrus.readthedocs.io/"
+ogp_image = "https://purduecitrus.readthedocs.io/en/latest/_static/citrus_pipeline.png"
 
 
 def _literal_docstrings(app, what, name, obj, options, lines):
