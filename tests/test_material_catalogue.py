@@ -309,7 +309,7 @@ def test_synthesize_wlab_dataset_on_a_reduced_set(small_libraries):
         out[name] = synthesize_wlab_dataset(2, 2.0, noise=False, config=SMALL_SOLVER, library=small_libraries[name],
                                             geometry=wlab_geometry(), device="cuda")
     reduced, default = out["reduced"], out["default"]
-    assert reduced["rho_true"].shape == (3, *wlab_grid(2.0).shape) and reduced["meta"]["materials"] == list(REDUCED)
+    assert reduced["X_true"].shape == tuple(wlab_grid(2.0).shape) and reduced["meta"]["materials"] == list(REDUCED)
     np.testing.assert_allclose(reduced["X_true"], default["X_true"], rtol=1e-6)
     np.testing.assert_allclose(reduced["SPR"], default["SPR"], rtol=1e-4)
     with pytest.raises(ValueError, match="WLAB phantom needs 'water' and 'bone'"):

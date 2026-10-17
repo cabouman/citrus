@@ -86,7 +86,7 @@ import json
 import math
 import os
 import time
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Callable, Optional, Sequence, Union
 
 import numpy as np
@@ -185,26 +185,102 @@ def wlab_phantom(grid: Grid, *, lung_center: tuple[float, float] = (-5.0, 0.0),
                     and abs(center_i[1] - center_j[1]) < (size_i[1] + size_j[1]) / 2 - tolerance):
                 raise ValueError(f"inserts at {center_i} and {center_j} overlap")
 
-    x, y, z = grid.axis_coordinates(device, torch.float64)
-    xx = x[None, :, None]
-    yy = y[:, None, None]
-    zz = z[None, None, :]
-    prism = _in_interval(xx, 0.0, size_x) & _in_interval(yy, 0.0, size_y) & _in_interval(zz, 0.0, size_z)
+    phantom = WlabPhantom(grid, names, lung_center=lung_center, air_center=air_center, bone_center=bone_center,
+                          device=device, dtype=dtype)
+    rho = torch.zeros(len(names), *grid.shape, device=device, dtype=dtype)
+    rho[water_row] = phantom.material(None, water_row)
+    rho[bone_row] = phantom.material(None, bone_row)
+    return rho
 
-    def column(center: tuple[float, float], size: tuple[float, float]) -> Tensor:
-        return _in_interval(xx, center[0], size[0]) & _in_interval(yy, center[1], size[1]) & prism
 
-    lung = column(lung_center, LUNG_SIZE_XY)
-    air = column(air_center, AIR_SIZE_XY)
-    bone = column(bone_center, BONE_SIZE_XY)
-    rho = torch.zeros(len(names), *grid.shape, device=device, dtype=torch.float64)
-    water = rho[water_row]
-    water[prism] = RHO_WATER
-    water[lung] = RHO_LUNG
-    water[air] = RHO_AIR
-    water[bone] = 0.0
-    rho[bone_row][bone] = RHO_BONE
-    return rho.to(dtype)
+@dataclass(frozen=True)
+class WlabPhantom:
+    """The WLAB phantom as a density model that rasterizes ONE material map at a time (`MaterialDensityModel`:
+    `material(X, m)`, X ignored), so that a fine grid never holds the [M, R, C, S] volume: the ground-truth data
+    (`synthesize_cone_beam_data`) and the solver (`ScatterSolver.material_fields_from_attenuation`) take the maps one
+    by one. `wlab_phantom` stacks them for small grids. grid must cover the 30 x 20 x 40 cm prism; materials: the
+    library's material names (water and bone must be among them, `wlab_phantom`); the insert centres as in
+    `wlab_phantom`. `attenuation(library)` is X_true = sum_m rho_m m_m(E_eff), accumulated map by map; `densities()`
+    the stacked [M, R, C, S] volume."""
+
+    grid: Grid
+    materials: tuple[str, ...] = MATERIALS
+    lung_center: tuple[float, float] = (-5.0, 0.0)
+    air_center: tuple[float, float] = (3.0, 0.0)
+    bone_center: tuple[float, float] = (7.0, 0.0)
+    device: object = None
+    dtype: torch.dtype = torch.float32
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "materials", tuple(self.materials))
+        _phantom_row(self.materials, "water")
+        _phantom_row(self.materials, "bone")
+
+    @property
+    def num_materials(self) -> int:
+        return len(self.materials)
+
+    def _masks(self):
+        """(prism, lung, air, bone) boolean masks [R, C, S] (broadcast products of the 1-D axis intervals)."""
+        size_x, size_y, size_z = WLAB_SIZE_XYZ
+        x, y, z = self.grid.axis_coordinates(self.device, torch.float64)
+        xx, yy, zz = x[None, :, None], y[:, None, None], z[None, None, :]
+        prism = _in_interval(xx, 0.0, size_x) & _in_interval(yy, 0.0, size_y) & _in_interval(zz, 0.0, size_z)
+
+        def column(center: tuple[float, float], size: tuple[float, float]) -> Tensor:
+            return _in_interval(xx, center[0], size[0]) & _in_interval(yy, center[1], size[1]) & prism
+
+        return prism, column(self.lung_center, LUNG_SIZE_XY), column(self.air_center, AIR_SIZE_XY), \
+            column(self.bone_center, BONE_SIZE_XY)
+
+    def material(self, X, m: int) -> Tensor:
+        """Density map [R, C, S] (g/cm^3, `dtype`) of library material m; X is ignored (a phantom has no
+        reconstruction). The water row holds the prism with the lung and air inserts as water of reduced density, the
+        bone row the bone insert; every other material is zero."""
+        rho = torch.zeros(*self.grid.shape, device=self.device, dtype=self.dtype)
+        water_row = _phantom_row(self.materials, "water")
+        bone_row = _phantom_row(self.materials, "bone")
+        if m not in (water_row, bone_row):
+            return rho
+        prism, lung, air, bone = self._masks()
+        if m == water_row:
+            rho[prism] = RHO_WATER
+            rho[lung] = RHO_LUNG
+            rho[air] = RHO_AIR
+            rho[bone] = 0.0
+        else:
+            rho[bone] = RHO_BONE
+        return rho
+
+    def attenuation(self, library: MultigroupLibrary, energy_kev: Optional[float] = None) -> Tensor:
+        """X_true [R, C, S] (1/cm) = sum_m rho_m m_m(E), accumulated one material map at a time (E: `energy_kev`,
+        None = E_eff)."""
+        if tuple(library.materials) != self.materials:
+            raise ValueError(f"the phantom's materials {self.materials} are not the library's {library.materials}")
+        m_at = mass_attenuation_at(library, effective_energy(library) if energy_kev is None else float(energy_kev))
+        X = torch.zeros(*self.grid.shape, device=self.device, dtype=self.dtype)
+        for m in (_phantom_row(self.materials, "water"), _phantom_row(self.materials, "bone")):
+            X.add_(self.material(None, m), alpha=float(m_at[m]))
+        return X
+
+    def densities(self) -> Tensor:
+        """The stacked [M, R, C, S] volume (`wlab_phantom`; for grids small enough to hold it)."""
+        return torch.stack([self.material(None, m) for m in range(self.num_materials)])
+
+
+class StackedDensities:
+    """A density volume rho [M, R, C, S] as a `MaterialDensityModel` (`material(X, m)` = rho[m], X ignored): lets
+    `synthesize_cone_beam_data` take an explicit volume through the same one-map-at-a-time path as a phantom."""
+
+    def __init__(self, rho: Tensor) -> None:
+        self.rho = rho
+
+    @property
+    def num_materials(self) -> int:
+        return int(self.rho.shape[0])
+
+    def material(self, X, m: int) -> Tensor:
+        return self.rho[m]
 
 
 def _phantom_row(materials: Sequence[str], name: str) -> int:
@@ -467,27 +543,31 @@ def view_angles(num_views: int, geometry: Optional[ConeGeometry] = None, start_v
     return start + (end - start) * np.arange(n, dtype=np.float64) / n
 
 
-def synthesize_cone_beam_data(rho: Tensor, grid: Grid, geometry: ConeGeometry, angles, solver: ScatterSolver,
+def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, angles, solver: ScatterSolver,
                               I0: float = 1.0e5, noise: bool = True, seed: int = 0, *,
                               energy_kev: Optional[float] = None, device=None,
                               progress: Optional[Callable[[int, float], None]] = None) -> dict:
     """Cone-beam counts with scatter for any density volume (module docstring, "Synthetic cone-beam data").
 
-    rho [M, R, C, S] densities (g/cm^3) of the solver library's M materials (`solver.library.materials`) on `grid`
-    (the reconstruction grid, the solver's fine grid); geometry: the scan (used by MBIRTORCH and must be the solver's
-    geometry); angles [V] (rad); solver: the ScatterSolver that defines the scatter truth (one fully converged
-    solve_view per view); I0: flat-field counts per pixel; noise: Poisson(Y_mean) with torch.Generator(seed), else
-    Y = Y_mean; energy_kev: E_eff (None: the spectrum mean of the solver's library). progress(view_index, seconds) is
-    called after every solved view. The SPR's denominator is always the primary model of the CITRUS loop (MBIRTORCH's
-    per-material line integrals through the solver's transmission, `citrus.citrus.primary_signals`); meta records
-    primary_projector "mbirtorch" and data_format 2.
+    densities: the true object, either a density model that gives one material map at a time (`material(X, m)` ->
+    [R, C, S] g/cm^3 of library material m with X ignored, e.g. `WlabPhantom`) or a volume rho [M, R, C, S] of the
+    solver library's M materials (`solver.library.materials`; wrapped in `StackedDensities`), on `grid` (the
+    reconstruction grid, the solver's fine grid). The fine grid never holds more than X and one material map at a
+    time (`ScatterSolver.material_fields_from_attenuation`, built once and shared by every view), so the truth of a
+    fine reconstruction grid fits the GPU like the reconstruction itself. geometry: the scan (used by MBIRTORCH and
+    must be the solver's geometry); angles [V] (rad); solver: the ScatterSolver that defines the scatter truth (one
+    fully converged solve per view); I0: flat-field counts per pixel; noise: Poisson(Y_mean) with
+    torch.Generator(seed), else Y = Y_mean; energy_kev: E_eff (None: the spectrum mean of the solver's library).
+    progress(view_index, seconds) is called after every solved view. The SPR's denominator is always the primary model
+    of the CITRUS loop (MBIRTORCH's per-material line integrals through the solver's transmission,
+    `citrus.citrus.primary_signals`); meta records primary_projector "mbirtorch" and data_format 2.
 
-    Returns a dict of numpy arrays (float32 unless noted): X_true [R, C, S] (1/cm), rho_true [M, R, C, S], angles [V]
-    (float64), line_integrals, P, S, Y, Y_mean, SPR [V, Rd, Cd], solver_primary, solver_scatter [V, Rd, Cd] (planar
-    fluence summed over groups, photons/cm^2 per source photon/sr), phi_air [Rd, Cd] (solver primary of an empty
-    volume), view_seconds [V], si_iterations [V] (int), I0, energy_kev, mass_attenuation [M] (the materials' mass
-    attenuation at E_eff, cm^2/g) and meta (dict: geometry, grid, solver config, materials, angular range, versions,
-    timings, statistics).
+    Returns a dict of numpy arrays (float32 unless noted): X_true [R, C, S] (1/cm), angles [V] (float64),
+    line_integrals, P, S, Y, Y_mean, SPR [V, Rd, Cd], solver_primary, solver_scatter [V, Rd, Cd] (planar fluence
+    summed over groups, photons/cm^2 per source photon/sr), phi_air [Rd, Cd] (solver primary of an empty volume),
+    view_seconds [V], si_iterations [V] (int), I0, energy_kev, mass_attenuation [M] (the materials' mass attenuation
+    at E_eff, cm^2/g) and meta (dict: geometry, grid, solver config, materials, angular range, versions, timings,
+    statistics). The density volume itself is not stored (it is M fine volumes; `WlabPhantom` rebuilds it).
     """
     from .recon.mbir_bridge import forward_project, make_cone_model, mbirtorch_version
 
@@ -501,8 +581,15 @@ def synthesize_cone_beam_data(rho: Tensor, grid: Grid, geometry: ConeGeometry, a
     library = solver.library
     energy_kev = effective_energy(library) if energy_kev is None else float(energy_kev)
     mass_attenuation = mass_attenuation_at(library, energy_kev)
-    rho = torch.as_tensor(rho, device=device, dtype=torch.float32)
-    X = densities_to_attenuation(library, rho, energy_kev)
+    if isinstance(densities, Tensor) or not hasattr(densities, "material"):
+        densities = StackedDensities(torch.as_tensor(densities, device=device, dtype=torch.float32))
+    if int(densities.num_materials) != library.num_materials:
+        raise ValueError(f"the densities have {int(densities.num_materials)} materials, the library "
+                         f"{library.num_materials} {tuple(library.materials)}")
+    # X_true accumulated one material map at a time
+    X = torch.zeros(*grid.shape, device=device, dtype=torch.float32)
+    for m in range(library.num_materials):
+        X.add_(densities.material(None, m).to(device=device, dtype=torch.float32), alpha=float(mass_attenuation[m]))
     angles = np.asarray(angles.detach().cpu().numpy() if isinstance(angles, Tensor) else angles,
                         dtype=np.float64).reshape(-1)
 
@@ -515,16 +602,17 @@ def synthesize_cone_beam_data(rho: Tensor, grid: Grid, geometry: ConeGeometry, a
     projection_seconds = time.perf_counter() - t0
     P = float(I0) * torch.exp(-line_integrals)
 
-    # scatter-to-primary ratio from the solver, one converged solve per view
+    # scatter-to-primary ratio from the solver, one converged solve per view on the fields built once from the maps
     V, Rd, Cd = len(angles), geometry.num_det_rows, geometry.num_det_channels
     solver_scatter = torch.empty(V, Rd, Cd, device=device, dtype=torch.float32)
     view_seconds = np.zeros(V)
     source_iterations = np.zeros(V, dtype=np.int64)
     source_iteration_converged = np.zeros(V, dtype=bool)
     t0 = time.perf_counter()
+    fields = solver.material_fields_from_attenuation(X, grid, densities)
     for v in range(V):
         view_start = time.perf_counter()
-        result = solver.solve_view(rho, grid, float(angles[v]))
+        result = solver.solve_view_from_fields(fields, float(angles[v]))
         solver_scatter[v] = result.scatter_planar_fluence.sum(0)
         source_iterations[v] = result.source_iteration_result.num_iterations
         source_iteration_converged[v] = bool(result.source_iteration_result.converged)
@@ -534,14 +622,15 @@ def synthesize_cone_beam_data(rho: Tensor, grid: Grid, geometry: ConeGeometry, a
             progress(v, view_seconds[v])
     solver_seconds = time.perf_counter() - t0
     # the primary model of the CITRUS loop: MBIRTORCH's per-material line integrals through the solver's transmission
-    fields = solver.material_fields(rho, grid)
     projector = ViewChunkProjector(grid, geometry, angles, model=model, device=device)
     solver_primary = primary_signals(solver, fields, angles, projector,
                                      quantity="planar_fluence").to(device, torch.float32)
     del fields, projector
-    empty_fields = solver.material_fields(torch.zeros_like(rho), grid)
-    phi_air = solver.primary(empty_fields, 0.0)["planar_fluence"].sum(0)
-    del empty_fields
+    # the solver's primary of an empty volume: zero path lengths of one material (no volume is traced)
+    n = int(solver.primary_samples_per_pixel_axis or getattr(solver.projectors, "samples_per_pixel_axis", 1) or 1)
+    zero_path = torch.zeros(1, Rd * n, Cd * n, device=device, dtype=torch.float32)
+    phi_air = solver.primary_from_path_lengths(zero_path, [0], 0.0)["planar_fluence"].sum(0)
+    del zero_path
 
     SPR = solver_scatter / solver_primary.clamp_min(torch.finfo(solver_primary.dtype).tiny)
     S = SPR * P
@@ -582,7 +671,7 @@ def synthesize_cone_beam_data(rho: Tensor, grid: Grid, geometry: ConeGeometry, a
                   "Y_min": float(Y.min()), "Y_max": float(Y.max())},
     }
     return {
-        "X_true": to_numpy(X), "rho_true": to_numpy(rho), "angles": angles, "line_integrals": to_numpy(line_integrals),
+        "X_true": to_numpy(X), "angles": angles, "line_integrals": to_numpy(line_integrals),
         "P": to_numpy(P), "S": to_numpy(S), "Y": to_numpy(Y), "Y_mean": to_numpy(Y_mean), "SPR": spr_array,
         "solver_primary": to_numpy(solver_primary), "solver_scatter": to_numpy(solver_scatter),
         "phi_air": to_numpy(phi_air), "view_seconds": view_seconds, "si_iterations": source_iterations,
@@ -616,7 +705,7 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
     detector, no grid). The library's materials follow config.materials (the reference materials of
     `SolverConfig.materials`;
     default the seven of `cross_sections.MATERIALS`) unless `library` is given; the phantom is placed in the library's
-    water and bone rows (`wlab_phantom(materials=library.materials)`, which needs both in the set). meta also records
+    water and bone rows (`WlabPhantom`, one material map at a time; both must be in the set). meta also records
     delta_voxel, start_view_angle and end_view_angle. out_path: if given, the data are written with `save_dataset`
     (<out_path>.npz and <out_path>.json)."""
     device = (torch.device(device) if device is not None
@@ -624,10 +713,10 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
     geometry = full_field_wlab_geometry() if geometry is None else geometry
     grid = wlab_grid(delta_voxel)
     solver = wlab_solver(delta_voxel, config=config, library=library, geometry=geometry, device=device)
-    rho = wlab_phantom(grid, materials=solver.library.materials, device=device, dtype=torch.float32)
+    phantom = WlabPhantom(grid, solver.library.materials, device=device, dtype=torch.float32)
     angles = view_angles(num_views, geometry, start_view_angle, end_view_angle)
     end = float(start_view_angle) + math.pi + fan_angle(geometry) if end_view_angle is None else float(end_view_angle)
-    out = synthesize_cone_beam_data(rho, grid, geometry, angles, solver, I0, noise, seed, energy_kev=energy_kev,
+    out = synthesize_cone_beam_data(phantom, grid, geometry, angles, solver, I0, noise, seed, energy_kev=energy_kev,
                                     device=device, progress=progress)
     out["meta"].update(description="synthetic WLAB scatter dataset, citrus.utilities.synthesize_wlab_dataset",
                        delta_voxel=float(delta_voxel), start_view_angle=float(start_view_angle),

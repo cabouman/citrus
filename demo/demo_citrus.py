@@ -160,7 +160,9 @@ def main() -> None:
                         help="resume MBIR from its error sinogram between outer iterations (default) or restart it "
                              "from the sinogram (--no-resume-error-sinogram)")
     parser.add_argument("--save-recon", action="store_true", help="also save the CITRUS volume (.npy)")
-    parser.add_argument("--memory-cap-mib", type=float, default=4400.0, help="PyTorch CUDA memory cap (0: none)")
+    parser.add_argument("--memory-cap-mib", type=float, default=None,
+                        help="PyTorch CUDA allocator cap in MiB (default: 85 percent of the device's memory, which "
+                             "keeps Windows from spilling into system memory; 0: none)")
     parser.add_argument("--input", default=os.path.join(HERE, "input"))
     parser.add_argument("--out", default=os.path.join(HERE, "output"))
     args = parser.parse_args()
@@ -183,7 +185,9 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("this demo needs a CUDA GPU (MBIRTORCH and the scatter solver run on the GPU)")
     device = torch.device("cuda")
-    set_memory_cap(args.memory_cap_mib)
+    if args.memory_cap_mib is None and torch.cuda.is_available():
+        args.memory_cap_mib = 0.85 * torch.cuda.get_device_properties(0).total_memory / 2 ** 20
+    set_memory_cap(args.memory_cap_mib or 0.0)
     os.makedirs(args.input, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
     # the truth solver keeps the default reference materials (the data do not depend on --materials); the loop uses

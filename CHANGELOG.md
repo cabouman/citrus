@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.5.1 - 2026-10-17
+
+Ground-truth data for fine reconstruction grids. `utilities.synthesize_cone_beam_data` takes a density MODEL that gives
+one material map at a time (`utilities.WlabPhantom`, the WLAB phantom as such a model; a volume rho [M, R, C, S] is
+wrapped in `utilities.StackedDensities`) and builds the solver's fields once with
+`ScatterSolver.material_fields_from_attenuation`, shared by every view through the new
+`ScatterSolver.solve_view_from_fields`; the fine grid never holds the [M, R, C, S] volume, so the truth of a 0.5 mm
+reconstruction fits the GPU like the reconstruction. `synthesize_wlab_dataset` uses `WlabPhantom`; `wlab_phantom`
+stacks its maps. The data sets no longer store `rho_true` (M fine volumes); `X_true` stays. The solver's primary of an
+empty volume (`phi_air`) comes from zero path lengths instead of a zero volume. The demo's `--memory-cap-mib` defaults
+to 85 percent of the device's memory instead of a fixed value.
+
 ## v0.5.0 — 2026-10-17
 
 The CITRUS loop always computes its primary with MBIRTORCH; a material catalogue and user-selectable reference materials

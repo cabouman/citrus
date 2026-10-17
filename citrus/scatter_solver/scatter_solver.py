@@ -674,13 +674,27 @@ class ScatterSolver:
         rho_fine: [M, R, C, S] basis-material densities (g/cm^3; M = the library's materials) on grid_fine (any
         voxel size: the transport grid covers it, `transport_grid`). angle: view angle (rad). keep_phi_total: also
         return the collided moments [G, (L+1)^2, 4, Rc, Cc, Sc]. Returns ViewResult. On CUDA the per-stage peak memory
-        is measured by resetting the device's peak-memory statistics at the start of every stage.
+        is measured by resetting the device's peak-memory statistics at the start of every stage. For a fine grid
+        that cannot hold the M-material volume, build the fields one material map at a time
+        (`material_fields_from_attenuation`) and call `solve_view_from_fields`.
         """
         timings: dict[str, float] = {}
         peaks: dict[str, int] = {}
         start_time = time.perf_counter()
         with self._stage("materials", timings, peaks):
             fields = self.material_fields(rho_fine, grid_fine)
+        return self._solve_view(fields, angle, keep_phi_total, timings, peaks, start_time)
+
+    def solve_view_from_fields(self, fields: MaterialFields, angle: float, keep_phi_total: bool = False) -> ViewResult:
+        """`solve_view` on prebuilt `MaterialFields` (`material_fields` or `material_fields_from_attenuation`): the
+        fields are shared by every view of a volume, so a multi-view truth (`utilities.synthesize_cone_beam_data`)
+        resamples the densities once."""
+        return self._solve_view(fields, angle, keep_phi_total, {}, {}, time.perf_counter())
+
+    def _solve_view(self, fields: MaterialFields, angle: float, keep_phi_total: bool, timings: dict[str, float],
+                    peaks: dict[str, int], start_time: float) -> ViewResult:
+        with self._stage("sweep_context", timings, peaks):
+            grid_fine = fields.grid_fine
             sweep_context = self.sweep_context(fields.grid_coarse)
         with self._stage("uncollided", timings, peaks):
             phi_uncollided = self.uncollided_fluence(fields, angle)

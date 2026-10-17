@@ -213,7 +213,7 @@ def test_smoke_dataset_2cm(real_library, tmp_path):
     R, C, S = wlab_grid(2.0).shape
     for k in ("P", "S", "Y", "Y_mean", "SPR", "line_integrals", "solver_primary", "solver_scatter"):
         assert out[k].shape == (V, 75, 100) and out[k].dtype == np.float32, k
-    assert out["X_true"].shape == (R, C, S) and out["rho_true"].shape == (7, R, C, S)
+    assert out["X_true"].shape == (R, C, S) and "rho_true" not in out
     assert out["angles"].shape == (V,) and np.allclose(out["angles"], 2 * np.pi * np.arange(V) / V)
     assert out["meta"]["materials"] == list(MATERIALS) and out["mass_attenuation"].shape == (7,)
     assert out["meta"]["short_scan"] is False and out["meta"]["end_view_angle"] == pytest.approx(2 * np.pi)
@@ -266,7 +266,7 @@ def test_synthesize_cone_beam_data_generic():
                            grid_response=no_grid(), device=device, dtype=torch.float32)
     angles = [0.0, 1.0, 2.5]
     out = synthesize_cone_beam_data(rho, grid, geometry, angles, solver, I0=1.0e4, noise=False)
-    assert out["Y"].shape == (3, 24, 24) and out["X_true"].shape == grid.shape and out["rho_true"].shape == rho.shape
+    assert out["Y"].shape == (3, 24, 24) and out["X_true"].shape == grid.shape and "rho_true" not in out
     assert np.allclose(out["Y"], out["P"] + out["S"], rtol=1e-6)
     assert np.allclose(out["P"], 1.0e4 * np.exp(-out["line_integrals"]), rtol=1e-5)
     assert np.allclose(out["S"], out["SPR"] * out["P"], rtol=1e-5)
@@ -281,3 +281,33 @@ def test_synthesize_cone_beam_data_generic():
                        for a in angles])
     d = np.abs(out["solver_primary"] / siddon - 1)
     assert float(np.median(d)) < 0.01 and float(d.max()) > 0
+
+
+def test_wlab_phantom_model_matches_the_stacked_volume():
+    """`WlabPhantom` gives the maps of `wlab_phantom` one at a time, its attenuation equals
+    `densities_to_attenuation` of the stacked volume, and `synthesize_cone_beam_data` gives the same data from the
+    model and from the volume (the model path never holds the [M, R, C, S] volume)."""
+    from citrus.utilities import WlabPhantom, densities_to_attenuation, wlab_phantom, wlab_solver
+
+    grid = wlab_grid(2.0)
+    phantom = WlabPhantom(grid, MATERIALS, device="cpu", dtype=torch.float64)
+    rho = wlab_phantom(grid, device="cpu", dtype=torch.float64)
+    assert torch.equal(phantom.densities(), rho)
+    for m in range(7):
+        assert torch.equal(phantom.material(None, m), rho[m])
+    library = synthetic_library(num_materials=7)
+    assert torch.allclose(phantom.attenuation(library), densities_to_attenuation(library, rho), rtol=1e-12, atol=0)
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda")
+    geometry = full_field_wlab_geometry()
+    config = SolverConfig(num_groups=4, legendre_order=1, num_polar=2, num_azimuthal=4, cone_num_polar=4,
+                          cone_num_azimuthal=8, transport_cell_cm=4.0, source_iteration_tolerance=1e-3)
+    solver = wlab_solver(2.0, config=config, library=library, geometry=geometry, device=device)
+    angles = [0.0, 1.2]
+    from_model = synthesize_cone_beam_data(WlabPhantom(grid, MATERIALS, device=device), grid, geometry, angles, solver,
+                                           noise=False)
+    from_volume = synthesize_cone_beam_data(wlab_phantom(grid, device=device), grid, geometry, angles, solver,
+                                            noise=False)
+    for key in ("X_true", "Y", "SPR", "solver_primary", "solver_scatter", "phi_air"):
+        assert np.allclose(from_model[key], from_volume[key], rtol=1e-4, atol=0), key  # projector atomics
