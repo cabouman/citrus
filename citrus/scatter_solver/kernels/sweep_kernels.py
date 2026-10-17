@@ -1,15 +1,17 @@
-"""Fused Triton kernel for the per-plane LD cell solve of the discrete-ordinates sweep (`transport_sweep.py`).
+"""Fused Triton kernel for the per-plane linear-discontinuous cell solve of the discrete-ordinates sweep
+(`transport_sweep.py`).
 
 The PyTorch plane step (`transport_sweep._plane_step`) issues about 15 kernels per wavefront plane (gathers, the
-broadcasting elementwise LD algebra of `ld_cell.py` and the scatter), each reading and writing
-[Dc, G, ., E] temporaries. This module replaces the whole plane step by ONE kernel launch:
+broadcasting elementwise linear-discontinuous algebra of `linear_discontinuous_cell.py` and the scatter), each reading
+and writing [Dc, G, ., E] temporaries. This module replaces the whole plane step by ONE kernel launch:
 
-    _ld_plane_kernel   for every (entry e of the plane, chunk direction d, group g):
+    _linear_discontinuous_plane_kernel   for every (entry e of the plane, chunk direction d, group g):
         o, n, (u_x, u_y, u_z) = octant, cell, upstream cells of entry e   (vacuum -> the zero cell N)
         nbr_a[0..3]  = store[o, d, u_a, 4g : 4g+4]          a = x, y, z   (one 16-byte vector load each)
-        S[0..3]      = src[o, d, n, 4g : 4g+4]
+        S[0..3]      = source[o, d, n, 4g : 4g+4]
         mu           = mu_cells[n, g];  c_a = c[o, d, a];  s_a = +-1 from the octant code bits
-        R_0, R_a     exactly as ld_cell.ld_cell_rhs; psi_0, psi_a exactly as ld_cell.ld_cell_solve
+        R_0, R_a     exactly as linear_discontinuous_cell.cell_right_hand_sides; psi_0, psi_a exactly as
+        linear_discontinuous_cell.cell_solve
         store[o, d, n, 4g : 4g+4] = (psi_0, psi_x, psi_y, psi_z)              (one 16-byte vector store)
 
 Program grid: one lane per (entry, direction, group) of the plane, flattened with the group fastest
@@ -24,10 +26,10 @@ Plane entries are read from a flat, plane-sorted int32 copy of the sweep plan (`
 that are not specialized (one compiled variant per (G, Dc)).
 
 Numerics: float32 only (the PyTorch path serves float64 and CPU tensors). The per-lane arithmetic follows
-`ld_cell.py` term by term, so the result equals the PyTorch path up to float32 rounding (measured max
+`linear_discontinuous_cell.py` term by term, so the result equals the PyTorch path up to float32 rounding (measured max
 deviation ~1e-6 relative to the field maximum, see tests/test_transport_sweep.py).
 
-Availability: `triton_available()` (shared, from `triton_utils`: probe kernel, cached per
+Availability: `triton_available()` (shared, from `triton_utilities`: probe kernel, cached per
 process; `CITRUS_DISABLE_TRITON=1` is the kill switch) and `kernels_usable(device)`, which additionally runs
 the fused plane loop against the PyTorch plane step on a small heterogeneous problem once per device
 (two direction chunks) and reports a tolerance breach as unusable.
@@ -40,7 +42,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from .triton_utils import DISABLE_ENV_VAR, triton_available
+from .triton_utilities import DISABLE_ENV_VAR, triton_available
 
 try:  # import errors are reported by triton_available(), never raised at import time
     import triton
@@ -78,17 +80,17 @@ class FlatPlaneIndex:
 
     octant: Tensor
     cell: Tensor
-    up: Tensor
+    upstream: Tensor
     offsets: tuple[int, ...]
 
 
-def build_flat_index(octant: Tensor, cell: Tensor, up_cell: Tensor, offsets: list[int]) -> FlatPlaneIndex:
-    """FlatPlaneIndex from the plane-sorted plan tables octant [E_tot], cell [E_tot], up_cell [E_tot, 3]
+def build_flat_index(octant: Tensor, cell: Tensor, upstream_cell: Tensor, offsets: list[int]) -> FlatPlaneIndex:
+    """FlatPlaneIndex from the plane-sorted plan tables octant [E_tot], cell [E_tot], upstream_cell [E_tot, 3]
     (vacuum already replaced by num_cells) and the plane offsets (host ints, length num_planes + 1)."""
     return FlatPlaneIndex(
         octant=octant.to(torch.int32).contiguous(),
         cell=cell.to(torch.int32).contiguous(),
-        up=up_cell.to(torch.int32).contiguous().view(-1),
+        upstream=upstream_cell.to(torch.int32).contiguous().view(-1),
         offsets=tuple(int(v) for v in offsets),
     )
 
@@ -103,13 +105,13 @@ def kernels_usable(device: torch.device) -> tuple[bool, str]:
     ok, why = triton_available()
     if not ok:
         return ok, why
-    dev = torch.device(device)
-    if dev.type != "cuda":
+    device = torch.device(device)
+    if device.type != "cuda":
         return False, "not a CUDA device"
-    key = str(dev)
+    key = str(device)
     if key not in _SELF_CHECK:
         try:
-            _SELF_CHECK[key] = _self_check(dev)
+            _SELF_CHECK[key] = _self_check(device)
         except Exception as e:  # noqa: BLE001
             _SELF_CHECK[key] = (False, f"self-check failed ({type(e).__name__}: {str(e)[:300]})")
     return _SELF_CHECK[key]
@@ -123,20 +125,20 @@ def _self_check(device: torch.device) -> tuple[bool, str]:
     from ..transport_sweep import _sweep_chunk, make_sweep_context
 
     grid = Grid((3, 4, 5), 0.7, 1.3, 0.9)
-    q = product_quadrature(4, 8, dtype=torch.float64)
-    ctx = make_sweep_context(grid, q, 1, device=device, dtype=torch.float32, backend="torch")
-    G, N = 3, ctx.num_cells
-    gen = torch.Generator().manual_seed(11)
-    mu_cells = (torch.rand(N, G, generator=gen) * 2.0 + 0.1).to(device)
+    quadrature = product_quadrature(4, 8, dtype=torch.float64)
+    sweep_context = make_sweep_context(grid, quadrature, 1, device=device, dtype=torch.float32, backend="torch")
+    G, N = 3, sweep_context.num_cells
+    generator = torch.Generator().manual_seed(11)
+    mu_cells = (torch.rand(N, G, generator=generator) * 2.0 + 0.1).to(device)
     worst = 0.0
-    for Dc in (ctx.directions_per_octant, 3):
-        src = torch.randn(8, Dc, N, 4 * G, generator=gen).to(device)
-        c = ctx.c[:, :Dc].contiguous()
-        s = ctx.s[:, :Dc].contiguous()
-        ref = _sweep_chunk(ctx, src, mu_cells, c, s, use_triton=False)
-        out = _sweep_chunk(ctx, src, mu_cells, c, s, use_triton=True)
-        scale = float(ref.abs().max())
-        worst = max(worst, float((ref - out).abs().max()) / max(scale, 1e-30))
+    for Dc in (sweep_context.directions_per_octant, 3):
+        source = torch.randn(8, Dc, N, 4 * G, generator=generator).to(device)
+        c = sweep_context.c[:, :Dc].contiguous()
+        s = sweep_context.s[:, :Dc].contiguous()
+        reference = _sweep_chunk(sweep_context, source, mu_cells, c, s, use_triton=False)
+        out = _sweep_chunk(sweep_context, source, mu_cells, c, s, use_triton=True)
+        scale = float(reference.abs().max())
+        worst = max(worst, float((reference - out).abs().max()) / max(scale, 1e-30))
     if worst > SELF_CHECK_REL_TOL:
         return False, f"self-check: fused plane kernel deviates from the PyTorch plane step by {worst:.2e} (rel)"
     return True, f"fused plane kernel matches the PyTorch plane step (max rel dev {worst:.1e})"
@@ -159,9 +161,9 @@ if triton is not None:
         return v0, v1, v2, v3
 
     @triton.jit(do_not_specialize=["start", "E"])
-    def _ld_plane_kernel(store_ptr, src_ptr, mu_ptr, c_ptr, oct_ptr, cell_ptr, up_ptr,
-                         start, E, N,
-                         G: tl.constexpr, DC: tl.constexpr, BLOCK: tl.constexpr):
+    def _linear_discontinuous_plane_kernel(store_ptr, source_ptr, mu_ptr, c_ptr, octant_ptr, cell_ptr, upstream_ptr,
+                                           start, E, N,
+                                           G: tl.constexpr, DC: tl.constexpr, BLOCK: tl.constexpr):
         """One wavefront plane: lanes over (entry, direction, group), group fastest. See module docstring."""
         Q: tl.constexpr = 4 * G
         i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
@@ -171,11 +173,11 @@ if triton is not None:
         d = ed % DC
         e = start + ed // DC
         e = tl.where(mask, e, start)  # keep masked lanes' table reads in bounds
-        o = tl.load(oct_ptr + e).to(tl.int64)
+        o = tl.load(octant_ptr + e).to(tl.int64)
         n = tl.load(cell_ptr + e).to(tl.int64)
-        ux = tl.load(up_ptr + 3 * e).to(tl.int64)
-        uy = tl.load(up_ptr + 3 * e + 1).to(tl.int64)
-        uz = tl.load(up_ptr + 3 * e + 2).to(tl.int64)
+        ux = tl.load(upstream_ptr + 3 * e).to(tl.int64)
+        uy = tl.load(upstream_ptr + 3 * e + 1).to(tl.int64)
+        uz = tl.load(upstream_ptr + 3 * e + 2).to(tl.int64)
         od = o * DC + d
         cx = tl.load(c_ptr + od * 3)
         cy = tl.load(c_ptr + od * 3 + 1)
@@ -188,13 +190,13 @@ if triton is not None:
 
         row = od * (N + 1)
         q0 = 4 * g
-        # upstream neighbors' LD moments [0, x, y, z]; the vacuum cell N is all zeros
+        # upstream neighbors' linear-discontinuous moments [0, x, y, z]; the vacuum cell N is all zeros
         x0, xx, xy, xz = _load4(store_ptr, (row + ux) * Q + q0, mask, BLOCK)
         y0, yx, yy, yz = _load4(store_ptr, (row + uy) * Q + q0, mask, BLOCK)
         z0, zx, zy, zz = _load4(store_ptr, (row + uz) * Q + q0, mask, BLOCK)
-        s0, s1, s2, s3 = _load4(src_ptr, (od * N + n) * Q + q0, mask, BLOCK)
+        s0, s1, s2, s3 = _load4(source_ptr, (od * N + n) * Q + q0, mask, BLOCK)
 
-        # ld_cell_rhs: face-averaged inflow psibar_a = psi_0[N_a] + s_a psi_a[N_a]
+        # cell_right_hand_sides: face-averaged inflow psibar_a = psi_0[N_a] + s_a psi_a[N_a]
         pbx = x0 + sx * xx
         pby = y0 + sy * yy
         pbz = z0 + sz * zz
@@ -203,7 +205,7 @@ if triton is not None:
         rx = s1 - 3.0 * sx * cx * pbx + (cy * yx + cz * zx)
         ry = s2 - 3.0 * sy * cy * pby + (cx * xy + cz * zy)
         rz = s3 - 3.0 * sz * cz * pbz + (cx * xz + cy * yz)
-        # ld_cell_solve
+        # cell_solve
         csum = cx + cy + cz
         dx = 3.0 * cx + (csum - cx) + mu
         dy = 3.0 * cy + (csum - cy) + mu
@@ -227,25 +229,25 @@ if triton is not None:
 # host wrapper
 # ================================================================================================
 
-def sweep_planes(index: FlatPlaneIndex, store: Tensor, src: Tensor, mu_cells: Tensor, c: Tensor) -> None:
+def sweep_planes(index: FlatPlaneIndex, store: Tensor, source: Tensor, mu_cells: Tensor, c: Tensor) -> None:
     """Run the fused plane kernel for every plane of `index` in order (one launch per plane), in place.
 
     store    : [8, Dc, N + 1, 4G] float32 CUDA, contiguous; cell N (the vacuum cell) must be zero
-    src      : [8, Dc, N, 4G]     float32, contiguous: source LD moments of the chunk
+    source   : [8, Dc, N, 4G]     float32, contiguous: source linear-discontinuous moments of the chunk
     mu_cells : [N, G]             float32, contiguous: total attenuation per cell
     c        : [8, Dc, 3]         float32, contiguous: |Omega_a| / Delta_a of the chunk directions
     """
-    _, Dc, N1, Q = store.shape
-    N = N1 - 1
+    _, Dc, num_cells_plus_vacuum, Q = store.shape
+    N = num_cells_plus_vacuum - 1
     G = Q // 4
-    if not (store.is_contiguous() and src.is_contiguous() and mu_cells.is_contiguous() and c.is_contiguous()):
-        raise ValueError("sweep_planes needs contiguous store, src, mu_cells and c")
+    if not (store.is_contiguous() and source.is_contiguous() and mu_cells.is_contiguous() and c.is_contiguous()):
+        raise ValueError("sweep_planes needs contiguous store, source, mu_cells and c")
     lanes_per_entry = Dc * G
-    offs = index.offsets
-    kern = _ld_plane_kernel
-    for p in range(len(offs) - 1):
-        a = offs[p]
-        E = offs[p + 1] - a
+    offsets = index.offsets
+    kernel = _linear_discontinuous_plane_kernel
+    for p in range(len(offsets) - 1):
+        a = offsets[p]
+        E = offsets[p + 1] - a
         grid = (triton.cdiv(E * lanes_per_entry, BLOCK),)
-        kern[grid](store, src, mu_cells, c, index.octant, index.cell, index.up, a, E, N,
-                   G=G, DC=Dc, BLOCK=BLOCK, num_warps=NUM_WARPS)
+        kernel[grid](store, source, mu_cells, c, index.octant, index.cell, index.upstream, a, E, N,
+                     G=G, DC=Dc, BLOCK=BLOCK, num_warps=NUM_WARPS)

@@ -4,9 +4,9 @@ import numpy as np
 import pytest
 import torch
 
-from citrus.scatter_solver.detector import (DetectorResponse, csi_mass_attenuation, csi_response, energy_weighted_response,
-                                  focused_1d_grid, grid_angles, ideal_counting_response, lead_mass_attenuation,
-                                  no_grid)
+from citrus.scatter_solver.detector import (DetectorResponse, csi_mass_attenuation, csi_response,
+                                            energy_weighted_response, focused_1d_grid, grid_angles,
+                                            ideal_counting_response, lead_mass_attenuation, no_grid)
 from citrus.scatter_solver.geometry import ConeGeometry
 
 F64 = torch.float64
@@ -38,8 +38,8 @@ def test_csi_limits_and_angle(device):
     assert torch.all(r < E_G.to(device)[:, None]) and torch.all(r > 0)
     # normal incidence against the formula with the table's mu
     mu = torch.as_tensor(csi_mass_attenuation(E_G.numpy()))
-    ref = E_G * (1 - torch.exp(-mu * 4.51 * 0.06))
-    np.testing.assert_allclose(r[:, 0].cpu().numpy(), ref.numpy(), rtol=2e-3)  # 0.5 keV node spacing
+    reference = E_G * (1 - torch.exp(-mu * 4.51 * 0.06))
+    np.testing.assert_allclose(r[:, 0].cpu().numpy(), reference.numpy(), rtol=2e-3)  # 0.5 keV node spacing
 
 
 def test_detector_interpolation_reproduces_nodes(device):
@@ -83,21 +83,23 @@ def test_grid_transmission(device):
 
 
 def test_grid_angles():
-    geom = ConeGeometry(100.0, 150.0, 5, 7, 4.0, 4.0, det_row_offset=1.0)
+    geometry = ConeGeometry(100.0, 150.0, 5, 7, 4.0, 4.0, det_row_offset=1.0)
     for angle in (0.0, 0.9):
-        pix = geom.pixel_centers(angle, dtype=F64)
-        prim = geom.primary_directions(angle, dtype=F64)
-        th1, th2 = grid_angles(prim, pix, geom, angle)
+        pix = geometry.pixel_centers(angle, dtype=F64)
+        primary = geometry.primary_directions(angle, dtype=F64)
+        th1, th2 = grid_angles(primary, pix, geometry, angle)
         assert th1.shape == (5, 7)
         assert th1.abs().max() < 1e-12
-        u, v = geom.pixel_uv(dtype=F64)
+        u, v = geometry.pixel_uv(dtype=F64)
         np.testing.assert_allclose(th2.numpy(), torch.atan(-u / 150.0)[None].expand(5, 7).numpy(), atol=1e-12)
         # a direction tilted in the v-source plane by 0.1 rad relative to the primary at every pixel
-        u_hat, v_hat, n_hat = (torch.tensor(a, dtype=F64) for a in geom.panel_axes(angle))
+        u_hat, v_hat, n_hat = (torch.tensor(a, dtype=F64) for a in geometry.panel_axes(angle))
         omegas = torch.stack([-n_hat, -(n_hat * math.cos(0.1) + v_hat * math.sin(0.1))])  # [2, 3]
-        t1, t2 = grid_angles(omegas, pix, geom, angle)
+        t1, t2 = grid_angles(omegas, pix, geometry, angle)
         assert t1.shape == (2, 5, 7)
-        _, vv = geom.pixel_uv(dtype=F64)
-        np.testing.assert_allclose(t1[0].numpy(), (-torch.atan2(-vv, torch.tensor(150.0, dtype=F64)))[:, None].expand(5, 7).numpy(), atol=1e-12)
+        _, vv = geometry.pixel_uv(dtype=F64)
+        np.testing.assert_allclose(t1[0].numpy(),
+                                   (-torch.atan2(-vv, torch.tensor(150.0, dtype=F64)))[:, None].expand(5, 7).numpy(),
+                                   atol=1e-12)
         np.testing.assert_allclose((t1[1] - t1[0]).numpy(), 0.1, atol=1e-12)
         np.testing.assert_allclose(t2.numpy(), 0.0, atol=1e-12)

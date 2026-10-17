@@ -10,9 +10,10 @@ Kernels
   `_ray_kernel` (generic DDA, one ray per lane; MODE selects where the segment end points come from):
     MODE 0  line_integrals:       p0, p1 read from starts / ends [N, 3] (any strides), optional per-ray volume index
     MODE 1  oblique_project:      the line through pixel center (r, c) with direction omega_k, clipped to the
-                                  box-centered segment of `ray_tracing.SiddonProjectors.oblique_project` (computed in-kernel)
+                                  box-centered segment of `ray_tracing.SiddonProjectors.oblique_project` (computed
+                                  in-kernel)
     MODE 2  upstream_cumulative:  focal spot -> voxel center
-    MODE 3  primary_project:      focal spot -> pixel center (n_sub = 1; sub-pixel rays use MODE 0)
+    MODE 3  primary_project:      focal spot -> pixel center (samples_per_pixel_axis = 1; sub-pixel rays use MODE 0)
     Per ray: slab clipping exactly as the reference ([a_lo, a_hi] in the segment parameter a in [0, 1]), the entry
     voxel (floor of the entry point; ceil - 1 along axes the ray descends, so a ray starting on a plane enters the
     voxel it heads into), then the loop: a_next = min(next x / y / z plane parameter, a_hi); acc += vol[voxel]
@@ -21,7 +22,7 @@ Kernels
     from the voxel index each step ((lo + k delta - p0) / d, the reference's arithmetic), so no error accumulates.
     The loop runs to the block maximum of a per-ray bound (1 + sum_a (floor(L_a / delta_a) + 1) + 1 crossings),
     lanes that are done are masked.
-  `_down_shared_kernel` (downstream_cumulative): all rays of a direction start at
+  `_downstream_shared_kernel` (downstream_cumulative): all rays of a direction start at
     voxel centers and are parallel, so the distance from the start to the first x / y / z plane is half a voxel
     for EVERY ray and the whole crossing sequence t_m = (n_a + 1/2) delta_a / |omega_a| is identical for all rays
     of the direction (Amanatides-Woo with a shared tMax). Each program (direction k, BLOCK consecutive voxels in
@@ -39,10 +40,10 @@ oblique / upstream / primary at 0.5 cm, the same order as the float32 reference'
 evaluation (up to 6.4e-6); tests/test_ray_tracing.py asserts 1e-5. No atomics: results are bitwise reproducible.
 
 Availability (the pattern of `uncollided_kernels.py` / `sweep_kernels.py`): `triton_available()` is the shared
-probe of `triton_utils` (kill switch CITRUS_DISABLE_TRITON=1); `kernels_usable(device)` additionally runs
+probe of `triton_utilities` (kill switch CITRUS_DISABLE_TRITON=1); `kernels_usable(device)` additionally runs
 every operation against the PyTorch path on a tiny problem once per device and caches the verdict;
 `SiddonProjectors(backend="auto")` falls back to PyTorch on any failure. The kernels are compiled without value or
-alignment specialization so the fast launch path of `triton_utils.launch` (direct CompiledKernel.run,
+alignment specialization so the fast launch path of `triton_utilities.launch` (direct CompiledKernel.run,
 triton 3.8) reuses one binary per (kernel, constexprs, num_warps, device); `warmup(device, G)` compiles the
 variants of one group count ahead of timing.
 """
@@ -55,19 +56,19 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from . import triton_utils as _tu
+from . import triton_utilities
 
 SELF_CHECK_REL_TOL = 1e-5
 BLOCK_RAYS = 128  # rays per program of `_ray_kernel` (tile [GP, 128], 4 warps)
-BLOCK_DOWN = 128  # voxels per program of `_down_shared_kernel`
+BLOCK_DOWN = 128  # voxels per program of `_downstream_shared_kernel`
 NUM_WARPS = 4
 BIG = 3.0e38  # "no crossing" parameter (finite, so that products stay finite)
 _BIG_INT = 1 << 30
 
 _SELF_CHECK: dict[str, tuple[bool, str]] = {}
 
-triton = _tu.triton
-tl = _tu.tl
+triton = triton_utilities.triton
+tl = triton_utilities.tl
 
 MODE_GENERIC, MODE_OBLIQUE, MODE_UPSTREAM, MODE_PRIMARY = 0, 1, 2, 3
 
@@ -77,8 +78,8 @@ MODE_GENERIC, MODE_OBLIQUE, MODE_UPSTREAM, MODE_PRIMARY = 0, 1, 2, 3
 # ================================================================================================
 
 def triton_available() -> tuple[bool, str]:
-    """(usable, reason): the shared Triton probe of `triton_utils` (honours CITRUS_DISABLE_TRITON=1)."""
-    return _tu.triton_available()
+    """(usable, reason): the shared Triton probe of `triton_utilities` (honours CITRUS_DISABLE_TRITON=1)."""
+    return triton_utilities.triton_available()
 
 
 def kernels_usable(device: torch.device) -> tuple[bool, str]:
@@ -113,37 +114,42 @@ def use_kernels(t: Tensor, backend: str) -> bool:
 
 def _self_check(device: torch.device) -> tuple[bool, str]:
     """Kernels vs the PyTorch Siddon path on a 5 x 7 x 6 grid (anisotropic voxels), G = 2, at view angle 0.3:
-    upstream, primary (n_sub 1 and 2), downstream (directions incl. an axis-aligned one and one pointing away
-    from the panel), oblique (shared and per-direction fields) and line_integrals (random segments, a stacked
-    volume index)."""
+    upstream, primary (samples_per_pixel_axis 1 and 2), downstream (directions incl. an axis-aligned one and one
+    pointing away from the panel), oblique (shared and per-direction fields) and line_integrals (random segments, a
+    stacked volume index)."""
     from ..geometry import ConeGeometry, Grid
     from ..ray_tracing import SiddonProjectors, line_integrals
 
     grid = Grid(shape=(5, 7, 6), delta_voxel=1.0, voxel_row_aspect=1.25, voxel_slice_aspect=0.8,
                 recon_slice_offset=0.2)
-    geom = ConeGeometry(source_iso_dist=30.0, source_detector_dist=45.0, num_det_rows=9, num_det_channels=11,
-                        delta_det_row=1.1, delta_det_channel=1.3)
+    geometry = ConeGeometry(source_iso_dist=30.0, source_detector_dist=45.0, num_det_rows=9, num_det_channels=11,
+                            delta_det_row=1.1, delta_det_channel=1.3)
     angle = 0.3
-    gen = torch.Generator().manual_seed(9)
-    mu = (0.3 * torch.rand(2, *grid.shape, generator=gen)).to(device)
-    om = torch.tensor([[0.2, -1.0, 0.1], [-0.3, -1.0, 0.25], [0.0, -1.0, 0.0], [0.1, 1.0, 0.0]])
-    om = geom.view_to_recon(torch.nn.functional.normalize(om, dim=-1), angle).to(device)
-    K = om.shape[0]
-    field = torch.rand(K, 2, *grid.shape, generator=gen).to(device)
+    generator = torch.Generator().manual_seed(9)
+    mu = (0.3 * torch.rand(2, *grid.shape, generator=generator)).to(device)
+    directions = torch.tensor([[0.2, -1.0, 0.1], [-0.3, -1.0, 0.25], [0.0, -1.0, 0.0], [0.1, 1.0, 0.0]])
+    directions = geometry.view_to_recon(torch.nn.functional.normalize(directions, dim=-1), angle).to(device)
+    K = directions.shape[0]
+    field = torch.rand(K, 2, *grid.shape, generator=generator).to(device)
     lo = torch.tensor(grid.lower_corner())
-    ext = torch.tensor(grid.extent)
-    a = (lo + (torch.rand(64, 3, generator=gen) * 1.6 - 0.3) * ext).to(device)
-    b = (lo + (torch.rand(64, 3, generator=gen) * 1.6 - 0.3) * ext).to(device)
-    kk = torch.randint(0, K, (64,), generator=gen).to(device)
-    ref = SiddonProjectors(backend="torch")
+    extent = torch.tensor(grid.extent)
+    a = (lo + (torch.rand(64, 3, generator=generator) * 1.6 - 0.3) * extent).to(device)
+    b = (lo + (torch.rand(64, 3, generator=generator) * 1.6 - 0.3) * extent).to(device)
+    volume_index = torch.randint(0, K, (64,), generator=generator).to(device)
+    reference = SiddonProjectors(backend="torch")
     pairs = [
-        (ref.upstream_cumulative(mu, grid, geom, angle), upstream_cumulative(mu, grid, geom, angle)),
-        (ref.primary_project(mu, grid, geom, angle), primary_project(mu, grid, geom, angle)),
-        (ref.primary_project(mu, grid, geom, angle, n_sub=2), primary_project(mu, grid, geom, angle, n_sub=2)),
-        (ref.downstream_cumulative(mu, grid, geom, angle, om), downstream_cumulative(mu, grid, geom, angle, om)),
-        (ref.oblique_project(field[0], grid, geom, angle, om), oblique_project(field[0], grid, geom, angle, om)),
-        (ref.oblique_project(field, grid, geom, angle, om), oblique_project(field, grid, geom, angle, om)),
-        (line_integrals(field, a, b, grid, volume_index=kk), line_integrals_triton(field, a, b, grid, volume_index=kk)),
+        (reference.upstream_cumulative(mu, grid, geometry, angle), upstream_cumulative(mu, grid, geometry, angle)),
+        (reference.primary_project(mu, grid, geometry, angle), primary_project(mu, grid, geometry, angle)),
+        (reference.primary_project(mu, grid, geometry, angle, samples_per_pixel_axis=2),
+         primary_project(mu, grid, geometry, angle, samples_per_pixel_axis=2)),
+        (reference.downstream_cumulative(mu, grid, geometry, angle, directions),
+         downstream_cumulative(mu, grid, geometry, angle, directions)),
+        (reference.oblique_project(field[0], grid, geometry, angle, directions),
+         oblique_project(field[0], grid, geometry, angle, directions)),
+        (reference.oblique_project(field, grid, geometry, angle, directions),
+         oblique_project(field, grid, geometry, angle, directions)),
+        (line_integrals(field, a, b, grid, volume_index=volume_index),
+         line_integrals_triton(field, a, b, grid, volume_index=volume_index)),
     ]
     torch.cuda.synchronize(device)
     worst = 0.0
@@ -171,7 +177,7 @@ if triton is not None:
     _BIG_INT_C = tl.constexpr(_BIG_INT)
 
     _RAY_INTS = ["M", "sa_n", "sa_c", "sb_n", "sb_c", "sK", "sG", "sR", "sC", "sS", "NX", "NY", "NZ", "Rd", "Cd"]
-    _RAY_PTRS = ["vol_ptr", "out_ptr", "a_ptr", "b_ptr", "vidx_ptr", "om_ptr"]
+    _RAY_PTRS = ["volume_ptr", "out_ptr", "a_ptr", "b_ptr", "volume_index_ptr", "direction_ptr"]
 
     @triton.jit
     def _plane_param(lo, delta, idx, dpos, p0, inv, nz):
@@ -187,7 +193,7 @@ if triton is not None:
         return tl.minimum(tl.maximum(i, 0.0), (n - 1).to(tl.float32)).to(tl.int32)
 
     @triton.jit
-    def _trace(vol_ptr, vbase, p0x, p0y, p0z, p1x, p1y, p1z, live, sG, sR, sC, sS,
+    def _trace(volume_ptr, vbase, p0x, p0y, p0z, p1x, p1y, p1z, live, sG, sR, sC, sS,
                lox, loy, loz, hix, hiy, hiz, ddx, ddy, ddz, NX, NY, NZ,
                G: tl.constexpr, GP: tl.constexpr, BLOCK: tl.constexpr):
         """Exact integral of the voxel field along p0 -> p1 for a block of rays.
@@ -253,7 +259,7 @@ if triton is not None:
             inb = act & (ix >= 0) & (ix < NX) & (iy >= 0) & (iy < NY) & (iz >= 0) & (iz < NZ)
             sp = iy.to(tl.int64) * sR + ix.to(tl.int64) * sC + iz.to(tl.int64) * sS
             lm = gm[:, None] & inb[None, :]
-            v = tl.load(vol_ptr + (vbase + sp)[None, :] + gofs[:, None], mask=lm, other=0.0)
+            v = tl.load(volume_ptr + (vbase + sp)[None, :] + gofs[:, None], mask=lm, other=0.0)
             acc += v * seg[None, :]
             selx = (anx <= any_) & (anx <= anz)
             sely = (any_ < anx) & (any_ <= anz)
@@ -270,12 +276,12 @@ if triton is not None:
         return acc * length[None, :]
 
     @triton.jit(do_not_specialize=_RAY_INTS, do_not_specialize_on_alignment=_RAY_PTRS)
-    def _ray_kernel(vol_ptr, out_ptr, a_ptr, b_ptr, vidx_ptr, om_ptr,
+    def _ray_kernel(volume_ptr, out_ptr, a_ptr, b_ptr, volume_index_ptr, direction_ptr,
                     M, sa_n, sa_c, sb_n, sb_c, sK, sG, sR, sC, sS, NX, NY, NZ, Rd, Cd,
                     lox, loy, loz, hix, hiy, hiz, ddx, ddy, ddz, zoff,
                     qx, qy, qz, ux_, uy_, uz_, vx_, vy_, vz_,
                     rmid, cmid, drow, dch, rowoff, choff, bcx, bcy, bcz, half,
-                    MODE: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, HAS_VIDX: tl.constexpr,
+                    MODE: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, HAS_VOLUME_INDEX: tl.constexpr,
                     BLOCK: tl.constexpr):
         """One block of rays (program_id 0) of direction / major index k (program_id 1); out[(k G + g) M + m]."""
         k = tl.program_id(1)
@@ -294,8 +300,8 @@ if triton is not None:
             p1x = tl.load(rb, mask=live, other=0.0)
             p1y = tl.load(rb + sb_c, mask=live, other=0.0)
             p1z = tl.load(rb + 2 * sb_c, mask=live, other=0.0)
-            if HAS_VIDX:
-                vi = tl.load(vidx_ptr + mm, mask=live, other=0).to(tl.int64)
+            if HAS_VOLUME_INDEX:
+                vi = tl.load(volume_index_ptr + mm, mask=live, other=0).to(tl.int64)
                 vbase = vi * sK
         elif MODE == 1 or MODE == 3:
             # pixel center (r, c) = panel center + u u_hat + v v_hat (ConeGeometry.pixel_centers). Lanes run along
@@ -309,9 +315,9 @@ if triton is not None:
             py = qy + u * uy_ + v * vy_
             pz = qz + u * uz_ + v * vz_
             if MODE == 1:
-                ox = tl.load(om_ptr + 3 * k)
-                oy = tl.load(om_ptr + 3 * k + 1)
-                oz = tl.load(om_ptr + 3 * k + 2)
+                ox = tl.load(direction_ptr + 3 * k)
+                oy = tl.load(direction_ptr + 3 * k + 1)
+                oz = tl.load(direction_ptr + 3 * k + 2)
                 om2 = ox * ox + oy * oy + oz * oz
                 tc = ((bcx - px) * ox + (bcy - py) * oy + (bcz - pz) * oz) / om2
                 h = half / tl.sqrt(om2)
@@ -342,7 +348,7 @@ if triton is not None:
             p1x = cx
             p1y = cy
             p1z = cz
-        acc = _trace(vol_ptr, vbase, p0x, p0y, p0z, p1x, p1y, p1z, live, sG, sR, sC, sS,
+        acc = _trace(volume_ptr, vbase, p0x, p0y, p0z, p1x, p1y, p1z, live, sG, sR, sC, sS,
                      lox, loy, loz, hix, hiy, hiz, ddx, ddy, ddz, NX, NY, NZ, G, GP, BLOCK)
         g = tl.arange(0, GP)
         if MODE == 1 or MODE == 3:
@@ -353,20 +359,20 @@ if triton is not None:
     _DOWN_INTS = ["V", "sG", "sR", "sC", "sS", "NX", "NY", "NZ"]
 
     @triton.jit(do_not_specialize=_DOWN_INTS,
-                do_not_specialize_on_alignment=["mu_ptr", "om_ptr", "tw_ptr", "out_ptr"])
-    def _down_shared_kernel(mu_ptr, om_ptr, tw_ptr, out_ptr, V, sG, sR, sC, sS, NX, NY, NZ,
-                            ddx, ddy, ddz, zoff, qx, qy, qz, nx_, ny_, nz_, diag,
-                            G: tl.constexpr, GP: tl.constexpr, BLOCK: tl.constexpr):
+                do_not_specialize_on_alignment=["mu_ptr", "direction_ptr", "toward_ptr", "out_ptr"])
+    def _downstream_shared_kernel(mu_ptr, direction_ptr, toward_ptr, out_ptr, V, sG, sR, sC, sS, NX, NY, NZ,
+                                  ddx, ddy, ddz, zoff, qx, qy, qz, nx_, ny_, nz_, diag,
+                                  G: tl.constexpr, GP: tl.constexpr, BLOCK: tl.constexpr):
         """tau_down of BLOCK consecutive voxels (program_id 0) for direction k (program_id 1) with the shared
         crossing sequence of the direction (module docstring); out[(k G + g) V + v]."""
         k = tl.program_id(1)
         m = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         live = m < V
         mm = tl.where(live, m, 0)
-        ox = tl.load(om_ptr + 3 * k)
-        oy = tl.load(om_ptr + 3 * k + 1)
-        oz = tl.load(om_ptr + 3 * k + 2)
-        toward = tl.load(tw_ptr + k) != 0
+        ox = tl.load(direction_ptr + 3 * k)
+        oy = tl.load(direction_ptr + 3 * k + 1)
+        oz = tl.load(direction_ptr + 3 * k + 2)
+        toward = tl.load(toward_ptr + k) != 0
         s = mm % NZ
         c = (mm // NZ) % NX
         r = mm // (NZ * NX)
@@ -452,35 +458,41 @@ def _check_cuda_f32(t: Tensor, name: str) -> None:
         raise ValueError(f"the Siddon kernels need a float32 CUDA {name}, got {t.dtype} on {t.device}")
 
 
-def _launch_ray(vol: Tensor, out: Tensor, num_rays: int, num_major: int, mode: int, G: int, grid, *,
-                a: Optional[Tensor] = None, b: Optional[Tensor] = None, vidx: Optional[Tensor] = None,
-                om: Optional[Tensor] = None, vol_k_stride: int = 0, geo: Optional[dict] = None) -> None:
+def _launch_ray(volume: Tensor, out: Tensor, num_rays: int, num_major: int, mode: int, G: int, grid, *,
+                a: Optional[Tensor] = None, b: Optional[Tensor] = None, volume_index: Optional[Tensor] = None,
+                directions: Optional[Tensor] = None, volume_stride: int = 0,
+                geometry_scalars: Optional[dict] = None) -> None:
     """Launch `_ray_kernel` over num_major x ceil(num_rays / BLOCK_RAYS) programs (see its docstring).
 
-    vol: [..., G, R, C, S] view whose last four strides are used (vol_k_stride: per major / volume index);
-    geo: mode-specific scalars (q, u, v, pixel parameters, box center)."""
-    geo = geo or {}
-    sG, sR, sC, sS = (int(x) for x in vol.stride()[-4:])
-    dummy = vol
+    volume: [..., G, R, C, S] view whose last four strides are used (volume_stride: per major / volume index);
+    geometry_scalars: mode-specific scalars (q, u, v, pixel parameters, box center)."""
+    geometry_scalars = geometry_scalars or {}
+    sG, sR, sC, sS = (int(x) for x in volume.stride()[-4:])
+    dummy = volume
     a_t = a if a is not None else dummy
     b_t = b if b is not None else dummy
     sa = (int(a.stride(0)), int(a.stride(1))) if a is not None else (0, 0)
     sb = (int(b.stride(0)), int(b.stride(1))) if b is not None else (0, 0)
     lox, loy, loz, hix, hiy, hiz, dx, dy, dz = _grid_scalars(grid)
-    q = geo.get("q", (0.0, 0.0, 0.0))
-    uh = geo.get("u", (0.0, 0.0, 0.0))
-    vh = geo.get("v", (0.0, 0.0, 0.0))
-    pixp = geo.get("pix", (0.0, 0.0, 0.0, 0.0, 0.0, 0.0))  # rmid, cmid, drow, dch, rowoff, choff
-    bc = geo.get("bc", (0.0, 0.0, 0.0))
-    args = (vol, out, a_t, b_t, vidx if vidx is not None else dummy, om if om is not None else dummy,
-            int(num_rays), *sa, *sb, int(vol_k_stride), sG, sR, sC, sS,
-            int(grid.num_cols), int(grid.num_rows), int(grid.num_slices), int(geo.get("Rd", 1)),
-            int(geo.get("Cd", 1)),
+    q = geometry_scalars.get("q", (0.0, 0.0, 0.0))
+    u_axis = geometry_scalars.get("u", (0.0, 0.0, 0.0))
+    v_axis = geometry_scalars.get("v", (0.0, 0.0, 0.0))
+    # rmid, cmid, drow, dch, rowoff, choff
+    pixel_parameters = geometry_scalars.get("pixel", (0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+    box_center = geometry_scalars.get("box_center", (0.0, 0.0, 0.0))
+    args = (volume, out, a_t, b_t, volume_index if volume_index is not None else dummy,
+            directions if directions is not None else dummy,
+            int(num_rays), *sa, *sb, int(volume_stride), sG, sR, sC, sS,
+            int(grid.num_cols), int(grid.num_rows), int(grid.num_slices), int(geometry_scalars.get("Rd", 1)),
+            int(geometry_scalars.get("Cd", 1)),
             lox, loy, loz, hix, hiy, hiz, dx, dy, dz, float(grid.recon_slice_offset),
-            *(float(x) for x in q), *(float(x) for x in uh), *(float(x) for x in vh),
-            *(float(x) for x in pixp), *(float(x) for x in bc), float(geo.get("half", 0.0)))
-    cx = dict(MODE=int(mode), G=int(G), GP=_next_pow2(G), HAS_VIDX=vidx is not None, BLOCK=BLOCK_RAYS)
-    _tu.launch(_ray_kernel, (triton.cdiv(max(num_rays, 1), BLOCK_RAYS), int(num_major), 1), args, cx, NUM_WARPS)
+            *(float(x) for x in q), *(float(x) for x in u_axis), *(float(x) for x in v_axis),
+            *(float(x) for x in pixel_parameters), *(float(x) for x in box_center),
+            float(geometry_scalars.get("half", 0.0)))
+    constexprs = dict(MODE=int(mode), G=int(G), GP=_next_pow2(G), HAS_VOLUME_INDEX=volume_index is not None,
+                      BLOCK=BLOCK_RAYS)
+    triton_utilities.launch(_ray_kernel, (triton.cdiv(max(num_rays, 1), BLOCK_RAYS), int(num_major), 1), args,
+                            constexprs, NUM_WARPS)
 
 
 def line_integrals_triton(volume: Tensor, starts: Tensor, ends: Tensor, grid, *,
@@ -493,25 +505,25 @@ def line_integrals_triton(volume: Tensor, starts: Tensor, ends: Tensor, grid, *,
     outside the grid box.
     """
     _check_cuda_f32(volume, "volume")
-    dev = volume.device
+    device = volume.device
     if volume.dim() == 5:
         if volume_index is None:
             raise ValueError("a [K, G, rows, cols, slices] volume needs volume_index [N]")
         K, G = volume.shape[:2]
         if tuple(volume.shape[2:]) != tuple(grid.shape):
             raise ValueError(f"volume spatial shape {tuple(volume.shape[2:])} != grid shape {grid.shape}")
-        ks = int(volume.stride(0))
-        vidx = volume_index.to(device=dev, dtype=torch.int64).reshape(-1)
+        volume_stride = int(volume.stride(0))
+        volume_index = volume_index.to(device=device, dtype=torch.int64).reshape(-1)
     elif volume.dim() == 4:
         G = volume.shape[0]
         if tuple(volume.shape[1:]) != tuple(grid.shape):
             raise ValueError(f"volume spatial shape {tuple(volume.shape[1:])} != grid shape {grid.shape}")
-        ks = 0
-        vidx = None
+        volume_stride = 0
+        volume_index = None
     else:
         raise ValueError(f"volume must be [G, rows, cols, slices], got {tuple(volume.shape)}")
-    a = starts.to(device=dev, dtype=torch.float32)
-    b = ends.to(device=dev, dtype=torch.float32)
+    a = starts.to(device=device, dtype=torch.float32)
+    b = ends.to(device=device, dtype=torch.float32)
     if a.dim() != 2:
         a = a.reshape(-1, 3)
     if b.dim() != 2:
@@ -519,25 +531,26 @@ def line_integrals_triton(volume: Tensor, starts: Tensor, ends: Tensor, grid, *,
     if a.shape != b.shape or a.shape[-1] != 3:
         raise ValueError("starts and ends must both be [N, 3]")
     N = a.shape[0]
-    if vidx is not None and vidx.shape[0] != N:
+    if volume_index is not None and volume_index.shape[0] != N:
         raise ValueError("volume_index must have one entry per ray")
-    out = torch.empty(G, N, device=dev, dtype=torch.float32)
+    out = torch.empty(G, N, device=device, dtype=torch.float32)
     if N == 0:
         return out
-    _launch_ray(volume, out, N, 1, MODE_GENERIC, G, grid, a=a, b=b, vidx=vidx, vol_k_stride=ks)
+    _launch_ray(volume, out, N, 1, MODE_GENERIC, G, grid, a=a, b=b, volume_index=volume_index,
+                volume_stride=volume_stride)
     return out
 
 
-def _pixel_geo(geom, angle: float) -> dict:
+def _pixel_geometry_scalars(geometry, angle: float) -> dict:
     """Scalars of ConeGeometry.pixel_centers: panel center, axes and the pixel-coordinate parameters."""
-    u_hat, v_hat, _ = geom.panel_axes(angle)
-    return dict(q=geom.panel_center(angle), u=u_hat, v=v_hat, Rd=geom.num_det_rows,
-                Cd=geom.num_det_channels,
-                pix=((geom.num_det_rows - 1) / 2, (geom.num_det_channels - 1) / 2, geom.delta_det_row,
-                     geom.delta_det_channel, geom.det_row_offset, geom.det_channel_offset))
+    u_hat, v_hat, _ = geometry.panel_axes(angle)
+    return dict(q=geometry.panel_center(angle), u=u_hat, v=v_hat, Rd=geometry.num_det_rows,
+                Cd=geometry.num_det_channels,
+                pixel=((geometry.num_det_rows - 1) / 2, (geometry.num_det_channels - 1) / 2, geometry.delta_det_row,
+                       geometry.delta_det_channel, geometry.det_row_offset, geometry.det_channel_offset))
 
 
-def upstream_cumulative(mu: Tensor, grid, geom, angle: float) -> Tensor:
+def upstream_cumulative(mu: Tensor, grid, geometry, angle: float) -> Tensor:
     """Fused `SiddonProjectors.upstream_cumulative`: line integral of mu from the focal spot to every voxel center.
 
     mu: [G, rows, cols, slices] float32 CUDA (any strides). Returns tau_up [G, rows, cols, slices]."""
@@ -545,80 +558,83 @@ def upstream_cumulative(mu: Tensor, grid, geom, angle: float) -> Tensor:
     G = mu.shape[0]
     V = grid.num_voxels
     out = torch.empty(G, *grid.shape, device=mu.device, dtype=torch.float32)
-    _launch_ray(mu, out, V, 1, MODE_UPSTREAM, G, grid, geo=dict(q=geom.source_position(angle)))
+    _launch_ray(mu, out, V, 1, MODE_UPSTREAM, G, grid, geometry_scalars=dict(q=geometry.source_position(angle)))
     return out
 
 
-def primary_project(mu: Tensor, grid, geom, angle: float, n_sub: int = 1) -> Tensor:
+def primary_project(mu: Tensor, grid, geometry, angle: float, samples_per_pixel_axis: int = 1) -> Tensor:
     """Fused `SiddonProjectors.primary_project`: line integral of mu from the focal spot to every pixel center.
 
-    mu: [G, rows, cols, slices] float32 CUDA. Returns [G, num_det_rows, num_det_channels]. n_sub > 1: n_sub^2
-    sub-rays per pixel on the reference's midpoint lattice, combined as -log(mean(exp(-integral)))."""
+    mu: [G, rows, cols, slices] float32 CUDA. Returns [G, num_det_rows, num_det_channels]. samples_per_pixel_axis > 1:
+    samples_per_pixel_axis^2 sub-rays per pixel on the reference's midpoint lattice, combined as
+    -log(mean(exp(-integral)))."""
     _check_cuda_f32(mu, "mu")
-    dev, dt = mu.device, mu.dtype
+    device, dtype = mu.device, mu.dtype
     G = mu.shape[0]
-    Rd, Cd = geom.num_det_rows, geom.num_det_channels
-    src = geom.source_position(angle)
-    if n_sub == 1:
-        out = torch.empty(G, Rd, Cd, device=dev, dtype=dt)
-        geo = _pixel_geo(geom, angle)
-        geo["bc"] = src  # MODE_PRIMARY reads the focal spot from the box-center slots
-        _launch_ray(mu, out, Rd * Cd, 1, MODE_PRIMARY, G, grid, geo=geo)
+    Rd, Cd = geometry.num_det_rows, geometry.num_det_channels
+    source_position = geometry.source_position(angle)
+    if samples_per_pixel_axis == 1:
+        out = torch.empty(G, Rd, Cd, device=device, dtype=dtype)
+        geometry_scalars = _pixel_geometry_scalars(geometry, angle)
+        geometry_scalars["box_center"] = source_position  # MODE_PRIMARY reads the focal spot from the box-center slots
+        _launch_ray(mu, out, Rd * Cd, 1, MODE_PRIMARY, G, grid, geometry_scalars=geometry_scalars)
         return out
-    pix = geom.pixel_centers(angle, dev, dt)
-    u_hat, v_hat, _ = geom.panel_axes(angle)
-    uh = torch.tensor(u_hat, device=dev, dtype=dt)
-    vh = torch.tensor(v_hat, device=dev, dtype=dt)
-    off = (2 * torch.arange(n_sub, device=dev, dtype=dt) + 1) / (2 * n_sub) - 0.5
-    shift = (off * geom.delta_det_row)[:, None, None] * vh + (off * geom.delta_det_channel)[None, :, None] * uh
-    ends = (pix[:, :, None, None, :] + shift).reshape(-1, 3)
-    starts = torch.tensor(src, device=dev, dtype=dt).expand_as(ends)
-    tau = line_integrals_triton(mu, starts, ends, grid).reshape(G, Rd, Cd, n_sub * n_sub)
-    return -(torch.logsumexp(-tau, dim=-1) - math.log(n_sub * n_sub))
+    pixels = geometry.pixel_centers(angle, device, dtype)
+    u_hat, v_hat, _ = geometry.panel_axes(angle)
+    u_axis = torch.tensor(u_hat, device=device, dtype=dtype)
+    v_axis = torch.tensor(v_hat, device=device, dtype=dtype)
+    offsets = ((2 * torch.arange(samples_per_pixel_axis, device=device, dtype=dtype) + 1)
+               / (2 * samples_per_pixel_axis) - 0.5)
+    shift = ((offsets * geometry.delta_det_row)[:, None, None] * v_axis
+             + (offsets * geometry.delta_det_channel)[None, :, None] * u_axis)
+    ends = (pixels[:, :, None, None, :] + shift).reshape(-1, 3)
+    starts = torch.tensor(source_position, device=device, dtype=dtype).expand_as(ends)
+    tau = line_integrals_triton(mu, starts, ends, grid).reshape(G, Rd, Cd, samples_per_pixel_axis ** 2)
+    return -(torch.logsumexp(-tau, dim=-1) - math.log(samples_per_pixel_axis * samples_per_pixel_axis))
 
 
-def toward_flags(omegas: Tensor, geom, angle: float) -> Tensor:
+def toward_flags(omegas: Tensor, geometry, angle: float) -> Tensor:
     """[K] uint8: omega_k . (-n_hat) > 0, evaluated with the reference's torch expression (bit-identical)."""
-    _, _, n_hat = geom.panel_axes(angle)
+    _, _, n_hat = geometry.panel_axes(angle)
     n = torch.tensor(n_hat, device=omegas.device, dtype=omegas.dtype)
     return ((omegas * (-n)).sum(-1) > 0).to(torch.uint8)
 
 
-def downstream_cumulative(mu: Tensor, grid, geom, angle: float, omegas: Tensor,
+def downstream_cumulative(mu: Tensor, grid, geometry, angle: float, omegas: Tensor,
                           toward: Optional[Tensor] = None) -> Tensor:
     """Fused `SiddonProjectors.downstream_cumulative`: line integral of mu from every voxel center to the panel
     plane along each direction (+inf where omega . (-n_hat) <= 0).
 
     mu: [G, rows, cols, slices] float32 CUDA (any strides); omegas: [K, 3]. Returns [K, G, rows, cols, slices].
-    One `_down_shared_kernel` launch (one crossing sequence per direction). toward: optional precomputed
-    `toward_flags(omegas, geom, angle)`.
+    One `_downstream_shared_kernel` launch (one crossing sequence per direction). toward: optional precomputed
+    `toward_flags(omegas, geometry, angle)`.
     """
     _check_cuda_f32(mu, "mu")
-    dev = mu.device
+    device = mu.device
     G = mu.shape[0]
     if tuple(mu.shape[1:]) != tuple(grid.shape):
         raise ValueError(f"mu spatial shape {tuple(mu.shape[1:])} != grid shape {grid.shape}")
-    om = omegas.to(device=dev, dtype=torch.float32).reshape(-1, 3).contiguous()
-    K = om.shape[0]
+    directions = omegas.to(device=device, dtype=torch.float32).reshape(-1, 3).contiguous()
+    K = directions.shape[0]
     V = grid.num_voxels
-    out = torch.empty(K, G, *grid.shape, device=dev, dtype=torch.float32)
+    out = torch.empty(K, G, *grid.shape, device=device, dtype=torch.float32)
     if K == 0 or V == 0:
         return out
-    tw = toward_flags(om, geom, angle) if toward is None else toward
-    _, _, n_hat = geom.panel_axes(angle)
-    pc = geom.panel_center(angle)
+    toward = toward_flags(directions, geometry, angle) if toward is None else toward
+    _, _, n_hat = geometry.panel_axes(angle)
+    panel_center = geometry.panel_center(angle)
     diag = math.sqrt(sum(e * e for e in grid.extent)) * (1 + 1e-9) + 1e-9
     sG, sR, sC, sS = (int(x) for x in mu.stride())
     dx, dy, dz = (float(d) for d in grid.deltas)
-    args = (mu, om, tw, out, int(V), sG, sR, sC, sS, int(grid.num_cols), int(grid.num_rows), int(grid.num_slices),
-            dx, dy, dz, float(grid.recon_slice_offset), *(float(x) for x in pc), *(float(x) for x in n_hat),
-            float(diag))
-    _tu.launch(_down_shared_kernel, (triton.cdiv(V, BLOCK_DOWN), K, 1), args,
-                dict(G=int(G), GP=_next_pow2(G), BLOCK=BLOCK_DOWN), NUM_WARPS)
+    args = (mu, directions, toward, out, int(V), sG, sR, sC, sS, int(grid.num_cols), int(grid.num_rows),
+            int(grid.num_slices), dx, dy, dz, float(grid.recon_slice_offset), *(float(x) for x in panel_center),
+            *(float(x) for x in n_hat), float(diag))
+    triton_utilities.launch(_downstream_shared_kernel, (triton.cdiv(V, BLOCK_DOWN), K, 1), args,
+                            dict(G=int(G), GP=_next_pow2(G), BLOCK=BLOCK_DOWN), NUM_WARPS)
     return out
 
 
-def oblique_project(field: Tensor, grid, geom, angle: float, omegas: Tensor) -> Tensor:
+def oblique_project(field: Tensor, grid, geometry, angle: float, omegas: Tensor) -> Tensor:
     """Fused `SiddonProjectors.oblique_project`: full line integral of a field along the line through each pixel
     center with direction omega_k (clipped to the box).
 
@@ -626,31 +642,32 @@ def oblique_project(field: Tensor, grid, geom, angle: float, omegas: Tensor) -> 
     omegas: [K, 3]. Returns [K, G, num_det_rows, num_det_channels] (field x cm).
     """
     _check_cuda_f32(field, "field")
-    dev = field.device
-    om = omegas.to(device=dev, dtype=torch.float32).reshape(-1, 3).contiguous()
-    K = om.shape[0]
+    device = field.device
+    directions = omegas.to(device=device, dtype=torch.float32).reshape(-1, 3).contiguous()
+    K = directions.shape[0]
     if field.dim() == 4:
         G = field.shape[0]
         if tuple(field.shape[1:]) != tuple(grid.shape):
             raise ValueError(f"field spatial shape {tuple(field.shape[1:])} != grid shape {grid.shape}")
-        ks = 0
+        volume_stride = 0
     elif field.dim() == 5 and field.shape[0] == K:
         G = field.shape[1]
         if tuple(field.shape[2:]) != tuple(grid.shape):
             raise ValueError(f"field spatial shape {tuple(field.shape[2:])} != grid shape {grid.shape}")
-        ks = int(field.stride(0))
+        volume_stride = int(field.stride(0))
     else:
         raise ValueError(f"field must be [G, ...] or [K={K}, G, ...], got {tuple(field.shape)}")
-    Rd, Cd = geom.num_det_rows, geom.num_det_channels
-    out = torch.empty(K, G, Rd, Cd, device=dev, dtype=torch.float32)
+    Rd, Cd = geometry.num_det_rows, geometry.num_det_channels
+    out = torch.empty(K, G, Rd, Cd, device=device, dtype=torch.float32)
     if K == 0:
         return out
     lo = grid.lower_corner()
-    ext = grid.extent
-    geo = _pixel_geo(geom, angle)
-    geo["bc"] = tuple(lo[a] + 0.5 * ext[a] for a in range(3))
-    geo["half"] = 0.5 * math.sqrt(sum(e * e for e in ext)) * (1 + 1e-6) + 1e-6
-    _launch_ray(field, out, Rd * Cd, K, MODE_OBLIQUE, G, grid, om=om, vol_k_stride=ks, geo=geo)
+    extent = grid.extent
+    geometry_scalars = _pixel_geometry_scalars(geometry, angle)
+    geometry_scalars["box_center"] = tuple(lo[a] + 0.5 * extent[a] for a in range(3))
+    geometry_scalars["half"] = 0.5 * math.sqrt(sum(e * e for e in extent)) * (1 + 1e-6) + 1e-6
+    _launch_ray(field, out, Rd * Cd, K, MODE_OBLIQUE, G, grid, directions=directions, volume_stride=volume_stride,
+                geometry_scalars=geometry_scalars)
     return out
 
 
@@ -660,14 +677,14 @@ def warmup(device: torch.device, num_groups: int) -> None:
     from ..geometry import ConeGeometry, Grid
 
     grid = Grid(shape=(3, 4, 5), delta_voxel=1.0)
-    geom = ConeGeometry(source_iso_dist=20.0, source_detector_dist=30.0, num_det_rows=4, num_det_channels=5,
-                        delta_det_row=1.0, delta_det_channel=1.0)
+    geometry = ConeGeometry(source_iso_dist=20.0, source_detector_dist=30.0, num_det_rows=4, num_det_channels=5,
+                            delta_det_row=1.0, delta_det_channel=1.0)
     mu = torch.rand(num_groups, *grid.shape, device=device)
-    om = torch.tensor([[0.1, -1.0, 0.2], [0.0, -1.0, 0.0]], device=device)
-    upstream_cumulative(mu, grid, geom, 0.0)
-    primary_project(mu, grid, geom, 0.0)
-    primary_project(mu, grid, geom, 0.0, n_sub=2)
-    downstream_cumulative(mu, grid, geom, 0.0, om)
-    oblique_project(mu, grid, geom, 0.0, om)
-    oblique_project(mu[None].expand(2, -1, -1, -1, -1), grid, geom, 0.0, om)
+    directions = torch.tensor([[0.1, -1.0, 0.2], [0.0, -1.0, 0.0]], device=device)
+    upstream_cumulative(mu, grid, geometry, 0.0)
+    primary_project(mu, grid, geometry, 0.0)
+    primary_project(mu, grid, geometry, 0.0, samples_per_pixel_axis=2)
+    downstream_cumulative(mu, grid, geometry, 0.0, directions)
+    oblique_project(mu, grid, geometry, 0.0, directions)
+    oblique_project(mu[None].expand(2, -1, -1, -1, -1), grid, geometry, 0.0, directions)
     torch.cuda.synchronize(device)

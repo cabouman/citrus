@@ -15,7 +15,8 @@ points (scatter_image.combined_scatter_image). Here the quadrature points are th
 
 Backends:
     torch     SiddonProjectors(backend="torch")     (exact; PyTorch traversal: the reference)
-    triton    SiddonProjectors(backend="auto")      (exact; the fused kernels of kernels/ray_tracing_kernels.py; default)
+    triton    SiddonProjectors(backend="auto")      (exact; the fused kernels of kernels/ray_tracing_kernels.py;
+    default)
 
 Parts (--parts):
     equality  max |Triton - PyTorch| / max |PyTorch| for every operation on the WLAB grids (one chunk of 8 directions
@@ -23,13 +24,14 @@ Parts (--parts):
               upstream and primary on the fine grid), and vs the float64 PyTorch path for one chunk.
     chunks    ms per chunk of 8 of downstream_cumulative(mu_coarse) on the coarse grid and of
               oblique_project([8, G, fine]) on the fine grid, over every panel-facing chunk of the set, pipelined as in
-              the scatter image (one synchronize at the end), median of 3 passes after a warm pass. The PyTorch Siddon is timed
-              on the first --torch-chunks chunks (one pass; its cost per chunk does not depend on the chunk). Also the
-              peak memory of one chunk pair.
-    images    the first-order image (`combined_scatter_image(chunk=8, fc_chunk=4)` with a zero multiple-collision
-              source) with a fresh projector per image, seconds (wall, synchronized, after an untimed warm-up of every
-              backend on a 4x8 set), peak MiB, and rel RMS of the detector signal vs the PyTorch Siddon image of the
-              same set and factor. phi_uc comes from the PyTorch Siddon upstream operator once (identical inputs).
+              the scatter image (one synchronize at the end), median of 3 passes after a warm pass. The PyTorch Siddon
+              is timed on the first --torch-chunks chunks (one pass; its cost per chunk does not depend on the chunk).
+              Also the peak memory of one chunk pair.
+    images    the first-order image (`combined_scatter_image(chunk=8, first_collision_chunk=4)` with a zero
+              multiple-collision source) with a fresh projector per image, seconds (wall, synchronized, after an untimed
+              warm-up of every backend on a 4x8 set), peak MiB, and rel RMS of the detector signal vs the PyTorch Siddon
+              image of the same set and factor. phi_uncollided comes from the PyTorch Siddon upstream operator once
+              (identical inputs).
     fine      the first-order image on a single grid (q = 1, the quadrature grid equal to the transport grid) at
               2 / 1 cm (0.5 cm is the images part at factor 1, the identical computation).
 Outputs: <out>/records.jsonl, <out>/img/<key>.npz, <out>/bench_ray_tracing.md (printed).
@@ -53,7 +55,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from citrus.scatter_solver.config import SolverConfig  # noqa: E402
 from citrus.scatter_solver.detector import csi_response, no_grid  # noqa: E402
 from citrus.utilities import wlab_setup  # noqa: E402
-from citrus.scatter_solver.kernels import ray_tracing_kernels as siddon_triton  # noqa: E402
+from citrus.scatter_solver.kernels import ray_tracing_kernels  # noqa: E402
 from citrus.scatter_solver.ray_tracing import SiddonProjectors  # noqa: E402
 from citrus.scatter_solver.scatter_solver import build_solver_library  # noqa: E402
 from citrus.scatter_solver.source import SourceModel  # noqa: E402
@@ -85,12 +87,16 @@ def rel_rms(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]
     return float(np.linalg.norm(a - b) / np.linalg.norm(b))
 
 
-def first_order_image(lib, rho, phi_uc, grid, factor: int, geom, quad, mu_coarse, projectors, det, grid_resp) -> dict:
+def first_order_image(library, rho, phi_uncollided, grid, factor: int, geometry, quadrature, mu_coarse, projectors,
+                      detector,
+                      grid_response) -> dict:
     """First-order image of the solver's scatter pass: combined_scatter_image with a zero multiple-collision source
     (mu_coarse None -> the true coarse attenuation)."""
-    T0 = torch.zeros(lib.num_groups, 1, *grid.coarsen(factor).shape, device=phi_uc.device, dtype=phi_uc.dtype)
-    return combined_scatter_image(lib, rho, phi_uc, grid, factor, T0, 0, geom, 0.0, quad, mu_coarse, projectors, det,
-                                  grid_resp, chunk=8, fc_chunk=4)
+    T0 = torch.zeros(library.num_groups, 1, *grid.coarsen(factor).shape, device=phi_uncollided.device,
+                     dtype=phi_uncollided.dtype)
+    return combined_scatter_image(library, rho, phi_uncollided, grid, factor, T0, 0, geometry, 0.0, quadrature,
+                                  mu_coarse, projectors, detector,
+                                  grid_response, chunk=8, first_collision_chunk=4)
 
 
 def foreign_gpu_load() -> str:
@@ -108,49 +114,50 @@ def foreign_gpu_load() -> str:
 class Bench:
     def __init__(self, args):
         self.args = args
-        self.dev = torch.device("cuda")
+        self.device = torch.device("cuda")
         os.makedirs(os.path.join(args.out, "img"), exist_ok=True)
         self.jsonl = os.path.join(args.out, "records.jsonl")
         self.records: dict[str, dict] = {}
         if os.path.isfile(self.jsonl) and not args.rerun:
-            with open(self.jsonl) as fh:
-                for line in fh:
+            with open(self.jsonl) as file:
+                for line in file:
                     if line.strip():
                         r = json.loads(line)
                         self.records[r["key"]] = r
-        self.lib = library()
-        self.det, self.grid_resp = csi_response(0.06), no_grid()
+        self.library = library()
+        self.detector, self.grid_response = csi_response(0.06), no_grid()
         self.setups: dict[float, tuple] = {}
 
     # ---- inputs -----------------------------------------------------------------------------------
     def setup(self, d: float):
-        """(grid, geom, rho, mu, phi_uc) on the d cm grid; phi_uc from the PyTorch Siddon upstream operator."""
+        """(grid, geometry, rho, mu, phi_uncollided) on the d cm grid; phi_uncollided from the PyTorch Siddon upstream
+    operator."""
         if d not in self.setups:
-            grid, geom, rho = wlab_setup(d, device=self.dev, dtype=torch.float32)
-            mu = mu_t_volume(self.lib, rho)
-            phi_uc = uncollided_fluence(self.lib, rho, grid, geom, 0.0, SourceModel(),
-                                        SiddonProjectors(backend="torch"))
-            self.setups[d] = (grid, geom, rho, mu, phi_uc)
+            grid, geometry, rho = wlab_setup(d, device=self.device, dtype=torch.float32)
+            mu = mu_t_volume(self.library, rho)
+            phi_uncollided = uncollided_fluence(self.library, rho, grid, geometry, 0.0, SourceModel(),
+                                                SiddonProjectors(backend="torch"))
+            self.setups[d] = (grid, geometry, rho, mu, phi_uncollided)
         return self.setups[d]
 
-    def quad(self, cone: tuple[int, int]):
-        grid, geom = self.setup(FINE)[:2]
-        return panel_direction_set(geom, 0.0, cone, max_polar_angle=grid, device=self.dev, dtype=torch.float32)
+    def quadrature(self, cone: tuple[int, int]):
+        grid, geometry = self.setup(FINE)[:2]
+        return panel_direction_set(geometry, 0.0, cone, max_polar_angle=grid, device=self.device, dtype=torch.float32)
 
     def chunks(self, cone: tuple[int, int], chunk: int = 8) -> list[torch.Tensor]:
-        geom = self.setup(FINE)[1]
-        om = self.quad(cone).omega.to(self.dev, torch.float32)
-        _, _, n = geom.panel_axes(0.0)
-        om = om[(om * (-torch.tensor(n, device=self.dev))).sum(-1) > 0].contiguous()
-        return [om[s:s + chunk] for s in range(0, om.shape[0], chunk)]
+        geometry = self.setup(FINE)[1]
+        directions = self.quadrature(cone).omega.to(self.device, torch.float32)
+        _, _, n = geometry.panel_axes(0.0)
+        directions = directions[(directions * (-torch.tensor(n, device=self.device))).sum(-1) > 0].contiguous()
+        return [directions[s:s + chunk] for s in range(0, directions.shape[0], chunk)]
 
     # ---- records ----------------------------------------------------------------------------------
-    def store(self, rec: dict, imgs: Optional[dict] = None) -> None:
-        if imgs is not None:
-            np.savez_compressed(os.path.join(self.args.out, "img", rec["key"] + ".npz"), **imgs)
-        self.records[rec["key"]] = rec
-        with open(self.jsonl, "a") as fh:
-            fh.write(json.dumps(rec) + "\n")
+    def store(self, record: dict, images: Optional[dict] = None) -> None:
+        if images is not None:
+            np.savez_compressed(os.path.join(self.args.out, "img", record["key"] + ".npz"), **images)
+        self.records[record["key"]] = record
+        with open(self.jsonl, "a") as file:
+            file.write(json.dumps(record) + "\n")
 
     def image(self, key: str) -> Optional[np.ndarray]:
         p = os.path.join(self.args.out, "img", key + ".npz")
@@ -159,15 +166,15 @@ class Bench:
         with np.load(p) as z:
             return z["signal"]
 
-    def timed(self, fn: Callable[[], object]) -> tuple[object, float, float]:
+    def timed(self, function: Callable[[], object]) -> tuple[object, float, float]:
         gc.collect()
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(self.dev)
+        torch.cuda.reset_peak_memory_stats(self.device)
         sync()
         t0 = time.perf_counter()
-        r = fn()
+        r = function()
         sync()
-        return r, time.perf_counter() - t0, torch.cuda.max_memory_allocated(self.dev) / 2 ** 20
+        return r, time.perf_counter() - t0, torch.cuda.max_memory_allocated(self.device) / 2 ** 20
 
     def skip(self, key: str) -> bool:
         return key in self.records or key in self.args.skip
@@ -177,42 +184,47 @@ class Bench:
         key = "equality"
         if self.skip(key):
             return self.records[key]["rows"]
-        grid_f, geom, rho_f, mu_f, _ = self.setup(FINE)
-        om = self.chunks((16, 32))[5]
+        grid_fine, geometry, rho_fine, mu_fine, _ = self.setup(FINE)
+        directions = self.chunks((16, 32))[5]
         T = SiddonProjectors(backend="torch")
         rows = []
 
-        def dev_of(a: torch.Tensor, b: torch.Tensor) -> float:
+        def deviation_of(a: torch.Tensor, b: torch.Tensor) -> float:
             m = torch.isfinite(b)
             assert bool((torch.isfinite(a) == m).all())
             return float((a[m].double() - b[m].double()).abs().max() / b[m].double().abs().max())
 
         for d in coarse:
             f = int(round(d / FINE))
-            grid_c = grid_f.coarsen(f)
-            mu_c = coarsen_mu_t(mu_f, grid_f, grid_c)
-            ref = T.downstream_cumulative(mu_c, grid_c, geom, 0.0, om)
-            r64 = T.downstream_cumulative(mu_c.double(), grid_c, geom, 0.0, om.double())
-            got = MAKERS["triton"]().downstream_cumulative(mu_c, grid_c, geom, 0.0, om)
-            rows.append({"op": f"downstream_cumulative ({d:g} cm)", "impl": "triton", "vs_torch32": dev_of(got, ref),
-                         "vs_torch64": dev_of(got, r64)})
+            grid_coarse = grid_fine.coarsen(f)
+            mu_coarse_values = coarsen_mu_t(mu_fine, grid_fine, grid_coarse)
+            reference = T.downstream_cumulative(mu_coarse_values, grid_coarse, geometry, 0.0, directions)
+            result64 = T.downstream_cumulative(mu_coarse_values.double(), grid_coarse, geometry, 0.0,
+                                               directions.double())
+            got = MAKERS["triton"]().downstream_cumulative(mu_coarse_values, grid_coarse, geometry, 0.0, directions)
+            rows.append({"op": f"downstream_cumulative ({d:g} cm)", "impl": "triton",
+                         "vs_torch32": deviation_of(got, reference), "vs_torch64": deviation_of(got, result64)})
             rows.append({"op": f"downstream_cumulative ({d:g} cm)", "impl": "torch", "vs_torch32": 0.0,
-                         "vs_torch64": dev_of(ref, r64)})
-            del ref, r64
-        gen = torch.Generator(self.dev).manual_seed(3)
-        field = torch.rand(om.shape[0], mu_f.shape[0], *grid_f.shape, device=self.dev, generator=gen)
+                         "vs_torch64": deviation_of(reference, result64)})
+            del reference, result64
+        generator = torch.Generator(self.device).manual_seed(3)
+        field = torch.rand(directions.shape[0], mu_fine.shape[0], *grid_fine.shape, device=self.device,
+                           generator=generator)
         P = MAKERS["triton"]()
         ops = [("oblique_project (0.5 cm, [8, G] field)",
-                lambda Q, dt: Q.oblique_project(field.to(dt), grid_f, geom, 0.0, om.to(dt))),
-               ("upstream_cumulative (0.5 cm)", lambda Q, dt: Q.upstream_cumulative(mu_f.to(dt), grid_f, geom, 0.0)),
-               ("primary_project (0.5 cm)", lambda Q, dt: Q.primary_project(mu_f.to(dt), grid_f, geom, 0.0))]
-        for op, fn in ops:
-            ref = fn(T, torch.float32)
-            got = fn(P, torch.float32)
-            r64 = fn(T, torch.float64)
-            rows.append({"op": op, "impl": "triton", "vs_torch32": dev_of(got, ref), "vs_torch64": dev_of(got, r64)})
-            rows.append({"op": op, "impl": "torch", "vs_torch32": 0.0, "vs_torch64": dev_of(ref, r64)})
-            del ref, got, r64
+                lambda Q, dtype: Q.oblique_project(field.to(dtype), grid_fine, geometry, 0.0, directions.to(dtype))),
+               ("upstream_cumulative (0.5 cm)",
+                lambda Q, dtype: Q.upstream_cumulative(mu_fine.to(dtype), grid_fine, geometry, 0.0)),
+               ("primary_project (0.5 cm)",
+                lambda Q, dtype: Q.primary_project(mu_fine.to(dtype), grid_fine, geometry, 0.0))]
+        for op, function in ops:
+            reference = function(T, torch.float32)
+            got = function(P, torch.float32)
+            result64 = function(T, torch.float64)
+            rows.append({"op": op, "impl": "triton", "vs_torch32": deviation_of(got, reference),
+                         "vs_torch64": deviation_of(got, result64)})
+            rows.append({"op": op, "impl": "torch", "vs_torch32": 0.0, "vs_torch64": deviation_of(reference, result64)})
+            del reference, got, result64
         self.store({"key": key, "rows": rows})
         for r in rows:
             print(f"equality {r['op']} {r['impl']}: vs torch32 {r['vs_torch32']:.1e}, vs torch64 {r['vs_torch64']:.1e}",
@@ -224,108 +236,111 @@ class Bench:
         key = f"chunks_c{d:g}_q{cone[0]}x{cone[1]}_{impl}"
         if self.skip(key):
             return self.records.get(key, {})
-        grid_f, geom, _, mu_f = self.setup(FINE)[:4]
+        grid_fine, geometry, _, mu_fine = self.setup(FINE)[:4]
         f = int(round(d / FINE))
-        grid_c = grid_f.coarsen(f)
-        mu_c = coarsen_mu_t(mu_f, grid_f, grid_c)
+        grid_coarse = grid_fine.coarsen(f)
+        mu_coarse_values = coarsen_mu_t(mu_fine, grid_fine, grid_coarse)
         chunks = self.chunks(cone)
-        G = mu_f.shape[0]
-        field = torch.rand(8, G, *grid_f.shape, device=self.dev, generator=torch.Generator(self.dev).manual_seed(3))
+        G = mu_fine.shape[0]
+        generator = torch.Generator(self.device).manual_seed(3)
+        field = torch.rand(8, G, *grid_fine.shape, device=self.device, generator=generator)
         P = MAKERS[impl]()
         reps = 3
         if impl == "torch":
             chunks = chunks[:self.args.torch_chunks]
             reps = 1
 
-        def down():
+        def downstream():
             for o in chunks:
-                P.downstream_cumulative(mu_c, grid_c, geom, 0.0, o)
+                P.downstream_cumulative(mu_coarse_values, grid_coarse, geometry, 0.0, o)
 
-        def obl():
+        def oblique():
             for o in chunks:
-                P.oblique_project(field[:o.shape[0]], grid_f, geom, 0.0, o)
+                P.oblique_project(field[:o.shape[0]], grid_fine, geometry, 0.0, o)
 
         def pair():
             for o in chunks:
-                t = P.downstream_cumulative(mu_c, grid_c, geom, 0.0, o)
-                P.oblique_project(field[:o.shape[0]], grid_f, geom, 0.0, o)
+                t = P.downstream_cumulative(mu_coarse_values, grid_coarse, geometry, 0.0, o)
+                P.oblique_project(field[:o.shape[0]], grid_fine, geometry, 0.0, o)
                 del t
 
-        rec = {"key": key, "coarse": d, "cone": list(cone), "impl": impl, "chunks": len(chunks),
-               "gpu": foreign_gpu_load()}
-        for name, fn in (("down", down), ("obl", obl), ("pair", pair)):
-            fn()
-            ts = []
+        record = {"key": key, "coarse": d, "cone": list(cone), "impl": impl, "chunks": len(chunks),
+                  "gpu": foreign_gpu_load()}
+        for name, function in (("down", downstream), ("obl", oblique), ("pair", pair)):
+            function()
+            times = []
             for _ in range(reps):
                 sync()
                 t0 = time.perf_counter()
-                fn()
+                function()
                 sync()
-                ts.append(time.perf_counter() - t0)
-            rec[f"{name}_ms"] = 1e3 * sorted(ts)[len(ts) // 2] / len(chunks)
+                times.append(time.perf_counter() - t0)
+            record[f"{name}_ms"] = 1e3 * sorted(times)[len(times) // 2] / len(chunks)
         gc.collect()
         torch.cuda.empty_cache()
-        base = torch.cuda.memory_allocated(self.dev)
-        torch.cuda.reset_peak_memory_stats(self.dev)
+        base = torch.cuda.memory_allocated(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
         o = chunks[0]
-        t = P.downstream_cumulative(mu_c, grid_c, geom, 0.0, o)
-        P.oblique_project(field[:o.shape[0]], grid_f, geom, 0.0, o)
+        t = P.downstream_cumulative(mu_coarse_values, grid_coarse, geometry, 0.0, o)
+        P.oblique_project(field[:o.shape[0]], grid_fine, geometry, 0.0, o)
         del t
         sync()
-        rec["pair_peak_extra_mib"] = (torch.cuda.max_memory_allocated(self.dev) - base) / 2 ** 20
-        self.store(rec)
-        print(f"chunks {d:g} cm {cone} {impl}: " + ", ".join(f"{k} {v:.3f}" for k, v in rec.items()
-                                                           if k.endswith("_ms") or k.endswith("_mib"))
-              + f" (nvidia-smi: {rec['gpu']})", flush=True)
-        return rec
+        record["pair_peak_extra_mib"] = (torch.cuda.max_memory_allocated(self.device) - base) / 2 ** 20
+        self.store(record)
+        print(f"chunks {d:g} cm {cone} {impl}: " + ", ".join(f"{k} {v:.3f}" for k, v in record.items()
+                                                             if k.endswith("_ms") or k.endswith("_mib"))
+              + f" (nvidia-smi: {record['gpu']})", flush=True)
+        return record
 
     # ---- part 3: first-order image (supervoxel, sub-points on the fine grid) -------------------------
-    def first_order(self, d: float, quad, impl: str) -> dict:
-        grid_f, geom, rho_f, _, phi_f = self.setup(FINE)
+    def first_order(self, d: float, quadrature, impl: str) -> dict:
+        grid_fine, geometry, rho_fine, _, phi_fine = self.setup(FINE)
         f = int(round(d / FINE))
-        return first_order_image(self.lib, rho_f, phi_f, grid_f, f, geom, quad, None, MAKERS[impl](), self.det,
-                                 self.grid_resp)
+        return first_order_image(self.library, rho_fine, phi_fine, grid_fine, f, geometry, quadrature, None,
+                                 MAKERS[impl](),
+                                 self.detector,
+                                 self.grid_response)
 
     def run_image(self, d: float, cone: tuple[int, int], impl: str) -> dict:
         key = f"img_c{d:g}_q{cone[0]}x{cone[1]}_{impl}"
         if self.skip(key):
             return self.records.get(key, {})
-        q = self.quad(cone)
+        q = self.quadrature(cone)
         print(f"[{time.strftime('%H:%M:%S')}] {key} ({q.num_directions} dirs)", flush=True)
         r, secs, peak = self.timed(lambda: self.first_order(d, q, impl))
-        rec = {"key": key, "coarse": d, "cone": list(cone), "impl": impl, "seconds": secs, "peak_mib": peak,
-               "dirs": q.num_directions, "gpu": foreign_gpu_load()}
-        self.store(rec, {"signal": r["signal"].double().cpu().numpy()})
-        print(f"    {secs:.3f} s, peak {peak:.0f} MiB (nvidia-smi: {rec['gpu']})", flush=True)
-        return rec
+        record = {"key": key, "coarse": d, "cone": list(cone), "impl": impl, "seconds": secs, "peak_mib": peak,
+                  "dirs": q.num_directions, "gpu": foreign_gpu_load()}
+        self.store(record, {"signal": r["signal"].double().cpu().numpy()})
+        print(f"    {secs:.3f} s, peak {peak:.0f} MiB (nvidia-smi: {record['gpu']})", flush=True)
+        return record
 
     # ---- part 4: single-grid first-order image --------------------------------------------------------
     def run_fine_image(self, d: float, cone: tuple[int, int], impl: str) -> dict:
         key = f"fine_d{d:g}_q{cone[0]}x{cone[1]}_{impl}"
         if self.skip(key):
             return self.records.get(key, {})
-        grid, geom, rho, mu, phi = self.setup(d)
-        q = panel_direction_set(geom, 0.0, cone, max_polar_angle=grid, device=self.dev, dtype=torch.float32)
+        grid, geometry, rho, mu, phi = self.setup(d)
+        q = panel_direction_set(geometry, 0.0, cone, max_polar_angle=grid, device=self.device, dtype=torch.float32)
         print(f"[{time.strftime('%H:%M:%S')}] {key} ({q.num_directions} dirs)", flush=True)
-        r, secs, peak = self.timed(lambda: first_order_image(self.lib, rho, phi, grid, 1, geom, q, mu,
-                                                             MAKERS[impl](), self.det, self.grid_resp))
-        rec = {"key": key, "fine": d, "cone": list(cone), "impl": impl, "seconds": secs, "peak_mib": peak,
-               "dirs": q.num_directions, "gpu": foreign_gpu_load()}
-        self.store(rec, {"signal": r["signal"].double().cpu().numpy()})
-        print(f"    {secs:.3f} s, peak {peak:.0f} MiB (nvidia-smi: {rec['gpu']})", flush=True)
-        return rec
+        r, secs, peak = self.timed(lambda: first_order_image(self.library, rho, phi, grid, 1, geometry, q, mu,
+                                                             MAKERS[impl](), self.detector, self.grid_response))
+        record = {"key": key, "fine": d, "cone": list(cone), "impl": impl, "seconds": secs, "peak_mib": peak,
+                  "dirs": q.num_directions, "gpu": foreign_gpu_load()}
+        self.store(record, {"signal": r["signal"].double().cpu().numpy()})
+        print(f"    {secs:.3f} s, peak {peak:.0f} MiB (nvidia-smi: {record['gpu']})", flush=True)
+        return record
 
     def warmup(self, coarse: list[float]) -> None:
         """Untimed small runs of every backend (CUDA context, allocator, every Triton kernel variant)."""
         t0 = time.perf_counter()
-        siddon_triton.warmup(self.dev, int(self.lib.num_groups))
-        q = self.quad((4, 8))
+        ray_tracing_kernels.warmup(self.device, int(self.library.num_groups))
+        q = self.quadrature((4, 8))
         for d in coarse:
             for impl in IMPLS:
                 self.first_order(d, q, impl)
         sync()
-        print(f"warm-up: {time.perf_counter() - t0:.1f} s; siddon kernels: {siddon_triton.kernels_usable(self.dev)}",
-              flush=True)
+        print(f"warm-up: {time.perf_counter() - t0:.1f} s; siddon kernels: "
+              f"{ray_tracing_kernels.kernels_usable(self.device)}", flush=True)
 
 
 # =====================================================================================================
@@ -361,57 +376,59 @@ def tables(b: Bench, coarse: list[float], cones: list[tuple[int, int]], parts: s
                               f"{_f(r.get('pair_peak_extra_mib'), '.0f')} |")
         md.append("")
     if "images" in parts:
-        md += ["### First-order image (supervoxel tau on the coarse grid, sub-points projected on the fine 0.5 cm grid)",
-               "", "| coarse grid | dirs | backend | image s | peak MiB | rel RMS vs Siddon (PyTorch) | "
+        md += ["### First-order image (supervoxel tau on the coarse grid, sub-points projected on the fine 0.5 cm "
+               "grid)", "",
+               "| coarse grid | dirs | backend | image s | peak MiB | rel RMS vs Siddon (PyTorch) | "
                "rel RMS vs Siddon (Triton) |", "|---|---|---|---|---|---|---|"]
         for d in coarse:
             for cone in cones:
-                ref_t = b.image(f"img_c{d:g}_q{cone[0]}x{cone[1]}_torch")
-                ref_k = b.image(f"img_c{d:g}_q{cone[0]}x{cone[1]}_triton")
+                reference_t = b.image(f"img_c{d:g}_q{cone[0]}x{cone[1]}_torch")
+                reference_k = b.image(f"img_c{d:g}_q{cone[0]}x{cone[1]}_triton")
                 for impl in IMPLS:
                     key = f"img_c{d:g}_q{cone[0]}x{cone[1]}_{impl}"
                     r = R.get(key)
                     if not r:
                         continue
-                    img = b.image(key)
+                    image = b.image(key)
                     md.append(f"| {d:g} cm | {r['dirs']} | {LABEL[impl]} | {r['seconds']:.3f} | {r['peak_mib']:.0f} | "
-                              f"{_f(rel_rms(img, ref_t), '.2e')} | {_f(rel_rms(img, ref_k), '.2e')} |")
+                              f"{_f(rel_rms(image, reference_t), '.2e')} | {_f(rel_rms(image, reference_k), '.2e')} |")
         md.append("")
     if "fine" in parts:
         md += ["### First-order image on a single grid (q = 1)", "",
-               "| grid | dirs | backend | image s | peak MiB | rel RMS vs Siddon (PyTorch) | rel RMS vs Siddon (Triton) |",
+               "| grid | dirs | backend | image s | peak MiB | rel RMS vs Siddon (PyTorch) | "
+               "rel RMS vs Siddon (Triton) |",
                "|---|---|---|---|---|---|---|"]
         for d in sorted({float(x) for x in b.args.fine_grids}, reverse=True):
             for cone in cones:
-                ref_t = b.image(f"fine_d{d:g}_q{cone[0]}x{cone[1]}_torch")
-                ref_k = b.image(f"fine_d{d:g}_q{cone[0]}x{cone[1]}_triton")
+                reference_t = b.image(f"fine_d{d:g}_q{cone[0]}x{cone[1]}_torch")
+                reference_k = b.image(f"fine_d{d:g}_q{cone[0]}x{cone[1]}_triton")
                 for impl in IMPLS:
                     key = f"fine_d{d:g}_q{cone[0]}x{cone[1]}_{impl}"
                     r = R.get(key)
                     if not r:
                         continue
-                    img = b.image(key)
+                    image = b.image(key)
                     md.append(f"| {d:g} cm | {r['dirs']} | {LABEL[impl]} | {r['seconds']:.3f} | {r['peak_mib']:.0f} | "
-                              f"{_f(rel_rms(img, ref_t), '.2e')} | {_f(rel_rms(img, ref_k), '.2e')} |")
+                              f"{_f(rel_rms(image, reference_t), '.2e')} | {_f(rel_rms(image, reference_k), '.2e')} |")
         md.append("")
     return "\n".join(md)
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--coarse", type=float, nargs="+", default=[2.0, 1.0, 0.5])
-    ap.add_argument("--cones", nargs="+", default=["16x32", "32x64"])
-    ap.add_argument("--fine-grids", type=float, nargs="+", default=[2.0, 1.0],
-                    help="fine part: single-grid image grids (0.5 cm = the images part at factor 1)")
-    ap.add_argument("--out", default=os.path.join("_cache", "runs", "bench_ray_tracing"))
-    ap.add_argument("--parts", default="equality,chunks,images,fine")
-    ap.add_argument("--torch-chunks", type=int, default=8, help="chunks timed for the PyTorch Siddon (one pass)")
-    ap.add_argument("--torch-images", default="all", choices=["all", "none"],
-                    help="run the PyTorch Siddon images (the 0.5 cm / 2048 one takes about 2 minutes)")
-    ap.add_argument("--skip", default="", help="comma-separated record keys to skip")
-    ap.add_argument("--rerun", action="store_true")
-    ap.add_argument("--tables-only", action="store_true")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--coarse", type=float, nargs="+", default=[2.0, 1.0, 0.5])
+    parser.add_argument("--cones", nargs="+", default=["16x32", "32x64"])
+    parser.add_argument("--fine-grids", type=float, nargs="+", default=[2.0, 1.0],
+                        help="fine part: single-grid image grids (0.5 cm = the images part at factor 1)")
+    parser.add_argument("--out", default=os.path.join("_cache", "runs", "bench_ray_tracing"))
+    parser.add_argument("--parts", default="equality,chunks,images,fine")
+    parser.add_argument("--torch-chunks", type=int, default=8, help="chunks timed for the PyTorch Siddon (one pass)")
+    parser.add_argument("--torch-images", default="all", choices=["all", "none"],
+                        help="run the PyTorch Siddon images (the 0.5 cm / 2048 one takes about 2 minutes)")
+    parser.add_argument("--skip", default="", help="comma-separated record keys to skip")
+    parser.add_argument("--rerun", action="store_true")
+    parser.add_argument("--tables-only", action="store_true")
+    args = parser.parse_args()
     args.skip = set(k for k in args.skip.split(",") if k)
     parts = set(p for p in args.parts.split(",") if p)
     cones = [tuple(int(v) for v in c.split("x")) for c in args.cones]
@@ -434,16 +451,18 @@ def main() -> None:
                         b.run_image(d, cone, impl)
         if "fine" in parts:
             for d in args.fine_grids:
-                grid, geom, rho, mu, phi = b.setup(d)
-                q = panel_direction_set(geom, 0.0, (4, 8), max_polar_angle=grid, device=b.dev, dtype=torch.float32)
+                grid, geometry, rho, mu, phi = b.setup(d)
+                q = panel_direction_set(geometry, 0.0, (4, 8), max_polar_angle=grid, device=b.device,
+                                        dtype=torch.float32)
                 for impl in IMPLS:  # warm-up of this grid's kernel variants
-                    first_order_image(b.lib, rho, phi, grid, 1, geom, q, mu, MAKERS[impl](), b.det, b.grid_resp)
+                    first_order_image(b.library, rho, phi, grid, 1, geometry, q, mu, MAKERS[impl](), b.detector,
+                                      b.grid_response)
                 for cone in cones:
                     for impl in ("triton",) + (("torch",) if args.torch_images == "all" else ()):
                         b.run_fine_image(d, cone, impl)
     md = tables(b, args.coarse, cones, parts)
-    with open(os.path.join(args.out, "bench_ray_tracing.md"), "w") as fh:
-        fh.write(md + "\n")
+    with open(os.path.join(args.out, "bench_ray_tracing.md"), "w") as file:
+        file.write(md + "\n")
     print(md)
     print(f"nvidia-smi after: {foreign_gpu_load()}", flush=True)
 

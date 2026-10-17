@@ -53,8 +53,8 @@ ArrayLike = Union[Tensor, np.ndarray, Sequence[float]]
 MassAttenuation = Callable[[np.ndarray], np.ndarray]
 
 RHO_CSI = 4.51  # g/cm^3
-RHO_PB = 11.35  # g/cm^3
-_EDGE_EPS = 1e-3  # keV; the two points of a K/L-edge pair are this far apart
+RHO_LEAD = 11.35  # g/cm^3
+_EDGE_SPACING_KEV = 1e-3  # keV; the two points of a K/L-edge pair are this far apart
 
 # ---- coarse NIST XCOM tables (total attenuation with coherent scattering, cm^2/g) ----------------
 # CsI (Cs 51.15 %, I 48.85 % by weight). Edge pairs: I K-edge 33.17 keV, Cs K-edge 35.98 keV.
@@ -65,9 +65,9 @@ _CSI_TABLE = np.array([
     (25.0, 14.6),
     (30.0, 8.9),
     (33.17, 6.6),
-    (33.17 + _EDGE_EPS, 21.6),
+    (33.17 + _EDGE_SPACING_KEV, 21.6),
     (35.98, 17.5),
-    (35.98 + _EDGE_EPS, 31.3),
+    (35.98 + _EDGE_SPACING_KEV, 31.3),
     (40.0, 23.5),
     (50.0, 12.9),
     (60.0, 7.95),
@@ -76,10 +76,10 @@ _CSI_TABLE = np.array([
     (150.0, 0.72),
 ])
 # Pb. Edge pairs: L3 13.04 keV, K 88.00 keV (L2/L1 omitted: lead is opaque there anyway).
-_PB_TABLE = np.array([
+_LEAD_TABLE = np.array([
     (10.0, 130.6),
     (13.04, 67.0),
-    (13.04 + _EDGE_EPS, 157.0),
+    (13.04 + _EDGE_SPACING_KEV, 157.0),
     (15.0, 111.6),
     (20.0, 86.4),
     (30.0, 30.3),
@@ -88,39 +88,39 @@ _PB_TABLE = np.array([
     (60.0, 5.02),
     (80.0, 2.42),
     (88.0, 1.91),
-    (88.0 + _EDGE_EPS, 7.68),
+    (88.0 + _EDGE_SPACING_KEV, 7.68),
     (100.0, 5.55),
     (150.0, 2.01),
 ])
 
 
-def _loglog(table: np.ndarray, energy_kev: ArrayLike) -> np.ndarray:
+def _log_log_interpolation(table: np.ndarray, energy_kev: ArrayLike) -> np.ndarray:
     """Log-log interpolation (linear extrapolation in log-log outside the table) of a (E, mu) table."""
     e = np.asarray(torch.as_tensor(energy_kev).detach().cpu().numpy() if isinstance(energy_kev, Tensor)
                    else energy_kev, dtype=np.float64)
     if np.any(e <= 0):
         raise ValueError("energies must be positive")
-    le, lm = np.log(table[:, 0]), np.log(table[:, 1])
+    log_energy, log_mu = np.log(table[:, 0]), np.log(table[:, 1])
     x = np.log(e)
-    y = np.interp(x, le, lm)
-    lo, hi = x < le[0], x > le[-1]
+    y = np.interp(x, log_energy, log_mu)
+    lo, hi = x < log_energy[0], x > log_energy[-1]
     if np.any(lo):
-        s = (lm[1] - lm[0]) / (le[1] - le[0])
-        y = np.where(lo, lm[0] + s * (x - le[0]), y)
+        s = (log_mu[1] - log_mu[0]) / (log_energy[1] - log_energy[0])
+        y = np.where(lo, log_mu[0] + s * (x - log_energy[0]), y)
     if np.any(hi):
-        s = (lm[-1] - lm[-2]) / (le[-1] - le[-2])
-        y = np.where(hi, lm[-1] + s * (x - le[-1]), y)
+        s = (log_mu[-1] - log_mu[-2]) / (log_energy[-1] - log_energy[-2])
+        y = np.where(hi, log_mu[-1] + s * (x - log_energy[-1]), y)
     return np.exp(y)
 
 
 def csi_mass_attenuation(energy_kev: ArrayLike) -> np.ndarray:
     """Total mass attenuation of CsI (cm^2/g) at energies (keV), coarse XCOM table, log-log interpolated."""
-    return _loglog(_CSI_TABLE, energy_kev)
+    return _log_log_interpolation(_CSI_TABLE, energy_kev)
 
 
 def lead_mass_attenuation(energy_kev: ArrayLike) -> np.ndarray:
     """Total mass attenuation of Pb (cm^2/g) at energies (keV), coarse XCOM table, log-log interpolated."""
-    return _loglog(_PB_TABLE, energy_kev)
+    return _log_log_interpolation(_LEAD_TABLE, energy_kev)
 
 
 # ---- interpolation helper -------------------------------------------------------------------------
@@ -167,18 +167,18 @@ class DetectorResponse:
 
         group_energy: [G] keV; theta: [...] rad. Returns [G, ...] with theta's device and dtype.
         """
-        dev, dt = theta.device, theta.dtype
-        e_nodes = self.energy_kev.to(dev, dt)
-        t_nodes = self.theta_rad.to(dev, dt)
-        R = self.response.to(dev, dt)
-        e = group_energy.to(dev, dt).reshape(-1)
-        ie0, ie1, we = _bracket(e_nodes, e)  # [G]
-        it0, it1, wt = _bracket(t_nodes, theta.abs())  # [...]
-        r0 = R[ie0]  # [G, T]
-        r1 = R[ie1]
-        rg = r0 + (r1 - r0) * we[:, None]  # [G, T]
-        a = rg[:, it0]  # [G, ...]
-        b = rg[:, it1]
+        device, dtype = theta.device, theta.dtype
+        energy_nodes = self.energy_kev.to(device, dtype)
+        theta_nodes = self.theta_rad.to(device, dtype)
+        table = self.response.to(device, dtype)
+        e = group_energy.to(device, dtype).reshape(-1)
+        ie0, ie1, we = _bracket(energy_nodes, e)  # [G]
+        it0, it1, wt = _bracket(theta_nodes, theta.abs())  # [...]
+        r0 = table[ie0]  # [G, T]
+        r1 = table[ie1]
+        table_at_energy = r0 + (r1 - r0) * we[:, None]  # [G, T]
+        a = table_at_energy[:, it0]  # [G, ...]
+        b = table_at_energy[:, it1]
         return a + (b - a) * wt
 
 
@@ -189,30 +189,30 @@ def _theta_nodes_detector(n: int = 181, max_deg: float = 89.5) -> np.ndarray:
 
 def csi_response(thickness_cm: float = 0.06, density: float = RHO_CSI,
                  energies: Optional[ArrayLike] = None,
-                 mu_mass_csi: Optional[MassAttenuation] = None,
+                 mass_attenuation: Optional[MassAttenuation] = None,
                  thetas: Optional[ArrayLike] = None) -> DetectorResponse:
     """Energy-integrating CsI scintillator model:
 
         D(E, theta) = E * (1 - exp(-mu_CsI(E) * rho * t / cos(theta)))      keV per incident photon
 
     i.e. every interacting photon deposits its full energy (no escape, no fluorescence), with the
-    oblique path length t / cos(theta). mu_mass_csi: callable keV -> cm^2/g (numpy in/out); default
+    oblique path length t / cos(theta). mass_attenuation: callable keV -> cm^2/g (numpy in/out); default
     `csi_mass_attenuation` (coarse XCOM table). energies: table energies in keV (default 10..150 keV
     every 0.5 keV; pass the group energies to make the table exact at the groups). thetas: table
     angles in rad (default 0..89.5 deg, 181 nodes). float64 CPU tables.
     """
     if thickness_cm < 0:
         raise ValueError("thickness must be non-negative")
-    e = np.sort(np.asarray(np.linspace(10.0, 150.0, 281) if energies is None else
-                           (energies.detach().cpu().numpy() if isinstance(energies, Tensor) else energies),
-                           dtype=np.float64).reshape(-1))
-    th = np.sort(np.asarray(_theta_nodes_detector() if thetas is None else
-                            (thetas.detach().cpu().numpy() if isinstance(thetas, Tensor) else thetas),
-                            dtype=np.float64).reshape(-1))
-    mu = (csi_mass_attenuation if mu_mass_csi is None else mu_mass_csi)(e)
-    path = thickness_cm / np.cos(np.clip(th, 0.0, math.pi / 2 - 1e-9))  # [T]
-    resp = e[:, None] * (-np.expm1(-np.asarray(mu)[:, None] * density * path[None, :]))
-    return DetectorResponse(torch.as_tensor(e), torch.as_tensor(th), torch.as_tensor(resp),
+    energy_nodes = np.sort(np.asarray(np.linspace(10.0, 150.0, 281) if energies is None else
+                                      (energies.detach().cpu().numpy() if isinstance(energies, Tensor) else energies),
+                                      dtype=np.float64).reshape(-1))
+    thetas_rad = np.sort(np.asarray(_theta_nodes_detector() if thetas is None else
+                                    (thetas.detach().cpu().numpy() if isinstance(thetas, Tensor) else thetas),
+                                    dtype=np.float64).reshape(-1))
+    mu = (csi_mass_attenuation if mass_attenuation is None else mass_attenuation)(energy_nodes)
+    path = thickness_cm / np.cos(np.clip(thetas_rad, 0.0, math.pi / 2 - 1e-9))  # [T]
+    response = energy_nodes[:, None] * (-np.expm1(-np.asarray(mu)[:, None] * density * path[None, :]))
+    return DetectorResponse(torch.as_tensor(energy_nodes), torch.as_tensor(thetas_rad), torch.as_tensor(response),
                             name=f"CsI {thickness_cm * 10:.2f} mm (1/cos model)")
 
 
@@ -264,21 +264,21 @@ class GridResponse:
 
     def at(self, group_energy: Tensor, theta1: Tensor, theta2: Tensor) -> Tensor:
         """group_energy [G] keV; theta1, theta2 [...] rad (broadcastable). Returns [G, ...] (theta1's device/dtype)."""
-        dev, dt = theta1.device, theta1.dtype
-        theta1, theta2 = torch.broadcast_tensors(theta1, theta2.to(dev, dt))
-        e_nodes = self.energy_kev.to(dev, dt)
-        t1n = self.theta1_rad.to(dev, dt)
-        t2n = self.theta2_rad.to(dev, dt)
-        Tt = self.transmission.to(dev, dt)
-        e = group_energy.to(dev, dt).reshape(-1)
-        ie0, ie1, we = _bracket(e_nodes, e)
-        tg = Tt[ie0] + (Tt[ie1] - Tt[ie0]) * we[:, None, None]  # [G, T1, T2]
-        i10, i11, w1 = _bracket(t1n, theta1.abs())
-        i20, i21, w2 = _bracket(t2n, theta2.abs())
-        a00 = tg[:, i10, i20]
-        a01 = tg[:, i10, i21]
-        a10 = tg[:, i11, i20]
-        a11 = tg[:, i11, i21]
+        device, dtype = theta1.device, theta1.dtype
+        theta1, theta2 = torch.broadcast_tensors(theta1, theta2.to(device, dtype))
+        energy_nodes = self.energy_kev.to(device, dtype)
+        theta1_nodes = self.theta1_rad.to(device, dtype)
+        theta2_nodes = self.theta2_rad.to(device, dtype)
+        table = self.transmission.to(device, dtype)
+        e = group_energy.to(device, dtype).reshape(-1)
+        ie0, ie1, we = _bracket(energy_nodes, e)
+        table_at_energy = table[ie0] + (table[ie1] - table[ie0]) * we[:, None, None]  # [G, T1, T2]
+        i10, i11, w1 = _bracket(theta1_nodes, theta1.abs())
+        i20, i21, w2 = _bracket(theta2_nodes, theta2.abs())
+        a00 = table_at_energy[:, i10, i20]
+        a01 = table_at_energy[:, i10, i21]
+        a10 = table_at_energy[:, i11, i20]
+        a11 = table_at_energy[:, i11, i21]
         a0 = a00 + (a01 - a00) * w2
         a1 = a10 + (a11 - a10) * w2
         return a0 + (a1 - a0) * w1
@@ -298,7 +298,7 @@ def _theta_nodes_grid() -> np.ndarray:
 
 def focused_1d_grid(ratio: float = 10.0, lamella_thickness_cm: float = 0.0036, lamella_height_cm: float = 0.15,
                     pitch_cm: float = 1.0 / 60.0, focal_distance_cm: float = 150.0,
-                    mu_lead: Optional[MassAttenuation] = None, density_lead: float = RHO_PB,
+                    mass_attenuation: Optional[MassAttenuation] = None, lead_density: float = RHO_LEAD,
                     energies: Optional[ArrayLike] = None, theta1: Optional[ArrayLike] = None) -> GridResponse:
     """Geometric model of a focused 1-D lead grid (nominal 10:1, 60 lp/cm, 36 um lamellae, 1.5 mm high, focused at
     150 cm).
@@ -319,51 +319,54 @@ def focused_1d_grid(ratio: float = 10.0, lamella_thickness_cm: float = 0.0036, l
     material and the cover are ignored. `ratio` is the manufacturer's nominal label and is not used: the
     geometry is set by (t, h, p); with the default specifications h / (p - t) = 11.5 and h / p = 9.0, so
     "10:1" is only nominal. focal_distance_cm is stored for `grid_angles`.
-    mu_lead: callable keV -> cm^2/g; default `lead_mass_attenuation` (coarse XCOM table).
+    mass_attenuation: callable keV -> cm^2/g; default `lead_mass_attenuation` (coarse XCOM table).
     energies (keV, default 10..150 every 0.5) and theta1 (rad, default dense in [0, 10 deg]) set the nodes.
     """
     p, t, h = float(pitch_cm), float(lamella_thickness_cm), float(lamella_height_cm)
     if not (0.0 <= t < p) or h < 0:
         raise ValueError("need 0 <= lamella thickness < pitch and height >= 0")
     nominal = h / (p - t)
-    e = np.sort(np.asarray(np.linspace(10.0, 150.0, 281) if energies is None else
-                           (energies.detach().cpu().numpy() if isinstance(energies, Tensor) else energies),
-                           dtype=np.float64).reshape(-1))
-    th1 = np.sort(np.asarray(_theta_nodes_grid() if theta1 is None else
-                             (theta1.detach().cpu().numpy() if isinstance(theta1, Tensor) else theta1),
-                             dtype=np.float64).reshape(-1))
-    mu = np.asarray((lead_mass_attenuation if mu_lead is None else mu_lead)(e))  # [E]
-    tan1 = np.abs(np.tan(np.clip(th1, -math.pi / 2 + 1e-9, math.pi / 2 - 1e-9)))
-    cos1 = np.cos(th1)
-    open_frac = np.maximum(0.0, (p - t) - h * tan1) / p  # [T1]
+    energy_nodes = np.sort(np.asarray(np.linspace(10.0, 150.0, 281) if energies is None else
+                                      (energies.detach().cpu().numpy() if isinstance(energies, Tensor) else energies),
+                                      dtype=np.float64).reshape(-1))
+    theta1_nodes = np.sort(np.asarray(_theta_nodes_grid() if theta1 is None else
+                                      (theta1.detach().cpu().numpy() if isinstance(theta1, Tensor) else theta1),
+                                      dtype=np.float64).reshape(-1))
+    # [E]
+    mu = np.asarray((lead_mass_attenuation if mass_attenuation is None else mass_attenuation)(energy_nodes))
+    tan_theta1 = np.abs(np.tan(np.clip(theta1_nodes, -math.pi / 2 + 1e-9, math.pi / 2 - 1e-9)))
+    cos_theta1 = np.cos(theta1_nodes)
+    open_frac = np.maximum(0.0, (p - t) - h * tan_theta1) / p  # [T1]
     shadow = 1.0 - open_frac
     with np.errstate(divide="ignore", invalid="ignore"):
-        path = np.where(shadow > 0, (t / p) * h / cos1 / np.where(shadow > 0, shadow, 1.0), 0.0)
-    trans = open_frac[None, :] + shadow[None, :] * np.exp(-mu[:, None] * density_lead * path[None, :])  # [E, T1]
-    th2 = np.array([0.0, math.pi / 2])
-    table = np.repeat(trans[:, :, None], 2, axis=2)
-    return GridResponse(torch.as_tensor(e), torch.as_tensor(th1), torch.as_tensor(th2), torch.as_tensor(table),
-                        focal_distance_cm=float(focal_distance_cm),
-                        name=f"focused 1D grid (nominal {ratio:g}:1, h/(p-t) = {nominal:.1f}), {1 / p:.0f} lp/cm (geometric model)")
+        path = np.where(shadow > 0, (t / p) * h / cos_theta1 / np.where(shadow > 0, shadow, 1.0), 0.0)
+    # [E, T1]
+    transmission = open_frac[None, :] + shadow[None, :] * np.exp(-mu[:, None] * lead_density * path[None, :])
+    theta2_nodes = np.array([0.0, math.pi / 2])
+    table = np.repeat(transmission[:, :, None], 2, axis=2)
+    return GridResponse(torch.as_tensor(energy_nodes), torch.as_tensor(theta1_nodes), torch.as_tensor(theta2_nodes),
+                        torch.as_tensor(table), focal_distance_cm=float(focal_distance_cm),
+                        name=f"focused 1D grid (nominal {ratio:g}:1, h/(p-t) = {nominal:.1f}), {1 / p:.0f} lp/cm "
+                             f"(geometric model)")
 
 
 # ---- angles -------------------------------------------------------------------------------------------
 
-def detector_angle(omega: Tensor, geom: ConeGeometry, angle: float) -> Tensor:
+def detector_angle(omega: Tensor, geometry: ConeGeometry, angle: float) -> Tensor:
     """Angle theta0 between the photon direction omega [..., 3] and the inward panel normal -n_hat. Returns [...]."""
-    _, _, n_hat = geom.panel_axes(angle)
+    _, _, n_hat = geometry.panel_axes(angle)
     n = torch.tensor(n_hat, device=omega.device, dtype=omega.dtype)
     c = (omega * (-n)).sum(-1) / torch.linalg.norm(omega, dim=-1)
     return torch.arccos(c.clamp(-1.0, 1.0))
 
 
-def grid_angles(omega: Tensor, pixel_positions: Tensor, geom: ConeGeometry, angle: float,
+def grid_angles(omega: Tensor, pixel_positions: Tensor, geometry: ConeGeometry, angle: float,
                 focal_distance: Optional[float] = None) -> tuple[Tensor, Tensor]:
     """Grid angles (theta1, theta2) of photons arriving at pixels.
 
     ASSUMPTIONS: 1-D grid whose lamellae run along u (channels) and repeat along v (rows), focused on
     the line through the focal point parallel to u, at distance `focal_distance` from the panel along
-    n_hat (default geom.source_detector_dist, i.e. through the focal spot). With a = -omega (unit
+    n_hat (default geometry.source_detector_dist, i.e. through the focal spot). With a = -omega (unit
     vector from the pixel back toward where the photon came from) and f = focus - pixel:
 
         theta1 = atan2(a.v_hat, a.n_hat) - atan2(f.v_hat, f.n_hat)   angle in the v-source plane (the plane
@@ -376,22 +379,22 @@ def grid_angles(omega: Tensor, pixel_positions: Tensor, geom: ConeGeometry, angl
     Shapes: omega [K, 3] with pixel_positions [rows, channels, 3] -> [K, rows, channels]; otherwise omega
     [..., 3] and pixel_positions [..., 3] are broadcast elementwise -> [...]. Recon frame, cm, rad.
     """
-    dev, dt = pixel_positions.device, pixel_positions.dtype
-    omega = omega.to(dev, dt)
-    u_hat, v_hat, n_hat = (torch.tensor(a, device=dev, dtype=dt) for a in geom.panel_axes(angle))
-    fd = geom.source_detector_dist if focal_distance is None else float(focal_distance)
-    focus = torch.tensor(geom.panel_center(angle), device=dev, dtype=dt) + fd * n_hat
+    device, dtype = pixel_positions.device, pixel_positions.dtype
+    omega = omega.to(device, dtype)
+    u_hat, v_hat, n_hat = (torch.tensor(a, device=device, dtype=dtype) for a in geometry.panel_axes(angle))
+    focal_distance = geometry.source_detector_dist if focal_distance is None else float(focal_distance)
+    focus = torch.tensor(geometry.panel_center(angle), device=device, dtype=dtype) + focal_distance * n_hat
     if omega.dim() == 2 and pixel_positions.dim() == 3:
         a = -omega[:, None, None, :]  # [K, 1, 1, 3]
-        pix = pixel_positions[None]
+        pixels = pixel_positions[None]
     else:
         a = -omega
-        pix = pixel_positions
-    f = focus - pix
-    an = (a * n_hat).sum(-1)
-    theta_a = torch.atan2((a * v_hat).sum(-1), an)
+        pixels = pixel_positions
+    f = focus - pixels
+    a_normal = (a * n_hat).sum(-1)
+    theta_a = torch.atan2((a * v_hat).sum(-1), a_normal)
     theta_f = torch.atan2((f * v_hat).sum(-1), (f * n_hat).sum(-1))
     theta1 = theta_a - theta_f
-    theta2 = torch.atan2((a * u_hat).sum(-1), an)
+    theta2 = torch.atan2((a * u_hat).sum(-1), a_normal)
     theta1, theta2 = torch.broadcast_tensors(theta1, theta2)
     return theta1, theta2

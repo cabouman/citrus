@@ -77,11 +77,11 @@ def _angles_array(angles) -> np.ndarray:
     return np.asarray(angles, dtype=np.float64).reshape(-1)
 
 
-def make_cone_model(grid: Grid, geom: ConeGeometry, angles: Union[Sequence[float], np.ndarray, Tensor], *,
+def make_cone_model(grid: Grid, geometry: ConeGeometry, angles: Union[Sequence[float], np.ndarray, Tensor], *,
                     device: DeviceLike = None, use_ror_mask: bool = False, compile_mode: Optional[str] = None,
                     verbose: int = 0, **params):
     """MBIRTORCH `ConeBeamModel` whose forward projection of a volume [R, C, S] on `grid` lands on the panel of
-    `geom` with our pixel indexing (rows along +z, channels along +x_view, same offsets), one view per angle (rad).
+    `geometry` with our pixel indexing (rows along +z, channels along +x_view, same offsets), one view per angle (rad).
 
     Sets: sinogram_shape (V, num_det_rows, num_det_channels), source_iso_dist, source_detector_dist (constructor);
     delta_det_channel, delta_det_row, det_channel_offset, det_row_offset, recon_shape = grid.shape,
@@ -93,25 +93,28 @@ def make_cone_model(grid: Grid, geom: ConeGeometry, angles: Union[Sequence[float
     **params: further `set_params` entries (e.g. snr_db, sharpness, positivity_flag, granularity,
     partition_sequence).
     """
-    import mbirtorch as mt
+    import mbirtorch
 
-    dev = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = (torch.device(device) if device is not None
+              else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     if compile_mode is None:
-        compile_mode = "auto" if dev.type == "cuda" else "off"
-    ang = _angles_array(angles)
-    model = mt.ConeBeamModel((len(ang), geom.num_det_rows, geom.num_det_channels), ang,
-                             source_detector_dist=float(geom.source_detector_dist),
-                             source_iso_dist=float(geom.source_iso_dist), compile_mode=compile_mode)
+        compile_mode = "auto" if device.type == "cuda" else "off"
+    angle_array = _angles_array(angles)
+    model = mbirtorch.ConeBeamModel((len(angle_array), geometry.num_det_rows, geometry.num_det_channels), angle_array,
+                                    source_detector_dist=float(geometry.source_detector_dist),
+                                    source_iso_dist=float(geometry.source_iso_dist), compile_mode=compile_mode)
     model.set_params(no_warning=True,
-                     delta_det_channel=float(geom.delta_det_channel), delta_det_row=float(geom.delta_det_row),
-                     det_channel_offset=float(geom.det_channel_offset), det_row_offset=float(geom.det_row_offset),
+                     delta_det_channel=float(geometry.delta_det_channel),
+                     delta_det_row=float(geometry.delta_det_row),
+                     det_channel_offset=float(geometry.det_channel_offset),
+                     det_row_offset=float(geometry.det_row_offset),
                      recon_shape=tuple(int(n) for n in grid.shape), delta_voxel=float(grid.delta_voxel),
                      voxel_row_aspect=float(grid.voxel_row_aspect),
                      voxel_slice_aspect=float(grid.voxel_slice_aspect),
                      recon_slice_offset=float(grid.recon_slice_offset), use_ror_mask=use_ror_mask, verbose=int(verbose))
     if params:
         model.set_params(**params)
-    model.configure_devices(devices=[str(dev)])
+    model.configure_devices(devices=[str(device)])
     return model
 
 
@@ -135,12 +138,12 @@ def scan_range(angles) -> float:
     return float(abs(a[-1] - a[0]) * a.size / (a.size - 1))
 
 
-def is_short_scan(angles, tol: float = 1e-6) -> bool:
+def is_short_scan(angles, tolerance: float = 1e-6) -> bool:
     """True when the evenly spaced views cover less than a full rotation (`scan_range` < 2 pi)."""
-    return scan_range(angles) < 2.0 * np.pi - tol
+    return scan_range(angles) < 2.0 * np.pi - tolerance
 
 
-def short_scan_weights(geom: ConeGeometry, angles, device: DeviceLike = None) -> Optional[Tensor]:
+def short_scan_weights(geometry: ConeGeometry, angles, device: DeviceLike = None) -> Optional[Tensor]:
     """FDK redundancy weights [V, 1, Cd] (float32) for views evenly spaced over a range Lambda < 2 pi, or None for a
     full rotation (MBIRTORCH's FDK is then exact as is).
 
@@ -160,50 +163,51 @@ def short_scan_weights(geom: ConeGeometry, angles, device: DeviceLike = None) ->
     approximate off the central plane like FDK itself)."""
     a = _angles_array(angles)
     V = a.size
-    lam = scan_range(a)
-    if V < 2 or lam >= 2.0 * np.pi - 1e-6:
+    arc = scan_range(a)
+    if V < 2 or arc >= 2.0 * np.pi - 1e-6:
         return None
-    sdd = float(geom.source_detector_dist)
-    u = (np.arange(geom.num_det_channels) - (geom.num_det_channels - 1) / 2.0) * float(geom.delta_det_channel) \
-        - float(geom.det_channel_offset)
-    gamma = _PARKER_SIGN * np.arctan(u / sdd)  # [Cd]
-    gm = float(np.abs(gamma).max())
-    delta = 0.5 * (lam - np.pi)
-    if delta < gm - 1e-9:
+    source_detector_distance = float(geometry.source_detector_dist)
+    u = ((np.arange(geometry.num_det_channels) - (geometry.num_det_channels - 1) / 2.0)
+         * float(geometry.delta_det_channel) - float(geometry.det_channel_offset))
+    gamma = _PARKER_SIGN * np.arctan(u / source_detector_distance)  # [Cd]
+    max_fan_angle = float(np.abs(gamma).max())
+    delta = 0.5 * (arc - np.pi)
+    if delta < max_fan_angle - 1e-9:
         import warnings
 
-        warnings.warn(f"scan range {np.degrees(lam):.1f} deg is shorter than a short scan (180 deg + fan angle "
-                      f"{np.degrees(2 * gm):.1f} deg): no redundancy weighting, the FDK is incomplete", RuntimeWarning)
+        warnings.warn(f"scan range {np.degrees(arc):.1f} deg is shorter than a short scan (180 deg + fan angle "
+                      f"{np.degrees(2 * max_fan_angle):.1f} deg): no redundancy weighting, the FDK is incomplete",
+                      RuntimeWarning)
         return None
-    beta = (np.arange(V) + 0.5) * lam / V
+    beta = (np.arange(V) + 0.5) * arc / V
     if a[-1] < a[0]:
         beta = beta[::-1].copy()
-    B, Gm = beta[:, None], gamma[None, :]
+    beta_grid, gamma_grid = beta[:, None], gamma[None, :]
     w = np.ones((V, gamma.size))
     with np.errstate(divide="ignore", invalid="ignore"):
-        r1 = B < 2.0 * (delta - Gm)
-        w = np.where(r1, np.sin(np.pi / 4.0 * B / np.where(r1, delta - Gm, 1.0)) ** 2, w)
-        r3 = B >= np.pi - 2.0 * Gm
-        w = np.where(r3, np.sin(np.pi / 4.0 * np.clip(np.pi + 2.0 * delta - B, 0.0, None)
-                                / np.where(r3, delta + Gm, 1.0)) ** 2, w)
-    w = w * (lam / np.pi)
-    dev = torch.device(device) if device is not None else None
-    return torch.as_tensor(w[:, None, :].astype(np.float32), device=dev)
+        ramp_up = beta_grid < 2.0 * (delta - gamma_grid)
+        w = np.where(ramp_up, np.sin(np.pi / 4.0 * beta_grid / np.where(ramp_up, delta - gamma_grid, 1.0)) ** 2, w)
+        ramp_down = beta_grid >= np.pi - 2.0 * gamma_grid
+        w = np.where(ramp_down, np.sin(np.pi / 4.0 * np.clip(np.pi + 2.0 * delta - beta_grid, 0.0, None)
+                                       / np.where(ramp_down, delta + gamma_grid, 1.0)) ** 2, w)
+    w = w * (arc / np.pi)
+    device = torch.device(device) if device is not None else None
+    return torch.as_tensor(w[:, None, :].astype(np.float32), device=device)
 
 
 _PARKER_SIGN = -1.0  # gamma = -atan(u / SDD): orientation relative to the rotation in MBIRTORCH's frame (measured:
 # the other sign leaves a 13 % error on an off-center test object, this one the full-rotation FDK error; tests)
 
 
-def fdk(model, sinogram: Tensor, filter_name: str = "ramp", *, geom: Optional[ConeGeometry] = None,
+def fdk(model, sinogram: Tensor, filter_name: str = "ramp", *, geometry: Optional[ConeGeometry] = None,
         angles=None) -> Tensor:
     """FDK reconstruction (`ConeBeamModel.recon_fdk` = `recon_direct`: ramp filter with the FDK cosine pre-weight,
     then the adjoint of the forward projector) of line integrals [views, rows, channels] -> volume [R, C, S] (1/cm)
-    on the model device. MBIRTORCH's FDK assumes a full rotation (no short-scan weighting); given the scan `geom` and
-    `angles` of a short scan (`is_short_scan`), the line integrals are first multiplied by the Parker weights of
+    on the model device. MBIRTORCH's FDK assumes a full rotation (no short-scan weighting); given the scan `geometry`
+    and `angles` of a short scan (`is_short_scan`), the line integrals are first multiplied by the Parker weights of
     `short_scan_weights` (without them a half-rotation FDK carries the usual short-scan shading and a wrong scale)."""
-    if geom is not None and angles is not None:
-        w = short_scan_weights(geom, angles, device=sinogram.device if isinstance(sinogram, Tensor) else None)
+    if geometry is not None and angles is not None:
+        w = short_scan_weights(geometry, angles, device=sinogram.device if isinstance(sinogram, Tensor) else None)
         if w is not None:
             sinogram = torch.as_tensor(sinogram, dtype=torch.float32, device=w.device) * w
     return model.recon_fdk(sinogram, filter_name=filter_name, output_sharded=True)
@@ -285,8 +289,8 @@ def _vcd_recon_resumable(model, sinogram, weights, init_recon, max_iterations: i
                             [len(fm_rmse), granularity, partition_sequence, fm_rmse, [0], regularization_params,
                              [100 * float(val) for val in loss_vectors[2]], [float(val) for val in loss_vectors[3]],
                              [[float(v) for v in row] for row in loss_vectors[4]]]))
-    for h in list(model.logger.handlers):
-        h.flush()
+    for handler in list(model.logger.handlers):
+        handler.flush()
     model.close_log_file()
     recon_dict = model.get_recon_dict(recon_params, notes=f"Reconstruction completed: {datetime.datetime.now()}\n\n")
     return recon, recon_dict, checkpoint
@@ -301,16 +305,16 @@ def freeze_regularization(model) -> dict[str, float]:
 
 
 class ViewChunkProjector:
-    """MBIRTORCH forward projections of volumes on `grid` onto the views of a scan (`geom`, `angles` [V] rad), in
+    """MBIRTORCH forward projections of volumes on `grid` onto the views of a scan (`geometry`, `angles` [V] rad), in
     chunks of consecutive views (module docstring): `project(volume, start, stop)` -> [stop - start, Rd, Cd] line
     integrals (value x cm). The views [0, V) use `model` when it is given (the reconstruction's own ConeBeamModel over
     all angles); any other range uses a sub-model over angles[start:stop] (`make_cone_model`, built on first use and
     kept in an LRU of `max_models` entries). `chunks(n)` lists the (start, stop) ranges of n views each."""
 
-    def __init__(self, grid: Grid, geom: ConeGeometry, angles, *, model=None, device: DeviceLike = None,
+    def __init__(self, grid: Grid, geometry: ConeGeometry, angles, *, model=None, device: DeviceLike = None,
                  max_models: int = 8) -> None:
         self.grid = grid
-        self.geom = geom
+        self.geometry = geometry
         self.angles = _angles_array(angles)
         self.model = model
         self.device = device
@@ -334,15 +338,15 @@ class ViewChunkProjector:
         if (start, stop) == (0, self.num_views) and self.model is not None:
             return self.model
         key = (start, stop)
-        m = self._models.get(key)
-        if m is None:
-            m = make_cone_model(self.grid, self.geom, self.angles[start:stop], device=self.device)
-            self._models[key] = m
+        model = self._models.get(key)
+        if model is None:
+            model = make_cone_model(self.grid, self.geometry, self.angles[start:stop], device=self.device)
+            self._models[key] = model
             while len(self._models) > self.max_models:
                 self._models.popitem(last=False)
         else:
             self._models.move_to_end(key)
-        return m
+        return model
 
     def project(self, volume: Tensor, start: int = 0, stop: Optional[int] = None) -> Tensor:
         """Forward projection of volume [R, C, S] onto the views [start, stop) (default all): [stop - start, Rd, Cd]

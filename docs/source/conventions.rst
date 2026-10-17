@@ -51,7 +51,7 @@ The solver uses three grids (``geometry.Grid``):
   axis in 1 cm cells, 4 in 2 cm cells, 1 in 0.5 cm cells): q^3 equal-weight points
   per cell of C at local coordinates ``(2j + 1)/q - 1`` (the midpoint lattice). The uncollided fluence, the
   first-collision source and the first-order emission of the scatter image live on Q.
-* ``rho_coarse`` and ``rho_quad`` are conservative overlap resamplings of ``rho_fine``
+* ``rho_coarse`` and ``rho_quadrature`` are conservative overlap resamplings of ``rho_fine``
   (``geometry.resample_conservative``): each target cell gets the exact average of the voxel-wise constant fine
   field over its volume (zero outside the fine box), so every material's mass is conserved. For an integer ratio
   with aligned boxes this is the block mean.
@@ -74,13 +74,13 @@ Scattering convention
   ``S(Omega) = sum_g' sum_n mu_s_l(n) phi_n(g') Y_n(Omega)``.
 * Octant code: ``(omega_x < 0) * 4 + (omega_y < 0) * 2 + (omega_z < 0)``; a zero component counts as non-negative.
 
-Linear-discontinuous (LD) cell moments
---------------------------------------
+Linear-discontinuous cell moments
+---------------------------------
 
 * Per cell, 4 spatial moments ordered ``[0, x, y, z]`` = mean, u-slope, v-slope, w-slope with local coordinates
   ``u = 2(x - x_c)/dx`` etc. in [-1, 1]; ``f_0 = (1/V) int f dV``, ``f_a = (3/V) int f u_a dV``.
-* LD-moment fields: ``[G, 4, rows, cols, slices]``; spherical-harmonic moments of LD fields:
-  ``[G, N_sh, 4, rows, cols, slices]``.
+* Linear-discontinuous moment fields: ``[G, 4, rows, cols, slices]``; spherical-harmonic moments of linear-discontinuous
+  fields: ``[G, N_sh, 4, rows, cols, slices]``.
 
 Materials
 ---------
@@ -89,13 +89,14 @@ Materials
   densities: 0 air (0.0012 g/cm^3), 1 lung (0.26), 2 adipose (0.95), 3 water (1.0), 4 skeletal muscle (1.05),
   5 soft tissue (1.06), 6 cortical bone (ICRP composition, 1.85); ``WATER = 3``, ``BONE = 6``.
   Density maps ``rho: [7, rows, cols, slices]`` in g/cm^3. All coefficients are linear in rho:
-  ``mu_x[g] = sum_m rho[m] * lib.mu_x[m, g]`` with per-unit-density (mass) coefficients; the library carries
+  ``mu_x[g] = sum_m rho[m] * library.mu_x[m, g]`` with per-unit-density (mass) coefficients; the library carries
   ``materials`` (names) and ``nominal_density [M]``.
-* At most two nonzero materials per voxel of ``rho_fine`` (the density model's output). The resampled ``rho_quad``
+* At most two nonzero materials per voxel of ``rho_fine`` (the density model's output). The resampled ``rho_quadrature``
   can mix more materials at a point (a quadrature cell straddling a boundary): the first-collision source uses the
   compact pair representation ``MaterialPairs`` (``index [2, ...]`` int32, ``density [2, ...]``) when every point of
-  ``rho_quad`` has at most two nonzero materials and evaluates all M materials densely otherwise; the choice is made
-  once per density field (``ScatterSolver.material_fields`` -> ``MaterialFields.pairs_quad``, None for dense).
+  ``rho_quadrature`` has at most two nonzero materials and evaluates all M materials densely otherwise; the choice is
+  made once per density field (``ScatterSolver.material_fields`` -> ``MaterialFields.pairs_quadrature``, None for
+  dense).
 
 Device and dtype
 ----------------

@@ -4,9 +4,9 @@ Contents
 --------
 * Direction sets (`Quadrature`): the Gauss-Legendre x equal-azimuth product set of the sweep and the cone product
   sets of the collapsed-cone scatter image (`hemisphere_quadrature`).
-* Legendre polynomials and real orthonormal spherical harmonics (`legendre_p`,
-  `real_spherical_harmonics`, `sh_degree_index`).
-* Moment <-> ordinate transforms (`SHBasis`, `moments_from_ordinates`, `ordinates_from_moments`).
+* Legendre polynomials and real orthonormal spherical harmonics (`legendre_polynomials`,
+  `real_spherical_harmonics`, `spherical_harmonic_degree_index`).
+* Moment <-> ordinate transforms (`SphericalHarmonicBasis`, `moments_from_ordinates`, `ordinates_from_moments`).
 * The scattering-source operator (`scatter_source_moments`, `scatter_source_at_directions`):
 
       S_g(Omega) = sum_{g'} sum_n mu_s,l(n)^{g' -> g} phi_n,g' Y_n(Omega)
@@ -31,8 +31,8 @@ Y_l,+k = sqrt(2) (-1)^k Re Y_l^k,  Y_l,-k = sqrt(2) (-1)^k Im Y_l^k  (k > 0),  Y
 Scattering-source normalization (derivation; confirmed numerically in tests/test_angular.py)
 -----------------------------------------------------------------------------------------
 Convention: mu_s(Omega' -> Omega) = sum_l (2l+1)/(4 pi) mu_s_l P_l(Omega . Omega').
-Addition theorem for orthonormal real SH: P_l(Omega . Omega') = 4 pi/(2l+1) sum_k Y_lk(Omega) Y_lk(Omega').
-Hence
+Addition theorem for orthonormal real spherical harmonics: P_l(Omega . Omega') = 4 pi/(2l+1) sum_k Y_lk(Omega)
+Y_lk(Omega'). Hence
 
     S(Omega) = int mu_s(Omega' -> Omega) psi(Omega') dOmega'
              = sum_l (2l+1)/(4 pi) mu_s_l * 4 pi/(2l+1) sum_k Y_lk(Omega) int Y_lk(Omega') psi(Omega') dOmega'
@@ -62,12 +62,12 @@ __all__ = [
     "octant_of",
     "product_quadrature",
     "hemisphere_quadrature",
-    "legendre_p",
-    "num_sh",
-    "sh_degree_index",
+    "legendre_polynomials",
+    "num_spherical_harmonics",
+    "spherical_harmonic_degree_index",
     "real_spherical_harmonics",
-    "SHBasis",
-    "sh_basis",
+    "SphericalHarmonicBasis",
+    "spherical_harmonic_basis",
     "moments_from_ordinates",
     "ordinates_from_moments",
     "scatter_source_moments",
@@ -157,19 +157,20 @@ class Quadrature:
 
     def reordered(self, perm: Tensor) -> "Quadrature":
         """The same set with directions permuted by perm [M]."""
-        cw = None if self.cell_width is None else self.cell_width[perm.to(self.cell_width.device)]
-        return Quadrature(omega=self.omega[perm], weight=self.weight[perm], octant=self.octant[perm], cell_width=cw)
+        cell_width = None if self.cell_width is None else self.cell_width[perm.to(self.cell_width.device)]
+        return Quadrature(omega=self.omega[perm], weight=self.weight[perm], octant=self.octant[perm],
+                          cell_width=cell_width)
 
     def to(self, device: _DeviceLike = None, dtype: Optional[torch.dtype] = None) -> "Quadrature":
-        kw = {}
+        keywords = {}
         if device is not None:
-            kw["device"] = device
-        omega = self.omega.to(dtype=dtype, **kw) if dtype is not None else self.omega.to(**kw)
-        weight = self.weight.to(dtype=dtype, **kw) if dtype is not None else self.weight.to(**kw)
-        cw = self.cell_width
-        if cw is not None:
-            cw = cw.to(dtype=dtype, **kw) if dtype is not None else cw.to(**kw)
-        return Quadrature(omega=omega, weight=weight, octant=self.octant.to(**kw), cell_width=cw)
+            keywords["device"] = device
+        omega = self.omega.to(dtype=dtype, **keywords) if dtype is not None else self.omega.to(**keywords)
+        weight = self.weight.to(dtype=dtype, **keywords) if dtype is not None else self.weight.to(**keywords)
+        cell_width = self.cell_width
+        if cell_width is not None:
+            cell_width = cell_width.to(dtype=dtype, **keywords) if dtype is not None else cell_width.to(**keywords)
+        return Quadrature(omega=omega, weight=weight, octant=self.octant.to(**keywords), cell_width=cell_width)
 
 
 def _gauss_legendre(n: int) -> tuple[np.ndarray, np.ndarray]:
@@ -198,34 +199,35 @@ def product_quadrature(
     """
     if num_azimuthal < 1:
         raise ValueError("num_azimuthal must be >= 1")
-    mu_np, wgl_np = _gauss_legendre(num_polar)
-    mu = torch.as_tensor(mu_np, dtype=torch.float64)
-    wgl = torch.as_tensor(wgl_np, dtype=torch.float64)
-    dphi = 2.0 * math.pi / num_azimuthal
-    phi = (torch.arange(num_azimuthal, dtype=torch.float64) + 0.5) * dphi
-    sin_t = torch.sqrt((1.0 - mu * mu).clamp_min(0.0))
-    ox = sin_t[:, None] * torch.cos(phi)[None, :]
-    oy = sin_t[:, None] * torch.sin(phi)[None, :]
+    nodes, gauss_weights_np = _gauss_legendre(num_polar)
+    mu = torch.as_tensor(nodes, dtype=torch.float64)
+    gauss_weights = torch.as_tensor(gauss_weights_np, dtype=torch.float64)
+    azimuth_step = 2.0 * math.pi / num_azimuthal
+    phi = (torch.arange(num_azimuthal, dtype=torch.float64) + 0.5) * azimuth_step
+    sin_theta = torch.sqrt((1.0 - mu * mu).clamp_min(0.0))
+    ox = sin_theta[:, None] * torch.cos(phi)[None, :]
+    oy = sin_theta[:, None] * torch.sin(phi)[None, :]
     oz = mu[:, None].expand(num_polar, num_azimuthal)
     omega = torch.stack([ox, oy, oz], dim=-1).reshape(-1, 3)
-    weight = (wgl[:, None] * dphi).expand(num_polar, num_azimuthal).reshape(-1)
-    quad = Quadrature.from_directions(omega.to(device=device, dtype=dtype), weight.to(device=device, dtype=dtype))
+    weight = (gauss_weights[:, None] * azimuth_step).expand(num_polar, num_azimuthal).reshape(-1)
+    quadrature = Quadrature.from_directions(omega.to(device=device, dtype=dtype),
+                                            weight.to(device=device, dtype=dtype))
     if num_polar % 2 == 0 and num_azimuthal % 4 == 0:
         expected = num_polar * num_azimuthal // 8
-        assert quad.directions_per_octant == expected, "product set octants are not balanced"
-    return quad
+        assert quadrature.directions_per_octant == expected, "product set octants are not balanced"
+    return quadrature
 
 
 # ---- cone sets of the collapsed-cone scatter image ------------------------------------------------
 
-def _as_vec3(v: Union[Tensor, Sequence[float]]) -> Tensor:
+def _unit_vector(v: Union[Tensor, Sequence[float]]) -> Tensor:
     t = torch.as_tensor(v, dtype=torch.float64).detach().to("cpu").reshape(-1)
     if t.numel() != 3:
         raise ValueError("axis must have 3 components")
-    nrm = torch.linalg.norm(t)
-    if not bool(nrm > 0):
+    norm = torch.linalg.norm(t)
+    if not bool(norm > 0):
         raise ValueError("axis must be non-zero")
-    return t / nrm
+    return t / norm
 
 
 def _local_frame(axis: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -235,9 +237,9 @@ def _local_frame(axis: Tensor) -> tuple[Tensor, Tensor, Tensor]:
     e1 = normalize(helper - (helper . a) a), e2 = a x e1.
     """
     a = axis
-    idx = int(torch.argmin(a.abs()))
+    least_aligned = int(torch.argmin(a.abs()))
     helper = torch.zeros(3, dtype=torch.float64)
-    helper[idx] = 1.0
+    helper[least_aligned] = 1.0
     e1 = helper - (helper @ a) * a
     e1 = e1 / torch.linalg.norm(e1)
     e2 = torch.linalg.cross(a, e1)
@@ -252,23 +254,24 @@ def _cone_product(
         raise ValueError("max_polar_angle must be in (0, pi]")
     if num_azimuthal < 1:
         raise ValueError("num_azimuthal must be >= 1")
-    c0 = math.cos(max_polar_angle)
-    t, wgl = _gauss_legendre(num_polar)
-    half_len = 0.5 * (1.0 - c0)
-    c = torch.as_tensor(c0 + half_len * (t + 1.0), dtype=torch.float64).flip(0)  # descending: near-axis first
-    wc = torch.as_tensor(wgl * half_len, dtype=torch.float64).flip(0)
-    dphi = 2.0 * math.pi / num_azimuthal
-    phi = (torch.arange(num_azimuthal, dtype=torch.float64) + 0.5) * dphi
+    cos_max = math.cos(max_polar_angle)
+    nodes, gauss_weights = _gauss_legendre(num_polar)
+    half_length = 0.5 * (1.0 - cos_max)
+    # descending: near-axis first
+    cos_theta = torch.as_tensor(cos_max + half_length * (nodes + 1.0), dtype=torch.float64).flip(0)
+    polar_weights = torch.as_tensor(gauss_weights * half_length, dtype=torch.float64).flip(0)
+    azimuth_step = 2.0 * math.pi / num_azimuthal
+    phi = (torch.arange(num_azimuthal, dtype=torch.float64) + 0.5) * azimuth_step
     e1, e2, a = _local_frame(axis)
-    s = torch.sqrt((1.0 - c * c).clamp_min(0.0))
+    sin_theta = torch.sqrt((1.0 - cos_theta * cos_theta).clamp_min(0.0))
     local = (
-        (s[:, None] * torch.cos(phi)[None, :])[..., None] * e1
-        + (s[:, None] * torch.sin(phi)[None, :])[..., None] * e2
-        + c[:, None, None] * a
+        (sin_theta[:, None] * torch.cos(phi)[None, :])[..., None] * e1
+        + (sin_theta[:, None] * torch.sin(phi)[None, :])[..., None] * e2
+        + cos_theta[:, None, None] * a
     )  # [P, A, 3]
     omega = local.reshape(-1, 3)
     omega = omega / torch.linalg.norm(omega, dim=-1, keepdim=True)
-    weight = (wc[:, None] * dphi).expand(num_polar, num_azimuthal).reshape(-1)
+    weight = (polar_weights[:, None] * azimuth_step).expand(num_polar, num_azimuthal).reshape(-1)
     return omega, weight
 
 
@@ -301,22 +304,23 @@ def hemisphere_quadrature(
     """
     if device is None and isinstance(axis, Tensor):
         device = axis.device
-    a = _as_vec3(axis)
-    omega, weight = _cone_product(a, num_polar, num_azimuthal, max_polar_angle)
-    q = Quadrature.from_directions(omega.to(device=device, dtype=dtype), weight.to(device=device, dtype=dtype))
+    unit_axis = _unit_vector(axis)
+    omega, weight = _cone_product(unit_axis, num_polar, num_azimuthal, max_polar_angle)
+    quadrature = Quadrature.from_directions(omega.to(device=device, dtype=dtype),
+                                            weight.to(device=device, dtype=dtype))
     if tangent_axes is None:
-        return q
-    u, v = _tangent_frame(a, *tangent_axes)
-    width = _cone_cell_widths(a, u, v, num_polar, num_azimuthal, max_polar_angle, subsamples)
-    return replace(q, cell_width=width.to(device=device, dtype=dtype))
+        return quadrature
+    u, v = _tangent_frame(unit_axis, *tangent_axes)
+    width = _cone_cell_widths(unit_axis, u, v, num_polar, num_azimuthal, max_polar_angle, subsamples)
+    return replace(quadrature, cell_width=width.to(device=device, dtype=dtype))
 
 
 def _tangent_frame(a: Tensor, u_axis, v_axis) -> tuple[Tensor, Tensor]:
     """u, v: u_axis and v_axis Gram-Schmidt orthonormalized against the unit axis a (float64 CPU)."""
-    u = _as_vec3(u_axis)
+    u = _unit_vector(u_axis)
     u = u - (u @ a) * a
     u = u / torch.linalg.norm(u)
-    v = _as_vec3(v_axis)
+    v = _unit_vector(v_axis)
     v = v - (v @ a) * a - (v @ u) * u
     return u, v / torch.linalg.norm(v)
 
@@ -328,60 +332,63 @@ def _cone_cell_widths(a: Tensor, u: Tensor, v: Tensor, num_polar: int, num_azimu
     so the cell's solid angle is its weight. Sampled on a subsamples x subsamples midpoint lattice in (cos theta, phi)
     (equal area). Returns float64 width [M, 2] = sqrt(12) x std of the gnomonic coordinates (alpha, beta) =
     (d.u / d.a, d.v / d.a) over the cell."""
-    f64 = torch.float64
-    s = int(subsamples)
-    q = (torch.arange(s, dtype=f64) + 0.5) / s
-    c0 = math.cos(max_polar_angle)
-    _, wgl = _gauss_legendre(num_polar)
-    wc = torch.as_tensor(wgl * 0.5 * (1.0 - c0), dtype=f64).flip(0)  # per polar node, near-axis first
-    c_edge = torch.cat([torch.ones(1, dtype=f64), 1.0 - torch.cumsum(wc, 0)])  # [P + 1], descending
-    c_edge[-1] = c0
-    dphi = 2.0 * math.pi / num_azimuthal
+    float64 = torch.float64
+    num_subsamples = int(subsamples)
+    fractions = (torch.arange(num_subsamples, dtype=float64) + 0.5) / num_subsamples
+    cos_max = math.cos(max_polar_angle)
+    _, gauss_weights = _gauss_legendre(num_polar)
+    # per polar node, near-axis first
+    polar_weights = torch.as_tensor(gauss_weights * 0.5 * (1.0 - cos_max), dtype=float64).flip(0)
+    # [P + 1], descending
+    cos_edges = torch.cat([torch.ones(1, dtype=float64), 1.0 - torch.cumsum(polar_weights, 0)])
+    cos_edges[-1] = cos_max
+    azimuth_step = 2.0 * math.pi / num_azimuthal
     e1, e2, _ = _local_frame(a)
-    cs = c_edge[1:, None] + (c_edge[:-1] - c_edge[1:])[:, None] * q[None, :]  # [P, s]
-    ps = (torch.arange(num_azimuthal, dtype=f64)[:, None] + q[None, :]) * dphi  # [A, s]
-    sn = torch.sqrt((1.0 - cs * cs).clamp_min(0.0))
-    lat = torch.cos(ps)[..., None] * e1 + torch.sin(ps)[..., None] * e2  # [A, s, 3]
-    # d[i, j, p, r] = sn[i, p] lat[j, r] + cs[i, p] a     [P, A, s, s, 3]
-    d = sn[:, None, :, None, None] * lat[None, :, None, :, :] + cs[:, None, :, None, None] * a
-    dn = (d @ a).clamp_min(1e-6)
-    al, bt = (d @ u) / dn, (d @ v) / dn
-    n = float(s * s)
+    cos_samples = cos_edges[1:, None] + (cos_edges[:-1] - cos_edges[1:])[:, None] * fractions[None, :]  # [P, s]
+    # [A, s]
+    azimuth_samples = (torch.arange(num_azimuthal, dtype=float64)[:, None] + fractions[None, :]) * azimuth_step
+    sin_samples = torch.sqrt((1.0 - cos_samples * cos_samples).clamp_min(0.0))
+    lateral = torch.cos(azimuth_samples)[..., None] * e1 + torch.sin(azimuth_samples)[..., None] * e2  # [A, s, 3]
+    # d[i, j, p, r] = sin_samples[i, p] lateral[j, r] + cos_samples[i, p] a     [P, A, s, s, 3]
+    d = sin_samples[:, None, :, None, None] * lateral[None, :, None, :, :] + cos_samples[:, None, :, None, None] * a
+    normal_component = (d @ a).clamp_min(1e-6)
+    alpha, beta = (d @ u) / normal_component, (d @ v) / normal_component
+    num_samples = float(num_subsamples * num_subsamples)
 
     def width(x: Tensor) -> Tensor:
-        mean = x.sum(dim=(2, 3)) / n
-        var = ((x * x).sum(dim=(2, 3)) / n - mean * mean).clamp_min(0.0)
+        mean = x.sum(dim=(2, 3)) / num_samples
+        var = ((x * x).sum(dim=(2, 3)) / num_samples - mean * mean).clamp_min(0.0)
         return torch.sqrt(12.0 * var).reshape(-1)
 
-    return torch.stack([width(al), width(bt)], dim=-1)
+    return torch.stack([width(alpha), width(beta)], dim=-1)
 
 
 # =====================================================================================================
 # Legendre polynomials and real spherical harmonics
 # =====================================================================================================
 
-def legendre_p(L: int, x: Tensor) -> Tensor:
+def legendre_polynomials(L: int, x: Tensor) -> Tensor:
     """Legendre polynomials P_0..P_L at x [...] -> [..., L+1] (same device/dtype as x).
 
     Three-term recurrence (l+1) P_{l+1} = (2l+1) x P_l - l P_{l-1}.
     """
     if L < 0:
         raise ValueError("L must be >= 0")
-    out = [torch.ones_like(x)]
+    values = [torch.ones_like(x)]
     if L >= 1:
-        out.append(x.clone())
+        values.append(x.clone())
     for l in range(1, L):
-        out.append(((2 * l + 1) * x * out[l] - l * out[l - 1]) / (l + 1))
-    return torch.stack(out, dim=-1)
+        values.append(((2 * l + 1) * x * values[l] - l * values[l - 1]) / (l + 1))
+    return torch.stack(values, dim=-1)
 
 
-def num_sh(L: int) -> int:
+def num_spherical_harmonics(L: int) -> int:
     """Number of real spherical harmonics up to degree L: (L+1)^2."""
     return (L + 1) * (L + 1)
 
 
-def sh_degree_index(L: int, device: _DeviceLike = None) -> Tensor:
-    """Degree l of each flat SH index n = l*l + (k+l): int64 [(L+1)^2]."""
+def spherical_harmonic_degree_index(L: int, device: _DeviceLike = None) -> Tensor:
+    """Degree l of each flat spherical-harmonic index n = l*l + (k+l): int64 [(L+1)^2]."""
     return torch.cat([torch.full((2 * l + 1,), l, dtype=torch.int64) for l in range(L + 1)]).to(device)
 
 
@@ -441,19 +448,19 @@ def real_spherical_harmonics(L: int, omega: Tensor) -> Tensor:
 # =====================================================================================================
 
 @dataclass(frozen=True, eq=False)
-class SHBasis:
-    """Real SH tables on a quadrature.
+class SphericalHarmonicBasis:
+    """Real spherical-harmonic tables on a quadrature.
 
-    L      : max degree; N = (L+1)^2.
-    Y      : [M, N]  Y_n(Omega_m).
-    Yw     : [M, N]  w_m Y_n(Omega_m).
-    l_of_n : [N] int64 degree of each flat index.
+    L                : max degree; N = (L+1)^2 moments, M directions.
+    Y                : [M, N]  Y_n(Omega_m).
+    Y_weighted       : [M, N]  w_m Y_n(Omega_m) (w_m the quadrature weights).
+    degree_of_moment : [N] int64 degree l of each flat index n.
     """
 
     L: int
     Y: Tensor
-    Yw: Tensor
-    l_of_n: Tensor
+    Y_weighted: Tensor
+    degree_of_moment: Tensor
 
     @property
     def num_moments(self) -> int:
@@ -464,18 +471,19 @@ class SHBasis:
         return int(self.Y.shape[0])
 
 
-def sh_basis(L: int, quad: Quadrature) -> SHBasis:
-    """Build the SH tables for degree L on `quad` (device/dtype of quad)."""
-    Y = real_spherical_harmonics(L, quad.omega)
-    return SHBasis(L=L, Y=Y, Yw=quad.weight[:, None] * Y, l_of_n=sh_degree_index(L, quad.omega.device))
+def spherical_harmonic_basis(L: int, quadrature: Quadrature) -> SphericalHarmonicBasis:
+    """Build the spherical-harmonic tables for degree L on `quadrature` (device/dtype of quadrature)."""
+    Y = real_spherical_harmonics(L, quadrature.omega)
+    return SphericalHarmonicBasis(L=L, Y=Y, Y_weighted=quadrature.weight[:, None] * Y,
+                                  degree_of_moment=spherical_harmonic_degree_index(L, quadrature.omega.device))
 
 
-def moments_from_ordinates(psi: Tensor, basis: SHBasis) -> Tensor:
+def moments_from_ordinates(psi: Tensor, basis: SphericalHarmonicBasis) -> Tensor:
     """phi_n = sum_m w_m Y_n(Omega_m) psi_m.  psi [..., M] -> phi [..., N]."""
-    return psi @ basis.Yw
+    return psi @ basis.Y_weighted
 
 
-def ordinates_from_moments(phi: Tensor, basis: SHBasis) -> Tensor:
+def ordinates_from_moments(phi: Tensor, basis: SphericalHarmonicBasis) -> Tensor:
     """psi(Omega_m) = sum_n phi_n Y_n(Omega_m).  phi [..., N] -> psi [..., M]."""
     return phi @ basis.Y.T
 
@@ -484,68 +492,71 @@ def ordinates_from_moments(phi: Tensor, basis: SHBasis) -> Tensor:
 # Scattering source
 # =====================================================================================================
 
-def scatter_source_moments(mu_s_l_vol: Tensor, phi: Tensor, *, moment_major: bool = False) -> Tensor:
-    """SH moments of the scattering source: T[g, n] = sum_{g_in} mu_s_l_vol[g_in, g, l(n)] * phi[g_in, n].
+def scatter_source_moments(mu_s_l_volume: Tensor, phi: Tensor, *, moment_major: bool = False) -> Tensor:
+    """Spherical-harmonic moments of the scattering source: T[g, n] = sum_{g_in} mu_s_l_volume[g_in, g, l(n)] *
+    phi[g_in, n].
 
-    mu_s_l_vol : [G_in, G_out, L+1, *spatial]   Legendre transfer moments per voxel (1/cm), e.g. from
-                 `cross_sections.transfer_moments_volume`; convention mu_s(Omega'->Omega) = sum_l (2l+1)/(4pi) mu_s_l P_l.
-    phi        : [G_in, N, *rest]   SH flux moments, N = (L_phi+1)^2 with L_phi <= L; *rest is either
-                 *spatial or (4, *spatial) (LD moments; the transfer broadcasts over that axis). May be a
-                 non-contiguous view (e.g. phi_ld[:, :, 0]).
-    moment_major : False (default): return a contiguous [G_out, N, *rest] tensor.
-                 True: allocate the result moment-major, [N, G_out, *rest], and return the [G_out, N, *rest]
-                 view `buf.movedim(0, 1)` (non-contiguous; `T.movedim(1, 0)` is contiguous). This is the layout
-                 `source_iteration.scatter_source_fn` contracts over without a copy.
-    Returns T  : [G_out, N, *rest], so that S(Omega) = sum_n T[:, n] Y_n(Omega) (no extra factor; see the
-                 module docstring for the derivation).
+    mu_s_l_volume : [G_in, G_out, L+1, *spatial]   Legendre transfer moments per voxel (1/cm), e.g. from
+                    `cross_sections.transfer_moments_volume`; convention mu_s(Omega'->Omega) = sum_l (2l+1)/(4pi)
+                    mu_s_l P_l.
+    phi           : [G_in, N, *rest]   spherical-harmonic flux moments, N = (L_phi+1)^2 with L_phi <= L; *rest is
+                    either *spatial or (4, *spatial) (linear-discontinuous moments; the transfer broadcasts over that
+                    axis). May be a non-contiguous view (e.g. phi[:, :, 0] of linear-discontinuous moments).
+    moment_major  : False (default): return a contiguous [G_out, N, *rest] tensor.
+                    True: allocate the result moment-major, [N, G_out, *rest], and return the [G_out, N, *rest]
+                    view `buffer.movedim(0, 1)` (non-contiguous; `T.movedim(1, 0)` is contiguous). This is the layout
+                    `source_iteration.scatter_source_function` contracts over without a copy.
+    Returns T     : [G_out, N, *rest], so that S(Omega) = sum_n T[:, n] Y_n(Omega) (no extra factor; see the
+                    module docstring for the derivation).
 
     Implementation (memory-lean): the output buffer is allocated once and every non-zero transfer block
-    (g_in, g_out) is accumulated into it in place, `out[g_out] += mu_s_l_vol[g_in, g_out, l(n)] * phi[g_in]`,
+    (g_in, g_out) is accumulated into it in place, `out[g_out] += mu_s_l_volume[g_in, g_out, l(n)] * phi[g_in]`,
     so the only temporary is one [N, *spatial] gather of the transfer. Zero blocks (upscatter) are skipped
     (one host sync to find them). Peak extra memory ~ N |spatial| values instead of the
     [G_in, G_out, N, *spatial] gather plus an output-sized term of a broadcast implementation (which peaks
     at ~6.5 GB on a 40x60x80 grid with G = 6, L = 7).
     """
-    G_in, G_out, Lp1 = mu_s_l_vol.shape[:3]
-    spatial = tuple(mu_s_l_vol.shape[3:])
+    G_in, G_out, num_legendre = mu_s_l_volume.shape[:3]
+    spatial = tuple(mu_s_l_volume.shape[3:])
     if phi.shape[0] != G_in:
         raise ValueError(f"phi has {phi.shape[0]} groups, transfer has {G_in}")
     N = phi.shape[1]
     L_phi = math.isqrt(N) - 1
     if (L_phi + 1) ** 2 != N:
         raise ValueError(f"phi.shape[1]={N} is not a square (L+1)^2")
-    if L_phi + 1 > Lp1:
-        raise ValueError(f"phi has degree {L_phi} > transfer Legendre order {Lp1 - 1}")
+    if L_phi + 1 > num_legendre:
+        raise ValueError(f"phi has degree {L_phi} > transfer Legendre order {num_legendre - 1}")
     rest = tuple(phi.shape[2:])
     if rest == spatial:
-        ld = False
+        linear_discontinuous_axis = False
     elif len(rest) == len(spatial) + 1 and rest[1:] == spatial:
-        ld = True
+        linear_discontinuous_axis = True
     else:
         raise ValueError(f"phi trailing shape {rest} must be spatial {spatial} or (4, *spatial)")
-    l_of_n = sh_degree_index(L_phi, mu_s_l_vol.device)
-    nonzero = (mu_s_l_vol.reshape(G_in, G_out, -1) != 0).any(dim=-1).cpu()  # one host sync
+    degree_of_moment = spherical_harmonic_degree_index(L_phi, mu_s_l_volume.device)
+    nonzero = (mu_s_l_volume.reshape(G_in, G_out, -1) != 0).any(dim=-1).cpu()  # one host sync
     if moment_major:
-        buf = torch.zeros((N, G_out) + rest, device=phi.device, dtype=phi.dtype)
-        out = buf.movedim(0, 1)  # [G_out, N, *rest] view
+        buffer = torch.zeros((N, G_out) + rest, device=phi.device, dtype=phi.dtype)
+        out = buffer.movedim(0, 1)  # [G_out, N, *rest] view
     else:
         out = torch.zeros((G_out, N) + rest, device=phi.device, dtype=phi.dtype)
-    for gi in range(G_in):
-        for go in range(G_out):
-            if not bool(nonzero[gi, go]):
+    for g_in in range(G_in):
+        for g_out in range(G_out):
+            if not bool(nonzero[g_in, g_out]):
                 continue
-            mn = mu_s_l_vol[gi, go].index_select(0, l_of_n)  # [N, *spatial]
-            if ld:
-                mn = mn.unsqueeze(1)  # [N, 1, *spatial]
-            out[go].addcmul_(mn, phi[gi])
+            transfer_rows = mu_s_l_volume[g_in, g_out].index_select(0, degree_of_moment)  # [N, *spatial]
+            if linear_discontinuous_axis:
+                transfer_rows = transfer_rows.unsqueeze(1)  # [N, 1, *spatial]
+            out[g_out].addcmul_(transfer_rows, phi[g_in])
     return out
 
 
-def scatter_source_at_directions(T: Tensor, Y_sub: Tensor) -> Tensor:
-    """Scattering source at K directions: S[k, g, ...] = sum_n Y_sub[k, n] T[g, n, ...].
+def scatter_source_at_directions(T: Tensor, Y_selected: Tensor) -> Tensor:
+    """Scattering source at K directions: S[k, g, ...] = sum_n Y_selected[k, n] T[g, n, ...].
 
-    T: [G, N, *rest] (from `scatter_source_moments`); Y_sub: [K, N] (rows of SHBasis.Y). Returns [K, G, *rest].
+    T: [G, N, *rest] (from `scatter_source_moments`); Y_selected: [K, N] (rows of SphericalHarmonicBasis.Y).
+    Returns [K, G, *rest].
     """
-    if T.shape[1] != Y_sub.shape[1]:
-        raise ValueError(f"T has {T.shape[1]} moments, Y_sub has {Y_sub.shape[1]}")
-    return torch.tensordot(Y_sub, T, dims=([1], [1]))
+    if T.shape[1] != Y_selected.shape[1]:
+        raise ValueError(f"T has {T.shape[1]} moments, Y_selected has {Y_selected.shape[1]}")
+    return torch.tensordot(Y_selected, T, dims=([1], [1]))

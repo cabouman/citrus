@@ -22,11 +22,11 @@ filter on a 1 keV grid (``default_spectrum_125kvp``); any two-column spectrum ca
 
 **Materials.** Seven materials (air, lung, adipose, water, muscle, soft tissue, cortical bone; the table of
 :doc:`method`, "CITRUS coupling"), among them water (H 0.1119, O 0.8881 by mass) and ICRP cortical bone (XrayPhysics
-``bone_cortical``, 1.85 g/cm^3). The seven-material library builds in about 16 s and is cached under a key that
-includes the material table; its water and bone rows equal those of a two-material library to 1e-13 (summation
-order only), and on the WLAB phantom (water and bone only) the seven-material solve equals the two-material solve
-bit for bit in float32. Narrow-group mass attenuation of water agrees with NIST XCOM to 0.1 % at 40-100 keV; the ICRP bone is
-1.45 % below ICRU-44 bone at 60 keV (different composition).
+``bone_cortical``, 1.85 g/cm^3). The seven-material library builds in about 16 s and is cached under a key that includes
+the material table; its water and bone rows equal those of a two-material library to 1e-13 (summation order only), and
+on the WLAB phantom (water and bone only) the seven-material solve equals the two-material solve bit for bit in float32.
+Narrow-group mass attenuation of water agrees with NIST XCOM to 0.1 % at 40-100 keV; the ICRP bone is 1.45 % below
+ICRU-44 bone at 60 keV (different composition).
 
 **Energy quadrature.** Each group is cut into bins of at most 0.5 keV; quantities are evaluated at bin midpoints and
 weighted with the exact spectrum integral over the bin, normalized within each group (a group without spectrum falls
@@ -78,18 +78,19 @@ into memory lent by the sweep). After the chunk, the moments are accumulated wit
 
 **Cost** (one sweep, G = 6, L = 7, 128 directions, 20 x 30 x 40 cells): 86 ms with the PyTorch plane step, 9 ms with
 the fused Triton plane kernel (one launch per diagonal plane); one source iteration (scattering source + sweep) 16 ms.
-The fused kernel follows ``ld_cell`` term by term and agrees with the PyTorch path to 1e-6 relative.
+The fused kernel follows ``linear_discontinuous_cell`` term by term and agrees with the PyTorch path to 1e-6 relative.
 
-**Convergence.** WLAB at 1 cm converges in 16 iterations to ``si_tol = 1e-3`` (asymptotic ratio ~0.64 per iteration).
+**Convergence.** WLAB at 1 cm converges in 16 iterations to ``source_iteration_tolerance = 1e-3`` (asymptotic ratio
+~0.64 per iteration).
 
 **First-collision sampling correction.** At the default 8 x 16 sweep quadrature, point samples of the forward-peaked
 first-collision source miss 1.4 % of its :math:`l = 0` and 11.7 % of its :math:`l = 1` moment on WLAB. Matching both
-moments per quadrature point and group (``fc_sampling_correction``) removes about 73 % of the sweep-quadrature
-sensitivity of the multiple-collision term and raises the total scatter by 1.7 % (the deficit of point sampling);
-8 x 16 with the correction is about as accurate as point-sampled 12 x 24 at half the cost. The quadrature sums are formed by one
-float32 matrix product per batch of directions and accumulated in float64 (factors within 1e-5 of an all-float64
-computation); the correction pass runs on the quadrature points: 8 ms per view with q = 1 and 21-26 ms with q = 2
-(1 cm cells), for any fine voxel size.
+moments per quadrature point and group (``first_collision_sampling_correction``) removes about 73 % of the
+sweep-quadrature sensitivity of the multiple-collision term and raises the total scatter by 1.7 % (the deficit of point
+sampling); 8 x 16 with the correction is about as accurate as point-sampled 12 x 24 at half the cost. The quadrature
+sums are formed by one float32 matrix product per batch of directions and accumulated in float64 (factors within 1e-5 of
+an all-float64 computation); the correction pass runs on the quadrature points: 8 ms per view with q = 1 and 21-26 ms
+with q = 2 (1 cm cells), for any fine voxel size.
 
 Scatter image
 -------------
@@ -132,8 +133,8 @@ inside a half-filled cell see half the density in the coarse trace: the coarse t
 0.13 % (AP) and 4.1 % (lateral), the quadrature trace by 0 (q = 2, Q = F) and 0.03 % / 0.8 % (q = 3). With 0.4 cm
 voxels: coarse 0.12 % / 0.06 %, quadrature 0.06 % / 0.03 %. The quadrature trace is therefore the default.
 
-**Pair and dense first-collision source.** ``rho_quad`` is checked once per density field: where every point has at
-most two nonzero materials the pair kernel runs, else the dense kernel over all seven materials (2.3 ms instead of
+**Pair and dense first-collision source.** ``rho_quadrature`` is checked once per density field: where every point has
+at most two nonzero materials the pair kernel runs, else the dense kernel over all seven materials (2.3 ms instead of
 0.85 ms per chunk of 8 directions on 192,000 points, G = 6).
 
 **Direction context.** Everything of an image that depends only on the view, the direction set and the detector / grid
@@ -145,19 +146,19 @@ for per-pixel tables; the solver keeps an LRU of contexts per view, so repeated 
 iteration) run without host synchronization.
 
 **Direction set and footprint.** The cone product set is limited to the smallest cone about the panel normal that
-contains every direction from the transport-grid box to the panel (51 degrees for the 100 x 75 panel at the AP view, 61-63
-degrees for the full-field panel). Per-pixel scatter of a finite direction set carries ray effects where the emission
-has sharp spatial structure (insert and object shadows along the beam). Against a 48 x 96 reference on the full-field
-panel, the uniform 16 x 32 set has 5.5 % / 13 % RMS per-pixel error in the AP / lateral views and 32 x 64 has
+contains every direction from the transport-grid box to the panel (51 degrees for the 100 x 75 panel at the AP view,
+61-63 degrees for the full-field panel). Per-pixel scatter of a finite direction set carries ray effects where the
+emission has sharp spatial structure (insert and object shadows along the beam). Against a 48 x 96 reference on the
+full-field panel, the uniform 16 x 32 set has 5.5 % / 13 % RMS per-pixel error in the AP / lateral views and 32 x 64 has
 1.6 % / 4.3 %; panel sums are exact to 0.3 % for both. The finite-cone footprint (one box blur per direction of width
-(emission-weighted panel height) x (cell width), no free parameter) brings 16 x 32 to 1.8 % / 4.8 % at +20 % image
-time (173 ms instead of 567 ms for 32 x 64 per scatter image at 0.5 cm). Splitting the emission into depth slabs adds
-40-100 % cost for under 0.35 % points and is not used.
+(emission-weighted panel height) x (cell width), no free parameter) brings 16 x 32 to 1.8 % / 4.8 % at +20 % image time
+(173 ms instead of 567 ms for 32 x 64 per scatter image at 0.5 cm). Splitting the emission into depth slabs adds 40-100
+% cost for under 0.35 % points and is not used.
 
-**Cost per view** (WLAB, AP view, 100 x 75 panel, 6 groups, L = 7): 0.39 s at 1 cm with q = 1 (source iteration
-0.34 s, scatter image 0.04 s; q = 1 is the default there), 0.60 s for 0.5 cm voxels in 1 cm cells (0.45 s /
-0.14 s; q = 2, the same for any smaller voxel); peak memory about 0.8 GB. The no-grid scatter fraction along the central row spans 0.29 behind the lung to 0.62 behind the
-bone; a focused 10:1 grid roughly halves it.
+**Cost per view** (WLAB, AP view, 100 x 75 panel, 6 groups, L = 7): 0.39 s at 1 cm with q = 1 (source iteration 0.34 s,
+scatter image 0.04 s; q = 1 is the default there), 0.60 s for 0.5 cm voxels in 1 cm cells (0.45 s / 0.14 s; q = 2, the
+same for any smaller voxel); peak memory about 0.8 GB. The no-grid scatter fraction along the central row spans 0.29
+behind the lung to 0.62 behind the bone; a focused 10:1 grid roughly halves it.
 
 Ray tracing and kernels
 -----------------------
@@ -196,7 +197,7 @@ a continuous run.
 
 **FDK.** ``recon_fdk``: cosine pre-weight, ramp filter along channels, the adjoint of the forward projector, every
 view scaled by pi / V; it assumes a full rotation (MBIRTORCH applies no short-scan weighting). For a short scan
-(range Lambda < 2 pi) ``mbir_bridge.fdk(..., geom=, angles=)`` multiplies the line integrals by
+(range Lambda < 2 pi) ``mbir_bridge.fdk(..., geometry=, angles=)`` multiplies the line integrals by
 (Lambda / pi) w(beta, gamma), the Parker weights in the overscan form of Wesarg et al.; the sign of the fan angle
 gamma = -atan(u / SDD) was fixed by measurement (with it an off-center test object reconstructs from a 202.6 degree
 scan as accurately as from a full rotation, 3.3 % against 3.2 %; the unweighted FDK is off by 11-14 %, the opposite
@@ -205,30 +206,28 @@ sign by 13 %).
 CITRUS cost and memory
 ----------------------
 
-Per view and outer iteration (0.5 cm voxels in 1 cm cells, q = 2, full-field 184 x 150 panel, 16 x 32 cone
-directions):
-about 0.29 s, of which the single sweep with its first-collision source 0.10 s (the first-collision source of the
-sweep is rebuilt every step because the densities change: sampling correction 21 ms, source at the sweep directions
-16 ms, restriction to LD moments 34 ms) and the scatter image 0.15-0.17 s (first-collision source at the cone
-directions 51 ms, sub-point emission 78 ms, downstream attenuation 18 ms, projection 22 ms, accumulation 9 ms).
-A converged solve of the same view costs about 0.55 s. With 1 cm voxels in 1 cm cells a CITRUS step costs about
-0.12 s (q = 1 by the resolution bound: everything on one grid; 0.30 s if q = 2 were used, 8 points per cell
-finer than the voxels).
-These are two-material (version 0.0.3) timings; with q = 2 every first-order stage of version 0.2.0 has the same size
-at 0.5 cm and costs the same. The seven-material basis adds about 6 % (``benchmarks/
-profile_citrus_step.py`` in one session with the desktop sharing the GPU: 317 ms per view before, 335 ms after): the
-pair mode of the first-collision kernel (larger table, per-voxel row offsets; 0.76 vs 0.60 ms per chunk of 8
-directions) and one ray trace per material present (four instead of two for the WLAB reconstructions, whose lung and
-air inserts become lung / adipose and air / lung mixtures) in the uncollided fluence and the primary.
+Per view and outer iteration (0.5 cm voxels in 1 cm cells, q = 2, full-field 184 x 150 panel, 16 x 32 cone directions):
+about 0.29 s, of which the single sweep with its first-collision source 0.10 s (the first-collision source of the sweep
+is rebuilt every step because the densities change: sampling correction 21 ms, source at the sweep directions 16 ms,
+restriction to linear-discontinuous moments 34 ms) and the scatter image 0.15-0.17 s (first-collision source at the cone
+directions 51 ms, sub-point emission 78 ms, downstream attenuation 18 ms, projection 22 ms, accumulation 9 ms). A
+converged solve of the same view costs about 0.55 s. With 1 cm voxels in 1 cm cells a CITRUS step costs about 0.12 s (q
+= 1 by the resolution bound: everything on one grid; 0.30 s if q = 2 were used, 8 points per cell finer than the
+voxels). These are two-material (version 0.0.3) timings; with q = 2 every first-order stage of version 0.2.0 has the
+same size at 0.5 cm and costs the same. The seven-material basis adds about 6 % (``benchmarks/ profile_citrus_step.py``
+in one session with the desktop sharing the GPU: 317 ms per view before, 335 ms after): the pair mode of the
+first-collision kernel (larger table, per-voxel row offsets; 0.76 vs 0.60 ms per chunk of 8 directions) and one ray
+trace per material present (four instead of two for the WLAB reconstructions, whose lung and air inserts become lung /
+adipose and air / lung mixtures) in the uncollided fluence and the primary.
 
-Small voxels (``benchmarks/profile_citrus_step.py --voxel``, 1 cm cells, q = 2, one session with the desktop sharing
-the GPU): version 0.1.0 evaluated every first-order quantity at the fine voxel centres, 319 ms per view at 0.5 cm,
-1760 ms at 0.25 cm (factor 4: first-collision source and sub-point emission 8x larger) and out of memory at 0.125 cm
+Small voxels (``benchmarks/profile_citrus_step.py --delta-voxel``, 1 cm cells, q = 2, one session with the desktop
+sharing the GPU): version 0.1.0 evaluated every first-order quantity at the fine voxel centres, 319 ms per view at 0.5
+cm, 1760 ms at 0.25 cm (factor 4: first-collision source and sub-point emission 8x larger) and out of memory at 0.125 cm
 on the 8 GB card (a chunk of 8 directions of the first-collision source alone is 2.4 GB; extrapolated 12 s per view).
-Version 0.2.0: 323 ms at 0.5 cm, 308 ms at 0.25 cm and 317 ms at 0.125 cm (160 x 240 x 320 voxels; peak 1.5 GB with
-two views' accumulators). What remains on the fine grid: the primary (6 ms per view at 0.5 cm, 8-10 ms at 0.125 cm)
-and, once per outer iteration rather than per view, the density model and the resampling onto C and Q (2 ms at
-0.5 cm, 7 ms at 0.125 cm).
+Version 0.2.0: 323 ms at 0.5 cm, 308 ms at 0.25 cm and 317 ms at 0.125 cm (160 x 240 x 320 voxels; peak 1.5 GB with two
+views' accumulators). What remains on the fine grid: the primary (6 ms per view at 0.5 cm, 8-10 ms at 0.125 cm) and,
+once per outer iteration rather than per view, the density model and the resampling onto C and Q (2 ms at 0.5 cm, 7 ms
+at 0.125 cm).
 
 Fine-grid memory of the loop (version 0.3.0). Up to version 0.2.0 every scatter stage formed the seven-material density
 volume [7, R, C, S] on the reconstruction grid (7 GB at 0.5 mm voxels, 256 M voxels) and the density model's own
@@ -265,9 +264,9 @@ reconstruction equals the restarted one to 1.1e-6 (relative L2 after the 80 oute
 forward-model Hessian could be kept as well (a back projection less per iteration), but it is a reconstruction-sized
 volume, so the loop recomputes it.
 
-The per-view accumulator is :math:`G (L+1)^2 \cdot 4` values per cell: 141 MiB in float32 on the 0.5 cm WLAB grid
-with 1 cm cells (24.7 GiB for 180 views). It is stored compactly (LD cell mean, scaled float16: 17.6 MiB per view,
-3.1 GiB for 180 views) on the GPU when the total fits a 2600 MiB budget, else in pinned host memory (about 9 ms of
+The per-view accumulator is :math:`G (L+1)^2 \cdot 4` values per cell: 141 MiB in float32 on the 0.5 cm WLAB grid with 1
+cm cells (24.7 GiB for 180 views). It is stored compactly (linear-discontinuous cell mean, scaled float16: 17.6 MiB per
+view, 3.1 GiB for 180 views) on the GPU when the total fits a 2600 MiB budget, else in pinned host memory (about 9 ms of
 transfer per view). The stored, aged accumulator re-enters only through the scattering source of the next sweep, to
-which its LD slopes contribute little; the final reconstruction differs from exact float32 storage by 6.5e-5
-(relative), three orders of magnitude below the reconstruction error.
+which its linear-discontinuous slopes contribute little; the final reconstruction differs from exact float32 storage by
+6.5e-5 (relative), three orders of magnitude below the reconstruction error.

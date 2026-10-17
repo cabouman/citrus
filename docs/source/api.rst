@@ -65,10 +65,10 @@ Scatter solver
 
 .. automodule:: citrus.scatter_solver.angular_quadrature
 
-``citrus.scatter_solver.ld_cell``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``citrus.scatter_solver.linear_discontinuous_cell``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. automodule:: citrus.scatter_solver.ld_cell
+.. automodule:: citrus.scatter_solver.linear_discontinuous_cell
 
 ``citrus.scatter_solver.wavefront``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -103,10 +103,10 @@ Scatter solver
 Triton kernels
 --------------
 
-``citrus.scatter_solver.kernels.triton_utils``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+``citrus.scatter_solver.kernels.triton_utilities``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. automodule:: citrus.scatter_solver.kernels.triton_utils
+.. automodule:: citrus.scatter_solver.kernels.triton_utilities
 
 ``citrus.scatter_solver.kernels.ray_tracing_kernels``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

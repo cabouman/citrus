@@ -12,7 +12,7 @@ Physics summary (all coefficients per unit density, cm^2/g):
   * Within-group weight w(E): the source spectrum, normalized to 1 within each group. A group with zero
     spectrum falls back to a flat weight (a ``RuntimeWarning`` is raised and the group is listed in
     ``BuildInfo.flat_fallback_groups``).
-  * Fine energy grid: each group is cut into equal bins of width <= ``de_kev`` (default 0.5 keV);
+  * Fine energy grid: each group is cut into equal bins of width <= ``fine_bin_width_kev`` (default 0.5 keV);
     every quantity is evaluated at the bin midpoint and weighted by the exact integral of w(E)
     over the bin (midpoint rule in E; the spectrum is integrated exactly as a piecewise-linear
     function, so characteristic lines are not lost).
@@ -23,10 +23,10 @@ Physics summary (all coefficients per unit density, cm^2/g):
   * Compton kinematics without Doppler broadening: E'(E, eta) = E / (1 + (E/m_e c^2)(1 - eta)).
     For each fine energy E the eta boundaries of every energy group are computed analytically,
     eta_edge = 1 - m_e c^2 (1/E_edge - 1/E), and the eta integral is done piecewise with
-    Gauss-Legendre (``n_gl`` nodes per piece, default 32), in the variable
+    Gauss-Legendre (``gauss_legendre_nodes`` nodes per piece, default 32), in the variable
     q = sin(theta/2) = sqrt((1 - eta)/2) (d eta = 4 q dq), which resolves the forward structure
     of the form factor / incoherent scattering function. Pieces are additionally split at fixed
-    q breakpoints (``_Q_BREAKS``) that are dense near q = 0.
+    q breakpoints (``_Q_BREAKPOINTS``) that are dense near q = 0.
   * BELOW-CUTOFF CONVENTION: Compton scatter whose outgoing energy E' falls below the lowest
     group edge (``energy_min_kev`` unless explicit edges are given) leaves the group structure.
     It is NOT put in ``mu_s_l``/``mu_s_eta``; it stays in ``mu_t``, so the solver treats it as
@@ -101,7 +101,7 @@ __all__ = [
     "parse_formula",
     "resolve_backend",
     "legendre_table",
-    "sphere_quadrature_q",
+    "eta_quadrature_in_q",
 ]
 
 _BUILD_VERSION = "citrus-xsec-2"  # 2: the seven-material table; names, nominal densities and formulas in the key
@@ -141,7 +141,7 @@ def default_material_table() -> tuple[tuple[str, float, str], ...]:
     return tuple((n, float(d), MATERIAL_FORMULAS[n]) for n, d in MATERIAL_TABLE)
 
 
-def _table(materials: Optional[MaterialTable]) -> tuple[tuple[str, float, str], ...]:
+def _material_table(materials: Optional[MaterialTable]) -> tuple[tuple[str, float, str], ...]:
     t = default_material_table() if materials is None else tuple((str(n), float(d), str(f)) for n, d, f in materials)
     if not t:
         raise ValueError("empty material table")
@@ -150,7 +150,7 @@ def _table(materials: Optional[MaterialTable]) -> tuple[tuple[str, float, str], 
     return t
 
 # Fixed q = sin(theta/2) breakpoints of the angular quadrature (dense near forward scatter).
-_Q_BREAKS = np.array(
+_Q_BREAKPOINTS = np.array(
     [0.0, 0.0025, 0.005, 0.01, 0.02, 0.035, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5,
      0.6, 0.7, 0.8, 0.9, 1.0]
 )
@@ -172,10 +172,10 @@ _SYMBOL_TO_Z = {s: i + 1 for i, s in enumerate(_SYMBOLS)}
 class _XrayPhysicsBackend:
     """Point-wise XrayPhysics data. Energies in keV, mass cross sections in cm^2/g.
 
-    ``sigma(kind, Z, E)`` with kind in {"total", "pe", "cs", "rs"}: E [K] -> [K].
-    ``pdf_raw(kind, Z, E, eta)`` with kind in {"cs", "rs"}: E scalar, eta [N] -> [N]; an
+    ``sigma(kind, Z, E)`` with kind in {"total", "photoelectric", "compton", "rayleigh"}: E [K] -> [K].
+    ``pdf_raw(kind, Z, E, eta)`` with kind in {"compton", "rayleigh"}: E scalar, eta [N] -> [N]; an
     unnormalized per-steradian angular shape (normalized by the caller).
-    ``library_pdf_norm(kind, Z, E)``: XrayPhysics' own sphere normalization of ``pdf_raw``.
+    ``library_pdf_normalization(kind, Z, E)``: XrayPhysics' own sphere normalization of ``pdf_raw``.
     ``.name`` ("xrayphysics", part of the cache key) and ``.reason`` (where it was loaded from).
     """
 
@@ -186,62 +186,66 @@ class _XrayPhysicsBackend:
 
         from xrayphysics import xrayPhysics  # type: ignore
 
-        xp = xrayPhysics()
-        lib = getattr(xp, "libxrayphysics", None)
-        if lib is None:
+        xray_physics = xrayPhysics()
+        shared_library = getattr(xray_physics, "libxrayphysics", None)
+        if shared_library is None:
             raise ImportError("xrayphysics imported but libxrayphysics shared library did not load")
-        self._xp = xp
-        cf = ctypes.c_float
-        self._fs: dict[str, Callable] = {}
-        for kind, cname in (("total", "sigma"), ("pe", "sigmaPE"), ("cs", "sigmaCS"), ("rs", "sigmaRS")):
-            f = getattr(lib, cname)
-            f.argtypes = [cf, cf]
-            f.restype = cf
-            self._fs[kind] = f
-        self._fd: dict[str, Callable] = {}
-        self._fn: dict[str, Callable] = {}
-        for kind, cname in (("cs", "incoherentScatterDistribution"), ("rs", "coherentScatterDistribution")):
-            f = getattr(lib, cname)
-            f.argtypes = [cf, cf, cf]
-            f.restype = cf
-            self._fd[kind] = f
-            fn = getattr(lib, cname + "_normalizationFactor")
-            fn.argtypes = [cf, cf]
-            fn.restype = cf
-            self._fn[kind] = fn
-        self._scalar = float(xp.cross_section_scalar())
-        import xrayphysics as _mod  # type: ignore
+        self._xray_physics = xray_physics
+        c_float = ctypes.c_float
+        self._cross_section_functions: dict[str, Callable] = {}
+        for kind, function_name in (("total", "sigma"), ("photoelectric", "sigmaPE"), ("compton", "sigmaCS"),
+                                    ("rayleigh", "sigmaRS")):
+            function = getattr(shared_library, function_name)
+            function.argtypes = [c_float, c_float]
+            function.restype = c_float
+            self._cross_section_functions[kind] = function
+        self._distribution_functions: dict[str, Callable] = {}
+        self._normalization_functions: dict[str, Callable] = {}
+        for kind, function_name in (("compton", "incoherentScatterDistribution"),
+                                    ("rayleigh", "coherentScatterDistribution")):
+            function = getattr(shared_library, function_name)
+            function.argtypes = [c_float, c_float, c_float]
+            function.restype = c_float
+            self._distribution_functions[kind] = function
+            normalization = getattr(shared_library, function_name + "_normalizationFactor")
+            normalization.argtypes = [c_float, c_float]
+            normalization.restype = c_float
+            self._normalization_functions[kind] = normalization
+        self._cross_section_scale = float(xray_physics.cross_section_scalar())
+        import xrayphysics as xray_physics_module  # type: ignore
 
-        self.reason = f"XrayPhysics (EPDL97) loaded from {os.path.dirname(_mod.__file__)}"
+        self.reason = f"XrayPhysics (EPDL97) loaded from {os.path.dirname(xray_physics_module.__file__)}"
 
     def atomic_mass(self, Z: int) -> float:
-        return float(self._xp.atomicMass(Z))
+        return float(self._xray_physics.atomicMass(Z))
 
     def sigma(self, kind: str, Z: int, E: np.ndarray) -> np.ndarray:
-        f = self._fs[kind]
-        Zf = float(Z)
+        function = self._cross_section_functions[kind]
+        Z_float = float(Z)
         E = np.asarray(E, dtype=np.float64).ravel()
-        out = np.fromiter((f(Zf, float(e)) for e in E), dtype=np.float64, count=E.size)
-        return out * self._scalar
+        out = np.fromiter((function(Z_float, float(e)) for e in E), dtype=np.float64, count=E.size)
+        return out * self._cross_section_scale
 
     def pdf_raw(self, kind: str, Z: int, E: float, eta: np.ndarray) -> np.ndarray:
-        f = self._fd[kind]
-        th = np.degrees(np.arccos(np.clip(np.asarray(eta, dtype=np.float64), -1.0, 1.0)))
-        th = np.maximum(th, _THETA_MIN_DEG)
-        Zf, Ef = float(Z), float(E)
-        return np.fromiter((f(Zf, Ef, float(t)) for t in th), dtype=np.float64, count=th.size)
+        function = self._distribution_functions[kind]
+        theta_deg = np.degrees(np.arccos(np.clip(np.asarray(eta, dtype=np.float64), -1.0, 1.0)))
+        theta_deg = np.maximum(theta_deg, _THETA_MIN_DEG)
+        Z_float, E_float = float(Z), float(E)
+        return np.fromiter((function(Z_float, E_float, float(t)) for t in theta_deg), dtype=np.float64,
+                           count=theta_deg.size)
 
-    def library_pdf_norm(self, kind: str, Z: int, E: float) -> float | None:
-        return float(self._fn[kind](float(Z), float(E)))
+    def library_pdf_normalization(self, kind: str, Z: int, E: float) -> float | None:
+        return float(self._normalization_functions[kind](float(Z), float(E)))
 
     def spectrum_125kvp(self) -> tuple[np.ndarray, np.ndarray]:
-        xp = self._xp
+        xray_physics = self._xray_physics
         # 1 keV grid: XrayPhysics adds characteristic-line amplitudes into single samples, which is
         # calibrated as counts per 1 keV bin; we interpret the result as a density per keV.
         gammas = np.arange(1.0, 126.0, 1.0, dtype=np.float32)
-        g, s = xp.simulateSpectra(125.0, takeOffAngle=11.0, Z=74, gammas=gammas)
-        filt = xp.filterResponse("Ti", 4.506, 0.089, g)
-        return np.asarray(g, dtype=np.float64), np.asarray(s, dtype=np.float64) * np.asarray(filt, dtype=np.float64)
+        energies, spectrum = xray_physics.simulateSpectra(125.0, takeOffAngle=11.0, Z=74, gammas=gammas)
+        filter_transmission = xray_physics.filterResponse("Ti", 4.506, 0.089, energies)
+        return (np.asarray(energies, dtype=np.float64),
+                np.asarray(spectrum, dtype=np.float64) * np.asarray(filter_transmission, dtype=np.float64))
 
 
 def resolve_backend() -> _XrayPhysicsBackend:
@@ -266,51 +270,51 @@ def parse_formula(formula: str, atomic_mass: Callable[[int], float]) -> dict[int
     the compounds; compound element counts are converted to mass fractions with ``atomic_mass``.
     Mirrors XrayPhysics' ``xsec::parseMaterialText``.
     """
-    s = formula.replace(" ", "")
-    terms = s.split("+")
-    acc: dict[int, float] = {}
-    total_frac = 0.0
+    text = formula.replace(" ", "")
+    terms = text.split("+")
+    mass_fractions: dict[int, float] = {}
+    total_fraction = 0.0
     parsed: list[tuple[float, str]] = []
     for t in terms:
-        m = re.match(r"^([0-9.eE\-]*)\*?([A-Z].*)$", t)
-        if m is None:
+        match = re.match(r"^([0-9.eE\-]*)\*?([A-Z].*)$", t)
+        if match is None:
             raise ValueError(f"cannot parse material term {t!r} in {formula!r}")
-        frac = float(m.group(1)) if m.group(1) else 1.0
-        if frac <= 0:
+        fraction = float(match.group(1)) if match.group(1) else 1.0
+        if fraction <= 0:
             raise ValueError(f"non-positive fraction in {formula!r}")
-        parsed.append((frac, m.group(2)))
-        total_frac += frac
-    for frac, comp in parsed:
+        parsed.append((fraction, match.group(2)))
+        total_fraction += fraction
+    for fraction, compound in parsed:
         counts: dict[int, float] = {}
-        for sym, cnt in re.findall(r"([A-Z][a-z]?)([0-9.]*)", comp):
-            if sym not in _SYMBOL_TO_Z:
-                raise ValueError(f"unknown element {sym!r} in {formula!r}")
-            Z = _SYMBOL_TO_Z[sym]
-            counts[Z] = counts.get(Z, 0.0) + (float(cnt) if cnt else 1.0)
+        for symbol, count in re.findall(r"([A-Z][a-z]?)([0-9.]*)", compound):
+            if symbol not in _SYMBOL_TO_Z:
+                raise ValueError(f"unknown element {symbol!r} in {formula!r}")
+            Z = _SYMBOL_TO_Z[symbol]
+            counts[Z] = counts.get(Z, 0.0) + (float(count) if count else 1.0)
         mass = sum(n * atomic_mass(Z) for Z, n in counts.items())
         for Z, n in counts.items():
-            acc[Z] = acc.get(Z, 0.0) + frac / total_frac * n * atomic_mass(Z) / mass
-    norm = sum(acc.values())
-    return {Z: w / norm for Z, w in sorted(acc.items())}
+            mass_fractions[Z] = mass_fractions.get(Z, 0.0) + fraction / total_fraction * n * atomic_mass(Z) / mass
+    total = sum(mass_fractions.values())
+    return {Z: w / total for Z, w in sorted(mass_fractions.items())}
 
 
 def material_composition(backend: _XrayPhysicsBackend,
                          materials: Optional[MaterialTable] = None) -> dict[str, dict[int, float]]:
     """Element mass fractions per basis material (table order; default the seven-material table), keyed by name."""
-    return {n: parse_formula(f, backend.atomic_mass) for n, _, f in _table(materials)}
+    return {n: parse_formula(f, backend.atomic_mass) for n, _, f in _material_table(materials)}
 
 
 def check_material_order(fine_mu_t: np.ndarray, nominal_density: np.ndarray, names=None) -> None:
     """Raise ValueError unless the nominal attenuations rho_m^nom m_m(E) [M, E] increase strictly with the material
     index at EVERY fine energy (the fixed bracketing order of the density model,
     ``citrus.utilities.attenuation_to_densities``)."""
-    a = np.asarray(nominal_density, dtype=np.float64)[:, None] * np.asarray(fine_mu_t, dtype=np.float64)
-    bad = np.nonzero(~(np.diff(a, axis=0) > 0).all(axis=1))[0]
+    attenuation = np.asarray(nominal_density, dtype=np.float64)[:, None] * np.asarray(fine_mu_t, dtype=np.float64)
+    bad = np.nonzero(~(np.diff(attenuation, axis=0) > 0).all(axis=1))[0]
     if bad.size:
         i = int(bad[0])
-        nm = list(names) if names is not None else [str(k) for k in range(a.shape[0])]
-        raise ValueError(f"materials {nm[i]!r} and {nm[i + 1]!r} cross in attenuation at nominal density inside the "
-                         f"library's energy range; reorder the material table")
+        material_names = list(names) if names is not None else [str(k) for k in range(attenuation.shape[0])]
+        raise ValueError(f"materials {material_names[i]!r} and {material_names[i + 1]!r} cross in attenuation at "
+                         f"nominal density inside the library's energy range; reorder the material table")
 
 
 # =============================================================================================
@@ -323,8 +327,8 @@ def load_spectrum_txt(path: str) -> tuple[np.ndarray, np.ndarray]:
     Commas or whitespace separate columns. Returns (energies [K] ascending, weights [K]) float64.
     """
     rows: list[tuple[float, float]] = []
-    with open(path, "r", encoding="utf-8") as fh:
-        for line in fh:
+    with open(path, "r", encoding="utf-8") as file:
+        for line in file:
             line = line.split("#", 1)[0].strip()
             if not line:
                 continue
@@ -333,9 +337,9 @@ def load_spectrum_txt(path: str) -> tuple[np.ndarray, np.ndarray]:
                 rows.append((float(parts[0]), float(parts[1])))
             except (ValueError, IndexError):
                 continue  # header line
-    a = np.array(rows, dtype=np.float64)
-    order = np.argsort(a[:, 0])
-    return a[order, 0], a[order, 1]
+    table = np.array(rows, dtype=np.float64)
+    order = np.argsort(table[:, 0])
+    return table[order, 0], table[order, 1]
 
 
 def default_spectrum_125kvp(backend: _XrayPhysicsBackend | None = None) -> tuple[np.ndarray, np.ndarray]:
@@ -345,43 +349,43 @@ def default_spectrum_125kvp(backend: _XrayPhysicsBackend | None = None) -> tuple
     ``resolve_backend()`` object, None loads one).
     Returns (energies_kev [K], weights [K]) with weights a photon density per keV (arbitrary scale).
     """
-    b = resolve_backend() if backend is None else backend
-    return b.spectrum_125kvp()
+    backend = resolve_backend() if backend is None else backend
+    return backend.spectrum_125kvp()
 
 
 class _Spectrum:
     """Piecewise-linear spectral density s(E) (zero outside the samples) with exact integrals."""
 
     def __init__(self, energies: np.ndarray, weights: np.ndarray) -> None:
-        e = np.asarray(energies, dtype=np.float64).ravel()
-        w = np.asarray(weights, dtype=np.float64).ravel()
-        if e.size != w.size or e.size < 2:
+        energies = np.asarray(energies, dtype=np.float64).ravel()
+        weights = np.asarray(weights, dtype=np.float64).ravel()
+        if energies.size != weights.size or energies.size < 2:
             raise ValueError("spectrum needs >= 2 (energy, weight) samples")
-        o = np.argsort(e)
-        self.e, self.w = e[o], np.clip(w[o], 0.0, None)
-        seg = 0.5 * (self.w[1:] + self.w[:-1]) * np.diff(self.e)
-        self.cum = np.concatenate([[0.0], np.cumsum(seg)])
+        o = np.argsort(energies)
+        self.energies, self.weights = energies[o], np.clip(weights[o], 0.0, None)
+        seg = 0.5 * (self.weights[1:] + self.weights[:-1]) * np.diff(self.energies)
+        self.cumulative = np.concatenate([[0.0], np.cumsum(seg)])
 
     def __call__(self, E: np.ndarray) -> np.ndarray:
-        return np.interp(E, self.e, self.w, left=0.0, right=0.0)
+        return np.interp(E, self.energies, self.weights, left=0.0, right=0.0)
 
-    def cumint(self, E: np.ndarray) -> np.ndarray:
+    def cumulative_integral(self, E: np.ndarray) -> np.ndarray:
         """int_{-inf}^{E} s(E') dE' (exact for the piecewise-linear interpolant)."""
-        E = np.clip(np.asarray(E, dtype=np.float64), self.e[0], self.e[-1])
-        i = np.clip(np.searchsorted(self.e, E, side="right") - 1, 0, self.e.size - 2)
-        x0, x1 = self.e[i], self.e[i + 1]
-        y0, y1 = self.w[i], self.w[i + 1]
+        E = np.clip(np.asarray(E, dtype=np.float64), self.energies[0], self.energies[-1])
+        i = np.clip(np.searchsorted(self.energies, E, side="right") - 1, 0, self.energies.size - 2)
+        x0, x1 = self.energies[i], self.energies[i + 1]
+        y0, y1 = self.weights[i], self.weights[i + 1]
         t = E - x0
         slope = (y1 - y0) / (x1 - x0)
-        return self.cum[i] + y0 * t + 0.5 * slope * t * t
+        return self.cumulative[i] + y0 * t + 0.5 * slope * t * t
 
     def max_energy(self) -> float:
         """Upper end of the support of s (first zero sample after the last positive one)."""
-        pos = np.nonzero(self.w > 0)[0]
+        pos = np.nonzero(self.weights > 0)[0]
         if pos.size == 0:
             raise ValueError("spectrum is identically zero")
         j = int(pos[-1])
-        return float(self.e[min(j + 1, self.e.size - 1)])
+        return float(self.energies[min(j + 1, self.energies.size - 1)])
 
 
 def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
@@ -396,39 +400,41 @@ def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarra
         if edges.size != G + 1 or np.any(np.diff(edges) >= 0):
             raise ValueError("group_edges_kev must be strictly descending with num_groups+1 entries")
         return edges
-    sp = _Spectrum(*spectrum)
-    emax, emin = sp.max_energy(), float(config.energy_min_kev)
-    if not emax > emin:
-        raise ValueError(f"spectrum max energy {emax} <= energy_min_kev {emin}")
-    grid = np.linspace(emin, emax, 200001)
-    c = sp.cumint(grid) - sp.cumint(np.array([emin]))[0]
-    if c[-1] <= 0:
+    spectrum_density = _Spectrum(*spectrum)
+    energy_max, energy_min = spectrum_density.max_energy(), float(config.energy_min_kev)
+    if not energy_max > energy_min:
+        raise ValueError(f"spectrum max energy {energy_max} <= energy_min_kev {energy_min}")
+    grid = np.linspace(energy_min, energy_max, 200001)
+    cumulative = (spectrum_density.cumulative_integral(grid)
+                  - spectrum_density.cumulative_integral(np.array([energy_min]))[0])
+    if cumulative[-1] <= 0:
         raise ValueError("spectrum has no photons in [energy_min_kev, kVp]")
-    targets = c[-1] * np.arange(1, G) / G
-    idx = np.clip(np.searchsorted(c, targets, side="left"), 1, grid.size - 1)
-    c0, c1 = c[idx - 1], c[idx]
+    targets = cumulative[-1] * np.arange(1, G) / G
+    indices = np.clip(np.searchsorted(cumulative, targets, side="left"), 1, grid.size - 1)
+    c0, c1 = cumulative[indices - 1], cumulative[indices]
     t = np.where(c1 > c0, (targets - c0) / np.where(c1 > c0, c1 - c0, 1.0), 0.0)
-    inner = grid[idx - 1] + t * (grid[idx] - grid[idx - 1])
-    asc = np.concatenate([[emin], inner, [emax]])
-    return asc[::-1].copy()
+    inner = grid[indices - 1] + t * (grid[indices] - grid[indices - 1])
+    ascending = np.concatenate([[energy_min], inner, [energy_max]])
+    return ascending[::-1].copy()
 
 
-def fine_energy_grid(edges: np.ndarray, de_kev: float = 0.5) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Cut every group into equal bins of width <= de_kev.
+def fine_energy_grid(edges: np.ndarray,
+                     fine_bin_width_kev: float = 0.5) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Cut every group into equal bins of width <= fine_bin_width_kev.
 
     Returns (E_mid [K], group [K] int, lo [K], hi [K]) with bins ordered by group then
     ascending energy; bins never straddle a group edge.
     """
-    mids, grp, los, his = [], [], [], []
+    midpoints, groups, lows, highs = [], [], [], []
     for g in range(edges.size - 1):
-        hi, lo = float(edges[g]), float(edges[g + 1])
-        n = max(1, int(math.ceil((hi - lo) / de_kev - 1e-9)))
-        b = np.linspace(lo, hi, n + 1)
-        los.append(b[:-1])
-        his.append(b[1:])
-        mids.append(0.5 * (b[:-1] + b[1:]))
-        grp.append(np.full(n, g, dtype=np.int64))
-    return np.concatenate(mids), np.concatenate(grp), np.concatenate(los), np.concatenate(his)
+        high, low = float(edges[g]), float(edges[g + 1])
+        n = max(1, int(math.ceil((high - low) / fine_bin_width_kev - 1e-9)))
+        bin_edges = np.linspace(low, high, n + 1)
+        lows.append(bin_edges[:-1])
+        highs.append(bin_edges[1:])
+        midpoints.append(0.5 * (bin_edges[:-1] + bin_edges[1:]))
+        groups.append(np.full(n, g, dtype=np.int64))
+    return np.concatenate(midpoints), np.concatenate(groups), np.concatenate(lows), np.concatenate(highs)
 
 
 def group_of_energy(E: np.ndarray, edges: np.ndarray) -> np.ndarray:
@@ -436,8 +442,8 @@ def group_of_energy(E: np.ndarray, edges: np.ndarray) -> np.ndarray:
 
     A group g holds edges[g+1] <= E < edges[g].
     """
-    asc = edges[::-1]
-    j = np.searchsorted(asc, np.asarray(E, dtype=np.float64), side="right") - 1
+    ascending = edges[::-1]
+    j = np.searchsorted(ascending, np.asarray(E, dtype=np.float64), side="right") - 1
     G = edges.size - 1
     g = G - 1 - np.minimum(j, G - 1)
     return np.where(j < 0, -1, g)
@@ -459,19 +465,19 @@ def legendre_table(eta: np.ndarray, L: int) -> np.ndarray:
     return P
 
 
-def sphere_quadrature_q(breaks_q: np.ndarray, n_gl: int) -> tuple[np.ndarray, np.ndarray]:
+def eta_quadrature_in_q(q_breakpoints: np.ndarray, gauss_legendre_nodes: int) -> tuple[np.ndarray, np.ndarray]:
     """Piecewise Gauss-Legendre in q = sqrt((1-eta)/2) over the given sorted q breakpoints.
 
     Returns (eta [N], w [N]) such that sum w f(eta) ~= int f(eta) d eta over the eta range of the
     breakpoints (w includes the Jacobian d eta = 4 q dq). Nodes of a piece lie strictly inside it.
     """
-    x, wx = np.polynomial.legendre.leggauss(n_gl)
-    a, b = breaks_q[:-1], breaks_q[1:]
+    x, node_weights = np.polynomial.legendre.leggauss(gauss_legendre_nodes)
+    a, b = q_breakpoints[:-1], q_breakpoints[1:]
     keep = b > a
     a, b = a[keep], b[keep]
-    h = 0.5 * (b - a)
-    q = (h[:, None] * x[None, :] + 0.5 * (a + b)[:, None]).ravel()
-    w = (h[:, None] * wx[None, :]).ravel() * 4.0 * q
+    half_width = 0.5 * (b - a)
+    q = (half_width[:, None] * x[None, :] + 0.5 * (a + b)[:, None]).ravel()
+    w = (half_width[:, None] * node_weights[None, :]).ravel() * 4.0 * q
     return 1.0 - 2.0 * q * q, w
 
 
@@ -487,14 +493,14 @@ class BuildInfo:
       backend, backend_reason       data backend ("xrayphysics") and where it was loaded from
       composition                   {material: {Z: mass fraction}}
       compton_below_cutoff [M, G]   group-weighted Compton scatter with E' < edges[-1] (absorbed)
-      sigma_cs_group / sigma_rs_group / sigma_pe_group / sigma_t_group [M, G]
+      sigma_compton_group / sigma_rayleigh_group / sigma_photoelectric_group / sigma_total_group [M, G]
                                     group-weighted mass cross sections (w(E) weights)
       fine_energy [K], fine_group [K], fine_weight [K]  the energy quadrature of the group constants
                                     (spectrum weights summing to 1 within each group; NOT the library's
                                     fine_weight, which is the spectrum normalized over all groups, zero
                                     bins dropped)
       flat_fallback_groups          groups whose spectrum weight was zero -> flat weight used
-      pdf_norm_max_rel_dev          max |N_backend / N_quadrature - 1| over elements, energies,
+      pdf_normalization_max_relative_deviation  max |N_backend / N_quadrature - 1| over elements, energies,
                                     processes
       rayleigh_l [M, G, L+1], rayleigh_eta [M, G, N_eta]
                                     the within-group Rayleigh parts of mu_s_l / mu_s_eta (diagonal)
@@ -504,23 +510,23 @@ class BuildInfo:
     backend_reason: str
     composition: dict[str, dict[int, float]]
     compton_below_cutoff: np.ndarray
-    sigma_cs_group: np.ndarray
-    sigma_rs_group: np.ndarray
-    sigma_pe_group: np.ndarray
-    sigma_t_group: np.ndarray
+    sigma_compton_group: np.ndarray
+    sigma_rayleigh_group: np.ndarray
+    sigma_photoelectric_group: np.ndarray
+    sigma_total_group: np.ndarray
     fine_energy: np.ndarray
     fine_group: np.ndarray
     fine_weight: np.ndarray
     flat_fallback_groups: list[int] = field(default_factory=list)
-    pdf_norm_max_rel_dev: float | None = None
+    pdf_normalization_max_relative_deviation: float | None = None
     rayleigh_l: np.ndarray | None = None
     rayleigh_eta: np.ndarray | None = None
 
 
 def _spectrum_or_default(spectrum: tuple[np.ndarray, np.ndarray] | None,
-                         b: _XrayPhysicsBackend) -> tuple[np.ndarray, np.ndarray]:
+                         backend: _XrayPhysicsBackend) -> tuple[np.ndarray, np.ndarray]:
     if spectrum is None:
-        spectrum = b.spectrum_125kvp()
+        spectrum = backend.spectrum_125kvp()
     e, w = spectrum
     return np.asarray(e, dtype=np.float64).ravel(), np.asarray(w, dtype=np.float64).ravel()
 
@@ -530,8 +536,8 @@ def compute_library(
     spectrum: tuple[np.ndarray, np.ndarray] | None = None,
     backend: _XrayPhysicsBackend | None = None,
     *,
-    de_kev: float = 0.5,
-    n_gl: int = 32,
+    fine_bin_width_kev: float = 0.5,
+    gauss_legendre_nodes: int = 32,
     materials: Optional[MaterialTable] = None,
 ) -> tuple[MultigroupLibrary, BuildInfo]:
     """Build the library without caching; also return diagnostics.
@@ -540,8 +546,8 @@ def compute_library(
       config: uses num_groups, group_edges_kev, energy_min_kev, legendre_order, num_eta_table.
       spectrum: (energies keV [K], photon density per keV [K]); None -> default 125 kVp spectrum.
       backend: a loaded ``resolve_backend()`` object (None loads one).
-      de_kev: maximum fine energy bin width (<= 0.5 keV for production).
-      n_gl: Gauss-Legendre nodes per angular piece (>= 32 for production).
+      fine_bin_width_kev: maximum fine energy bin width (<= 0.5 keV for production).
+      gauss_legendre_nodes: Gauss-Legendre nodes per angular piece (>= 32 for production).
       materials: (name, nominal density g/cm^3, formula) per basis material, in order of increasing attenuation at
         the nominal density (``check_material_order`` raises otherwise); None: the seven-material table
         (``default_material_table``).
@@ -549,66 +555,68 @@ def compute_library(
     Returns:
       (MultigroupLibrary with float64 CPU tensors, BuildInfo).
     """
-    b = resolve_backend() if backend is None else backend
-    e_sp, w_sp = _spectrum_or_default(spectrum, b)
-    sp = _Spectrum(e_sp, w_sp)
-    edges = make_group_edges(config, (e_sp, w_sp))
+    backend = resolve_backend() if backend is None else backend
+    spectrum_energies, spectrum_weights = _spectrum_or_default(spectrum, backend)
+    spectrum_density = _Spectrum(spectrum_energies, spectrum_weights)
+    edges = make_group_edges(config, (spectrum_energies, spectrum_weights))
     G = edges.size - 1
     L = int(config.legendre_order)
-    table = _table(materials)
+    table = _material_table(materials)
     names = tuple(n for n, _, _ in table)
     M = len(names)
     m_e = ELECTRON_REST_KEV
 
     # ---- energy quadrature ----------------------------------------------------------------
-    E, grp, lo, hi = fine_energy_grid(edges, de_kev)
+    E, fine_groups, bin_low, bin_high = fine_energy_grid(edges, fine_bin_width_kev)
     K = E.size
-    s_bin = sp.cumint(hi) - sp.cumint(lo)  # exact spectrum photons per fine bin [K]
+    # exact spectrum photons per fine bin [K]
+    photons_per_bin = spectrum_density.cumulative_integral(bin_high) - spectrum_density.cumulative_integral(bin_low)
     flat_fallback: list[int] = []
-    W = np.empty(K)  # within-group spectrum weight (flat where the group has no photons)
+    within_group_weight = np.empty(K)  # within-group spectrum weight (flat where the group has no photons)
     for g in range(G):
-        sel = grp == g
-        tot = s_bin[sel].sum()
-        if tot <= 0:
+        in_group = fine_groups == g
+        total = photons_per_bin[in_group].sum()
+        if total <= 0:
             flat_fallback.append(g)
-            W[sel] = (hi - lo)[sel] / (hi - lo)[sel].sum()
+            within_group_weight[in_group] = (bin_high - bin_low)[in_group] / (bin_high - bin_low)[in_group].sum()
         else:
-            W[sel] = s_bin[sel] / tot
+            within_group_weight[in_group] = photons_per_bin[in_group] / total
     if flat_fallback:
         warnings.warn(f"zero spectrum in groups {flat_fallback}; flat within-group weight used", RuntimeWarning)
 
-    group_energy = np.array([np.sum(W[grp == g] * E[grp == g]) for g in range(G)])
-    s_group = np.array([s_bin[grp == g].sum() for g in range(G)])
-    if s_group.sum() <= 0:
+    group_energy = np.array([np.sum(within_group_weight[fine_groups == g] * E[fine_groups == g]) for g in range(G)])
+    photons_per_group = np.array([photons_per_bin[fine_groups == g].sum() for g in range(G)])
+    if photons_per_group.sum() <= 0:
         raise ValueError("spectrum has no photons inside the group structure")
-    spectrum_fraction = s_group / s_group.sum()
+    spectrum_fraction = photons_per_group / photons_per_group.sum()
 
     # ---- materials and point-wise cross sections ------------------------------------------
-    comp = material_composition(b, table)
-    elements = sorted({Z for c in comp.values() for Z in c})
-    wfrac = np.array([[comp[m].get(Z, 0.0) for Z in elements] for m in names])  # [M, NZ]
-    sig = {k: np.stack([b.sigma(k, Z, E) for Z in elements]) for k in ("total", "pe", "cs", "rs")}  # [NZ, K]
-    mat_sig = {k: wfrac @ v for k, v in sig.items()}  # [M, K]
+    composition = material_composition(backend, table)
+    elements = sorted({Z for c in composition.values() for Z in c})
+    mass_fractions = np.array([[composition[m].get(Z, 0.0) for Z in elements] for m in names])  # [M, NZ]
+    element_sigma = {k: np.stack([backend.sigma(k, Z, E) for Z in elements])
+                     for k in ("total", "photoelectric", "compton", "rayleigh")}  # [NZ, K]
+    material_sigma = {k: mass_fractions @ v for k, v in element_sigma.items()}  # [M, K]
 
-    def gavg(x: np.ndarray) -> np.ndarray:  # x [M, K] -> [M, G]
+    def group_average(x: np.ndarray) -> np.ndarray:  # x [M, K] -> [M, G]
         out = np.zeros((x.shape[0], G))
-        np.add.at(out.T, grp, (x * W).T)
+        np.add.at(out.T, fine_groups, (x * within_group_weight).T)
         return out
 
-    mu_t = gavg(mat_sig["total"])
-    mu_pe = gavg(mat_sig["pe"])
+    mu_t = group_average(material_sigma["total"])
+    mu_pe = group_average(material_sigma["photoelectric"])
 
     # ---- angular quadratures ---------------------------------------------------------------
-    eta_ref, w_ref = sphere_quadrature_q(_Q_BREAKS, n_gl)
-    P_ref = legendre_table(eta_ref, L)  # [L+1, Nr]
+    eta_reference, w_reference = eta_quadrature_in_q(_Q_BREAKPOINTS, gauss_legendre_nodes)
+    legendre_reference = legendre_table(eta_reference, L)  # [L+1, Nr]
     N_eta = int(config.num_eta_table)
     eta_grid = np.linspace(-1.0, 1.0, N_eta)
 
     mu_s_l = np.zeros((M, G, G, L + 1))
-    below = np.zeros((M, G))
+    compton_below = np.zeros((M, G))
     mu_s_eta = np.zeros((M, G, G, N_eta))
-    rayl_l = np.zeros((M, G, L + 1))
-    rayl_eta = np.zeros((M, G, N_eta))
+    rayleigh_l = np.zeros((M, G, L + 1))
+    rayleigh_eta = np.zeros((M, G, N_eta))
     # Table kinematics: at fixed eta, E' lands in [edges[j+1], edges[j]) iff E lies in
     # [E_b(edges[j+1], eta), E_b(edges[j], eta)) with E_b(e, eta) = 1 / (1/e - (1 - eta)/m_e)
     # (+inf when 1/e <= (1 - eta)/m_e). Each fine bin contributes the fraction of its width inside
@@ -616,106 +624,111 @@ def compute_library(
     # give a staircase with 0.5 keV steps).
     inv_b = 1.0 / edges[:, None] - (1.0 - eta_grid[None, :]) / m_e  # [G+1, N_eta]
     E_b = np.where(inv_b > 0, 1.0 / np.where(inv_b > 0, inv_b, 1.0), np.inf)
-    norm_dev = 0.0
-    have_lib_norm = True
+    normalization_deviation = 0.0
+    have_library_normalization = True
 
     for k in range(K):
-        Ek, g, Wk = float(E[k]), int(grp[k]), float(W[k])
+        energy_k, g, weight_k = float(E[k]), int(fine_groups[k]), float(within_group_weight[k])
         # Compton eta pieces: kinematic group edges below Ek plus fixed q breaks.
-        ed = edges[edges < Ek]
-        qk = np.sqrt(np.clip(m_e * (1.0 / ed - 1.0 / Ek), 0.0, None) / 2.0)
-        qb = np.unique(np.concatenate([_Q_BREAKS, qk[qk < 1.0]]))
-        eta_c, w_c = sphere_quadrature_q(qb, n_gl)
-        e_out = Ek / (1.0 + (Ek / m_e) * (1.0 - eta_c))
-        gout = group_of_energy(e_out, edges)  # -1 = below cutoff
-        P_c = legendre_table(eta_c, L)
+        edges_below = edges[edges < energy_k]
+        q_edges = np.sqrt(np.clip(m_e * (1.0 / edges_below - 1.0 / energy_k), 0.0, None) / 2.0)
+        q_breaks = np.unique(np.concatenate([_Q_BREAKPOINTS, q_edges[q_edges < 1.0]]))
+        eta_compton, w_compton = eta_quadrature_in_q(q_breaks, gauss_legendre_nodes)
+        energy_out = energy_k / (1.0 + (energy_k / m_e) * (1.0 - eta_compton))
+        group_out = group_of_energy(energy_out, edges)  # -1 = below cutoff
+        legendre_compton = legendre_table(eta_compton, L)
 
-        dC_c = np.zeros((M, eta_c.size))
-        dR_r = np.zeros((M, eta_ref.size))
-        dC_t = np.zeros((M, N_eta))
-        dR_t = np.zeros((M, N_eta))
-        for iz, Z in enumerate(elements):
-            cs_ref = b.pdf_raw("cs", Z, Ek, eta_ref)
-            rs_ref = b.pdf_raw("rs", Z, Ek, eta_ref)
-            nC = _TWO_PI * float(np.dot(w_ref, cs_ref))
-            nR = _TWO_PI * float(np.dot(w_ref, rs_ref))
-            for kind, nq in (("cs", nC), ("rs", nR)):
-                nl = b.library_pdf_norm(kind, Z, Ek)
-                if nl is None:
-                    have_lib_norm = False
+        compton_pieces = np.zeros((M, eta_compton.size))
+        rayleigh_reference = np.zeros((M, eta_reference.size))
+        compton_table = np.zeros((M, N_eta))
+        rayleigh_table = np.zeros((M, N_eta))
+        for element_index, Z in enumerate(elements):
+            compton_shape = backend.pdf_raw("compton", Z, energy_k, eta_reference)
+            rayleigh_shape = backend.pdf_raw("rayleigh", Z, energy_k, eta_reference)
+            compton_norm = _TWO_PI * float(np.dot(w_reference, compton_shape))
+            rayleigh_norm = _TWO_PI * float(np.dot(w_reference, rayleigh_shape))
+            for kind, quadrature_norm in (("compton", compton_norm), ("rayleigh", rayleigh_norm)):
+                library_norm = backend.library_pdf_normalization(kind, Z, energy_k)
+                if library_norm is None:
+                    have_library_normalization = False
                 else:
-                    norm_dev = max(norm_dev, abs(nl / nq - 1.0))
-            aC = wfrac[:, iz] * sig["cs"][iz, k] / nC  # [M] scale of the raw shape
-            aR = wfrac[:, iz] * sig["rs"][iz, k] / nR
-            cs_c = b.pdf_raw("cs", Z, Ek, eta_c)
-            dC_c += aC[:, None] * cs_c[None, :]
-            dR_r += aR[:, None] * rs_ref[None, :]
-            dC_t += aC[:, None] * b.pdf_raw("cs", Z, Ek, eta_grid)[None, :]
-            dR_t += aR[:, None] * b.pdf_raw("rs", Z, Ek, eta_grid)[None, :]
+                    normalization_deviation = max(normalization_deviation, abs(library_norm / quadrature_norm - 1.0))
+            # [M] scale of the raw shape
+            compton_scale = mass_fractions[:, element_index] * element_sigma["compton"][element_index, k] / compton_norm
+            rayleigh_scale = (mass_fractions[:, element_index] * element_sigma["rayleigh"][element_index, k]
+                              / rayleigh_norm)
+            compton_shape_pieces = backend.pdf_raw("compton", Z, energy_k, eta_compton)
+            compton_pieces += compton_scale[:, None] * compton_shape_pieces[None, :]
+            rayleigh_reference += rayleigh_scale[:, None] * rayleigh_shape[None, :]
+            compton_table += compton_scale[:, None] * backend.pdf_raw("compton", Z, energy_k, eta_grid)[None, :]
+            rayleigh_table += rayleigh_scale[:, None] * backend.pdf_raw("rayleigh", Z, energy_k, eta_grid)[None, :]
 
         # Legendre moments: Compton binned by outgoing group (+1 shift; column 0 = below cutoff)
-        contrib = _TWO_PI * Wk * (dC_c * w_c[None, :])[:, None, :] * P_c[None, :, :]  # [M, L+1, Nc]
-        acc = np.zeros((M, L + 1, G + 1))
-        np.add.at(acc.transpose(2, 0, 1), gout + 1, contrib.transpose(2, 0, 1))
-        mu_s_l[:, g, :, :] += acc[:, :, 1:].transpose(0, 2, 1)
-        below[:, g] += acc[:, 0, 0]
-        r_l = _TWO_PI * Wk * (dR_r * w_ref[None, :]) @ P_ref.T  # [M, L+1]
-        mu_s_l[:, g, g, :] += r_l
-        rayl_l[:, g, :] += r_l
+        contribution = (_TWO_PI * weight_k * (compton_pieces * w_compton[None, :])[:, None, :]
+                        * legendre_compton[None, :, :])  # [M, L+1, Nc]
+        moments_by_group = np.zeros((M, L + 1, G + 1))
+        np.add.at(moments_by_group.transpose(2, 0, 1), group_out + 1, contribution.transpose(2, 0, 1))
+        mu_s_l[:, g, :, :] += moments_by_group[:, :, 1:].transpose(0, 2, 1)
+        compton_below[:, g] += moments_by_group[:, 0, 0]
+        # [M, L+1]
+        rayleigh_moments = _TWO_PI * weight_k * (rayleigh_reference * w_reference[None, :]) @ legendre_reference.T
+        mu_s_l[:, g, g, :] += rayleigh_moments
+        rayleigh_l[:, g, :] += rayleigh_moments
 
         # Direct per-steradian tables
-        lo_k, hi_k = float(lo[k]), float(hi[k])
-        frac = np.clip(np.minimum(hi_k, E_b[g:G]) - np.maximum(lo_k, E_b[g + 1:G + 1]), 0.0, None) / (hi_k - lo_k)
-        mu_s_eta[:, g, g:, :] += Wk * dC_t[:, None, :] * frac[None, :, :]
-        mu_s_eta[:, g, g, :] += Wk * dR_t
-        rayl_eta[:, g, :] += Wk * dR_t
+        bin_low_k, bin_high_k = float(bin_low[k]), float(bin_high[k])
+        fraction = (np.clip(np.minimum(bin_high_k, E_b[g:G]) - np.maximum(bin_low_k, E_b[g + 1:G + 1]), 0.0, None)
+                    / (bin_high_k - bin_low_k))
+        mu_s_eta[:, g, g:, :] += weight_k * compton_table[:, None, :] * fraction[None, :, :]
+        mu_s_eta[:, g, g, :] += weight_k * rayleigh_table
+        rayleigh_eta[:, g, :] += weight_k * rayleigh_table
 
     info = BuildInfo(
-        backend=b.name,
-        backend_reason=b.reason,
-        composition=comp,
-        compton_below_cutoff=below,
-        sigma_cs_group=gavg(mat_sig["cs"]),
-        sigma_rs_group=gavg(mat_sig["rs"]),
-        sigma_pe_group=mu_pe.copy(),
-        sigma_t_group=mu_t.copy(),
+        backend=backend.name,
+        backend_reason=backend.reason,
+        composition=composition,
+        compton_below_cutoff=compton_below,
+        sigma_compton_group=group_average(material_sigma["compton"]),
+        sigma_rayleigh_group=group_average(material_sigma["rayleigh"]),
+        sigma_photoelectric_group=mu_pe.copy(),
+        sigma_total_group=mu_t.copy(),
         fine_energy=E,
-        fine_group=grp,
-        fine_weight=W,
+        fine_group=fine_groups,
+        fine_weight=within_group_weight,
         flat_fallback_groups=flat_fallback,
-        pdf_norm_max_rel_dev=norm_dev if have_lib_norm else None,
-        rayleigh_l=rayl_l,
-        rayleigh_eta=rayl_eta,
+        pdf_normalization_max_relative_deviation=normalization_deviation if have_library_normalization else None,
+        rayleigh_l=rayleigh_l,
+        rayleigh_eta=rayleigh_eta,
     )
-    t = lambda a: torch.as_tensor(np.ascontiguousarray(a), dtype=torch.float64)  # noqa: E731
+    to_tensor = lambda a: torch.as_tensor(np.ascontiguousarray(a), dtype=torch.float64)  # noqa: E731
     # fine-energy attenuation table: spectrum weights normalized over the whole group structure (the same
     # denominator as spectrum_fraction), zero-weight bins dropped
-    fine_w = s_bin / s_bin.sum()
-    keep = fine_w > 0
+    fine_weights = photons_per_bin / photons_per_bin.sum()
+    keep = fine_weights > 0
     nominal = np.array([d for _, d, _ in table], dtype=np.float64)
     if M > 1:
-        check_material_order(mat_sig["total"][:, keep], nominal, names)
-    lib = MultigroupLibrary(
-        group_edges=t(edges),
-        group_energy=t(group_energy),
-        spectrum_fraction=t(spectrum_fraction),
-        mu_t=t(mu_t),
-        mu_pe=t(mu_pe),
-        mu_s_l=t(mu_s_l),
-        eta_grid=t(eta_grid),
-        mu_s_eta=t(mu_s_eta),
-        fine_energy=t(E[keep]),
-        fine_mu_t=t(mat_sig["total"][:, keep]),
-        fine_weight=t(fine_w[keep]),
-        fine_group=torch.as_tensor(np.ascontiguousarray(grp[keep]), dtype=torch.int64),
+        check_material_order(material_sigma["total"][:, keep], nominal, names)
+    library = MultigroupLibrary(
+        group_edges=to_tensor(edges),
+        group_energy=to_tensor(group_energy),
+        spectrum_fraction=to_tensor(spectrum_fraction),
+        mu_t=to_tensor(mu_t),
+        mu_pe=to_tensor(mu_pe),
+        mu_s_l=to_tensor(mu_s_l),
+        eta_grid=to_tensor(eta_grid),
+        mu_s_eta=to_tensor(mu_s_eta),
+        fine_energy=to_tensor(E[keep]),
+        fine_mu_t=to_tensor(material_sigma["total"][:, keep]),
+        fine_weight=to_tensor(fine_weights[keep]),
+        fine_group=torch.as_tensor(np.ascontiguousarray(fine_groups[keep]), dtype=torch.int64),
         materials=names,
-        nominal_density=t(nominal),
+        nominal_density=to_tensor(nominal),
     )
-    return lib, info
+    return library, info
 
 
 def _cache_key(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], backend_name: str,
-               de_kev: float, n_gl: int, materials: Optional[MaterialTable] = None) -> str:
+               fine_bin_width_kev: float, gauss_legendre_nodes: int, materials: Optional[MaterialTable] = None) -> str:
     fields = {
         "version": _BUILD_VERSION,
         "backend": backend_name,
@@ -724,9 +737,10 @@ def _cache_key(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], ba
         "energy_min_kev": float(config.energy_min_kev),
         "legendre_order": int(config.legendre_order),
         "num_eta_table": int(config.num_eta_table),
-        "de_kev": float(de_kev),
-        "n_gl": int(n_gl),
-        "materials": [list(m) for m in _table(materials)],  # names, nominal densities and formulas, in order
+        # the on-disk key names of citrus <= 0.3.0 (renaming them would orphan every cached library)
+        "de_kev": float(fine_bin_width_kev),
+        "n_gl": int(gauss_legendre_nodes),
+        "materials": [list(m) for m in _material_table(materials)],  # names, nominal densities and formulas, in order
     }
     h = hashlib.sha256(json.dumps(fields, sort_keys=True).encode())
     h.update(np.ascontiguousarray(spectrum[0], dtype=np.float64).tobytes())
@@ -744,8 +758,8 @@ def build_library(
     spectrum: tuple[np.ndarray, np.ndarray] | None = None,
     cache_dir: str | None = "default",
     *,
-    de_kev: float = 0.5,
-    n_gl: int = 32,
+    fine_bin_width_kev: float = 0.5,
+    gauss_legendre_nodes: int = 32,
     materials: Optional[MaterialTable] = None,
 ) -> MultigroupLibrary:
     """Build (or load from cache) the multigroup library for ``config`` and the material table ``materials`` (None:
@@ -754,36 +768,38 @@ def build_library(
     Shapes of the result (M materials, 7 by default; G = config.num_groups, L = config.legendre_order):
       group_edges [G+1] desc, group_energy [G], spectrum_fraction [G], mu_t/mu_pe [M, G],
       mu_s_l [M, G, G, L+1], eta_grid [num_eta_table], mu_s_eta [M, G, G, num_eta_table],
-      fine_energy [E], fine_mu_t [M, E], fine_weight [E], fine_group [E] (int64; E ~ (kVp - E_min) / de_kev);
-      float64 CPU tensors, per unit density (cm^2/g, cm^2/g/sr); plus materials (names) and nominal_density [M].
+      fine_energy [E], fine_mu_t [M, E], fine_weight [E], fine_group [E] (int64; E ~ (kVp - E_min) /
+      fine_bin_width_kev); float64 CPU tensors, per unit density (cm^2/g, cm^2/g/sr); plus materials (names) and
+      nominal_density [M].
 
     The cache file is ``<cache_dir>/mglib_<hash>.pt`` keyed by the build version, the relevant config
     fields, the spectrum arrays, the backend name, the numerical parameters and the material table (names, nominal
-    densities, formulas; the two-material caches of citrus < 0.1.0 have other keys and are never loaded). ``cache_dir="default"`` is
-    `default_cache_dir()`; ``cache_dir=None`` disables the cache. A cache file that cannot be loaded as a complete
-    library (e.g. one lacking the fine-energy table) is rebuilt and overwritten.
+    densities, formulas; the two-material caches of citrus < 0.1.0 have other keys and are never loaded).
+    ``cache_dir="default"`` is `default_cache_dir()`; ``cache_dir=None`` disables the cache. A cache file that cannot be
+    loaded as a complete library (e.g. one lacking the fine-energy table) is rebuilt and overwritten.
     """
     if cache_dir == "default":
         cache_dir = default_cache_dir()
-    b = resolve_backend()
-    spec = _spectrum_or_default(spectrum, b)
+    backend = resolve_backend()
+    spectrum_arrays = _spectrum_or_default(spectrum, backend)
     path = None
     if cache_dir is not None:
-        key = _cache_key(config, spec, b.name, de_kev, n_gl, materials)
+        key = _cache_key(config, spectrum_arrays, backend.name, fine_bin_width_kev, gauss_legendre_nodes, materials)
         path = os.path.join(cache_dir, f"mglib_{key}.pt")
         if os.path.isfile(path):
             try:
-                lib = MultigroupLibrary.load(path)
-                names = tuple(n for n, _, _ in _table(materials))
-                if tuple(lib.materials) != names:
-                    raise KeyError(f"cached materials {tuple(lib.materials)} != {names}")
-                return lib
+                library = MultigroupLibrary.load(path)
+                names = tuple(n for n, _, _ in _material_table(materials))
+                if tuple(library.materials) != names:
+                    raise KeyError(f"cached materials {tuple(library.materials)} != {names}")
+                return library
             except (KeyError, TypeError, ValueError) as exc:
                 warnings.warn(f"rebuilding the library cache {path}: {exc}", RuntimeWarning)
-    lib, _ = compute_library(config, spec, b, de_kev=de_kev, n_gl=n_gl, materials=materials)
+    library, _ = compute_library(config, spectrum_arrays, backend, fine_bin_width_kev=fine_bin_width_kev,
+                                 gauss_legendre_nodes=gauss_legendre_nodes, materials=materials)
     if path is not None:
         os.makedirs(cache_dir, exist_ok=True)  # type: ignore[arg-type]
         tmp = path + ".tmp"
-        lib.save(tmp)
+        library.save(tmp)
         os.replace(tmp, path)
-    return lib
+    return library

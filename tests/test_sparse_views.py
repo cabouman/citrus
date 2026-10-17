@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 
-from citrus.citrus import (SCATTER_VIEW_INTERP_ORDERS, CitrusConfig, angular_neighbors, full_rotation,
+from citrus.citrus import (SCATTER_VIEW_INTERPOLATION_ORDERS, CitrusConfig, angular_neighbors, full_rotation,
                            interpolate_scatter, interpolation_weights, scatter_view_indices)
 
 TWO_PI = 2.0 * math.pi
@@ -133,9 +133,9 @@ def test_nearest_view_and_neighbor_sets():
     # angles given in any order and any 2 pi offset
     perm = np.array([3, 0, 6, 1, 7, 2, 5, 4])
     a = 2.3
-    ref = dict(angular_neighbors(ca, a, 3))
+    reference = dict(angular_neighbors(ca, a, 3))
     shuffled = dict(angular_neighbors(ca[perm] - TWO_PI, a + 2 * TWO_PI, 3))
-    assert {int(perm[j]): w for j, w in shuffled.items()} == pytest.approx(ref, abs=1e-12)
+    assert {int(perm[j]): w for j, w in shuffled.items()} == pytest.approx(reference, abs=1e-12)
     # fewer computed views than the order needs: the order is lowered
     assert len(angular_neighbors(ca[:2], 1.0, 3)) == 2
     assert len(angular_neighbors(ca[:3], 1.0, 3)) == 3
@@ -161,7 +161,7 @@ def test_stride_one_passthrough_and_order_none():
     angles = _uniform(V)
     s = torch.rand(V, 3, 4, dtype=torch.float64) + 0.5
     every = scatter_view_indices(V, 1)
-    for order in SCATTER_VIEW_INTERP_ORDERS:
+    for order in SCATTER_VIEW_INTERPOLATION_ORDERS:
         assert torch.equal(interpolate_scatter(s, angles, every, order), s)
         np.testing.assert_array_equal(interpolation_weights(angles, every, order), np.eye(V))
     computed = scatter_view_indices(V, 3)
@@ -183,9 +183,9 @@ def test_weights_matrix_matches_interpolate_scatter():
     for order in (0, 1, 2, 3):
         M = interpolation_weights(angles, computed, order)
         np.testing.assert_allclose(M.sum(1), 1.0, atol=1e-14)
-        ref = torch.as_tensor(M) @ s_c.reshape(len(computed), -1)
+        reference = torch.as_tensor(M) @ s_c.reshape(len(computed), -1)
         out = interpolate_scatter(s_c, angles, computed, order, weights=torch.as_tensor(M))
-        torch.testing.assert_close(out, ref.reshape(V, 3, 2).clamp_min(0.0))
+        torch.testing.assert_close(out, reference.reshape(V, 3, 2).clamp_min(0.0))
 
 
 def test_interpolation_argument_errors():
@@ -242,23 +242,23 @@ def test_short_scan_interpolation_along_the_arc(start, order, degree):
 # ---- configuration ----------------------------------------------------------------------------------------------
 
 def test_config_defaults_and_validation():
-    cfg = CitrusConfig()
-    assert cfg.scatter_view_stride == 1 and cfg.scatter_view_interp_order == 3
-    cfg.validate()
-    for order in SCATTER_VIEW_INTERP_ORDERS:
-        CitrusConfig(scatter_view_stride=4, scatter_view_interp_order=order).validate()
-        CitrusConfig(scatter_view_stride=1, scatter_view_interp_order=order).validate()  # ignored at stride 1
+    config = CitrusConfig()
+    assert config.scatter_view_stride == 1 and config.scatter_view_interpolation_order == 3
+    config.validate()
+    for order in SCATTER_VIEW_INTERPOLATION_ORDERS:
+        CitrusConfig(scatter_view_stride=4, scatter_view_interpolation_order=order).validate()
+        CitrusConfig(scatter_view_stride=1, scatter_view_interpolation_order=order).validate()  # ignored at stride 1
     CitrusConfig(scatter_view_stride=np.int64(2)).validate()
     for stride in (0, -2, 1.5, 2.0, True, "2", None):
         with pytest.raises(ValueError, match="scatter_view_stride"):
             CitrusConfig(scatter_view_stride=stride).validate()
     for order in ("cubic", "linear", 4, -1, 2.0, True, False):
-        with pytest.raises(ValueError, match="scatter_view_interp_order"):
-            CitrusConfig(scatter_view_stride=2, scatter_view_interp_order=order).validate()
-        with pytest.raises(ValueError, match="scatter_view_interp_order"):  # validated at stride 1 too
-            CitrusConfig(scatter_view_interp_order=order).validate()
+        with pytest.raises(ValueError, match="scatter_view_interpolation_order"):
+            CitrusConfig(scatter_view_stride=2, scatter_view_interpolation_order=order).validate()
+        with pytest.raises(ValueError, match="scatter_view_interpolation_order"):  # validated at stride 1 too
+            CitrusConfig(scatter_view_interpolation_order=order).validate()
     # scatter step every n outer iterations
-    assert cfg.scatter_every == 1
+    assert config.scatter_every == 1
     for every in (1, 2, 7, np.int64(4)):
         CitrusConfig(scatter_every=every).validate()
     for every in (0, -1, 1.5, 2.0, True, "2", None):

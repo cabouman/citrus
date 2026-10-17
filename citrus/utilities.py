@@ -6,10 +6,10 @@ WLAB phantom
 A 20 x 30 x 40 cm^3 water prism (1.0 g/cm^3) with full-length (40 cm along z) inserts of lung (6 x 6 cm^2,
 0.26 g/cm^3), air (2 x 2 cm^2, 1.205e-3 g/cm^3) and bone (2 x 2 cm^2, 1.85 g/cm^3). The phantom is given in the
 package's seven-material basis (rho [7, ...], `cross_sections.MATERIALS`) but uses only two of its rows: lung and air
-are modeled as water of the stated density (the water row), bone as cortical bone (the bone row). Orientation (source on +y at angle 0): 30 cm along x (cols),
-20 cm along y (rows, the source-detector axis at angle 0), 40 cm along z (slices), centered at the isocenter. Default
-insert centers: lung at (x, y) = (-5, 0), air at (+3, 0), bone at (+7, 0) cm (keyword arguments of `wlab_phantom`).
-Outside the prism the density is 0 (vacuum).
+are modeled as water of the stated density (the water row), bone as cortical bone (the bone row). Orientation (source on
++y at angle 0): 30 cm along x (cols), 20 cm along y (rows, the source-detector axis at angle 0), 40 cm along z (slices),
+centered at the isocenter. Default insert centers: lung at (x, y) = (-5, 0), air at (+3, 0), bone at (+7, 0) cm (keyword
+arguments of `wlab_phantom`). Outside the prism the density is 0 (vacuum).
 
 Attenuation <-> density model
 -----------------------------
@@ -20,7 +20,7 @@ materials (M = 7: air, lung, adipose, water, muscle, soft tissue, cortical bone;
     forward  X = sum_m rho_m m_m(E_eff)                                     (exact, linear)
 
 The inverse is the interpolating seven-material model. Every material m has a NOMINAL density rho_m^nom
-(`lib.nominal_density`) and a nominal attenuation mu_m = rho_m^nom m_m(E_eff); the materials are taken in the fixed
+(`library.nominal_density`) and a nominal attenuation mu_m = rho_m^nom m_m(E_eff); the materials are taken in the fixed
 library order, in which mu_m increases at every library energy (`material_order` checks it). For each voxel:
 
     mu_a <= X < mu_b (consecutive materials a, b):  f = (X - mu_a) / (mu_b - mu_a),
@@ -31,13 +31,13 @@ library order, in which mu_m increases at every library energy (`material_order`
 
 At E_eff = 63.03 keV the nominal attenuations are 0.00022 (air), 0.0520 (lung), 0.1846 (adipose), 0.2013 (water),
 0.2102 (muscle), 0.2122 (soft tissue), 0.5366 (bone) /cm. The model is exact in attenuation at E_eff
-(densities_to_attenuation(lib, attenuation_to_densities(lib, X)) == max(X, 0)), gives the pure material m at
+(densities_to_attenuation(library, attenuation_to_densities(library, X)) == max(X, 0)), gives the pure material m at
 X = mu_m (a WLAB water voxel is pure water, a bone voxel pure bone at 1.85 g/cm^3) and at most two nonzero materials
 per voxel, the pair representation of the solver's first-collision source (`cross_sections.material_pairs`).
-`attenuation_to_density(lib, X, m)` evaluates ONE material's map, equal bit for bit to `attenuation_to_densities(lib,
-X)[m]` without forming the others: the CITRUS loop resamples the densities material by material and never holds the
-[M, R, C, S] fine-grid volume (`ScatterSolver.material_fields_from_attenuation`).
-m_m(E) are the library's fine-energy total mass attenuation coefficients (`lib.fine_mu_t`, cm^2/g), interpolated
+`attenuation_to_density(library, X, m)` evaluates ONE material's map, equal bit for bit to
+`attenuation_to_densities(library, X)[m]` without forming the others: the CITRUS loop resamples the densities material
+by material and never holds the [M, R, C, S] fine-grid volume (`ScatterSolver.material_fields_from_attenuation`).
+m_m(E) are the library's fine-energy total mass attenuation coefficients (`library.fine_mu_t`, cm^2/g), interpolated
 linearly in (log E, log m). (Up to citrus 0.0.3 the model was a two-material split, water of reduced density below
 mu_water and unit water PLUS bone above it: a pure-bone voxel came back as water 1.0 + bone 1.156 g/cm^3, the same
 attenuation at E_eff but another composition, which made the CITRUS loop overshoot the WLAB bone insert by 6 %.)
@@ -46,7 +46,7 @@ Synthetic cone-beam data
 ------------------------
 `synthesize_cone_beam_data` (any density volume) and `synthesize_wlab_dataset` (the WLAB phantom):
 
-    X_true    = densities_to_attenuation(lib, rho_true, E_eff)           [R, C, S] 1/cm, E_eff = spectrum mean
+    X_true    = densities_to_attenuation(library, rho_true, E_eff)       [R, C, S] 1/cm, E_eff = spectrum mean
     angles    = start + (end - start) i / V, i = 0..V-1 (`view_angles`; synthesize_wlab_dataset's default is the
                 short scan end = start + pi + fan angle of the panel, `fan_angle`)
     l         = A X_true  (MBIRTORCH ConeBeamModel forward projection)   [V, Rd, Cd] line integrals
@@ -157,26 +157,29 @@ def wlab_phantom(grid: Grid, *, lung_center: tuple[float, float] = (-5.0, 0.0),
     (`cross_sections.MATERIALS`): the water row (index `WATER` = 3) holds the water prism and the lung and air inserts
     (water of reduced density), the bone row (index `BONE` = 6) the bone insert; the other rows are zero.
     """
-    X, Y, Z = WLAB_SIZE_XYZ
-    ex, ey, ez = grid.extent
-    lo = grid.lower_corner()
-    tol = 1e-9
-    if lo[0] > -X / 2 + tol or lo[0] + ex < X / 2 - tol or lo[1] > -Y / 2 + tol or lo[1] + ey < Y / 2 - tol \
-            or lo[2] > -Z / 2 + tol or lo[2] + ez < Z / 2 - tol:
-        raise ValueError(f"grid box {lo} + {grid.extent} does not cover the WLAB prism {WLAB_SIZE_XYZ}")
+    size_x, size_y, size_z = WLAB_SIZE_XYZ
+    extent_x, extent_y, extent_z = grid.extent
+    lower = grid.lower_corner()
+    tolerance = 1e-9
+    if (lower[0] > -size_x / 2 + tolerance or lower[0] + extent_x < size_x / 2 - tolerance
+            or lower[1] > -size_y / 2 + tolerance or lower[1] + extent_y < size_y / 2 - tolerance
+            or lower[2] > -size_z / 2 + tolerance or lower[2] + extent_z < size_z / 2 - tolerance):
+        raise ValueError(f"grid box {lower} + {grid.extent} does not cover the WLAB prism {WLAB_SIZE_XYZ}")
     inserts = [(lung_center, LUNG_SIZE_XY), (air_center, AIR_SIZE_XY), (bone_center, BONE_SIZE_XY)]
-    for i, (ci, si) in enumerate(inserts):
-        if abs(ci[0]) + si[0] / 2 > X / 2 + tol or abs(ci[1]) + si[1] / 2 > Y / 2 + tol:
-            raise ValueError(f"insert {i} at {ci} leaves the water prism")
-        for cj, sj in inserts[i + 1:]:
-            if abs(ci[0] - cj[0]) < (si[0] + sj[0]) / 2 - tol and abs(ci[1] - cj[1]) < (si[1] + sj[1]) / 2 - tol:
-                raise ValueError(f"inserts at {ci} and {cj} overlap")
+    for i, (center_i, size_i) in enumerate(inserts):
+        if (abs(center_i[0]) + size_i[0] / 2 > size_x / 2 + tolerance
+                or abs(center_i[1]) + size_i[1] / 2 > size_y / 2 + tolerance):
+            raise ValueError(f"insert {i} at {center_i} leaves the water prism")
+        for center_j, size_j in inserts[i + 1:]:
+            if (abs(center_i[0] - center_j[0]) < (size_i[0] + size_j[0]) / 2 - tolerance
+                    and abs(center_i[1] - center_j[1]) < (size_i[1] + size_j[1]) / 2 - tolerance):
+                raise ValueError(f"inserts at {center_i} and {center_j} overlap")
 
     x, y, z = grid.axis_coordinates(device, torch.float64)
     xx = x[None, :, None]
     yy = y[:, None, None]
     zz = z[None, None, :]
-    prism = _in_interval(xx, 0.0, X) & _in_interval(yy, 0.0, Y) & _in_interval(zz, 0.0, Z)
+    prism = _in_interval(xx, 0.0, size_x) & _in_interval(yy, 0.0, size_y) & _in_interval(zz, 0.0, size_z)
 
     def column(center: tuple[float, float], size: tuple[float, float]) -> Tensor:
         return _in_interval(xx, center[0], size[0]) & _in_interval(yy, center[1], size[1]) & prism
@@ -196,12 +199,12 @@ def wlab_phantom(grid: Grid, *, lung_center: tuple[float, float] = (-5.0, 0.0),
 
 def wlab_grid(delta_voxel: float) -> Grid:
     """Grid that exactly tiles the 30 x 20 x 40 cm WLAB box (cols x rows x slices) at pitch delta_voxel (cm)."""
-    X, Y, Z = WLAB_SIZE_XYZ
+    size_x, size_y, size_z = WLAB_SIZE_XYZ
     n = []
-    for L in (Y, X, Z):
-        k = round(L / delta_voxel)
-        if k < 1 or abs(k * delta_voxel - L) > 1e-9 * max(1.0, L):
-            raise ValueError(f"delta_voxel={delta_voxel} does not divide the WLAB extent {L} cm")
+    for length in (size_y, size_x, size_z):
+        k = round(length / delta_voxel)
+        if k < 1 or abs(k * delta_voxel - length) > 1e-9 * max(1.0, length):
+            raise ValueError(f"delta_voxel={delta_voxel} does not divide the WLAB extent {length} cm")
         n.append(int(k))
     return Grid(shape=(n[0], n[1], n[2]), delta_voxel=float(delta_voxel))
 
@@ -222,7 +225,7 @@ def full_field_wlab_geometry() -> ConeGeometry:
 
 
 def wlab_setup(delta_voxel: float = 1.0, device=None, dtype=torch.float32) -> tuple[Grid, ConeGeometry, Tensor]:
-    """(grid, geom, rho) of the WLAB scatter study: `wlab_grid(delta_voxel)`, `wlab_geometry()`, `wlab_phantom`."""
+    """(grid, geometry, rho) of the WLAB scatter study: `wlab_grid(delta_voxel)`, `wlab_geometry()`, `wlab_phantom`."""
     grid = wlab_grid(delta_voxel)
     return grid, wlab_geometry(), wlab_phantom(grid, device=device, dtype=dtype)
 
@@ -231,18 +234,18 @@ def wlab_setup(delta_voxel: float = 1.0, device=None, dtype=torch.float32) -> tu
 # attenuation <-> density
 # =====================================================================================================
 
-def effective_energy(lib: MultigroupLibrary) -> float:
+def effective_energy(library: MultigroupLibrary) -> float:
     """Spectrum-mean photon energy sum_e fine_weight[e] fine_energy[e] / sum_e fine_weight[e] (keV); 63.03 keV for the
     default 125 kVp spectrum."""
-    w = lib.fine_weight.to(torch.float64)
-    return float((w * lib.fine_energy.to(torch.float64)).sum() / w.sum())
+    w = library.fine_weight.to(torch.float64)
+    return float((w * library.fine_energy.to(torch.float64)).sum() / w.sum())
 
 
-def mass_attenuation_at(lib: MultigroupLibrary, energy_kev: float) -> Tensor:
+def mass_attenuation_at(library: MultigroupLibrary, energy_kev: float) -> Tensor:
     """Total mass attenuation [M] (cm^2/g) of the basis materials at `energy_kev`: log-log linear interpolation of
-    lib.fine_mu_t on the sorted fine energies (float64, CPU). Raises outside the table's energy range."""
-    E = lib.fine_energy.detach().to("cpu", torch.float64)
-    mu = lib.fine_mu_t.detach().to("cpu", torch.float64)
+    library.fine_mu_t on the sorted fine energies (float64, CPU). Raises outside the table's energy range."""
+    E = library.fine_energy.detach().to("cpu", torch.float64)
+    mu = library.fine_mu_t.detach().to("cpu", torch.float64)
     order = torch.argsort(E)
     E, mu = E[order], mu[:, order]
     e = float(energy_kev)
@@ -255,87 +258,89 @@ def mass_attenuation_at(lib: MultigroupLibrary, energy_kev: float) -> Tensor:
     return torch.exp(torch.log(mu[:, i]) + t * (torch.log(mu[:, i + 1]) - torch.log(mu[:, i])))
 
 
-def nominal_densities(lib: MultigroupLibrary) -> Tensor:
-    """[M] nominal densities (g/cm^3, float64 CPU) of the library's materials (`lib.nominal_density`)."""
-    return lib.nominal_density.detach().to("cpu", torch.float64)
+def nominal_densities(library: MultigroupLibrary) -> Tensor:
+    """[M] nominal densities (g/cm^3, float64 CPU) of the library's materials (`library.nominal_density`)."""
+    return library.nominal_density.detach().to("cpu", torch.float64)
 
 
-def nominal_attenuation(lib: MultigroupLibrary, energy_kev: Optional[float] = None) -> Tensor:
+def nominal_attenuation(library: MultigroupLibrary, energy_kev: Optional[float] = None) -> Tensor:
     """[M] attenuation (1/cm, float64 CPU) of each material at its nominal density at `energy_kev` (None: E_eff);
     0.00022, 0.0520, 0.1846, 0.2013, 0.2102, 0.2122, 0.5366 /cm for the seven materials at 63.03 keV."""
-    e = effective_energy(lib) if energy_kev is None else float(energy_kev)
-    return nominal_densities(lib) * mass_attenuation_at(lib, e)
+    e = effective_energy(library) if energy_kev is None else float(energy_kev)
+    return nominal_densities(library) * mass_attenuation_at(library, e)
 
 
-def material_order(lib: MultigroupLibrary) -> list[int]:
+def material_order(library: MultigroupLibrary) -> list[int]:
     """The fixed bracketing order of the density model: material indices sorted by nominal attenuation at E_eff (the
     library order, [0, 1, ..., M-1], for a library built by `cross_section_library.build_library`). Raises ValueError
     if that order is not the same at every fine energy of the library (two materials cross; the library builder
     already refuses such a table)."""
-    order = torch.argsort(nominal_attenuation(lib)).tolist()
-    a = (nominal_densities(lib)[:, None] * lib.fine_mu_t.detach().to("cpu", torch.float64))[order]
+    order = torch.argsort(nominal_attenuation(library)).tolist()
+    a = (nominal_densities(library)[:, None] * library.fine_mu_t.detach().to("cpu", torch.float64))[order]
     if a.shape[0] > 1 and not bool((torch.diff(a, dim=0) > 0).all()):
         raise ValueError("the materials' nominal attenuations cross inside the library's energy range")
     return order
 
 
-def _coeffs(lib: MultigroupLibrary, energy_kev: Optional[float], like: Tensor) -> Tensor:
-    e = effective_energy(lib) if energy_kev is None else float(energy_kev)
-    return mass_attenuation_at(lib, e).to(device=like.device, dtype=like.dtype)
+def _mass_attenuation_coefficients(library: MultigroupLibrary, energy_kev: Optional[float], like: Tensor) -> Tensor:
+    e = effective_energy(library) if energy_kev is None else float(energy_kev)
+    return mass_attenuation_at(library, e).to(device=like.device, dtype=like.dtype)
 
 
-def densities_to_attenuation(lib: MultigroupLibrary, rho: Tensor, energy_kev: Optional[float] = None) -> Tensor:
+def densities_to_attenuation(library: MultigroupLibrary, rho: Tensor, energy_kev: Optional[float] = None) -> Tensor:
     """X = sum_m rho[m] m_m(E) (1/cm). rho [M, ...] g/cm^3 (M = the library's materials, 7) -> X [...], same
-    device/dtype. energy_kev None: `effective_energy(lib)`."""
-    M = lib.num_materials
+    device/dtype. energy_kev None: `effective_energy(library)`."""
+    M = library.num_materials
     if rho.shape[0] != M:
-        raise ValueError(f"rho must be [{M}, ...] for the library's materials {tuple(lib.materials)}, got "
+        raise ValueError(f"rho must be [{M}, ...] for the library's materials {tuple(library.materials)}, got "
                          f"{tuple(rho.shape)}")
-    m = _coeffs(lib, energy_kev, rho)
+    m = _mass_attenuation_coefficients(library, energy_kev, rho)
     X = rho[0] * m[0]
     for k in range(1, M):
         X = X + rho[k] * m[k]
     return X
 
 
-def attenuation_to_densities(lib: MultigroupLibrary, X: Tensor, energy_kev: Optional[float] = None) -> Tensor:
+def attenuation_to_densities(library: MultigroupLibrary, X: Tensor, energy_kev: Optional[float] = None) -> Tensor:
     """The interpolating density model (module docstring): rho [M, ...] (g/cm^3, same device/dtype) of X [...] (1/cm)
     at the energy (None: E_eff). The two materials whose nominal attenuations bracket X get (1 - f) rho_a^nom and
     f rho_b^nom, f = (X - mu_a) / (mu_b - mu_a); below the first material the first alone at X / m_first, above the
     last the last alone at X / m_last; X < 0 gives 0. Exact in attenuation, at most two nonzero materials per voxel."""
-    M = lib.num_materials
-    order = material_order(lib)
-    nd = X.dim()
-    m = _coeffs(lib, energy_kev, X).reshape((M,) + (1,) * nd)
-    perm = torch.as_tensor(order, device=X.device, dtype=torch.long)
-    m = m[perm].expand((M,) + tuple(X.shape))  # material slots in bracketing order
-    nom = nominal_densities(lib).to(device=X.device, dtype=X.dtype)[perm].reshape((M,) + (1,) * nd)
-    mu = nom * m  # nominal attenuation per slot [M, ...]
-    Xc = X.clamp_min(0)
-    j = (mu <= Xc[None]).sum(0)  # number of nominal attenuations <= X: bracket [j - 1, j]
+    M = library.num_materials
+    order = material_order(library)
+    num_dims = X.dim()
+    mass_attenuation = _mass_attenuation_coefficients(library, energy_kev, X).reshape((M,) + (1,) * num_dims)
+    slot_order = torch.as_tensor(order, device=X.device, dtype=torch.long)
+    # material slots in bracketing order
+    mass_attenuation = mass_attenuation[slot_order].expand((M,) + tuple(X.shape))
+    nominal = (nominal_densities(library).to(device=X.device, dtype=X.dtype)[slot_order]
+               .reshape((M,) + (1,) * num_dims))
+    mu = nominal * mass_attenuation  # nominal attenuation per slot [M, ...]
+    X_clamped = X.clamp_min(0)
+    j = (mu <= X_clamped[None]).sum(0)  # number of nominal attenuations <= X: bracket [j - 1, j]
     a = (j - 1).clamp(0, M - 1)
     b = j.clamp(max=M - 1)
     inside = (j >= 1) & (j <= M - 1)
     mu_a = torch.gather(mu, 0, a[None])[0]
     mu_b = torch.gather(mu, 0, b[None])[0]
-    m_a = torch.gather(m, 0, a[None])[0]
-    nom_a = nom.expand_as(mu).gather(0, a[None])[0]
-    nom_b = nom.expand_as(mu).gather(0, b[None])[0]
+    m_a = torch.gather(mass_attenuation, 0, a[None])[0]
+    nominal_a = nominal.expand_as(mu).gather(0, a[None])[0]
+    nominal_b = nominal.expand_as(mu).gather(0, b[None])[0]
     span = torch.where(inside, mu_b - mu_a, torch.ones_like(mu_a))
-    f = torch.where(inside, (Xc - mu_a) / span, torch.zeros_like(Xc))
+    f = torch.where(inside, (X_clamped - mu_a) / span, torch.zeros_like(X_clamped))
     # outside the bracket range: one material (slot a = first or last) of density X / m
-    rho_a = torch.where(inside, (1.0 - f) * nom_a, Xc / m_a)
-    rho_b = torch.where(inside, f * nom_b, torch.zeros_like(Xc))
+    rho_a = torch.where(inside, (1.0 - f) * nominal_a, X_clamped / m_a)
+    rho_b = torch.where(inside, f * nominal_b, torch.zeros_like(X_clamped))
     rho = torch.zeros((M,) + tuple(X.shape), device=X.device, dtype=X.dtype)
-    rho.scatter_add_(0, perm[a][None], rho_a[None])
-    rho.scatter_add_(0, perm[b][None], rho_b[None])
+    rho.scatter_add_(0, slot_order[a][None], rho_a[None])
+    rho.scatter_add_(0, slot_order[b][None], rho_b[None])
     return rho
 
 
-def attenuation_to_density(lib: MultigroupLibrary, X: Tensor, material: int,
+def attenuation_to_density(library: MultigroupLibrary, X: Tensor, material: int,
                            energy_kev: Optional[float] = None) -> Tensor:
     """ONE material's density map of the interpolating model: rho_m [...] (g/cm^3, same shape, device and dtype as X
-    [...], 1/cm) equal bit for bit to `attenuation_to_densities(lib, X, energy_kev)[material]` (library index
+    [...], 1/cm) equal bit for bit to `attenuation_to_densities(library, X, energy_kev)[material]` (library index
     `material`), without forming the maps of the other materials.
 
     With the material in slot s of the bracketing order (`material_order`) and mu the nominal attenuations in that
@@ -347,16 +352,17 @@ def attenuation_to_density(lib: MultigroupLibrary, X: Tensor, material: int,
     -f + 1). Temporaries of X's shape: the result, one interpolation weight and two boolean masks, never [M, ...]
     (`citrus.citrus.DensityModel.material` evaluates it slab by slab, so that only the result is a full map). The
     bracket tests use X itself: every nominal attenuation is positive, so X >= mu[k] implies X > 0."""
-    M = lib.num_materials
-    mat = int(material)
-    if not 0 <= mat < M:
-        raise ValueError(f"material {material} outside the library's {M} materials {tuple(lib.materials)}")
-    order = material_order(lib)
-    s = order.index(mat)
-    perm = torch.as_tensor(order, device=X.device, dtype=torch.long)
-    m = _coeffs(lib, energy_kev, X)[perm]  # [M] mass attenuations in bracketing order
-    nom = nominal_densities(lib).to(device=X.device, dtype=X.dtype)[perm]
-    mu = nom * m  # nominal attenuations in bracketing order (ascending, positive)
+    M = library.num_materials
+    material_index = int(material)
+    if not 0 <= material_index < M:
+        raise ValueError(f"material {material} outside the library's {M} materials {tuple(library.materials)}")
+    order = material_order(library)
+    slot = order.index(material_index)
+    slot_order = torch.as_tensor(order, device=X.device, dtype=torch.long)
+    # [M] mass attenuations in bracketing order
+    mass_attenuation = _mass_attenuation_coefficients(library, energy_kev, X)[slot_order]
+    nominal = nominal_densities(library).to(device=X.device, dtype=X.dtype)[slot_order]
+    mu = nominal * mass_attenuation  # nominal attenuations in bracketing order (ascending, positive)
     out: Optional[Tensor] = None
 
     def put(f: Tensor, inside: Tensor) -> None:  # out += f on `inside` (disjoint regions: x + 0 = x exactly)
@@ -367,18 +373,18 @@ def attenuation_to_density(lib: MultigroupLibrary, X: Tensor, material: int,
         else:
             out.add_(f)
 
-    if s >= 1:  # upper end of the bracket [s-1, s]: f rho^nom
-        f = (X - mu[s - 1]).div_(mu[s] - mu[s - 1]).mul_(nom[s])
-        put(f, (X >= mu[s - 1]).logical_and_(X < mu[s]))
+    if slot >= 1:  # upper end of the bracket [s-1, s]: f rho^nom
+        f = (X - mu[slot - 1]).div_(mu[slot] - mu[slot - 1]).mul_(nominal[slot])
+        put(f, (X >= mu[slot - 1]).logical_and_(X < mu[slot]))
         del f
-    if s <= M - 2:  # lower end of the bracket [s, s+1]: (1 - f) rho^nom
-        f = (X - mu[s]).div_(mu[s + 1] - mu[s]).neg_().add_(1.0).mul_(nom[s])
-        put(f, (X >= mu[s]).logical_and_(X < mu[s + 1]))
+    if slot <= M - 2:  # lower end of the bracket [s, s+1]: (1 - f) rho^nom
+        f = (X - mu[slot]).div_(mu[slot + 1] - mu[slot]).neg_().add_(1.0).mul_(nominal[slot])
+        put(f, (X >= mu[slot]).logical_and_(X < mu[slot + 1]))
         del f
-    if s == 0:  # below the first nominal attenuation: the first material alone (X < 0 -> 0)
-        put(X.clamp_min(0).div_(m[0]), X < mu[0])
-    if s == M - 1:  # from the last nominal attenuation on: the last material alone
-        put(X / m[M - 1], X >= mu[M - 1])
+    if slot == 0:  # below the first nominal attenuation: the first material alone (X < 0 -> 0)
+        put(X.clamp_min(0).div_(mass_attenuation[0]), X < mu[0])
+    if slot == M - 1:  # from the last nominal attenuation on: the last material alone
+        put(X / mass_attenuation[M - 1], X >= mu[M - 1])
     return out
 
 
@@ -386,19 +392,21 @@ def attenuation_to_density(lib: MultigroupLibrary, X: Tensor, material: int,
 # synthetic cone-beam data
 # =====================================================================================================
 
-def wlab_solver(delta_voxel: float, *, config: Optional[SolverConfig] = None, lib: Optional[MultigroupLibrary] = None,
-                geom: Optional[ConeGeometry] = None, device=None,
+def wlab_solver(delta_voxel: float, *, config: Optional[SolverConfig] = None,
+                library: Optional[MultigroupLibrary] = None,
+                geometry: Optional[ConeGeometry] = None, device=None,
                 cache_dir: Optional[str] = "default") -> ScatterSolver:
     """ScatterSolver for the WLAB data: the given config (default SolverConfig(): 1 cm transport cells,
     `SolverConfig.transport_cell_cm`, whatever the fine voxel size `delta_voxel`, which only names the grid the solver
     will be used with), the real library (build_solver_library, cached in `cache_dir`; "default" is
     $CITRUS_CACHE_DIR or ~/.cache/citrus; needs XrayPhysics unless cached), the full-field WLAB geometry (default), an
     ideal counting detector and no grid, float32."""
-    cfg = config if config is not None else SolverConfig()
-    lib = lib if lib is not None else build_solver_library(cfg, cache_dir=cache_dir)
-    dev = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return ScatterSolver(lib, cfg, geom if geom is not None else full_field_wlab_geometry(),
-                         detector=ideal_counting_response(), grid_response=no_grid(), device=dev,
+    config = config if config is not None else SolverConfig()
+    library = library if library is not None else build_solver_library(config, cache_dir=cache_dir)
+    device = (torch.device(device) if device is not None
+              else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    return ScatterSolver(library, config, geometry if geometry is not None else full_field_wlab_geometry(),
+                         detector=ideal_counting_response(), grid_response=no_grid(), device=device,
                          dtype=torch.float32)
 
 
@@ -456,128 +464,145 @@ def synthesize_cone_beam_data(rho: Tensor, grid: Grid, geometry: ConeGeometry, a
     """
     from .recon.mbir_bridge import forward_project, make_cone_model, mbirtorch_version
 
-    if solver.geom != geometry:
+    if solver.geometry != geometry:
         raise ValueError("the solver's geometry must be the scan geometry")
     if primary_projector not in ("mbirtorch", "siddon"):
         raise ValueError(f"primary_projector must be 'mbirtorch' or 'siddon', got {primary_projector!r}")
-    t_all = time.perf_counter()
-    dev = torch.device(device) if device is not None else solver.device
-    lib = solver.lib
-    E = effective_energy(lib) if energy_kev is None else float(energy_kev)
-    m = mass_attenuation_at(lib, E)
-    rho = torch.as_tensor(rho, device=dev, dtype=torch.float32)
-    X = densities_to_attenuation(lib, rho, E)
+    start_time = time.perf_counter()
+    device = torch.device(device) if device is not None else solver.device
+    library = solver.library
+    energy_kev = effective_energy(library) if energy_kev is None else float(energy_kev)
+    mass_attenuation = mass_attenuation_at(library, energy_kev)
+    rho = torch.as_tensor(rho, device=device, dtype=torch.float32)
+    X = densities_to_attenuation(library, rho, energy_kev)
     angles = np.asarray(angles.detach().cpu().numpy() if isinstance(angles, Tensor) else angles,
                         dtype=np.float64).reshape(-1)
 
     # primary: MBIRTORCH forward projection (the reconstruction's own operator)
     t0 = time.perf_counter()
-    model = make_cone_model(grid, geometry, angles, device=dev)
-    line = forward_project(model, X).to(dev)
-    if dev.type == "cuda":
-        torch.cuda.synchronize(dev)
-    t_project = time.perf_counter() - t0
-    P = float(I0) * torch.exp(-line)
+    model = make_cone_model(grid, geometry, angles, device=device)
+    line_integrals = forward_project(model, X).to(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    projection_seconds = time.perf_counter() - t0
+    P = float(I0) * torch.exp(-line_integrals)
 
     # scatter-to-primary ratio from the solver, one converged solve per view
     V, Rd, Cd = len(angles), geometry.num_det_rows, geometry.num_det_channels
-    s_sol = torch.empty(V, Rd, Cd, device=dev, dtype=torch.float32)
-    p_sol = torch.empty(V, Rd, Cd, device=dev, dtype=torch.float32)
+    solver_scatter = torch.empty(V, Rd, Cd, device=device, dtype=torch.float32)
+    solver_primary = torch.empty(V, Rd, Cd, device=device, dtype=torch.float32)
     view_seconds = np.zeros(V)
-    si_iters = np.zeros(V, dtype=np.int64)
-    si_conv = np.zeros(V, dtype=bool)
+    source_iterations = np.zeros(V, dtype=np.int64)
+    source_iteration_converged = np.zeros(V, dtype=bool)
     t0 = time.perf_counter()
     for v in range(V):
-        tv = time.perf_counter()
-        res = solver.solve_view(rho, grid, float(angles[v]))
-        p_sol[v] = res.primary["planar_fluence"].sum(0)
-        s_sol[v] = res.scatter_planar_fluence.sum(0)
-        si_iters[v] = res.si.num_iterations
-        si_conv[v] = bool(res.si.converged)
-        del res
-        view_seconds[v] = time.perf_counter() - tv
+        view_start = time.perf_counter()
+        result = solver.solve_view(rho, grid, float(angles[v]))
+        solver_primary[v] = result.primary["planar_fluence"].sum(0)
+        solver_scatter[v] = result.scatter_planar_fluence.sum(0)
+        source_iterations[v] = result.source_iteration_result.num_iterations
+        source_iteration_converged[v] = bool(result.source_iteration_result.converged)
+        del result
+        view_seconds[v] = time.perf_counter() - view_start
         if progress is not None:
             progress(v, view_seconds[v])
-    t_solver = time.perf_counter() - t0
+    solver_seconds = time.perf_counter() - t0
     if primary_projector == "mbirtorch":  # the primary model of the loop's default (MBIRTORCH line integrals)
         from .citrus import primary_signals
         from .recon.mbir_bridge import ViewChunkProjector
 
         fields = solver.material_fields(rho, grid)
-        projector = ViewChunkProjector(grid, geometry, angles, model=model, device=dev)
-        p_sol = primary_signals(solver, fields, angles, projector, quantity="planar_fluence").to(dev, torch.float32)
+        projector = ViewChunkProjector(grid, geometry, angles, model=model, device=device)
+        solver_primary = primary_signals(solver, fields, angles, projector,
+                                         quantity="planar_fluence").to(device, torch.float32)
         del fields, projector
-    empty = solver.material_fields(torch.zeros_like(rho), grid)
-    phi_air = solver.primary(empty, 0.0)["planar_fluence"].sum(0)
-    del empty
+    empty_fields = solver.material_fields(torch.zeros_like(rho), grid)
+    phi_air = solver.primary(empty_fields, 0.0)["planar_fluence"].sum(0)
+    del empty_fields
 
-    SPR = s_sol / p_sol.clamp_min(torch.finfo(p_sol.dtype).tiny)
+    SPR = solver_scatter / solver_primary.clamp_min(torch.finfo(solver_primary.dtype).tiny)
     S = SPR * P
     Y_mean = P + S
     if noise:
-        g = torch.Generator(device=dev)
-        g.manual_seed(int(seed))
-        Y = torch.poisson(Y_mean, generator=g)
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+        Y = torch.poisson(Y_mean, generator=generator)
     else:
         Y = Y_mean.clone()
 
-    def a(t: Tensor) -> np.ndarray:
+    def to_numpy(t: Tensor) -> np.ndarray:
         return t.detach().to("cpu", torch.float32).numpy()
 
-    spr = a(SPR)
+    spr_array = to_numpy(SPR)
     meta = {
         "description": "synthetic cone-beam data with scatter, citrus.utilities.synthesize_cone_beam_data",
-        "num_views": int(V), "I0": float(I0), "noise": bool(noise), "seed": int(seed), "energy_kev": E,
+        "num_views": int(V), "I0": float(I0), "noise": bool(noise), "seed": int(seed), "energy_kev": energy_kev,
         "primary_projector": primary_projector, "data_format": 2,
-        "materials": list(lib.materials), "nominal_density": [float(d) for d in lib.nominal_density],
-        "mass_attenuation": {n: float(v) for n, v in zip(lib.materials, m)},
+        "materials": list(library.materials), "nominal_density": [float(d) for d in library.nominal_density],
+        "mass_attenuation": {n: float(v) for n, v in zip(library.materials, mass_attenuation)},
         "angle_range_rad": [float(angles[0]), float(angles[-1])] if len(angles) else [],
-        "geometry": asdict(geometry), "grid": asdict(grid), "solver_config": solver.config.to_dict(),
+        "geometry": asdict(geometry), "grid": asdict(grid), "solver_config": _solver_config_record(solver.config),
         "detector": getattr(solver.detector, "name", "detector"),
         "grid_response": getattr(solver.grid_response, "name", "grid"), "solver_dtype": str(solver.dtype),
-        "mbirtorch_version": mbirtorch_version(), "torch_version": torch.__version__, "device": str(dev),
-        "seconds": {"total": time.perf_counter() - t_all, "mbirtorch_projection": t_project, "solver_total": t_solver,
+        "mbirtorch_version": mbirtorch_version(), "torch_version": torch.__version__, "device": str(device),
+        "seconds": {"total": time.perf_counter() - start_time, "mbirtorch_projection": projection_seconds,
+                    "solver_total": solver_seconds,
                     "solver_per_view_mean": float(view_seconds.mean()),
                     "solver_per_view_median": float(np.median(view_seconds)),
                     "solver_per_view_max": float(view_seconds.max())},
-        "si_iterations": {"min": int(si_iters.min()), "max": int(si_iters.max()), "all_converged": bool(si_conv.all())},
-        "stats": {"SPR_min": float(spr.min()), "SPR_max": float(spr.max()), "SPR_mean": float(spr.mean()),
-                  "SPR_p01": float(np.percentile(spr, 1)), "SPR_p99": float(np.percentile(spr, 99)),
-                  "line_integral_max": float(line.max()), "P_over_I0_min": float((P / I0).min()),
+        "si_iterations": {"min": int(source_iterations.min()), "max": int(source_iterations.max()),
+                          "all_converged": bool(source_iteration_converged.all())},
+        "stats": {"SPR_min": float(spr_array.min()), "SPR_max": float(spr_array.max()),
+                  "SPR_mean": float(spr_array.mean()),
+                  "SPR_p01": float(np.percentile(spr_array, 1)), "SPR_p99": float(np.percentile(spr_array, 99)),
+                  "line_integral_max": float(line_integrals.max()), "P_over_I0_min": float((P / I0).min()),
                   "Y_min": float(Y.min()), "Y_max": float(Y.max())},
     }
     return {
-        "X_true": a(X), "rho_true": a(rho), "angles": angles, "line_integrals": a(line), "P": a(P), "S": a(S),
-        "Y": a(Y), "Y_mean": a(Y_mean), "SPR": spr, "solver_primary": a(p_sol), "solver_scatter": a(s_sol),
-        "phi_air": a(phi_air), "view_seconds": view_seconds, "si_iterations": si_iters,
-        "I0": np.asarray(float(I0)), "energy_kev": np.asarray(E), "mass_attenuation": m.numpy(), "meta": meta,
+        "X_true": to_numpy(X), "rho_true": to_numpy(rho), "angles": angles, "line_integrals": to_numpy(line_integrals),
+        "P": to_numpy(P), "S": to_numpy(S), "Y": to_numpy(Y), "Y_mean": to_numpy(Y_mean), "SPR": spr_array,
+        "solver_primary": to_numpy(solver_primary), "solver_scatter": to_numpy(solver_scatter),
+        "phi_air": to_numpy(phi_air), "view_seconds": view_seconds, "si_iterations": source_iterations,
+        "I0": np.asarray(float(I0)), "energy_kev": np.asarray(energy_kev), "mass_attenuation": mass_attenuation.numpy(),
+        "meta": meta,
     }
+
+
+# Keys of the solver configuration as recorded in a data set's meta (on-disk format of citrus <= 0.3.0, unchanged
+# when the fields got plain names in 0.4.0)
+_ON_DISK_SOLVER_CONFIG_KEYS = {"source_iteration_tolerance": "si_tol", "max_source_iterations": "si_max_iterations"}
+
+
+def _solver_config_record(config: SolverConfig) -> dict:
+    """`config.to_dict()` with the data-set keys of the renamed fields (`_ON_DISK_SOLVER_CONFIG_KEYS`)."""
+    return {_ON_DISK_SOLVER_CONFIG_KEYS.get(k, k): v for k, v in config.to_dict().items()}
 
 
 def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: float = 1.0e5, noise: bool = True,
                             seed: int = 0, out_path: Optional[Union[str, os.PathLike]] = None, *,
                             energy_kev: Optional[float] = None, config: Optional[SolverConfig] = None,
-                            lib: Optional[MultigroupLibrary] = None, device=None, start_view_angle: float = 0.0,
+                            library: Optional[MultigroupLibrary] = None, device=None, start_view_angle: float = 0.0,
                             end_view_angle: Optional[float] = None,
                             progress: Optional[Callable[[int, float], None]] = None,
-                            geom: Optional[ConeGeometry] = None, primary_projector: str = "mbirtorch") -> dict:
+                            geometry: Optional[ConeGeometry] = None, primary_projector: str = "mbirtorch") -> dict:
     """`synthesize_cone_beam_data` for the WLAB phantom on `wlab_grid(delta_voxel)` (0.5 cm: 40 x 60 x 80 voxels),
     num_views angles evenly spaced over [start_view_angle, end_view_angle) (`view_angles`; default end: the short scan
     start + pi + fan angle of the panel, 202.6 degrees for the full-field panel; end = start + 2 pi for a full
-    rotation), the solver `wlab_solver(delta_voxel, config=config, lib=lib, geom=geom)` (default: SolverConfig() with
-    1 cm transport cells, the full-field geometry `full_field_wlab_geometry()`, ideal counting detector, no grid).
-    meta also records delta_voxel, start_view_angle and end_view_angle. primary_projector: the primary model of the
-    SPR (`synthesize_cone_beam_data`). out_path: if given, the data are written with `save_dataset` (<out_path>.npz and
-    <out_path>.json)."""
-    dev = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    geom = full_field_wlab_geometry() if geom is None else geom
+    rotation), the solver `wlab_solver(delta_voxel, config=config, library=library, geometry=geometry)` (default:
+    SolverConfig() with 1 cm transport cells, the full-field geometry `full_field_wlab_geometry()`, ideal counting
+    detector, no grid). meta also records delta_voxel, start_view_angle and end_view_angle. primary_projector: the
+    primary model of the SPR (`synthesize_cone_beam_data`). out_path: if given, the data are written with `save_dataset`
+    (<out_path>.npz and <out_path>.json)."""
+    device = (torch.device(device) if device is not None
+              else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    geometry = full_field_wlab_geometry() if geometry is None else geometry
     grid = wlab_grid(delta_voxel)
-    solver = wlab_solver(delta_voxel, config=config, lib=lib, geom=geom, device=dev)
-    rho = wlab_phantom(grid, device=dev, dtype=torch.float32)
-    angles = view_angles(num_views, geom, start_view_angle, end_view_angle)
-    end = float(start_view_angle) + math.pi + fan_angle(geom) if end_view_angle is None else float(end_view_angle)
-    out = synthesize_cone_beam_data(rho, grid, geom, angles, solver, I0, noise, seed, energy_kev=energy_kev,
-                                    device=dev, progress=progress, primary_projector=primary_projector)
+    solver = wlab_solver(delta_voxel, config=config, library=library, geometry=geometry, device=device)
+    rho = wlab_phantom(grid, device=device, dtype=torch.float32)
+    angles = view_angles(num_views, geometry, start_view_angle, end_view_angle)
+    end = float(start_view_angle) + math.pi + fan_angle(geometry) if end_view_angle is None else float(end_view_angle)
+    out = synthesize_cone_beam_data(rho, grid, geometry, angles, solver, I0, noise, seed, energy_kev=energy_kev,
+                                    device=device, progress=progress, primary_projector=primary_projector)
     out["meta"].update(description="synthetic WLAB scatter dataset, citrus.utilities.synthesize_wlab_dataset",
                        delta_voxel=float(delta_voxel), start_view_angle=float(start_view_angle),
                        end_view_angle=end, short_scan=bool(end - float(start_view_angle) < 2.0 * math.pi - 1e-9))
@@ -629,22 +654,23 @@ def set_memory_cap(mib: float = 4400.0, device: int = 0) -> None:
 # plotting helpers (matplotlib is imported lazily)
 # =====================================================================================================
 
-def _np(x) -> np.ndarray:
+def _to_numpy(x) -> np.ndarray:
     return x.detach().float().cpu().numpy() if isinstance(x, Tensor) else np.asarray(x)
 
 
 def central_slice(X) -> np.ndarray:
-    """Central z slice [rows, cols] of a volume [rows, cols, slices] (mean of the two middle slices for an even count)."""
-    X = _np(X)
+    """Central z slice [rows, cols] of a volume [rows, cols, slices] (mean of the two middle slices for an even
+    count)."""
+    X = _to_numpy(X)
     S = X.shape[2]
     return X[:, :, S // 2] if S % 2 else 0.5 * (X[:, :, S // 2 - 1] + X[:, :, S // 2])
 
 
-def central_row(sl) -> np.ndarray:
+def central_row(image_slice) -> np.ndarray:
     """Central row [cols] of a slice [rows, cols] (mean of the two middle rows for an even count)."""
-    sl = _np(sl)
-    R = sl.shape[0]
-    return sl[R // 2] if R % 2 else 0.5 * (sl[R // 2 - 1] + sl[R // 2])
+    image_slice = _to_numpy(image_slice)
+    R = image_slice.shape[0]
+    return image_slice[R // 2] if R % 2 else 0.5 * (image_slice[R // 2 - 1] + image_slice[R // 2])
 
 
 def _pyplot():
@@ -660,18 +686,18 @@ def plot_slices(images: Sequence[tuple[str, np.ndarray]], grid: Grid, path: Opti
     plt = _pyplot()
     n = len(images)
     fig, axes = plt.subplots(1, n, figsize=(3.4 * n, 2.9), squeeze=False)
-    ex, ey, _ = grid.extent
-    lo = grid.lower_corner()
-    im = None
-    for ax, (label, img) in zip(axes[0], images):
-        img = _np(img)
-        sl = central_slice(img) if img.ndim == 3 else img
-        im = ax.imshow(sl, cmap="gray", vmin=vmin, vmax=vmax, origin="lower",
-                       extent=[lo[0], lo[0] + ex, lo[1], lo[1] + ey])
+    extent_x, extent_y, _ = grid.extent
+    lower = grid.lower_corner()
+    image_artist = None
+    for ax, (label, image) in zip(axes[0], images):
+        image = _to_numpy(image)
+        image_slice = central_slice(image) if image.ndim == 3 else image
+        image_artist = ax.imshow(image_slice, cmap="gray", vmin=vmin, vmax=vmax, origin="lower",
+                                 extent=[lower[0], lower[0] + extent_x, lower[1], lower[1] + extent_y])
         ax.set_title(label, fontsize=9)
         ax.set_xlabel("x (cm)", fontsize=8)
     axes[0, 0].set_ylabel("y (cm)", fontsize=8)
-    fig.colorbar(im, ax=axes[0].tolist(), shrink=0.85, label="attenuation (1/cm)")
+    fig.colorbar(image_artist, ax=axes[0].tolist(), shrink=0.85, label="attenuation (1/cm)")
     if title:
         fig.suptitle(title, fontsize=10)
     if path:
@@ -687,8 +713,8 @@ def plot_profiles(profiles: Sequence[tuple[str, np.ndarray]], grid: Grid, path: 
     fig, ax = plt.subplots(figsize=(8.0, 3.2))
     x = grid.axis_coordinates(dtype=torch.float64)[0].numpy()
     styles = ["-", "--", "-.", ":"]
-    for i, (label, vol) in enumerate(profiles):
-        ax.plot(x, central_row(central_slice(vol)), ls=styles[i % len(styles)], lw=1.6 if i else 1.2, label=label)
+    for i, (label, volume) in enumerate(profiles):
+        ax.plot(x, central_row(central_slice(volume)), ls=styles[i % len(styles)], lw=1.6 if i else 1.2, label=label)
     ax.set_xlabel("x (cm), row y = 0, slice z = 0")
     ax.set_ylabel(ylabel)
     ax.grid(True, alpha=0.3)

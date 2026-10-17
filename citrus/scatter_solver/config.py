@@ -33,15 +33,16 @@ class SolverConfig:
                         transport_cell_cm / largest fine voxel edge))), Python's round (halves to even: a ratio of 2.5
                         gives 2), `quadrature_points`. Default 0.5 cm: 1 cm cells -> q = 2, 2 cm cells -> 4, 0.5 cm
                         cells -> 1; 1 cm voxels in 1 cm cells -> 1 (the data bound)
-      uncollided_trace_grid     grid through which the uncollided fluence at the Q points is ray traced: "quadrature"
-                        (default: Q itself with rho_quad, material boundaries resolved at the Q spacing), "coarse"
-                        (the transport grid C with the resampled densities: smears a boundary inside a cell, up to a
-                        few percent of the scatter where rays run along it) or "fine" (the reconstruction grid; for
-                        validation); the cost is about the same for all three
+      uncollided_trace_grid  grid through which the uncollided fluence at the Q points is ray traced: "quadrature"
+                        (default: Q itself with rho_quadrature, material boundaries resolved at the Q spacing),
+                        "coarse" (the transport grid C with the resampled densities: smears a boundary inside a cell,
+                        up to a few percent of the scatter where rays run along it) or "fine" (the reconstruction
+                        grid; for validation); the cost is about the same for all three
 
     Source iteration
-      si_tol            stop when ||phi_n|| / ||phi_total|| < si_tol (scalar-flux cell means)
-      si_max_iterations maximum number of sweeps (collision orders)
+      source_iteration_tolerance  stop when ||phi_n|| / ||phi_total|| < source_iteration_tolerance (scalar-flux cell
+                        means; phi_n the n-times-collided fluence, phi_total their sum)
+      max_source_iterations  maximum number of sweeps (collision orders)
 
     Scatter image (collapsed cone)
       cone_num_polar, cone_num_azimuthal  product direction set over the cone that covers the panel
@@ -68,8 +69,8 @@ class SolverConfig:
     uncollided_trace_grid: Literal["coarse", "quadrature", "fine"] = "quadrature"
 
     # --- source iteration ---------------------------------------------------------------------
-    si_tol: float = 1.0e-3
-    si_max_iterations: int = 30
+    source_iteration_tolerance: float = 1.0e-3
+    max_source_iterations: int = 30
 
     # --- scatter image ------------------------------------------------------------------------
     cone_num_polar: int = 16
@@ -86,9 +87,9 @@ class SolverConfig:
         """Effective quadrature points per axis per transport cell for fine voxels whose largest edge is fine_voxel_cm:
         q = min(max(1, round(transport_cell_cm / quadrature_point_spacing_cm)), max(1, round(transport_cell_cm /
         fine_voxel_cm))) (Python's round, halves to even): the points are about quadrature_point_spacing_cm apart, and
-        their spacing does not go much below the fine voxel size. With the default 0.5 cm spacing: 1 cm cells give 2 (0.5 cm
-        and smaller voxels; 1 cm voxels: 1; 0.4 cm: round(2.5) = 2), 2 cm cells give 4 (voxels of 0.5 cm and less),
-        0.5 cm cells give 1."""
+        their spacing does not go much below the fine voxel size. With the default 0.5 cm spacing: 1 cm cells give 2
+        (0.5 cm and smaller voxels; 1 cm voxels: 1; 0.4 cm: round(2.5) = 2), 2 cm cells give 4 (voxels of 0.5 cm and
+        less), 0.5 cm cells give 1."""
         cell = float(self.transport_cell_cm)
         target = max(1, round(cell / float(self.quadrature_point_spacing_cm)))
         return min(target, max(1, round(cell / float(fine_voxel_cm))))
@@ -112,8 +113,8 @@ class SolverConfig:
         if self.uncollided_trace_grid not in ("coarse", "quadrature", "fine"):
             raise ValueError(f"uncollided_trace_grid must be 'coarse', 'quadrature' or 'fine', "
                              f"got {self.uncollided_trace_grid!r}")
-        if self.si_max_iterations < 1 or self.si_tol <= 0:
-            raise ValueError("need si_max_iterations >= 1 and si_tol > 0")
+        if self.max_source_iterations < 1 or self.source_iteration_tolerance <= 0:
+            raise ValueError("need max_source_iterations >= 1 and source_iteration_tolerance > 0")
         if self.cone_num_polar < 1 or self.cone_num_azimuthal < 1:
             raise ValueError("need cone_num_polar >= 1 and cone_num_azimuthal >= 1")
         if self.direction_chunk < 1:

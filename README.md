@@ -78,7 +78,7 @@ python demo/demo_citrus.py           # CITRUS vs uncorrected MBIR: 180 views ove
 python demo/demo_citrus.py --end-view-angle 360      # the same over a full rotation
 python demo/demo_citrus.py --full    # the report study: 180 views over a full rotation, 0.5 cm grid, 20 iterations,
                                      # scatter step on every view at every iteration
-python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer 10 --scatter-view-stride 1 --scatter-every 1
+python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 --scatter-every 1
                                      # a quick run (~2 min)
 ```
 
@@ -93,12 +93,16 @@ Figures are written to `demo/output/`. In Python:
 from citrus import CitrusConfig, citrus_recon
 from citrus.utilities import wlab_solver
 
-solver = wlab_solver(delta_voxel, geom=geom)       # ScatterSolver with the cached cross-section library
-recon, info = citrus_recon(Y, I0, angles, grid, geom, solver, CitrusConfig(num_outer=10))
+solver = wlab_solver(delta_voxel, geometry=geometry)       # ScatterSolver with the cached cross-section library
+recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, CitrusConfig(num_outer_iterations=10))
 ```
 
 Tests: `dev_scripts/run_tests.sh` or `python -m pytest -q` (GPU, Triton, MBIRTORCH and XrayPhysics tests are skipped
 when unavailable).
+
+Version 0.4.0 spells out every abbreviated name of the package (functions, parameters, configuration fields, record
+keys, command-line flags, two module files); `CHANGELOG.md` has the complete old -> new table. Data sets, demo
+outputs and cached cross-section libraries of earlier versions are read unchanged.
 
 ## Citation
 
@@ -109,7 +113,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.3.0},
+  note = {Version 0.4.0},
   year = 2026
 }
 ```

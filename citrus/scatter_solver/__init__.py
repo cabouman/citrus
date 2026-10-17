@@ -12,8 +12,9 @@ Modules
     cross_section_library  library builder from XrayPhysics (EPDL97) data, cached on disk
     source, detector       point source with collimation; detector and anti-scatter-grid responses
     angular_quadrature     direction sets, real spherical harmonics, scattering-source operator
-    ld_cell, wavefront     LD cell equations; wavefront ordering of the sweep
-    transport_sweep        batched LD discrete-ordinates sweep
+    linear_discontinuous_cell  linear-discontinuous cell equations and their closed-form solve
+    wavefront              wavefront ordering of the sweep
+    transport_sweep        batched linear-discontinuous discrete-ordinates sweep
     source_iteration       source iteration over collision order
     uncollided             uncollided fluence and first-collision source
     scatter_image          collapsed-cone scatter image, finite-cone footprint, primary image

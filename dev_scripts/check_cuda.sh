@@ -33,14 +33,14 @@ except Exception as exc:  # noqa: BLE001
     print(f"triton not importable: {type(exc).__name__}: {exc}")
 
 print("\n=== citrus kernels ===")
-from citrus.scatter_solver.kernels import ray_tracing_kernels, sweep_kernels, triton_utils, uncollided_kernels
+from citrus.scatter_solver.kernels import ray_tracing_kernels, sweep_kernels, triton_utilities, uncollided_kernels
 
-print("probe:              ", triton_utils.triton_available())
+print("probe:              ", triton_utilities.triton_available())
 if cuda:
-    dev = torch.device("cuda")
-    print("ray tracing kernels:", ray_tracing_kernels.kernels_usable(dev))
-    print("first-collision:    ", uncollided_kernels.kernel_usable(dev))
-    print("sweep plane kernel: ", sweep_kernels.kernels_usable(dev))
+    device = torch.device("cuda")
+    print("ray tracing kernels:", ray_tracing_kernels.kernels_usable(device))
+    print("first-collision:    ", uncollided_kernels.kernel_usable(device))
+    print("sweep plane kernel: ", sweep_kernels.kernels_usable(device))
 else:
     print("no CUDA device: the PyTorch paths are used")
 try:

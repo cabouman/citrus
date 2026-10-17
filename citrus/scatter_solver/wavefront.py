@@ -63,33 +63,36 @@ class SweepPlan:
 def build_sweep_plan(shape: tuple[int, int, int], device=None) -> SweepPlan:
     """Build the wavefront ordering for all 8 octants of a [rows, cols, slices] grid."""
     R, C, S = shape
-    ii, jj, kk = torch.meshgrid(torch.arange(R), torch.arange(C), torch.arange(S), indexing="ij")
-    ii, jj, kk = ii.reshape(-1), jj.reshape(-1), kk.reshape(-1)
-    flat = (ii * C + jj) * S + kk
+    row_index, col_index, slice_index = torch.meshgrid(torch.arange(R), torch.arange(C), torch.arange(S), indexing="ij")
+    row_index, col_index, slice_index = row_index.reshape(-1), col_index.reshape(-1), slice_index.reshape(-1)
+    flat = (row_index * C + col_index) * S + slice_index
     n = flat.numel()
 
-    oct_list, cell_list, up_list, plane_list = [], [], [], []
+    octant_list, cell_list, upstream_list, plane_list = [], [], [], []
     for o in range(8):
         sx, sy, sz = (int(v) for v in OCTANT_SIGNS[o])
-        px = jj if sx > 0 else (C - 1 - jj)
-        py = ii if sy > 0 else (R - 1 - ii)
-        pz = kk if sz > 0 else (S - 1 - kk)
-        plane = px + py + pz
+        plane_x = col_index if sx > 0 else (C - 1 - col_index)
+        plane_y = row_index if sy > 0 else (R - 1 - row_index)
+        plane_z = slice_index if sz > 0 else (S - 1 - slice_index)
+        plane = plane_x + plane_y + plane_z
         # upstream neighbors
-        jn = jj - sx
-        in_ = ii - sy
-        kn = kk - sz
-        ux = torch.where((jn >= 0) & (jn < C), (ii * C + jn) * S + kk, torch.full_like(flat, -1))
-        uy = torch.where((in_ >= 0) & (in_ < R), (in_ * C + jj) * S + kk, torch.full_like(flat, -1))
-        uz = torch.where((kn >= 0) & (kn < S), (ii * C + jj) * S + kn, torch.full_like(flat, -1))
-        oct_list.append(torch.full((n,), o, dtype=torch.int64))
+        neighbor_col = col_index - sx
+        neighbor_row = row_index - sy
+        neighbor_slice = slice_index - sz
+        upstream_x = torch.where((neighbor_col >= 0) & (neighbor_col < C),
+                                 (row_index * C + neighbor_col) * S + slice_index, torch.full_like(flat, -1))
+        upstream_y = torch.where((neighbor_row >= 0) & (neighbor_row < R),
+                                 (neighbor_row * C + col_index) * S + slice_index, torch.full_like(flat, -1))
+        upstream_z = torch.where((neighbor_slice >= 0) & (neighbor_slice < S),
+                                 (row_index * C + col_index) * S + neighbor_slice, torch.full_like(flat, -1))
+        octant_list.append(torch.full((n,), o, dtype=torch.int64))
         cell_list.append(flat)
-        up_list.append(torch.stack([ux, uy, uz], dim=1))
+        upstream_list.append(torch.stack([upstream_x, upstream_y, upstream_z], dim=1))
         plane_list.append(plane)
 
-    octant = torch.cat(oct_list)
+    octant = torch.cat(octant_list)
     cell = torch.cat(cell_list)
-    upstream = torch.cat(up_list)
+    upstream = torch.cat(upstream_list)
     plane = torch.cat(plane_list)
     order = torch.argsort(plane * 8 + octant, stable=True)  # planes ascending, octants grouped within a plane
     octant, cell, upstream, plane = octant[order], cell[order], upstream[order], plane[order]
@@ -97,5 +100,6 @@ def build_sweep_plan(shape: tuple[int, int, int], device=None) -> SweepPlan:
     counts = torch.bincount(plane, minlength=num_planes)
     offsets = torch.zeros(num_planes + 1, dtype=torch.int64)
     offsets[1:] = torch.cumsum(counts, dim=0)
-    plan = SweepPlan(shape=(R, C, S), num_planes=num_planes, plane_offsets=offsets, octant=octant, cell=cell, upstream=upstream)
+    plan = SweepPlan(shape=(R, C, S), num_planes=num_planes, plane_offsets=offsets, octant=octant, cell=cell,
+                     upstream=upstream)
     return plan.to(device) if device is not None else plan

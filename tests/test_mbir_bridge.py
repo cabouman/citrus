@@ -21,8 +21,8 @@ from citrus.recon.mbir_bridge import (fdk, forward_project, freeze_regularizatio
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="MBIRTORCH bridge tests run on CUDA")
 
-DEV = torch.device("cuda")
-GEOM = wlab_geometry()
+DEVICE = torch.device("cuda")
+GEOMETRY = wlab_geometry()
 ANGLES = [0.0, 0.3, 1.0, 2.5, 4.0]
 SIDDON = SiddonProjectors(backend="torch")
 
@@ -30,23 +30,23 @@ SIDDON = SiddonProjectors(backend="torch")
 def _siddon_pixel_average(vol: torch.Tensor, grid, angle: float, n: int = 4) -> torch.Tensor:
     """Exact (Siddon, PyTorch reference) line integrals averaged over an n x n lattice of sub-pixel rays: the
     pixel-averaged line integral that MBIRTORCH's footprint projector models. [Rd, Cd]."""
-    g = replace(GEOM, num_det_rows=GEOM.num_det_rows * n, num_det_channels=GEOM.num_det_channels * n,
-                delta_det_row=GEOM.delta_det_row / n, delta_det_channel=GEOM.delta_det_channel / n)
-    p = SIDDON.primary_project(vol[None], grid, g, angle, n_sub=1)[0]
-    return p.reshape(GEOM.num_det_rows, n, GEOM.num_det_channels, n).mean(dim=(1, 3))
+    g = replace(GEOMETRY, num_det_rows=GEOMETRY.num_det_rows * n, num_det_channels=GEOMETRY.num_det_channels * n,
+                delta_det_row=GEOMETRY.delta_det_row / n, delta_det_channel=GEOMETRY.delta_det_channel / n)
+    p = SIDDON.primary_project(vol[None], grid, g, angle, samples_per_pixel_axis=1)[0]
+    return p.reshape(GEOMETRY.num_det_rows, n, GEOMETRY.num_det_channels, n).mean(dim=(1, 3))
 
 
-def _centroid(img: torch.Tensor) -> tuple[float, float, float]:
-    w = img.sum()
-    r = torch.arange(img.shape[0], device=img.device, dtype=img.dtype)
-    c = torch.arange(img.shape[1], device=img.device, dtype=img.dtype)
-    return float((img.sum(1) * r).sum() / w), float((img.sum(0) * c).sum() / w), float(w)
+def _centroid(image: torch.Tensor) -> tuple[float, float, float]:
+    w = image.sum()
+    r = torch.arange(image.shape[0], device=image.device, dtype=image.dtype)
+    c = torch.arange(image.shape[1], device=image.device, dtype=image.dtype)
+    return float((image.sum(1) * r).sum() / w), float((image.sum(0) * c).sum() / w), float(w)
 
 
 @pytest.fixture(scope="module", params=[1.0, 0.5], ids=["1cm", "0.5cm"])
 def setup(request):
     grid = wlab_grid(request.param)
-    return grid, make_cone_model(grid, GEOM, ANGLES, device=DEV)
+    return grid, make_cone_model(grid, GEOMETRY, ANGLES, device=DEVICE)
 
 
 def test_model_parameters(setup):
@@ -66,15 +66,15 @@ def test_wlab_projection_matches_siddon(setup):
     """Line integrals of the WLAB attenuation map: MBIRTORCH (footprint model) vs exact pixel-averaged Siddon agree
     to ~1 % RMS (measured: <= 1.4 % at 1 cm, <= 0.25 % at 0.5 cm voxels), on the same pixels."""
     grid, model = setup
-    rho = wlab_phantom(grid, device=DEV)
+    rho = wlab_phantom(grid, device=DEVICE)
     X = 0.201 * rho[WATER] + 0.289 * rho[BONE]
-    sino = forward_project(model, X)
-    assert sino.shape == (len(ANGLES), 75, 100) and sino.device.type == "cuda"
-    tol = 0.02 if grid.delta_voxel >= 1.0 else 0.005
+    sinogram = forward_project(model, X)
+    assert sinogram.shape == (len(ANGLES), 75, 100) and sinogram.device.type == "cuda"
+    tolerance = 0.02 if grid.delta_voxel >= 1.0 else 0.005
     for i, a in enumerate(ANGLES):
-        ref = _siddon_pixel_average(X, grid, a)
-        rms = float((sino[i] - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt())
-        assert rms < tol, (a, rms)
+        reference = _siddon_pixel_average(X, grid, a)
+        rms = float((sinogram[i] - reference).pow(2).mean().sqrt() / reference.pow(2).mean().sqrt())
+        assert rms < tolerance, (a, rms)
 
 
 def test_bright_voxel_lands_on_same_pixel(setup):
@@ -82,22 +82,23 @@ def test_bright_voxel_lands_on_same_pixel(setup):
     and both follow the analytic projection of the voxel center through ConeGeometry (angle direction: a positive
     rotation moves the image the same way in both)."""
     grid, model = setup
-    vol = torch.zeros(grid.shape, device=DEV)
-    idx = tuple(int(0.65 * n) for n in grid.shape)
-    vol[idx] = 1.0
-    sino = forward_project(model, vol)
-    centers = grid.center_coordinates(DEV, torch.float64)[idx]
+    vol = torch.zeros(grid.shape, device=DEVICE)
+    index = tuple(int(0.65 * n) for n in grid.shape)
+    vol[index] = 1.0
+    sinogram = forward_project(model, vol)
+    centers = grid.center_coordinates(DEVICE, torch.float64)[index]
     cents = []
     for i, a in enumerate(ANGLES):
-        rm, cm, wm = _centroid(sino[i].double())
+        rm, cm, wm = _centroid(sinogram[i].double())
         rr, cr, wr = _centroid(_siddon_pixel_average(vol.double(), grid, a, n=8))
         assert abs(rm - rr) < 0.15 and abs(cm - cr) < 0.15, (a, rm, rr, cm, cr)
         assert abs(wm / wr - 1) < 0.01, (a, wm, wr)
         # analytic: magnified voxel center on the panel (our ConeGeometry), in fractional pixel indices
-        pv = GEOM.recon_to_view(centers[None], a)[0]
-        mag = GEOM.source_detector_dist / (GEOM.source_iso_dist - float(pv[1]))
-        c_an = (mag * float(pv[0]) + GEOM.det_channel_offset) / GEOM.delta_det_channel + (GEOM.num_det_channels - 1) / 2
-        r_an = (mag * float(pv[2]) + GEOM.det_row_offset) / GEOM.delta_det_row + (GEOM.num_det_rows - 1) / 2
+        pv = GEOMETRY.recon_to_view(centers[None], a)[0]
+        mag = GEOMETRY.source_detector_dist / (GEOMETRY.source_iso_dist - float(pv[1]))
+        c_an = ((mag * float(pv[0]) + GEOMETRY.det_channel_offset) / GEOMETRY.delta_det_channel
+                + (GEOMETRY.num_det_channels - 1) / 2)
+        r_an = (mag * float(pv[2]) + GEOMETRY.det_row_offset) / GEOMETRY.delta_det_row + (GEOMETRY.num_det_rows - 1) / 2
         assert abs(cm - c_an) < 0.3 and abs(rm - r_an) < 0.3, (a, cm, c_an, rm, r_an)
         cents.append((cm, cr))
     # +0.3 rad rotation: same direction and size of the channel shift in both
@@ -111,30 +112,30 @@ def test_fdk_and_single_iteration_recipe():
     runs none (the pitfall the recipe avoids)."""
     grid = wlab_grid(1.0)
     angles = np.linspace(0, 2 * np.pi, 60, endpoint=False)
-    model = make_cone_model(grid, GEOM, angles, device=DEV)
-    x, y, z = grid.axis_coordinates(DEV)
+    model = make_cone_model(grid, GEOMETRY, angles, device=DEVICE)
+    x, y, z = grid.axis_coordinates(DEVICE)
     obj = ((x[None, :, None].abs() < 6) & (y[:, None, None].abs() < 5) & (z[None, None, :].abs() < 5)).float() * 0.2
-    sino = forward_project(model, obj)
-    x0 = fdk(model, sino)
+    sinogram = forward_project(model, obj)
+    x0 = fdk(model, sinogram)
     inner = ((x[None, :, None].abs() < 4) & (y[:, None, None].abs() < 3) & (z[None, None, :].abs() < 3))
     assert abs(float(x0[inner].mean()) / 0.2 - 1) < 0.05
     x0_copy = x0.clone()
     np.random.seed(0)
-    r0, d0 = model.recon(sino, init_recon=x0, max_iterations=1, first_iteration=3, stop_threshold_change_pct=0,
+    r0, d0 = model.recon(sinogram, init_recon=x0, max_iterations=1, first_iteration=3, stop_threshold_change_pct=0,
                          logfile_path=None, print_logs=False, output_sharded=True)
     assert d0["recon_params"]["num_iterations"] == 0
     seq = model.get_params("partition_sequence")
     xk = x0
     errs = []
     for k in range(4):
-        xk, d = mbir_iterations(model, sino, xk, first_iteration=k)
+        xk, d = mbir_iterations(model, sinogram, xk, first_iteration=k)
         assert d["recon_params"]["num_iterations"] == 1
         assert d["recon_params"]["partition_sequence"] == [seq[k]]
         errs.append(float((xk - obj).norm() / obj.norm()))
     assert torch.equal(x0, x0_copy)  # init_recon is not modified
     assert errs[-1] < errs[0] and errs[-1] < 0.1, errs
     sig = freeze_regularization(model)
-    xk, _ = mbir_iterations(model, 2.0 * sino, xk, first_iteration=4)  # a different sinogram: sigmas stay frozen
+    xk, _ = mbir_iterations(model, 2.0 * sinogram, xk, first_iteration=4)  # a different sinogram: sigmas stay frozen
     assert model.get_params("sigma_y") == sig["sigma_y"] and model.get_params("sigma_x") == sig["sigma_x"]
 
 
@@ -146,80 +147,81 @@ def test_resume_from_error_sinogram_equals_restart():
     y_new - y_old, as the CITRUS loop does); the Hessian of a checkpoint can be passed back."""
     grid = wlab_grid(1.0)
     angles = np.linspace(0, 2 * np.pi, 60, endpoint=False)
-    model = make_cone_model(grid, GEOM, angles, device=DEV)
-    x, y, z = grid.axis_coordinates(DEV)
+    model = make_cone_model(grid, GEOMETRY, angles, device=DEVICE)
+    x, y, z = grid.axis_coordinates(DEVICE)
     obj = ((x[None, :, None].abs() < 6) & (y[:, None, None].abs() < 5) & (z[None, None, :].abs() < 5)).float() * 0.2
-    sino = forward_project(model, obj)
-    sinos = [sino, sino * 1.01, sino * 1.01, sino * 0.995]  # the data change between calls
-    x0 = fdk(model, sino)
+    sinogram = forward_project(model, obj)
+    sinograms = [sinogram, sinogram * 1.01, sinogram * 1.01, sinogram * 0.995]  # the data change between calls
+    x0 = fdk(model, sinogram)
     freeze_regularization(model)
     xa, xb = x0.clone(), x0.clone()
     e = None
-    hess = None
-    for k, s in enumerate(sinos):
+    hessian = None
+    for k, s in enumerate(sinograms):
         np.random.seed([0, k])
         xa, da = mbir_iterations(model, s, xa, first_iteration=k)
         if e is not None:
-            e.add_(s - sinos[k - 1])  # A x unchanged: e = s - A x
+            e.add_(s - sinograms[k - 1])  # A x unchanged: e = s - A x
         np.random.seed([0, k])
         xin = xb.clone()
-        xb, db, ck = mbir_iterations(model, s, xin, first_iteration=k, error_sinogram=e, hessian=hess,
+        xb, db, ck = mbir_iterations(model, s, xin, first_iteration=k, error_sinogram=e, hessian=hessian,
                                      return_checkpoint=True)
         assert db["recon_params"]["partition_sequence"] == da["recon_params"]["partition_sequence"]
         assert db["recon_params"]["num_iterations"] == 1
-        e, hess = ck["error_sinogram"], ck["fm_hessian"]
+        e, hessian = ck["error_sinogram"], ck["fm_hessian"]
         assert float((xb - xa).norm() / xa.norm()) < 1e-5, k
         resid = s - forward_project(model, xb)
         assert float((e - resid).norm() / resid.norm()) < 1e-4, k
     with pytest.raises(ValueError, match="init_recon"):
-        mbir_iterations(model, sino, None, first_iteration=0, error_sinogram=e)
+        mbir_iterations(model, sinogram, None, first_iteration=0, error_sinogram=e)
 
 
 def test_scan_range_and_short_scan_detection():
     from citrus.recon.mbir_bridge import is_short_scan, scan_range
     from citrus.utilities import fan_angle, full_field_wlab_geometry, view_angles
 
-    geom = full_field_wlab_geometry()
-    full = view_angles(36, geom, 0.3, 0.3 + 2 * np.pi)
-    short = view_angles(36, geom, 0.3)
+    geometry = full_field_wlab_geometry()
+    full = view_angles(36, geometry, 0.3, 0.3 + 2 * np.pi)
+    short = view_angles(36, geometry, 0.3)
     assert scan_range(full) == pytest.approx(2 * np.pi, rel=1e-12) and not is_short_scan(full)
-    assert scan_range(short) == pytest.approx(np.pi + fan_angle(geom), rel=1e-12) and is_short_scan(short)
+    assert scan_range(short) == pytest.approx(np.pi + fan_angle(geometry), rel=1e-12) and is_short_scan(short)
     assert scan_range([0.5]) == 0.0
 
 
 def test_short_scan_fdk_parker_weights():
-    """MBIRTORCH's FDK has no short-scan weighting; `fdk(..., geom=, angles=)` applies Parker weights to a short scan
-    (pi + fan angle): an off-center object is reconstructed as accurately as from a full rotation, whereas the plain
-    FDK of the short scan is 11-14 % off; the weights of conjugate rays sum to 1 (times Lambda / pi); a full rotation
-    is left unweighted."""
+    """MBIRTORCH's FDK has no short-scan weighting; `fdk(..., geometry=, angles=)` applies Parker weights to a short
+    scan (pi + fan angle): an off-center object is reconstructed as accurately as from a full rotation, whereas the
+    plain FDK of the short scan is 11-14 % off; the weights of conjugate rays sum to 1 (times Lambda / pi); a full
+    rotation is left unweighted."""
     from citrus.recon.mbir_bridge import short_scan_weights
     from citrus.utilities import full_field_wlab_geometry, view_angles
 
-    geom = full_field_wlab_geometry()
+    geometry = full_field_wlab_geometry()
     grid = wlab_grid(1.0)
-    x, y, z = grid.axis_coordinates(DEV)
-    obj = (((x[None, :, None] - 6) ** 2 + (y[:, None, None] + 2) ** 2 < 16) & (z[None, None, :].abs() < 8)).float() * 0.2
+    x, y, z = grid.axis_coordinates(DEVICE)
+    obj = (((x[None, :, None] - 6) ** 2 + (y[:, None,
+                                             None] + 2) ** 2 < 16) & (z[None, None, :].abs() < 8)).float() * 0.2
     obj += ((x[None, :, None].abs() < 14) & (y[:, None, None].abs() < 9) & (z[None, None, :].abs() < 8)).float() * 0.1
     inner = (x[None, :, None].abs() < 12) & (y[:, None, None].abs() < 7) & (z[None, None, :].abs() < 4)
 
     def err(r):
         return float((r - obj)[inner].norm() / obj[inner].norm())
 
-    full = view_angles(90, geom, 0.0, 2 * np.pi)
-    assert short_scan_weights(geom, full) is None
-    m_full = make_cone_model(grid, geom, full, device=DEV)
-    e_full = err(fdk(m_full, forward_project(m_full, obj), geom=geom, angles=full))
+    full = view_angles(90, geometry, 0.0, 2 * np.pi)
+    assert short_scan_weights(geometry, full) is None
+    m_full = make_cone_model(grid, geometry, full, device=DEVICE)
+    e_full = err(fdk(m_full, forward_project(m_full, obj), geometry=geometry, angles=full))
     for start in (0.0, 1.0):
-        ang = view_angles(90, geom, start)
-        model = make_cone_model(grid, geom, ang, device=DEV)
-        sino = forward_project(model, obj)
-        e_plain, e_parker = err(fdk(model, sino)), err(fdk(model, sino, geom=geom, angles=ang))
+        ang = view_angles(90, geometry, start)
+        model = make_cone_model(grid, geometry, ang, device=DEVICE)
+        sinogram = forward_project(model, obj)
+        e_plain, e_parker = err(fdk(model, sinogram)), err(fdk(model, sinogram, geometry=geometry, angles=ang))
         assert e_plain > 0.08 and e_parker < e_full + 0.01, (e_plain, e_parker, e_full)
     # redundancy: on a fine short scan the weights of the two measurements of a central-plane line sum to Lambda / pi
-    ang = view_angles(2000, geom, 0.0)
-    w = short_scan_weights(geom, ang)[:, 0].double().numpy()  # [V, Cd]
+    ang = view_angles(2000, geometry, 0.0)
+    w = short_scan_weights(geometry, ang)[:, 0].double().numpy()  # [V, Cd]
     lam = 2000 * (ang[1] - ang[0])
     assert w.min() >= 0 and w.max() == pytest.approx(lam / np.pi, rel=1e-6)
     assert w.sum(0).mean() * (ang[1] - ang[0]) == pytest.approx(lam, rel=1e-2)  # sum_beta w dbeta = pi (Lambda / pi)
     with pytest.warns(RuntimeWarning, match="shorter than a short scan"):
-        assert short_scan_weights(geom, np.linspace(0, np.pi, 50, endpoint=False)) is None
+        assert short_scan_weights(geometry, np.linspace(0, np.pi, 50, endpoint=False)) is None

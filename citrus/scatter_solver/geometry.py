@@ -147,7 +147,7 @@ class Grid:
         return replace(self, shape=(nr // factor, nc // factor, ns // factor), delta_voxel=self.delta_voxel * factor)
 
     def local_coordinates_of_fine_in_coarse(self, factor: int, device=None, dtype=torch.float32) -> Tensor:
-        """Local LD coordinates u in [-1, 1] of each fine sub-voxel center inside its coarse cell.
+        """Local linear-discontinuous coordinates u in [-1, 1] of each fine sub-voxel center inside its coarse cell.
 
         Returns a [factor] tensor; identical along each axis for a uniform integer coarsening.
         """
@@ -262,7 +262,8 @@ class ConeGeometry:
     def pixel_uv(self, device=None, dtype=torch.float32) -> tuple[Tensor, Tensor]:
         """Pixel-center panel coordinates (u[num_det_channels], v[num_det_rows]) in cm."""
         nc, nr = self.num_det_channels, self.num_det_rows
-        u = (torch.arange(nc, device=device, dtype=dtype) - (nc - 1) / 2) * self.delta_det_channel - self.det_channel_offset
+        u = ((torch.arange(nc, device=device, dtype=dtype) - (nc - 1) / 2) * self.delta_det_channel
+             - self.det_channel_offset)
         v = (torch.arange(nr, device=device, dtype=dtype) - (nr - 1) / 2) * self.delta_det_row - self.det_row_offset
         return u, v
 
@@ -298,7 +299,8 @@ class ConeGeometry:
         yv = self.panel_y_view
         return (s * yv, c * yv, 0.0)
 
-    def panel_axes(self, angle: float) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
+    def panel_axes(self, angle: float) -> tuple[tuple[float, float, float], tuple[float, float, float],
+                                                tuple[float, float, float]]:
         """Unit vectors (u_hat, v_hat, n_hat) of the panel in the recon frame; n_hat points toward the source."""
         c, s = self._rot(angle)
         u_hat = (c, -s, 0.0)
@@ -317,8 +319,8 @@ class ConeGeometry:
 
     def primary_directions(self, angle: float, device=None, dtype=torch.float32) -> Tensor:
         """Unit vectors from the focal spot to each pixel center, recon frame, [rows, channels, 3]."""
-        src = torch.tensor(self.source_position(angle), device=device, dtype=dtype)
-        d = self.pixel_centers(angle, device, dtype) - src
+        source_position = torch.tensor(self.source_position(angle), device=device, dtype=dtype)
+        d = self.pixel_centers(angle, device, dtype) - source_position
         return d / torch.linalg.norm(d, dim=-1, keepdim=True)
 
     def panel_distance_along(self, points: Tensor, omega: Tensor, angle: float) -> Tensor:

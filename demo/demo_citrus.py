@@ -7,7 +7,8 @@
                                                    # 20 outer iterations, scatter step on every view and at every
                                                    # outer iteration (about 30 min)
     python demo/demo_citrus.py --end-view-angle 360                     # the default over a full rotation
-    python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer 10 --scatter-view-stride 1 --scatter-every 1
+    python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 \\
+        --scatter-every 1
                                                    # a quick run (about 2 minutes)
     python demo/demo_citrus.py --transport-cell-cm 0.5                  # 0.5 cm transport cells (default: 1 cm)
     python demo/demo_citrus.py --truth-sweep 16x32 --truth-cone 32x64   # truth finer than the loop's solver
@@ -44,11 +45,11 @@
    data synthesis about 4x slower. ``--transport-cell-cm`` sets the transport cell size of both solvers (cm, any
    ratio to the voxel pitch; default 1 cm); the data set's cache name records it when it differs from 1 cm.
 2. CITRUS (citrus.citrus_recon): FDK initialization (Parker-weighted for a short scan: MBIRTORCH's FDK has no
-   short-scan weighting, recon.mbir_bridge.short_scan_weights), then per outer iteration one scatter step per view and one
-   warm-started MBIR iteration on Y / (1 + SPR). ``--scatter-view-stride n`` runs the scatter step on every n-th view
-   only and interpolates the other views' scatter signal in angle (``--scatter-view-interp-order``, default 3:
-   Catmull-Rom; default stride 8); ``--scatter-every n`` runs the scatter step at every n-th outer iteration only and
-   reuses the scatter-to-primary ratio in between (default 8). The output files carry ``_stride<n>`` and
+   short-scan weighting, recon.mbir_bridge.short_scan_weights), then per outer iteration one scatter step per view and
+   one warm-started MBIR iteration on Y / (1 + SPR). ``--scatter-view-stride n`` runs the scatter step on every n-th
+   view only and interpolates the other views' scatter signal in angle (``--scatter-view-interpolation-order``,
+   default 3: Catmull-Rom; default stride 8); ``--scatter-every n`` runs the scatter step at every n-th outer iteration
+   only and reuses the scatter-to-primary ratio in between (default 8). The output files carry ``_stride<n>`` and
    ``_every<n>`` suffixes for values other than 1 (``_stride<n>_order<k>`` for interpolation orders other than 3).
    The primary signal of every view comes from MBIRTORCH projections of the material maps (CitrusConfig.
    primary_projector "mbirtorch", the default; ``--primary-projector siddon``: the solver's Siddon primary per view,
@@ -106,84 +107,86 @@ def _counts(text: str, what: str) -> tuple[int, int]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--views", type=int, default=180, help="number of views over the angular range (default 180)")
-    ap.add_argument("--delta-voxel", type=float, default=0.5, help="voxel pitch in cm (default 0.5)")
-    ap.add_argument("--transport-cell-cm", type=float, default=1.0,
-                    help="transport cell edge length in cm, for the loop's and the truth's solver (default 1; any "
-                         "ratio to --delta-voxel)")
-    ap.add_argument("--outer", type=int, default=80, help="outer iterations (default 80)")
-    ap.add_argument("--full", action="store_true",
-                    help="the report study: 180 views over a FULL rotation (end view angle = start + 360 degrees, set "
-                         "explicitly; --end-view-angle is ignored), 0.5 cm grid, 20 outer iterations, scatter step on "
-                         "every view at every outer iteration (--views, --delta-voxel, --outer, --scatter-view-stride "
-                         "and --scatter-every are overridden)")
-    ap.add_argument("--start-view-angle", type=float, default=0.0,
-                    help="first view angle in degrees (default 0; MBIRTORCH's angle convention)")
-    ap.add_argument("--end-view-angle", type=float, default=None,
-                    help="end of the angular range in degrees, excluded (views evenly spaced over [start, end)); "
-                         "default: the short scan start + 180 + fan angle of the panel (22.6 degrees); "
-                         "start + 360 for a full rotation")
-    ap.add_argument("--I0", type=float, default=1.0e5, help="flat-field counts per pixel (default 1e5)")
-    ap.add_argument("--seed", type=int, default=0, help="Poisson noise seed")
-    ap.add_argument("--no-noise", action="store_true", help="noise-free data (Y = P + S)")
-    ap.add_argument("--regenerate", action="store_true", help="re-synthesize the data even if cached")
-    ap.add_argument("--truth-sweep", default=None,
-                    help="sweep quadrature of the ground-truth solver, POLARxAZIMUTHAL (default: the loop's, 8x16; "
-                         "recommended finer: 16x32; polar even, azimuthal divisible by 4)")
-    ap.add_argument("--truth-cone", default=None,
-                    help="collapsed-cone directions of the ground-truth solver, POLARxAZIMUTHAL (default: the loop's, "
-                         "16x32; recommended finer: 32x64)")
-    ap.add_argument("--scatter-view-stride", type=int, default=8,
-                    help="scatter step on every n-th view only (views 0, n, 2n, ...), the others interpolated in "
-                         "angle (default 8)")
-    ap.add_argument("--scatter-view-interp-order", default="3", choices=["none", "0", "1", "2", "3"],
-                    help="angular interpolation of the skipped views (with --scatter-view-stride > 1): 0 nearest, "
-                         "1 linear, 2 quadratic, 3 cubic Catmull-Rom (default), none = not corrected (diagnostics)")
-    ap.add_argument("--scatter-every", type=int, default=8,
-                    help="scatter step at every n-th outer iteration only; the previous correction is reused in "
-                         "between (default 8)")
-    ap.add_argument("--truth-primary-projector", default="mbirtorch", choices=["mbirtorch", "siddon"],
-                    help="primary model of the data's scatter-to-primary ratio: MBIRTORCH line integrals (default, "
-                         "the loop's default) or the solver's Siddon primary (citrus <= 0.2.0; cache suffix "
-                         "_primary-siddon)")
-    ap.add_argument("--primary-projector", default="mbirtorch", choices=["mbirtorch", "siddon"],
-                    help="primary signals of the scatter correction: MBIRTORCH projections of the material maps "
-                         "(default) or the solver's Siddon primary per view")
-    ap.add_argument("--resume-error-sinogram", default=True, action=argparse.BooleanOptionalAction,
-                    help="resume MBIR from its error sinogram between outer iterations (default) or restart it from "
-                         "the sinogram (--no-resume-error-sinogram)")
-    ap.add_argument("--save-recon", action="store_true", help="also save the CITRUS volume (.npy)")
-    ap.add_argument("--memory-cap-mib", type=float, default=4400.0, help="PyTorch CUDA memory cap (0: none)")
-    ap.add_argument("--input", default=os.path.join(HERE, "input"))
-    ap.add_argument("--out", default=os.path.join(HERE, "output"))
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--views", type=int, default=180, help="number of views over the angular range (default 180)")
+    parser.add_argument("--delta-voxel", type=float, default=0.5, help="voxel pitch in cm (default 0.5)")
+    parser.add_argument("--transport-cell-cm", type=float, default=1.0,
+                        help="transport cell edge length in cm, for the loop's and the truth's solver (default 1; any "
+                             "ratio to --delta-voxel)")
+    parser.add_argument("--outer-iterations", type=int, default=80, help="outer iterations (default 80)")
+    parser.add_argument("--full", action="store_true",
+                        help="the report study: 180 views over a FULL rotation (end view angle = start + 360 degrees, "
+                             "set explicitly; --end-view-angle is ignored), 0.5 cm grid, 20 outer iterations, scatter "
+                             "step on every view at every outer iteration (--views, --delta-voxel, --outer-iterations, "
+                             "--scatter-view-stride and --scatter-every are overridden)")
+    parser.add_argument("--start-view-angle", type=float, default=0.0,
+                        help="first view angle in degrees (default 0; MBIRTORCH's angle convention)")
+    parser.add_argument("--end-view-angle", type=float, default=None,
+                        help="end of the angular range in degrees, excluded (views evenly spaced over [start, end)); "
+                             "default: the short scan start + 180 + fan angle of the panel (22.6 degrees); start + 360 "
+                             "for a full rotation")
+    parser.add_argument("--I0", type=float, default=1.0e5, help="flat-field counts per pixel (default 1e5)")
+    parser.add_argument("--seed", type=int, default=0, help="Poisson noise seed")
+    parser.add_argument("--no-noise", action="store_true", help="noise-free data (Y = P + S)")
+    parser.add_argument("--regenerate", action="store_true", help="re-synthesize the data even if cached")
+    parser.add_argument("--truth-sweep", default=None,
+                        help="sweep quadrature of the ground-truth solver, POLARxAZIMUTHAL (default: the loop's, 8x16; "
+                             "recommended finer: 16x32; polar even, azimuthal divisible by 4)")
+    parser.add_argument("--truth-cone", default=None,
+                        help="collapsed-cone directions of the ground-truth solver, POLARxAZIMUTHAL (default: the "
+                             "loop's, 16x32; recommended finer: 32x64)")
+    parser.add_argument("--scatter-view-stride", type=int, default=8,
+                        help="scatter step on every n-th view only (views 0, n, 2n, ...), the others interpolated in "
+                             "angle (default 8)")
+    parser.add_argument("--scatter-view-interpolation-order", default="3", choices=["none", "0", "1", "2", "3"],
+                        help="angular interpolation of the skipped views (with --scatter-view-stride > 1): 0 nearest, "
+                             "1 linear, 2 quadratic, 3 cubic Catmull-Rom (default), none = not corrected (diagnostics)")
+    parser.add_argument("--scatter-every", type=int, default=8,
+                        help="scatter step at every n-th outer iteration only; the previous correction is reused in "
+                             "between (default 8)")
+    parser.add_argument("--truth-primary-projector", default="mbirtorch", choices=["mbirtorch", "siddon"],
+                        help="primary model of the data's scatter-to-primary ratio: MBIRTORCH line integrals (default, "
+                             "the loop's default) or the solver's Siddon primary (citrus <= 0.2.0; cache suffix "
+                             "_primary-siddon)")
+    parser.add_argument("--primary-projector", default="mbirtorch", choices=["mbirtorch", "siddon"],
+                        help="primary signals of the scatter correction: MBIRTORCH projections of the material maps "
+                             "(default) or the solver's Siddon primary per view")
+    parser.add_argument("--resume-error-sinogram", default=True, action=argparse.BooleanOptionalAction,
+                        help="resume MBIR from its error sinogram between outer iterations (default) or restart it "
+                             "from the sinogram (--no-resume-error-sinogram)")
+    parser.add_argument("--save-recon", action="store_true", help="also save the CITRUS volume (.npy)")
+    parser.add_argument("--memory-cap-mib", type=float, default=4400.0, help="PyTorch CUDA memory cap (0: none)")
+    parser.add_argument("--input", default=os.path.join(HERE, "input"))
+    parser.add_argument("--out", default=os.path.join(HERE, "output"))
+    args = parser.parse_args()
     if args.full:
-        args.views, args.delta_voxel, args.outer = 180, 0.5, 20
+        args.views, args.delta_voxel, args.outer_iterations = 180, 0.5, 20
         args.scatter_view_stride, args.scatter_every = 1, 1
         args.end_view_angle = args.start_view_angle + 360.0  # the report's full rotation
     if not args.transport_cell_cm > 0:
         raise SystemExit("--transport-cell-cm must be > 0")
-    interp_order = None if args.scatter_view_interp_order == "none" else int(args.scatter_view_interp_order)
+    interpolation_order = (None if args.scatter_view_interpolation_order == "none"
+                           else int(args.scatter_view_interpolation_order))
     if args.scatter_view_stride < 1:
         raise SystemExit("--scatter-view-stride must be >= 1")
     if args.scatter_every < 1:
         raise SystemExit("--scatter-every must be >= 1")
     if not torch.cuda.is_available():
         raise SystemExit("this demo needs a CUDA GPU (MBIRTORCH and the scatter solver run on the GPU)")
-    dev = torch.device("cuda")
+    device = torch.device("cuda")
     set_memory_cap(args.memory_cap_mib)
     os.makedirs(args.input, exist_ok=True)
     os.makedirs(args.out, exist_ok=True)
-    loop_cfg = replace(SolverConfig(), transport_cell_cm=args.transport_cell_cm)
-    tp, ta = _counts(args.truth_sweep, "--truth-sweep") if args.truth_sweep else (loop_cfg.num_polar,
-                                                                                 loop_cfg.num_azimuthal)
-    cp, ca = _counts(args.truth_cone, "--truth-cone") if args.truth_cone else (loop_cfg.cone_num_polar,
-                                                                              loop_cfg.cone_num_azimuthal)
-    if tp % 2 or ta % 4:
+    loop_config = replace(SolverConfig(), transport_cell_cm=args.transport_cell_cm)
+    truth_polar, truth_azimuthal = (_counts(args.truth_sweep, "--truth-sweep") if args.truth_sweep
+                                    else (loop_config.num_polar, loop_config.num_azimuthal))
+    cone_polar, cone_azimuthal = (_counts(args.truth_cone, "--truth-cone") if args.truth_cone
+                                  else (loop_config.cone_num_polar, loop_config.cone_num_azimuthal))
+    if truth_polar % 2 or truth_azimuthal % 4:
         raise SystemExit("--truth-sweep: the polar count must be even and the azimuthal count divisible by 4")
-    truth_cfg = replace(loop_cfg, num_polar=tp, num_azimuthal=ta, cone_num_polar=cp, cone_num_azimuthal=ca)
-    truth_cfg.validate()
+    truth_config = replace(loop_config, num_polar=truth_polar, num_azimuthal=truth_azimuthal, cone_num_polar=cone_polar,
+                           cone_num_azimuthal=cone_azimuthal)
+    truth_config.validate()
     start = math.radians(args.start_view_angle)
     end = None if args.end_view_angle is None else math.radians(args.end_view_angle)
     if end is not None and not end > start:
@@ -199,146 +202,159 @@ def main() -> None:
            + ("_nonoise" if args.no_noise else ""))
     if args.transport_cell_cm != 1.0:
         tag += f"_cell{args.transport_cell_cm:g}".replace(".", "p")
-    if truth_cfg != loop_cfg:
-        tag += f"_truth{tp}x{ta}_cone{cp}x{ca}"
+    if truth_config != loop_config:
+        tag += f"_truth{truth_polar}x{truth_azimuthal}_cone{cone_polar}x{cone_azimuthal}"
     tag += "_v2"  # data-set format 2: SPR with the primary model of the loop's default (citrus >= 0.3.0)
     if args.truth_primary_projector != "mbirtorch":
         tag += f"_primary-{args.truth_primary_projector}"
-    t_all = time.perf_counter()
+    start_time = time.perf_counter()
 
     # ---- 1. data ------------------------------------------------------------------------------------------------
     path = os.path.join(args.input, tag)
-    geom = full_field_wlab_geometry()
+    geometry = full_field_wlab_geometry()
     if os.path.exists(path + ".npz") and not args.regenerate:
         data = load_dataset(path)
         print(f"data: loaded {path}.npz")
     else:
         t0 = time.perf_counter()
         data = synthesize_wlab_dataset(args.views, args.delta_voxel, args.I0, not args.no_noise, args.seed, path,
-                                       geom=geom, device=dev, config=truth_cfg, start_view_angle=start,
+                                       geometry=geometry, device=device, config=truth_config, start_view_angle=start,
                                        end_view_angle=end, primary_projector=args.truth_primary_projector)
         print(f"data: synthesized {args.views} views in {time.perf_counter() - t0:.1f} s -> {path}.npz")
-    geom = ConeGeometry(**data["meta"]["geometry"])
+    geometry = ConeGeometry(**data["meta"]["geometry"])
     grid = wlab_grid(args.delta_voxel)
     I0 = float(data["I0"])
     Y, angles = data["Y"], data["angles"]
-    X_true = torch.as_tensor(data["X_true"], device=dev)
+    X_true = torch.as_tensor(data["X_true"], device=device)
     spr_true = data["SPR"]
     span = math.degrees(scan_range(angles))
     print(f"views over {math.degrees(float(angles[0])):.1f} + {span:.1f} degrees "
           f"({'short scan' if is_short_scan(angles) else 'full rotation'})")
     print(f"grid {grid.shape} at {grid.delta_voxel} cm, transport grid "
           f"{Grid.covering(grid, args.transport_cell_cm).shape} "
-          f"({args.transport_cell_cm:g} cm cells, {loop_cfg.quadrature_points(max(grid.deltas))} first-collision "
-          f"points per axis at {loop_cfg.quadrature_point_spacing_cm:g} cm target spacing), "
-          f"{len(angles)} views, panel {geom.num_det_rows} x {geom.num_det_channels}; SPR median "
+          f"({args.transport_cell_cm:g} cm cells, {loop_config.quadrature_points(max(grid.deltas))} first-collision "
+          f"points per axis at {loop_config.quadrature_point_spacing_cm:g} cm target spacing), "
+          f"{len(angles)} views, panel {geometry.num_det_rows} x {geometry.num_det_channels}; SPR median "
           f"{np.median(spr_true):.2f}, max {spr_true.max():.1f}")
 
     # ---- shared: solver, MBIRTORCH model, frozen regularization (scatter-free sinogram), metrics ---------------
-    solver = wlab_solver(args.delta_voxel, config=loop_cfg, geom=geom, device=dev)
-    print(f"truth solver: sweep {tp}x{ta}, cone {cp}x{ca}; loop solver: sweep {loop_cfg.num_polar}x"
-          f"{loop_cfg.num_azimuthal}, cone {loop_cfg.cone_num_polar}x{loop_cfg.cone_num_azimuthal}")
-    model = make_cone_model(grid, geom, angles, device=dev)
-    Yt = torch.as_tensor(Y, device=dev)
-    reg = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=dev) / I0), Yt / I0)
-    core = _box(grid, dev, (12.0, 9.0, 6.0))
+    solver = wlab_solver(args.delta_voxel, config=loop_config, geometry=geometry, device=device)
+    print(f"truth solver: sweep {truth_polar}x{truth_azimuthal}, cone {cone_polar}x{cone_azimuthal}; "
+          f"loop solver: sweep {loop_config.num_polar}x{loop_config.num_azimuthal}, "
+          f"cone {loop_config.cone_num_polar}x{loop_config.cone_num_azimuthal}")
+    model = make_cone_model(grid, geometry, angles, device=device)
+    Y_device = torch.as_tensor(Y, device=device)
+    regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=device) / I0),
+                                             Y_device / I0)
+    core = _box(grid, device, (12.0, 9.0, 6.0))
 
     def tracker(store: list):
-        def cb(k: int, X: torch.Tensor, rec: dict) -> None:
+        def track(k: int, X: torch.Tensor, record: dict) -> None:
             e = X - X_true
             store.append({"k": k, "rmse_rel": float(e.norm() / X_true.norm()),
                           "rmse_rel_core": float(e[core].norm() / X_true[core].norm())})
-        return cb
+        return track
 
-    cfg = CitrusConfig(num_outer=args.outer, verbose=True, scatter_view_stride=args.scatter_view_stride,
-                       scatter_view_interp_order=interp_order, scatter_every=args.scatter_every,
-                       primary_projector=args.primary_projector, resume_error_sinogram=args.resume_error_sinogram)
+    config = CitrusConfig(num_outer_iterations=args.outer_iterations, verbose=True,
+                          scatter_view_stride=args.scatter_view_stride,
+                          scatter_view_interpolation_order=interpolation_order, scatter_every=args.scatter_every,
+                          primary_projector=args.primary_projector, resume_error_sinogram=args.resume_error_sinogram)
     out_tag = tag
     if args.primary_projector != "mbirtorch":
         out_tag += f"_{args.primary_projector}"
     if not args.resume_error_sinogram:
         out_tag += "_restart"
     if args.scatter_view_stride > 1:
-        out_tag += f"_stride{args.scatter_view_stride}" + ("" if interp_order == 3 else f"_order{interp_order}")
+        out_tag += f"_stride{args.scatter_view_stride}" + ("" if interpolation_order == 3
+                                                           else f"_order{interpolation_order}")
         print(f"sparse-view scatter: scatter step on {len(range(0, len(angles), args.scatter_view_stride))} of "
-              f"{len(angles)} views (stride {args.scatter_view_stride}), interpolation order {interp_order}")
+              f"{len(angles)} views (stride {args.scatter_view_stride}), interpolation order {interpolation_order}")
     if args.scatter_every > 1:
         out_tag += f"_every{args.scatter_every}"
         print(f"scatter step at every {args.scatter_every}-th outer iteration "
-              f"({len(range(0, args.outer, args.scatter_every))} scatter steps in {args.outer} outer iterations)")
+              f"({len(range(0, args.outer_iterations, args.scatter_every))} scatter steps in "
+              f"{args.outer_iterations} outer iterations)")
 
     # ---- 2. CITRUS ------------------------------------------------------------------------------------------
-    hist_c: list = []
-    torch.cuda.synchronize(dev)
-    torch.cuda.reset_peak_memory_stats(dev)  # the CITRUS run's own peak (records reset it every outer iteration)
+    citrus_history: list = []
+    torch.cuda.synchronize(device)
+    torch.cuda.reset_peak_memory_stats(device)  # the CITRUS run's own peak (records reset it every outer iteration)
     t0 = time.perf_counter()
-    X_c, info_c = citrus_recon(Y, I0, angles, grid, geom, solver, cfg, regularization=reg, model=model,
-                               callback=tracker(hist_c))
+    X_citrus, citrus_info = citrus_recon(Y, I0, angles, grid, geometry, solver, config, regularization=regularization,
+                                         model=model,
+                                         callback=tracker(citrus_history))
     t_citrus = time.perf_counter() - t0
 
     # ---- 3. no scatter correction ------------------------------------------------------------------------------
-    hist_n: list = []
+    no_correction_history: list = []
     t0 = time.perf_counter()
-    X_n, info_n = mbir_recon(Y, I0, angles, grid, geom, cfg, regularization=reg, model=model,
-                             callback=tracker(hist_n))
+    X_no_correction, no_correction_info = mbir_recon(Y, I0, angles, grid, geometry, config,
+                                                     regularization=regularization, model=model,
+                                                     callback=tracker(no_correction_history))
     t_none = time.perf_counter() - t0
 
     # ---- summary ---------------------------------------------------------------------------------------------
-    rec = info_c["records"][1:]
+    records = citrus_info["records"][1:]
     summary = {
         "views": len(angles), "start_view_angle_deg": math.degrees(float(angles[0])), "scan_range_deg": span,
         "short_scan": bool(is_short_scan(angles)), "delta_voxel_cm": args.delta_voxel, "grid": list(grid.shape),
         "transport_cell_cm": args.transport_cell_cm, "data_tag": tag,
         "truth_primary_projector": data["meta"].get("primary_projector", "siddon"),
-        "quadrature_point_spacing_cm": loop_cfg.quadrature_point_spacing_cm,
-        "quadrature_points_per_axis": loop_cfg.quadrature_points(max(grid.deltas)),
-        "outer": args.outer,
-        "truth_sweep": [tp, ta], "truth_cone": [cp, ca],
-        "scatter_view_stride": args.scatter_view_stride, "scatter_view_interp_order": interp_order,
+        "quadrature_point_spacing_cm": loop_config.quadrature_point_spacing_cm,
+        "quadrature_points_per_axis": loop_config.quadrature_points(max(grid.deltas)),
+        "outer": args.outer_iterations,
+        "truth_sweep": [truth_polar, truth_azimuthal], "truth_cone": [cone_polar, cone_azimuthal],
+        "scatter_view_stride": args.scatter_view_stride, "scatter_view_interp_order": interpolation_order,
         "scatter_every": args.scatter_every,
         "primary_projector": args.primary_projector, "resume_error_sinogram": bool(args.resume_error_sinogram),
-        "scatter_steps": int(sum(1 for r in rec if r.get("scatter_refreshed", True))),
-        "computed_views": [int(v) for v in info_c["computed_views"]],
-        "regularization": reg,
-        "citrus": {"rmse_rel": hist_c[-1]["rmse_rel"], "rmse_rel_core": hist_c[-1]["rmse_rel_core"],
-                   "seconds": t_citrus, "scatter_s_per_outer": float(np.mean([r["t_scatter"] for r in rec])),
-                   "mbir_s_per_outer": float(np.mean([r["t_mbir"] for r in rec])), "state": info_c["state"],
-                   "gpu_peak_allocated_mib": max(r.get("gpu_peak_mib", 0.0) for r in rec),
-                   "gpu_peak_allocated_mib_per_outer": [r.get("gpu_peak_mib") for r in rec],
-                   "mbir_s": [r["t_mbir"] for r in rec], "scatter_s": [r["t_scatter"] for r in rec]},
-        "no_correction": {"rmse_rel": hist_n[-1]["rmse_rel"], "rmse_rel_core": hist_n[-1]["rmse_rel_core"],
+        "scatter_steps": int(sum(1 for r in records if r.get("scatter_refreshed", True))),
+        "computed_views": [int(v) for v in citrus_info["computed_views"]],
+        "regularization": regularization,
+        "citrus": {"rmse_rel": citrus_history[-1]["rmse_rel"], "rmse_rel_core": citrus_history[-1]["rmse_rel_core"],
+                   "seconds": t_citrus, "scatter_s_per_outer": float(np.mean([r["scatter_seconds"] for r in records])),
+                   "mbir_s_per_outer": float(np.mean([r["mbir_seconds"] for r in records])),
+                   "state": citrus_info["state"],
+                   "gpu_peak_allocated_mib": max(r.get("gpu_peak_allocated_mib", 0.0) for r in records),
+                   "gpu_peak_allocated_mib_per_outer": [r.get("gpu_peak_allocated_mib") for r in records],
+                   "mbir_s": [r["mbir_seconds"] for r in records],
+                   "scatter_s": [r["scatter_seconds"] for r in records]},
+        "no_correction": {"rmse_rel": no_correction_history[-1]["rmse_rel"],
+                          "rmse_rel_core": no_correction_history[-1]["rmse_rel_core"],
                           "seconds": t_none},
-        "fdk_rmse_rel": hist_c[0]["rmse_rel"],
-        "history": {"citrus": hist_c, "no_correction": hist_n},
+        "fdk_rmse_rel": citrus_history[0]["rmse_rel"],
+        "history": {"citrus": citrus_history, "no_correction": no_correction_history},
     }
     with open(os.path.join(args.out, f"citrus_{out_tag}.json"), "w") as f:
         json.dump(summary, f, indent=1)
     if args.save_recon:
-        np.save(os.path.join(args.out, f"citrus_{out_tag}_recon.npy"), X_c.detach().cpu().numpy())
-    print(f"\nrelative RMSE (whole prism / core): FDK {hist_c[0]['rmse_rel']:.4f} / {hist_c[0]['rmse_rel_core']:.4f}, "
-          f"no correction {hist_n[-1]['rmse_rel']:.4f} / {hist_n[-1]['rmse_rel_core']:.4f}, "
-          f"CITRUS {hist_c[-1]['rmse_rel']:.4f} / {hist_c[-1]['rmse_rel_core']:.4f}")
+        np.save(os.path.join(args.out, f"citrus_{out_tag}_recon.npy"), X_citrus.detach().cpu().numpy())
+    print(f"\nrelative RMSE (whole prism / core): FDK {citrus_history[0]['rmse_rel']:.4f} / "
+          f"{citrus_history[0]['rmse_rel_core']:.4f}, "
+          f"no correction {no_correction_history[-1]['rmse_rel']:.4f} / "
+          f"{no_correction_history[-1]['rmse_rel_core']:.4f}, "
+          f"CITRUS {citrus_history[-1]['rmse_rel']:.4f} / {citrus_history[-1]['rmse_rel_core']:.4f}")
     print(f"CITRUS {t_citrus:.1f} s ({summary['citrus']['scatter_s_per_outer']:.1f} s scatter + "
           f"{summary['citrus']['mbir_s_per_outer']:.1f} s MBIR per outer iteration), no correction {t_none:.1f} s; "
           f"peak allocated GPU memory of CITRUS {summary['citrus']['gpu_peak_allocated_mib']:.0f} MiB")
 
     # ---- figures ---------------------------------------------------------------------------------------------
-    Xt, X0 = data["X_true"], info_c["init_recon"]
-    vols = [("truth", Xt), ("FDK (initialization)", X0), ("MBIR, no correction", X_n), ("CITRUS", X_c)]
+    Xt, X0 = data["X_true"], citrus_info["init_recon"]
+    vols = [("truth", Xt), ("FDK (initialization)", X0), ("MBIR, no correction", X_no_correction), ("CITRUS", X_citrus)]
     figs = {
-        "slices": plot_slices(vols, grid, title=f"central slice z = 0 ({len(angles)} views, {args.outer} outer "
-                                                 f"iterations)"),
+        "slices": plot_slices(vols, grid, title=f"central slice z = 0 ({len(angles)} views, "
+                                                f"{args.outer_iterations} outer iterations)"),
         "profiles": plot_profiles(vols, grid, title="central row y = 0 (lung -8..-2, air 2..4, bone 6..8 cm)"),
-        "rmse": plot_history([("CITRUS", [h["rmse_rel"] for h in hist_c]),
-                              ("MBIR, no correction", [h["rmse_rel"] for h in hist_n])],
+        "rmse": plot_history([("CITRUS", [h["rmse_rel"] for h in citrus_history]),
+                              ("MBIR, no correction", [h["rmse_rel"] for h in no_correction_history])],
                              title="relative RMSE over the prism"),
     }
     # estimated vs true scatter-to-primary ratio of view 0 (central detector row)
     fig, ax = plt.subplots(figsize=(7.0, 3.2))
-    u = geom.pixel_uv(dtype=torch.float64)[0].numpy()
-    r = geom.num_det_rows // 2
+    u = geometry.pixel_uv(dtype=torch.float64)[0].numpy()
+    r = geometry.num_det_rows // 2
     ax.plot(u, spr_true[0, r], color="k", lw=1.2, label="true SPR")
-    ax.plot(u, info_c["spr"][0, r].cpu().numpy(), ls="--", label=f"CITRUS estimate (outer iteration {args.outer})")
+    ax.plot(u, citrus_info["spr"][0, r].cpu().numpy(), ls="--",
+            label=f"CITRUS estimate (outer iteration {args.outer_iterations})")
     ax.set_xlabel("u (cm), central detector row, view 0")
     ax.set_ylabel("scatter-to-primary ratio")
     ax.grid(True, alpha=0.3)
@@ -350,7 +366,7 @@ def main() -> None:
         fig.savefig(p, dpi=120, bbox_inches="tight")
         plt.close(fig)
         print(f"figure: {p}")
-    print(f"total {time.perf_counter() - t_all:.1f} s")
+    print(f"total {time.perf_counter() - start_time:.1f} s")
 
 
 if __name__ == "__main__":

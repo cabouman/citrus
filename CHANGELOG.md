@@ -1,5 +1,402 @@
 # Changelog
 
+## v0.4.0 — 2026-10-17
+
+Plain names. Every abbreviated identifier, file and module name, configuration field, command-line flag and
+user-facing dictionary key is spelled out (`fc` -> `first_collision`, `uc` -> `uncollided`, `mc` ->
+`multiple_collision`, `si` -> `source_iteration`, `ld` -> `linear_discontinuous`, `sh` -> `spherical_harmonic`,
+`ctx` -> `context` / `sweep_context`, `geom` -> `geometry`, `lib` -> `library`, `quad` -> `quadrature`, `om` ->
+`directions`, `dev` -> `device`, `dt` -> `dtype`, `cfg` -> `config`, `acc` -> `accumulator`, `rec` -> `record`,
+`idx` -> `index`, `tol` -> `tolerance`, `n_sub` -> `samples_per_pixel_axis`, `det` -> `detector`, `proj` ->
+`projection`, module aliases -> the module names). **Breaking change** for every caller; **no change in behaviour**:
+the computations, the defaults, the test tolerances and the regression anchors are unchanged, `check_cuda.sh` reports
+every kernel matching, and the demo at its defaults gives CITRUS 0.0215 / 0.0259 as in version 0.3.0.
+
+The documented equation symbols stay (rho, mu_t, mu_s, phi, psi, eta, omega, tau, X, Y, I0, P, S, SPR, Phi, T and
+the dimension letters G, L, K, M, N, V, Rd, Cd, Rc, Cc, Sc, D8, Dc, q, ...); each is explained where it first appears.
+Short loop indices, the names dictated by MBIRTORCH (`recon`, `init_recon`, `det_*` geometry fields, `fm_hessian`, ...),
+PyTorch, NumPy and argparse, and the register-level temporaries inside the Triton kernel bodies are unchanged.
+
+**On-disk formats are unchanged.** Data sets (`.npz` keys such as `si_iterations`, `phi_air`, the meta's
+`solver_config`, which maps `source_iteration_tolerance` / `max_source_iterations` back to `si_tol` /
+`si_max_iterations` through `utilities._solver_config_record`), the demo's summary JSON (`outer`, `k` in the
+histories, `scatter_view_interp_order`, ...), the cross-section library cache (the key JSON keeps `de_kev` and `n_gl`,
+so every cached `mglib_*.pt` is still found) and all cache and output file names read and write exactly as before.
+The `MultigroupLibrary` fields (`mu_t`, `mu_pe`, `mu_s_l`, `mu_s_eta`, `fine_mu_t`, ...) are saved in the library
+cache and keep their names; so do the benchmark record keys (`dev_triton_vs_torch`, `down_ms`, ...).
+
+### File renames
+
+| Old | New |
+|---|---|
+| `citrus/scatter_solver/ld_cell.py` | `citrus/scatter_solver/linear_discontinuous_cell.py` |
+| `citrus/scatter_solver/kernels/triton_utils.py` | `citrus/scatter_solver/kernels/triton_utilities.py` |
+| `tests/test_ld_cell.py` | `tests/test_linear_discontinuous_cell.py` |
+| `tests/oracles/ld_slab_1d.py` | `tests/oracles/linear_discontinuous_slab_1d.py` (`ld_slab_sweep` -> `linear_discontinuous_slab_sweep`) |
+
+### Dictionary keys
+
+| Where | Old | New |
+|---|---|---|
+| `citrus_recon` / `mbir_recon` `info["records"]` (and the callback's `record`) | `k` | `outer_iteration` |
+| | `t_scatter` | `scatter_seconds` |
+| | `t_mbir` | `mbir_seconds` |
+| | `t_total` | `total_seconds` |
+| | `t_transfer` | `transfer_seconds` |
+| | `t_primary` | `primary_seconds` |
+| | `t_skipped` | `interpolation_seconds` |
+| | `acc_change_mean` | `accumulator_change_mean` |
+| | `acc_change_max` | `accumulator_change_max` |
+| | `scatter_change_rel` | `scatter_change_relative` |
+| | `gpu_peak_mib` | `gpu_peak_allocated_mib` |
+| `ViewResult.timings` | `mc_source` | `multiple_collision_source` |
+| `ViewResult.to_numpy_dict()` | `si_converged`, `si_history`, `si_num_iterations`, `si_phi_norms` | `source_iteration_converged`, `source_iteration_history`, `source_iteration_num_iterations`, `source_iteration_phi_norms` (`timing_mc_source` -> `timing_multiple_collision_source`) |
+| cross-section backend `kind` (`sigma`, `pdf_raw`, `library_pdf_normalization`) | `"pe"`, `"cs"`, `"rs"` | `"photoelectric"`, `"compton"`, `"rayleigh"` |
+| `DirectionSetContext` in-memory cache key | `("sh", L)` | `("spherical_harmonics", L)` |
+| `ray_tracing_kernels._pixel_geometry_scalars` (internal) | `pix`, `bc` | `pixel`, `box_center` |
+
+### Command-line flags
+
+| Script | Old | New |
+|---|---|---|
+| `demo/demo_citrus.py` | `--outer` | `--outer-iterations` |
+| | `--scatter-view-interp-order` | `--scatter-view-interpolation-order` |
+| `benchmarks/bench_citrus_memory.py` | `--voxel` | `--delta-voxel` |
+| | `--cell` | `--transport-cell-cm` |
+| | `--stride` | `--scatter-view-stride` |
+| | `--outer` | `--outer-iterations` |
+| | `--memory-cap` | `--memory-cap-mib` |
+| `benchmarks/profile_citrus_step.py` | `--voxel` | `--delta-voxel` |
+| | `--cell` | `--transport-cell-cm` |
+| | `--memory-cap` | `--memory-cap-mib` |
+| `benchmarks/bench_transport_sweep.py` | `--mem-cap-mib` | `--memory-cap-mib` |
+| | `--no-si` | `--no-source-iteration` |
+| `benchmarks/bench_uncollided_kernel.py` | `--reps` | `--repeats` |
+
+### Names, by module
+
+Instance attributes follow the constructor parameters below (`ScatterSolver.library`, `.geometry`,
+`.first_collision_chunk`, `.primary_samples_per_pixel_axis`, `.direction_context_cache_size`, and
+`ScatterSolver.lib_transport` -> `transport_library`; `StateStore.pin` -> `StateStore.pinned`;
+`ViewChunkProjector.geometry`; `_Footprint.ctx` / `.h` / `.h_center` -> `.context` / `.heights` / `.center_height`;
+the private caches of `ScatterSolver` `_ctx_cache` / `_grid_cache` / `_cone_cache` / `_dir_ctx_cache` ->
+`_sweep_contexts` / `_transport_grids` / `_cone_quadratures` / `_direction_contexts`). Module-internal aliases are
+replaced by the module names (`_st`, `_tri`, `_tu`, `_fc_tri` -> `ray_tracing_kernels`, `sweep_kernels`,
+`triton_utilities`, `uncollided_kernels`). Local variables are renamed throughout and are not listed.
+
+#### `citrus.citrus`
+
+| Kind | Old | New |
+|---|---|---|
+| function | `_fields` | `_material_fields_or_build` |
+| function | `G1` | `uncollided_operator` |
+| function | `G1to2` | `first_collision_operator` |
+| function | `G_gt2` | `multiple_collision_operator` |
+| function | `G_step` | `accumulator_update_operator` |
+| constant | `_FP16_TARGET` | `_FLOAT16_TARGET` |
+| constant | `SCATTER_VIEW_INTERP_ORDERS` | `SCATTER_VIEW_INTERPOLATION_ORDERS` |
+| function | `_check_interp_order` | `_check_interpolation_order` |
+| field | `CitrusState.Phi_gt1` | `CitrusState.collided_moments` |
+| field | `CitrusState.cone_quad` | `CitrusState.cone_quadrature` |
+| field | `DensityModel.lib` | `DensityModel.library` |
+| field | `CitrusConfig.num_outer` | `CitrusConfig.num_outer_iterations` |
+| field | `CitrusConfig.pin_limit_gib` | `CitrusConfig.pinned_memory_limit_gib` |
+| field | `CitrusConfig.scatter_view_interp_order` | `CitrusConfig.scatter_view_interpolation_order` |
+| parameter | `phi_uc` | `phi_uncollided` (in `first_collision_operator`, `accumulator_update_operator`, `project_scatter`) |
+| parameter | `f` | `fields` (in `_check_accumulator`) |
+| parameter | `Phi_gt1` | `collided_moments` (in `_check_accumulator`, `multiple_collision_operator`, `accumulator_update_operator`, `project_scatter`) |
+| parameter | `quad` | `quadrature` (in `project_scatter`) |
+| parameter | `lib` | `library` (in `DensityModel.from_library`) |
+| parameter | `pin_limit_gib` | `pinned_memory_limit_gib` (in `StateStore`) |
+| parameter | `i` | `slot` (in `StateStore.put`, `StateStore.get`) |
+| parameter | `Phi` | `accumulator` (in `StateStore.put`) |
+| parameter | `s_c` | `computed_scatter` (in `interpolate_scatter`) |
+| parameter | `reg` | `regularization` (in `apply_regularization`) |
+| parameter | `dev` | `device` (in `_sync`) |
+
+#### `citrus.recon.mbir_bridge`
+
+| Kind | Old | New |
+|---|---|---|
+| parameter | `geom` | `geometry` (in `make_cone_model`, `short_scan_weights`, `fdk`, `ViewChunkProjector`) |
+| parameter | `tol` | `tolerance` (in `is_short_scan`) |
+
+#### `citrus.scatter_solver.angular_quadrature`
+
+| Kind | Old | New |
+|---|---|---|
+| function | `_as_vec3` | `_unit_vector` |
+| function | `legendre_p` | `legendre_polynomials` |
+| function | `num_sh` | `num_spherical_harmonics` |
+| function | `sh_degree_index` | `spherical_harmonic_degree_index` |
+| class | `SHBasis` | `SphericalHarmonicBasis` |
+| function | `sh_basis` | `spherical_harmonic_basis` |
+| field | `SphericalHarmonicBasis.Yw` | `SphericalHarmonicBasis.Y_weighted` |
+| field | `SphericalHarmonicBasis.l_of_n` | `SphericalHarmonicBasis.degree_of_moment` |
+| parameter | `quad` | `quadrature` (in `spherical_harmonic_basis`) |
+| parameter | `mu_s_l_vol` | `mu_s_l_volume` (in `scatter_source_moments`) |
+| parameter | `Y_sub` | `Y_selected` (in `scatter_source_at_directions`) |
+
+#### `citrus.scatter_solver.config`
+
+| Kind | Old | New |
+|---|---|---|
+| field | `SolverConfig.si_tol` | `SolverConfig.source_iteration_tolerance` |
+| field | `SolverConfig.si_max_iterations` | `SolverConfig.max_source_iterations` |
+
+#### `citrus.scatter_solver.cross_section_library`
+
+| Kind | Old | New |
+|---|---|---|
+| function | `_table` | `_material_table` |
+| constant | `_Q_BREAKS` | `_Q_BREAKPOINTS` |
+| method | `_XrayPhysicsBackend.library_pdf_norm` | `_XrayPhysicsBackend.library_pdf_normalization` |
+| method | `_Spectrum.cumint` | `_Spectrum.cumulative_integral` |
+| function | `sphere_quadrature_q` | `eta_quadrature_in_q` |
+| field | `BuildInfo.sigma_cs_group` | `BuildInfo.sigma_compton_group` |
+| field | `BuildInfo.sigma_rs_group` | `BuildInfo.sigma_rayleigh_group` |
+| field | `BuildInfo.sigma_pe_group` | `BuildInfo.sigma_photoelectric_group` |
+| field | `BuildInfo.sigma_t_group` | `BuildInfo.sigma_total_group` |
+| field | `BuildInfo.pdf_norm_max_rel_dev` | `BuildInfo.pdf_normalization_max_relative_deviation` |
+| parameter | `de_kev` | `fine_bin_width_kev` (in `fine_energy_grid`, `compute_library`, `_cache_key`, `build_library`) |
+| parameter | `breaks_q` | `q_breakpoints` (in `eta_quadrature_in_q`) |
+| parameter | `n_gl` | `gauss_legendre_nodes` (in `eta_quadrature_in_q`, `compute_library`, `_cache_key`, `build_library`) |
+| parameter | `b` | `backend` (in `_spectrum_or_default`) |
+
+#### `citrus.scatter_solver.cross_sections`
+
+| Kind | Old | New |
+|---|---|---|
+| parameter | `lib` | `library` (in `mu_t_volume`, `fine_group_weights`, `group_transmission`, `transfer_moments_volume`, `transfer_eta_at`, `transfer_eta_at_pairs`) |
+
+#### `citrus.scatter_solver.detector`
+
+| Kind | Old | New |
+|---|---|---|
+| constant | `RHO_PB` | `RHO_LEAD` |
+| constant | `_EDGE_EPS` | `_EDGE_SPACING_KEV` |
+| constant | `_PB_TABLE` | `_LEAD_TABLE` |
+| function | `_loglog` | `_log_log_interpolation` |
+| parameter | `mu_mass_csi` | `mass_attenuation` (in `csi_response`) |
+| parameter | `mu_lead` | `mass_attenuation` (in `focused_1d_grid`) |
+| parameter | `density_lead` | `lead_density` (in `focused_1d_grid`) |
+| parameter | `geom` | `geometry` (in `detector_angle`, `grid_angles`) |
+
+#### `citrus.scatter_solver.kernels.ray_tracing_kernels`
+
+| Kind | Old | New |
+|---|---|---|
+| Triton kernel | `_down_shared_kernel` | `_downstream_shared_kernel` |
+| function | `_pixel_geo` | `_pixel_geometry_scalars` |
+| parameter | `vol_ptr` | `volume_ptr` (in `_trace`, `_ray_kernel`) |
+| parameter | `vidx_ptr` | `volume_index_ptr` (in `_ray_kernel`) |
+| parameter | `om_ptr` | `direction_ptr` (in `_ray_kernel`, `_downstream_shared_kernel`) |
+| parameter | `HAS_VIDX` | `HAS_VOLUME_INDEX` (in `_ray_kernel`) |
+| parameter | `tw_ptr` | `toward_ptr` (in `_downstream_shared_kernel`) |
+| parameter | `vol` | `volume` (in `_launch_ray`) |
+| parameter | `vidx` | `volume_index` (in `_launch_ray`) |
+| parameter | `om` | `directions` (in `_launch_ray`) |
+| parameter | `vol_k_stride` | `volume_stride` (in `_launch_ray`) |
+| parameter | `geo` | `geometry_scalars` (in `_launch_ray`) |
+| parameter | `geom` | `geometry` (in `_pixel_geometry_scalars`, `upstream_cumulative`, `primary_project`, `toward_flags`, `downstream_cumulative`, `oblique_project`) |
+| parameter | `n_sub` | `samples_per_pixel_axis` (in `primary_project`) |
+
+#### `citrus.scatter_solver.kernels.sweep_kernels`
+
+| Kind | Old | New |
+|---|---|---|
+| Triton kernel | `_ld_plane_kernel` | `_linear_discontinuous_plane_kernel` |
+| field | `FlatPlaneIndex.up` | `FlatPlaneIndex.upstream` |
+| parameter | `up_cell` | `upstream_cell` (in `build_flat_index`) |
+| parameter | `src_ptr` | `source_ptr` (in `_linear_discontinuous_plane_kernel`) |
+| parameter | `oct_ptr` | `octant_ptr` (in `_linear_discontinuous_plane_kernel`) |
+| parameter | `up_ptr` | `upstream_ptr` (in `_linear_discontinuous_plane_kernel`) |
+| parameter | `src` | `source` (in `sweep_planes`) |
+
+#### `citrus.scatter_solver.kernels.triton_utils` -> `citrus.scatter_solver.kernels.triton_utilities`
+
+Module renamed; no names inside it changed.
+
+#### `citrus.scatter_solver.kernels.uncollided_kernels`
+
+| Kind | Old | New |
+|---|---|---|
+| Triton kernel | `_fc_kernel` | `_first_collision_kernel` |
+| function | `fc_source` | `first_collision_source` |
+| function | `fc_source_or_none` | `first_collision_source_or_none` |
+| parameter | `idx_ptr` | `index_ptr` (in `_first_collision_kernel`) |
+| parameter | `xax_ptr` | `x_axis_ptr` (in `_first_collision_kernel`) |
+| parameter | `yax_ptr` | `y_axis_ptr` (in `_first_collision_kernel`) |
+| parameter | `zax_ptr` | `z_axis_ptr` (in `_first_collision_kernel`) |
+| parameter | `om_ptr` | `direction_ptr` (in `_first_collision_kernel`) |
+| parameter | `tab_ptr` | `table_ptr` (in `_first_collision_kernel`) |
+| parameter | `lib` | `library` (in `prepared_table`, `kernel_supports`, `first_collision_source`, `first_collision_source_or_none`) |
+| parameter | `phi_uc` | `phi_uncollided` (in `kernel_supports`, `first_collision_source`, `first_collision_source_or_none`) |
+| parameter | `geom` | `geometry` (in `first_collision_source`, `first_collision_source_or_none`) |
+
+#### `citrus.scatter_solver.ld_cell` -> `citrus.scatter_solver.linear_discontinuous_cell`
+
+| Kind | Old | New |
+|---|---|---|
+| function | `ld_cell_rhs` | `cell_right_hand_sides` |
+| function | `ld_cell_solve` | `cell_solve` |
+| function | `ld_cell_matrix` | `cell_matrix` |
+| parameter | `nbr_psi0` | `neighbor_psi0` (in `cell_right_hand_sides`) |
+| parameter | `nbr_psia` | `neighbor_psia` (in `cell_right_hand_sides`) |
+
+#### `citrus.scatter_solver.ray_tracing`
+
+| Kind | Old | New |
+|---|---|---|
+| method | `SiddonProjectors._toward` | `SiddonProjectors._toward_panel` |
+| parameter | `geom` | `geometry` (in `Projectors.upstream_cumulative`, `Projectors.upstream_to_points`, `Projectors.primary_project`, `Projectors.downstream_cumulative`, `Projectors.oblique_project`, `SiddonProjectors._toward_panel`, `SiddonProjectors.upstream_cumulative`, `SiddonProjectors.upstream_to_points`, `SiddonProjectors.primary_project`, `SiddonProjectors.downstream_cumulative`, `SiddonProjectors.oblique_project`) |
+| parameter | `vol_t` | `flat_volume` (in `_trace_chunk`, `_line_integrals_flat`) |
+| parameter | `vol_offset` | `volume_offset` (in `_trace_chunk`) |
+| parameter | `n_sub` | `samples_per_pixel_axis` (in `SiddonProjectors`, `SiddonProjectors.primary_project`) |
+| parameter | `om` | `directions` (in `SiddonProjectors._toward_panel`) |
+
+#### `citrus.scatter_solver.scatter_image`
+
+| Kind | Old | New |
+|---|---|---|
+| type alias | `SourceFn` | `SourceFunction` |
+| function | `_primary_n_sub` | `_primary_samples_per_pixel_axis` |
+| field | `DirectionSetContext.quad` | `DirectionSetContext.quadrature` |
+| field | `DirectionSetContext.geom` | `DirectionSetContext.geometry` |
+| field | `DirectionSetContext.acc_weight` | `DirectionSetContext.accumulation_weight` |
+| field | `DirectionSetContext.bounds` | `DirectionSetContext.chunk_bounds` |
+| parameter | `geom` | `geometry` (in `covering_polar_angle`, `panel_direction_set`, `DirectionSetContext.check`, `make_direction_context`, `_resolve_context`, `scatter_image_from_source`, `panel_height_field`, `_Footprint`, `combined_scatter_image`, `primary_subpixel_geometry`, `primary_path_lengths`, `primary_from_path_lengths`, `primary_image`) |
+| parameter | `quad` | `quadrature` (in `DirectionSetContext.check`, `make_direction_context`, `_resolve_context`, `scatter_image_from_source`, `combined_scatter_image`) |
+| parameter | `grid_quad` | `grid_quadrature` (in `DirectionSetContext.subcell_offsets`, `_subcell_offsets`, `_check_subpoint_shapes`, `supervoxel_subpoint_emission`, `combined_scatter_image`) |
+| parameter | `acc` | `accumulator` (in `DirectionSetContext.accumulate`, `DirectionSetContext.finalize`) |
+| parameter | `img` | `image` (in `DirectionSetContext.accumulate`, `box_blur_rows_cols`, `_Footprint.blur`) |
+| parameter | `i` | `chunk_index` (in `DirectionSetContext.accumulate`, `_Footprint.blur`) |
+| parameter | `lib` | `library` (in `make_direction_context`, `_resolve_context`, `scatter_image_from_source`, `combined_scatter_image`, `primary_from_path_lengths`, `primary_image`) |
+| parameter | `source_fn` | `source_function` (in `scatter_image_from_source`) |
+| parameter | `src_quad` | `source_quadrature` (in `_check_subpoint_shapes`, `supervoxel_subpoint_emission`) |
+| parameter | `width_c` | `width_channels` (in `box_blur_rows_cols`) |
+| parameter | `width_r` | `width_rows` (in `box_blur_rows_cols`) |
+| parameter | `ctx` | `context` (in `_Footprint`) |
+| parameter | `e` | `emission` (in `_Footprint.mean_height`) |
+| parameter | `hbar` | `mean_heights` (in `_Footprint.blur`) |
+| parameter | `rho_quad` | `rho_quadrature` (in `combined_scatter_image`) |
+| parameter | `phi_uc_quad` | `phi_uncollided` (in `combined_scatter_image`) |
+| parameter | `T_mean` | `scatter_source_moments` (in `combined_scatter_image`) |
+| parameter | `fc_chunk` | `first_collision_chunk` (in `combined_scatter_image`) |
+| parameter | `n_sub` | `samples_per_pixel_axis` (in `primary_subpixel_geometry`, `_primary_samples_per_pixel_axis`, `primary_path_lengths`, `primary_image`) |
+
+#### `citrus.scatter_solver.scatter_solver`
+
+| Kind | Old | New |
+|---|---|---|
+| type alias | `SourceFn` | `SourceFunction` |
+| property | `MaterialFields.fc_pairs` | `MaterialFields.first_collision_pairs` |
+| method | `ScatterSolver.uncollided` | `ScatterSolver.uncollided_fluence` |
+| method | `ScatterSolver.fc_moment_source` | `ScatterSolver.first_collision_moment_source` |
+| method | `ScatterSolver.fc_sampling_correction` | `ScatterSolver.first_collision_sampling_correction` |
+| method | `ScatterSolver.mc_source_moments` | `ScatterSolver.multiple_collision_source_moments` |
+| field | `MaterialFields.grid_quad` | `MaterialFields.grid_quadrature` |
+| field | `MaterialFields.rho_quad` | `MaterialFields.rho_quadrature` |
+| field | `MaterialFields.pairs_quad` | `MaterialFields.pairs_quadrature` |
+| field | `ViewResult.si` | `ViewResult.source_iteration_result` |
+| parameter | `lib` | `library` (in `truncated_library`, `ScatterSolver`) |
+| parameter | `geom` | `geometry` (in `ScatterSolver`) |
+| parameter | `fc_chunk` | `first_collision_chunk` (in `ScatterSolver`) |
+| parameter | `primary_n_sub` | `primary_samples_per_pixel_axis` (in `ScatterSolver`) |
+| parameter | `direction_context_cache` | `direction_context_cache_size` (in `ScatterSolver`) |
+| parameter | `quad` | `quadrature` (in `ScatterSolver.direction_context`, `ScatterSolver.scatter_image`) |
+| parameter | `phi_uc` | `phi_uncollided` (in `ScatterSolver.first_collision_moment_source`, `ScatterSolver.first_collision_sampling_correction`, `ScatterSolver.scatter_image`) |
+| parameter | `ctx` | `sweep_context` (in `ScatterSolver.first_collision_moment_source`, `ScatterSolver.first_collision_sampling_correction`, `ScatterSolver.scatter_moment_source`) |
+| parameter | `source_fn` | `source_function` (in `ScatterSolver.transport_sweep`) |
+| parameter | `fc_source_fn` | `first_collision_source_function` (in `ScatterSolver.run_source_iteration`) |
+| parameter | `T_mean` | `scatter_source_moments` (in `ScatterSolver.scatter_image`) |
+
+#### `citrus.scatter_solver.source`
+
+| Kind | Old | New |
+|---|---|---|
+| parameter | `lib` | `library` (in `SourceModel.per_group_strength`) |
+| parameter | `geom` | `geometry` (in `SourceModel.angular_weight`) |
+
+#### `citrus.scatter_solver.source_iteration`
+
+| Kind | Old | New |
+|---|---|---|
+| type alias | `SourceFn` | `SourceFunction` |
+| class | `SIResult` | `SourceIterationResult` |
+| function | `scatter_source_fn` | `scatter_source_function` |
+| parameter | `mu_s_l_vol` | `mu_s_l_volume` (in `scatter_moments`) |
+| parameter | `ctx` | `sweep_context` (in `scatter_source_function`, `source_iteration`) |
+| parameter | `mu_s_l_vol_coarse` | `mu_s_l_volume_coarse` (in `multiple_collision_source_moments`, `source_iteration`) |
+| parameter | `fc_source_fn` | `first_collision_source_function` (in `source_iteration`) |
+| parameter | `tol` | `tolerance` (in `source_iteration`) |
+
+#### `citrus.scatter_solver.transport_sweep`
+
+| Kind | Old | New |
+|---|---|---|
+| type alias | `SourceFn` | `SourceFunction` |
+| function | `source_fn_accepts_out` | `source_function_accepts_out` |
+| field | `PlaneIndex.octant3` | `PlaneIndex.octant_column` |
+| field | `PlaneIndex.up_cell` | `PlaneIndex.upstream_cell` |
+| field | `SweepContext.quad` | `SweepContext.quadrature` |
+| field | `SweepContext.perm` | `SweepContext.permutation` |
+| field | `SweepContext.flat` | `SweepContext.flat_index` |
+| parameter | `quad` | `quadrature` (in `make_sweep_context`) |
+| parameter | `ctx` | `sweep_context` (in `_use_triton`, `_sweep_chunk`, `_resolve_chunk`, `_fill_source`, `sweep`) |
+| parameter | `pl` | `plane` (in `_plane_step`) |
+| parameter | `src` | `source` (in `_plane_step`, `_sweep_chunk`) |
+| parameter | `source_fn` | `source_function` (in `source_function_accepts_out`, `_fill_source`, `sweep`) |
+
+#### `citrus.scatter_solver.uncollided`
+
+| Kind | Old | New |
+|---|---|---|
+| type alias | `PairsArg` | `PairsArgument` |
+| function | `fc_source_at_directions` | `first_collision_source_at_directions` |
+| function | `_fc_source_torch` | `_first_collision_source_torch` |
+| function | `_fc_source_torch_pairs` | `_first_collision_source_torch_pairs` |
+| function | `restrict_fc_to_ld_moments` | `restrict_to_linear_discontinuous_moments` |
+| function | `fc_exact_moments` | `first_collision_exact_moments` |
+| class | `FCSamplingCorrection` | `FirstCollisionSamplingCorrection` |
+| function | `fc_sampling_correction` | `first_collision_sampling_correction` |
+| constant | `_FC_SUM_MAX_DIRECTIONS` | `_FIRST_COLLISION_SUM_MAX_DIRECTIONS` |
+| function | `fc_quadrature_sums` | `first_collision_quadrature_sums` |
+| function | `fc_correction_factors` | `first_collision_correction_factors` |
+| field | `FirstCollisionSamplingCorrection.om_uc` | `FirstCollisionSamplingCorrection.omega_uncollided` |
+| parameter | `geom` | `geometry` (in `primary_directions_to_voxels`, `uncollided_fluence`, `uncollided_path_lengths`, `uncollided_from_path_lengths`, `first_collision_source_at_directions`, `_first_collision_source_torch`, `_first_collision_source_torch_pairs`, `first_collision_sampling_correction`, `first_collision_quadrature_sums`) |
+| parameter | `lib` | `library` (in `uncollided_fluence`, `uncollided_from_path_lengths`, `first_collision_source_at_directions`, `_first_collision_source_torch`, `_first_collision_source_torch_pairs`, `first_collision_exact_moments`, `first_collision_sampling_correction`, `first_collision_quadrature_sums`) |
+| parameter | `path` | `path_lengths` (in `uncollided_from_path_lengths`) |
+| parameter | `phi_uc` | `phi_uncollided` (in `first_collision_source_at_directions`, `_first_collision_source_torch`, `_first_collision_source_torch_pairs`, `first_collision_exact_moments`, `first_collision_sampling_correction`, `first_collision_quadrature_sums`) |
+| parameter | `fc` | `field` (in `restrict_to_linear_discontinuous_moments`) |
+| parameter | `fc` | `source` (in `FirstCollisionSamplingCorrection.apply`) |
+| parameter | `om_uc` | `omega_uncollided` (in `first_collision_quadrature_sums`) |
+
+#### `citrus.utilities`
+
+| Kind | Old | New |
+|---|---|---|
+| function | `_coeffs` | `_mass_attenuation_coefficients` |
+| function | `_np` | `_to_numpy` |
+| parameter | `lib` | `library` (in `effective_energy`, `mass_attenuation_at`, `nominal_densities`, `nominal_attenuation`, `material_order`, `_mass_attenuation_coefficients`, `densities_to_attenuation`, `attenuation_to_densities`, `attenuation_to_density`, `wlab_solver`, `synthesize_wlab_dataset`) |
+| parameter | `geom` | `geometry` (in `wlab_solver`, `synthesize_wlab_dataset`) |
+| parameter | `sl` | `image_slice` (in `central_row`) |
+
+### Tests, benchmarks and demos
+
+Fixtures `libs` -> `libraries`, `real_lib` -> `real_library`, `bk` -> `sweep_backend` (its methods `ctx` / `tol` ->
+`context` / `tolerance`); helpers `use_fc_backend` -> `use_first_collision_backend`, `FC_BACKENDS` ->
+`FIRST_COLLISION_BACKENDS`, `ORIGINAL_FC` -> `ORIGINAL_FIRST_COLLISION`, `_dense_ld_solve` ->
+`_dense_linear_discontinuous_solve`, `_scipy_real_sh` -> `_scipy_real_spherical_harmonics`, `_fc_fn` ->
+`_first_collision_function`, `_fc_kernel_or_skip` -> `_first_collision_kernel_or_skip`, `_fc_moment_sources` ->
+`_first_collision_moment_sources`, `_small_fc_case` -> `_small_first_collision_case`, `_broadcast_mc_source` ->
+`_broadcast_multiple_collision_source`, `_zero_mc` -> `_zero_multiple_collision`, `dir_source_fn` /
+`const_source_fn` -> `direction_source_function` / `constant_source_function`, `TRITON_TOL` -> `TRITON_TOLERANCE`;
+module aliases (`step1`, `step3`, `step1_triton`, `solver_mod`, `citrus_mod`, `citrus_hooks`, `_si`, `xb`,
+`siddon_triton`, `sweep_triton`) -> the module names (`uncollided`, `scatter_image`, `uncollided_kernels`,
+`scatter_solver`, `citrus`, `cross_section_library`, `ray_tracing_kernels`, `sweep_kernels`, with a `_module` suffix
+where the plain name is taken).
+
 ## v0.3.0 — 2026-10-17
 
 Densities from the attenuation one material at a time, MBIRTORCH primaries in the CITRUS loop, MBIR resumed from its

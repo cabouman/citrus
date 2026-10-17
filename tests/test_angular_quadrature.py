@@ -9,16 +9,16 @@ import torch
 from citrus.scatter_solver.angular_quadrature import (
     Quadrature,
     hemisphere_quadrature,
-    legendre_p,
+    legendre_polynomials,
     moments_from_ordinates,
-    num_sh,
+    num_spherical_harmonics,
     ordinates_from_moments,
     product_quadrature,
     real_spherical_harmonics,
     scatter_source_at_directions,
     scatter_source_moments,
-    sh_basis,
-    sh_degree_index,
+    spherical_harmonic_basis,
+    spherical_harmonic_degree_index,
 )
 from citrus.scatter_solver.cross_sections import synthetic_library, transfer_eta_at, transfer_moments_volume
 
@@ -32,66 +32,66 @@ def _random_dirs(n, seed=0, dtype=F64):
     return v / torch.linalg.norm(v, dim=-1, keepdim=True)
 
 
-def _gram(L, quad):
-    b = sh_basis(L, quad)
-    return b.Yw.T @ b.Y
+def _gram(L, quadrature):
+    b = spherical_harmonic_basis(L, quadrature)
+    return b.Y_weighted.T @ b.Y
 
 
 # ---- (a) product quadrature -----------------------------------------------------------------------
 
 @pytest.mark.parametrize("L", [3, 5, 7])
 def test_product_orthonormality(L):
-    quad = product_quadrature(L + 1, 2 * L + 1)
-    assert abs(float(quad.weight.sum()) - FOUR_PI) < 1e-12
-    err = (_gram(L, quad) - torch.eye(num_sh(L), dtype=F64)).abs().max().item()
+    quadrature = product_quadrature(L + 1, 2 * L + 1)
+    assert abs(float(quadrature.weight.sum()) - FOUR_PI) < 1e-12
+    err = (_gram(L, quadrature) - torch.eye(num_spherical_harmonics(L), dtype=F64)).abs().max().item()
     assert err < 1e-10, err
 
 
 def test_product_default_orthonormality():
-    quad = product_quadrature(8, 16)
-    err = (_gram(7, quad) - torch.eye(64, dtype=F64)).abs().max().item()
+    quadrature = product_quadrature(8, 16)
+    err = (_gram(7, quadrature) - torch.eye(64, dtype=F64)).abs().max().item()
     assert err < 1e-10, err
 
 
 def test_product_orthonormality_fails_with_too_few_azimuths():
     L = 3
-    quad = product_quadrature(L + 1, 4)  # needs >= 2L+1 = 7
-    err = (_gram(L, quad) - torch.eye(num_sh(L), dtype=F64)).abs().max().item()
+    quadrature = product_quadrature(L + 1, 4)  # needs >= 2L+1 = 7
+    err = (_gram(L, quadrature) - torch.eye(num_spherical_harmonics(L), dtype=F64)).abs().max().item()
     assert err > 0.1
 
 
 def test_product_orthonormality_fails_with_too_few_polar():
     L = 5
-    quad = product_quadrature(3, 2 * L + 1)  # needs >= L+1 = 6
-    err = (_gram(L, quad) - torch.eye(num_sh(L), dtype=F64)).abs().max().item()
+    quadrature = product_quadrature(3, 2 * L + 1)  # needs >= L+1 = 6
+    err = (_gram(L, quadrature) - torch.eye(num_spherical_harmonics(L), dtype=F64)).abs().max().item()
     assert err > 1e-3
 
 
 def test_product_octants():
-    quad = product_quadrature(8, 16)
-    assert quad.directions_per_octant == 16
-    perm, counts = quad.by_octant()
+    quadrature = product_quadrature(8, 16)
+    assert quadrature.directions_per_octant == 16
+    perm, counts = quadrature.by_octant()
     assert counts.tolist() == [16] * 8
-    oct_sorted = quad.octant[perm]
+    oct_sorted = quadrature.octant[perm]
     assert torch.equal(oct_sorted, torch.arange(8).repeat_interleave(16))
     # octant code definition
-    om = quad.omega
-    code = (om[:, 0] < 0).long() * 4 + (om[:, 1] < 0).long() * 2 + (om[:, 2] < 0).long()
-    assert torch.equal(code, quad.octant)
-    re = quad.reordered(perm)
+    directions = quadrature.omega
+    code = (directions[:, 0] < 0).long() * 4 + (directions[:, 1] < 0).long() * 2 + (directions[:, 2] < 0).long()
+    assert torch.equal(code, quadrature.octant)
+    re = quadrature.reordered(perm)
     assert torch.equal(re.octant, oct_sorted)
     # odd polar count puts mu = 0 on the equator -> unbalanced
     assert product_quadrature(3, 8).directions_per_octant is None
 
 
-# ---- (c) real SH vs scipy -------------------------------------------------------------------------
+# ---- (c) real spherical-harmonic vs scipy -------------------------------------------------------------------------
 
-def _scipy_real_sh(L, omega):
+def _scipy_real_spherical_harmonics(L, omega):
     from scipy import special
 
-    om = omega.numpy()
-    theta = np.arccos(np.clip(om[:, 2], -1, 1))
-    phi = np.arctan2(om[:, 1], om[:, 0])
+    directions = omega.numpy()
+    theta = np.arccos(np.clip(directions[:, 2], -1, 1))
+    phi = np.arctan2(directions[:, 1], directions[:, 0])
     cols = []
     for l in range(L + 1):
         for k in range(-l, l + 1):
@@ -111,35 +111,35 @@ def _scipy_real_sh(L, omega):
 
 def test_real_sh_vs_scipy():
     L = 7
-    om = _random_dirs(200, seed=1)
-    om = torch.cat([om, torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]], dtype=F64)])
-    Y = real_spherical_harmonics(L, om)
-    assert Y.shape == (om.shape[0], 64)
-    ref = _scipy_real_sh(L, om)
-    assert np.abs(Y.numpy() - ref).max() < 1e-10
+    directions = _random_dirs(200, seed=1)
+    directions = torch.cat([directions, torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]], dtype=F64)])
+    Y = real_spherical_harmonics(L, directions)
+    assert Y.shape == (directions.shape[0], 64)
+    reference = _scipy_real_spherical_harmonics(L, directions)
+    assert np.abs(Y.numpy() - reference).max() < 1e-10
 
 
 def test_real_sh_low_order_explicit():
-    om = _random_dirs(10, seed=2)
-    Y = real_spherical_harmonics(1, om)
+    directions = _random_dirs(10, seed=2)
+    Y = real_spherical_harmonics(1, directions)
     c0, c1 = 1 / math.sqrt(4 * math.pi), math.sqrt(3 / (4 * math.pi))
     assert torch.allclose(Y[:, 0], torch.full((10,), c0, dtype=F64))
-    assert torch.allclose(Y[:, 1], c1 * om[:, 1])  # k = -1 -> y
-    assert torch.allclose(Y[:, 2], c1 * om[:, 2])  # k = 0 -> z
-    assert torch.allclose(Y[:, 3], c1 * om[:, 0])  # k = +1 -> x
+    assert torch.allclose(Y[:, 1], c1 * directions[:, 1])  # k = -1 -> y
+    assert torch.allclose(Y[:, 2], c1 * directions[:, 2])  # k = 0 -> z
+    assert torch.allclose(Y[:, 3], c1 * directions[:, 0])  # k = +1 -> x
 
 
 def test_sh_degree_index():
-    assert sh_degree_index(2).tolist() == [0, 1, 1, 1, 2, 2, 2, 2, 2]
-    assert num_sh(7) == 64
+    assert spherical_harmonic_degree_index(2).tolist() == [0, 1, 1, 1, 2, 2, 2, 2, 2]
+    assert num_spherical_harmonics(7) == 64
 
 
 def test_legendre_p_vs_numpy():
     x = torch.linspace(-1, 1, 101, dtype=F64)
-    P = legendre_p(8, x)
+    P = legendre_polynomials(8, x)
     for l in range(9):
-        ref = np.polynomial.legendre.legval(x.numpy(), [0] * l + [1])
-        assert np.abs(P[:, l].numpy() - ref).max() < 1e-13
+        reference = np.polynomial.legendre.legval(x.numpy(), [0] * l + [1])
+        assert np.abs(P[:, l].numpy() - reference).max() < 1e-13
 
 
 # ---- (d) addition theorem -------------------------------------------------------------------------
@@ -148,8 +148,8 @@ def test_addition_theorem():
     L = 7
     a, b = _random_dirs(50, seed=3), _random_dirs(50, seed=4)
     Ya, Yb = real_spherical_harmonics(L, a), real_spherical_harmonics(L, b)
-    P = legendre_p(L, (a * b).sum(-1))
-    lofn = sh_degree_index(L)
+    P = legendre_polynomials(L, (a * b).sum(-1))
+    lofn = spherical_harmonic_degree_index(L)
     for l in range(L + 1):
         sel = lofn == l
         lhs = FOUR_PI / (2 * l + 1) * (Ya[:, sel] * Yb[:, sel]).sum(-1)
@@ -160,17 +160,17 @@ def test_addition_theorem():
 
 def test_isotropic_moments_and_inversion(device):
     L = 5
-    quad = product_quadrature(L + 1, 2 * L + 2, device=device)
-    b = sh_basis(L, quad)
-    psi = torch.full((3, quad.num_directions), 2.5, dtype=F64, device=device)
+    quadrature = product_quadrature(L + 1, 2 * L + 2, device=device)
+    b = spherical_harmonic_basis(L, quadrature)
+    psi = torch.full((3, quadrature.num_directions), 2.5, dtype=F64, device=device)
     phi = moments_from_ordinates(psi, b)
     assert abs(phi[:, 0] - math.sqrt(FOUR_PI) * 2.5).max().item() < 1e-12
     assert phi[:, 1:].abs().max().item() < 1e-12
     # band-limited round trip
     g = torch.Generator().manual_seed(5)
-    phi_r = torch.randn(4, 2, num_sh(L), generator=g, dtype=F64).to(device)
+    phi_r = torch.randn(4, 2, num_spherical_harmonics(L), generator=g, dtype=F64).to(device)
     psi_r = ordinates_from_moments(phi_r, b)
-    assert psi_r.shape == (4, 2, quad.num_directions)
+    assert psi_r.shape == (4, 2, quadrature.num_directions)
     assert (moments_from_ordinates(psi_r, b) - phi_r).abs().max().item() < 1e-11
     assert psi_r.device.type == device.type
 
@@ -179,29 +179,29 @@ def test_isotropic_moments_and_inversion(device):
 
 def test_scatter_operator_matches_direct_kernel():
     G, L = 3, 3
-    lib = synthetic_library(num_groups=G, legendre_order=5)
+    library = synthetic_library(num_groups=G, legendre_order=5)
     g = torch.Generator().manual_seed(7)
     rho = torch.rand(2, 2, 2, 1, generator=g, dtype=F64) * torch.tensor([1.0, 0.5], dtype=F64)[:, None, None, None]
-    mu_vol = transfer_moments_volume(lib, rho)  # [G, G, 6, 2, 2, 1]
-    quad = product_quadrature(8, 16)
-    b = sh_basis(L, quad)
-    M = quad.num_directions
-    psi = ordinates_from_moments(torch.randn(G, num_sh(L), generator=g, dtype=F64), b)  # [G, M]
+    mu_vol = transfer_moments_volume(library, rho)  # [G, G, 6, 2, 2, 1]
+    quadrature = product_quadrature(8, 16)
+    b = spherical_harmonic_basis(L, quadrature)
+    M = quadrature.num_directions
+    psi = ordinates_from_moments(torch.randn(G, num_spherical_harmonics(L), generator=g, dtype=F64), b)  # [G, M]
 
     # moment path, psi shared across voxels
     phi = moments_from_ordinates(psi, b)  # [G, N]
-    phi_vox = phi[:, :, None, None, None].expand(G, num_sh(L), 2, 2, 1)
+    phi_vox = phi[:, :, None, None, None].expand(G, num_spherical_harmonics(L), 2, 2, 1)
     T = scatter_source_moments(mu_vol, phi_vox)  # [G, N, 2, 2, 1]
     S_mom = ordinates_from_moments(T.permute(0, 2, 3, 4, 1), b)  # [G, 2, 2, 1, M]
 
     # direct path: S(Omega_m) = sum_gin sum_m' w_m' mu_s(eta = Omega_m'.Omega_m) psi[gin, m']
-    eta = (quad.omega @ quad.omega.T).reshape(-1)  # [M*M] (m, m')
+    eta = (quadrature.omega @ quadrature.omega.T).reshape(-1)  # [M*M] (m, m')
     S_dir = torch.zeros(G, 2, 2, 1, M, dtype=F64)
     for i in range(2):
         for j in range(2):
             r = rho[:, i, j, 0][:, None].expand(2, eta.numel())
-            k = transfer_eta_at(lib, r, eta).reshape(G, G, M, M)  # [gin, gout, m, m']
-            S_dir[:, i, j, 0] = torch.einsum("abmp,p,ap->bm", k, quad.weight, psi)
+            k = transfer_eta_at(library, r, eta).reshape(G, G, M, M)  # [gin, gout, m, m']
+            S_dir[:, i, j, 0] = torch.einsum("abmp,p,ap->bm", k, quadrature.weight, psi)
     err = (S_mom - S_dir).abs().max().item()
     scale = S_dir.abs().max().item()
     assert err < 1e-8 * max(1.0, scale), (err, scale)
@@ -211,30 +211,31 @@ def test_scatter_operator_ld_axis_and_directions(device):
     G, L = 3, 2
     g = torch.Generator().manual_seed(11)
     mu_vol = torch.rand(G, G, 4, 3, 2, 2, generator=g, dtype=F64).to(device)
-    phi_ld = torch.randn(G, num_sh(L), 4, 3, 2, 2, generator=g, dtype=F64).to(device)
-    T = scatter_source_moments(mu_vol, phi_ld)
-    assert T.shape == (G, num_sh(L), 4, 3, 2, 2)
+    phi_linear_discontinuous = torch.randn(G, num_spherical_harmonics(L), 4, 3, 2, 2, generator=g, dtype=F64).to(device)
+    T = scatter_source_moments(mu_vol, phi_linear_discontinuous)
+    assert T.shape == (G, num_spherical_harmonics(L), 4, 3, 2, 2)
     for a in range(4):
-        Ta = scatter_source_moments(mu_vol, phi_ld[:, :, a])
+        Ta = scatter_source_moments(mu_vol, phi_linear_discontinuous[:, :, a])
         assert torch.allclose(T[:, :, a], Ta, atol=1e-13)
     # explicit reference
-    lofn = sh_degree_index(L).to(device)
-    ref = torch.einsum("abnxyz,anqxyz->bnqxyz", mu_vol[:, :, lofn], phi_ld)
-    assert torch.allclose(T, ref, atol=1e-12)
+    lofn = spherical_harmonic_degree_index(L).to(device)
+    reference = torch.einsum("abnxyz,anqxyz->bnqxyz", mu_vol[:, :, lofn], phi_linear_discontinuous)
+    assert torch.allclose(T, reference, atol=1e-12)
     assert T.is_contiguous()
     # moment-major layout (used by source_iteration): same values, T.movedim(1, 0) contiguous
-    Tm = scatter_source_moments(mu_vol, phi_ld, moment_major=True)
+    Tm = scatter_source_moments(mu_vol, phi_linear_discontinuous, moment_major=True)
     assert torch.equal(Tm, T) and Tm.movedim(1, 0).is_contiguous()
     # non-contiguous input (the cell-mean slice used for the multiple-collision source)
-    assert torch.allclose(scatter_source_moments(mu_vol, phi_ld[:, :, 0]), ref[:, :, 0], atol=1e-12)
-    quad = product_quadrature(4, 8, device=device)
-    b = sh_basis(L, quad)
+    assert torch.allclose(scatter_source_moments(mu_vol, phi_linear_discontinuous[:, :, 0]), reference[:, :, 0],
+                          atol=1e-12)
+    quadrature = product_quadrature(4, 8, device=device)
+    b = spherical_harmonic_basis(L, quadrature)
     S = scatter_source_at_directions(T, b.Y[:5])
     assert S.shape == (5, G, 4, 3, 2, 2)
-    S_ref = ordinates_from_moments(T.movedim(1, -1), b)[..., :5].movedim(-1, 0)
-    assert torch.allclose(S, S_ref, atol=1e-12)
+    S_reference = ordinates_from_moments(T.movedim(1, -1), b)[..., :5].movedim(-1, 0)
+    assert torch.allclose(S, S_reference, atol=1e-12)
     with pytest.raises(ValueError):
-        scatter_source_moments(mu_vol[:, :, :2], phi_ld)  # degree 2 > transfer order 1
+        scatter_source_moments(mu_vol[:, :, :2], phi_linear_discontinuous)  # degree 2 > transfer order 1
 
 
 # ---- (g) cone sets ---------------------------------------------------------------------------------
@@ -275,7 +276,7 @@ def test_builders_device_dtype(device, dtype):
         assert q.omega.device.type == device.type and q.weight.device.type == device.type
         assert q.octant.device.type == device.type and q.octant.dtype == torch.int64
         assert q.omega.dtype == dtype and q.weight.dtype == dtype
-        b = sh_basis(3, q)
-        assert b.Y.device.type == device.type and b.Y.dtype == dtype and b.l_of_n.device.type == device.type
+        b = spherical_harmonic_basis(3, q)
+        assert b.Y.device.type == device.type and b.Y.dtype == dtype and b.degree_of_moment.device.type == device.type
     x = torch.linspace(-1, 1, 5, device=device, dtype=dtype)
-    assert legendre_p(3, x).dtype == dtype and legendre_p(3, x).device.type == device.type
+    assert legendre_polynomials(3, x).dtype == dtype and legendre_polynomials(3, x).device.type == device.type

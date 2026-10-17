@@ -33,7 +33,7 @@ import torch
 from torch import Tensor
 
 from .geometry import ConeGeometry, Grid
-from .kernels import ray_tracing_kernels as _st
+from .kernels import ray_tracing_kernels
 
 __all__ = ["Projectors", "SiddonProjectors", "line_integrals"]
 
@@ -43,14 +43,15 @@ __all__ = ["Projectors", "SiddonProjectors", "line_integrals"]
 # ------------------------------------------------------------------------------------------------
 
 class Projectors(Protocol):
-    def upstream_cumulative(self, mu: Tensor, grid: Grid, geom: ConeGeometry, angle: float) -> Tensor:
+    def upstream_cumulative(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float) -> Tensor:
         """Line integral of mu from the focal spot to every voxel center.
 
         mu: [G, rows, cols, slices] (1/cm). Returns tau_up: [G, rows, cols, slices] (dimensionless).
         """
         ...
 
-    def upstream_to_points(self, mu: Tensor, grid: Grid, geom: ConeGeometry, angle: float, points: Tensor) -> Tensor:
+    def upstream_to_points(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
+                           points: Tensor) -> Tensor:
         """Line integral of mu (on `grid`, zero outside its box) from the focal spot to arbitrary points.
 
         mu: [G, rows, cols, slices]; points: [N, 3] (recon frame, cm; inside or outside the box).
@@ -58,7 +59,7 @@ class Projectors(Protocol):
         """
         ...
 
-    def primary_project(self, mu: Tensor, grid: Grid, geom: ConeGeometry, angle: float) -> Tensor:
+    def primary_project(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float) -> Tensor:
         """Line integral of mu from the focal spot to every pixel center.
 
         mu: [G, rows, cols, slices]. Returns [G, num_det_rows, num_det_channels].
@@ -67,7 +68,8 @@ class Projectors(Protocol):
         """
         ...
 
-    def downstream_cumulative(self, mu: Tensor, grid: Grid, geom: ConeGeometry, angle: float, omegas: Tensor) -> Tensor:
+    def downstream_cumulative(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
+                              omegas: Tensor) -> Tensor:
         """Line integral of mu from every voxel center to the panel plane along each direction.
 
         mu: [G, rows, cols, slices]; omegas: [K, 3] unit vectors (recon frame) pointing toward the panel.
@@ -76,7 +78,8 @@ class Projectors(Protocol):
         """
         ...
 
-    def oblique_project(self, field: Tensor, grid: Grid, geom: ConeGeometry, angle: float, omegas: Tensor) -> Tensor:
+    def oblique_project(self, field: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
+                        omegas: Tensor) -> Tensor:
         """Line integral of a volumetric field along each direction, landing on the panel.
 
         field: [K, G, rows, cols, slices] or [G, rows, cols, slices] (broadcast over K);
@@ -100,12 +103,12 @@ def _box_tensors(grid: Grid, device, dtype) -> tuple[Tensor, Tensor, Tensor, tup
     return lo, hi, delta, n
 
 
-def _trace_chunk(vol_t: Tensor, lo: Tensor, hi: Tensor, delta: Tensor, n: tuple[int, int, int],
-                 planes: list[Tensor], p0: Tensor, p1: Tensor, vol_offset: Tensor | None = None) -> Tensor:
+def _trace_chunk(flat_volume: Tensor, lo: Tensor, hi: Tensor, delta: Tensor, n: tuple[int, int, int],
+                 planes: list[Tensor], p0: Tensor, p1: Tensor, volume_offset: Tensor | None = None) -> Tensor:
     """Exact integrals of the voxel field along segments p0 -> p1 for one chunk of rays.
 
-    vol_t: [V, G] volume flattened in (row, col, slice) order (or [K*V, G] for K stacked volumes, with
-    vol_offset [N] = k(ray) * V selecting each ray's volume); p0, p1: [N, 3] (x, y, z).
+    flat_volume: [V, G] volume flattened in (row, col, slice) order (or [K*V, G] for K stacked volumes, with
+    volume_offset [N] = k(ray) * V selecting each ray's volume); p0, p1: [N, 3] (x, y, z).
     planes: interior plane coordinates per axis (x, y, z), each [n_a - 1]. Returns [N, G].
     """
     d = p1 - p0  # [N, 3]
@@ -124,33 +127,33 @@ def _trace_chunk(vol_t: Tensor, lo: Tensor, hi: Tensor, delta: Tensor, n: tuple[
     a_hi = torch.where(valid, a_hi, torch.zeros_like(a_hi))
 
     lists = [a_lo[:, None], a_hi[:, None]]
-    for ax in range(3):
-        pl = planes[ax]
-        if pl.numel() == 0:
+    for axis in range(3):
+        axis_planes = planes[axis]
+        if axis_planes.numel() == 0:
             continue
-        a = (pl[None, :] - p0[:, ax:ax + 1]) * inv[:, ax:ax + 1]  # [N, n_a - 1]
-        a = torch.where(nonzero[:, ax:ax + 1], a, a_lo[:, None])
+        a = (axis_planes[None, :] - p0[:, axis:axis + 1]) * inv[:, axis:axis + 1]  # [N, n_a - 1]
+        a = torch.where(nonzero[:, axis:axis + 1], a, a_lo[:, None])
         a = torch.minimum(torch.maximum(a, a_lo[:, None]), a_hi[:, None])
         lists.append(a)
     alphas = torch.cat(lists, dim=1).sort(dim=1).values  # [N, P]
-    seg = alphas[:, 1:] - alphas[:, :-1]  # [N, P-1]
-    mid = 0.5 * (alphas[:, 1:] + alphas[:, :-1])
+    segment = alphas[:, 1:] - alphas[:, :-1]  # [N, P-1]
+    midpoint = 0.5 * (alphas[:, 1:] + alphas[:, :-1])
     del alphas
 
     nx, ny, nz = n
     flat = None
     strides = (nz, nx * nz, 1)  # x -> col stride, y -> row stride, z -> slice stride
-    for ax, (na, stride) in enumerate(zip(n, strides)):
-        pos = p0[:, ax:ax + 1] + mid * d[:, ax:ax + 1]
-        idx = torch.floor((pos - lo[ax]) / delta[ax]).clamp_(0, na - 1).long()
-        flat = idx * stride if flat is None else flat + idx * stride
-    del mid
-    if vol_offset is not None:
-        flat = flat + vol_offset[:, None]
+    for axis, (cells_on_axis, stride) in enumerate(zip(n, strides)):
+        pos = p0[:, axis:axis + 1] + midpoint * d[:, axis:axis + 1]
+        cell_index = torch.floor((pos - lo[axis]) / delta[axis]).clamp_(0, cells_on_axis - 1).long()
+        flat = cell_index * stride if flat is None else flat + cell_index * stride
+    del midpoint
+    if volume_offset is not None:
+        flat = flat + volume_offset[:, None]
 
-    length = seg * torch.linalg.norm(d, dim=-1, keepdim=True)  # [N, P-1]
-    vals = vol_t.index_select(0, flat.reshape(-1)).reshape(*flat.shape, vol_t.shape[1])  # [N, P-1, G]
-    return torch.einsum("npg,np->ng", vals, length)
+    length = segment * torch.linalg.norm(d, dim=-1, keepdim=True)  # [N, P-1]
+    values = flat_volume.index_select(0, flat.reshape(-1)).reshape(*flat.shape, flat_volume.shape[1])  # [N, P-1, G]
+    return torch.einsum("npg,np->ng", values, length)
 
 
 def line_integrals(volume: Tensor, starts: Tensor, ends: Tensor, grid: Grid, *,
@@ -173,42 +176,43 @@ def line_integrals(volume: Tensor, starts: Tensor, ends: Tensor, grid: Grid, *,
         if tuple(volume.shape[2:]) != tuple(grid.shape):
             raise ValueError(f"volume spatial shape {tuple(volume.shape[2:])} != grid shape {grid.shape}")
         # [K, G, R, C, S] -> [K*V, G]: row k*V + v holds voxel v of volume k
-        vol_t = volume.reshape(K, volume.shape[1], V).permute(0, 2, 1).reshape(K * V, volume.shape[1]).contiguous()
+        flat_volume = (volume.reshape(K, volume.shape[1], V).permute(0, 2, 1).reshape(K * V, volume.shape[1])
+                       .contiguous())
         offset = volume_index.to(device=volume.device, dtype=torch.long).reshape(-1) * V
-        return _line_integrals_flat(vol_t, offset, starts, ends, grid, ray_chunk, element_budget)
+        return _line_integrals_flat(flat_volume, offset, starts, ends, grid, ray_chunk, element_budget)
     if volume.dim() != 4:
         raise ValueError(f"volume must be [G, rows, cols, slices], got {tuple(volume.shape)}")
     if tuple(volume.shape[1:]) != tuple(grid.shape):
         raise ValueError(f"volume spatial shape {tuple(volume.shape[1:])} != grid shape {grid.shape}")
     G = volume.shape[0]
-    vol_t = volume.reshape(G, -1).t().contiguous()  # [V, G]
-    return _line_integrals_flat(vol_t, None, starts, ends, grid, ray_chunk, element_budget)
+    flat_volume = volume.reshape(G, -1).t().contiguous()  # [V, G]
+    return _line_integrals_flat(flat_volume, None, starts, ends, grid, ray_chunk, element_budget)
 
 
-def _line_integrals_flat(vol_t: Tensor, offset: Tensor | None, starts: Tensor, ends: Tensor, grid: Grid,
+def _line_integrals_flat(flat_volume: Tensor, offset: Tensor | None, starts: Tensor, ends: Tensor, grid: Grid,
                          ray_chunk: int, element_budget: int) -> Tensor:
-    """line_integrals on a flattened volume vol_t [V or K*V, G] with optional per-ray offsets [N]. -> [G, N]."""
-    dev, dt = vol_t.device, vol_t.dtype
-    starts = starts.to(device=dev, dtype=dt).reshape(-1, 3)
-    ends = ends.to(device=dev, dtype=dt).reshape(-1, 3)
+    """line_integrals on a flattened volume flat_volume [V or K*V, G] with optional per-ray offsets [N]. -> [G, N]."""
+    device, dtype = flat_volume.device, flat_volume.dtype
+    starts = starts.to(device=device, dtype=dtype).reshape(-1, 3)
+    ends = ends.to(device=device, dtype=dtype).reshape(-1, 3)
     if starts.shape != ends.shape:
         raise ValueError("starts and ends must have the same number of rays")
-    G = vol_t.shape[1]
+    G = flat_volume.shape[1]
     N = starts.shape[0]
     if offset is not None and offset.shape[0] != N:
         raise ValueError("volume_index must have one entry per ray")
-    out = torch.empty(G, N, device=dev, dtype=dt)
+    out = torch.empty(G, N, device=device, dtype=dtype)
     if N == 0:
         return out
 
-    lo, hi, delta, n = _box_tensors(grid, dev, dt)
-    planes = [lo[a] + delta[a] * torch.arange(1, n[a], device=dev, dtype=dt) for a in range(3)]
+    lo, hi, delta, n = _box_tensors(grid, device, dtype)
+    planes = [lo[a] + delta[a] * torch.arange(1, n[a], device=device, dtype=dtype) for a in range(3)]
     num_planes = sum(n) - 1
     per_chunk = max(1, min(ray_chunk, element_budget // max(1, num_planes)))
     for s in range(0, N, per_chunk):
         e = min(N, s + per_chunk)
         off = None if offset is None else offset[s:e]
-        out[:, s:e] = _trace_chunk(vol_t, lo, hi, delta, n, planes, starts[s:e], ends[s:e], off).t()
+        out[:, s:e] = _trace_chunk(flat_volume, lo, hi, delta, n, planes, starts[s:e], ends[s:e], off).t()
     return out
 
 
@@ -222,7 +226,8 @@ class SiddonProjectors:
 
     ray_chunk: maximum rays per traversal chunk. element_budget: maximum (ray, plane) pairs per
     chunk; peak working memory is roughly element_budget x (G + ~12) scalars.
-    n_sub: default sub-pixel sampling per axis for `primary_project` (n_sub^2 sub-rays per pixel).
+    samples_per_pixel_axis: default sub-pixel sampling per axis for `primary_project` (samples_per_pixel_axis^2 sub-rays
+    per pixel).
 
     backend: "auto" (default: the fused Triton ray tracer of `kernels/ray_tracing_kernels.py` for float32 CUDA
       tensors when `ray_tracing_kernels.kernels_usable(device)` passes its per-device self-check against the PyTorch
@@ -232,22 +237,22 @@ class SiddonProjectors:
       apply to the PyTorch path) and equal it to float32 rounding (~1e-6 of the field maximum).
     """
 
-    def __init__(self, ray_chunk: int = 1 << 20, element_budget: int = 1 << 23, n_sub: int = 1,
+    def __init__(self, ray_chunk: int = 1 << 20, element_budget: int = 1 << 23, samples_per_pixel_axis: int = 1,
                  backend: str = "auto"):
-        if n_sub < 1:
-            raise ValueError("n_sub must be >= 1")
+        if samples_per_pixel_axis < 1:
+            raise ValueError("samples_per_pixel_axis must be >= 1")
         if backend not in ("auto", "torch", "triton"):
             raise ValueError("backend must be 'auto', 'torch' or 'triton'")
         if backend == "triton":
-            ok, why = _st.triton_available()
+            ok, why = ray_tracing_kernels.triton_available()
             if not ok:
                 raise RuntimeError(f"backend='triton' requested but Triton is unusable: {why}")
         self.ray_chunk = int(ray_chunk)
         self.element_budget = int(element_budget)
-        self.n_sub = int(n_sub)
+        self.samples_per_pixel_axis = int(samples_per_pixel_axis)
         self.backend = backend
-        self._tri_ok: dict[str, bool] = {}
-        self._neg_normal: dict[tuple, Tensor] = {}  # -n_hat per (n_hat, device) for the Triton +inf flags
+        self._triton_usable: dict[str, bool] = {}
+        self._negative_normals: dict[tuple, Tensor] = {}  # -n_hat per (n_hat, device) for the Triton +inf flags
 
     # ---- backend --------------------------------------------------------------------------------
     def kernel_status(self, device: torch.device) -> tuple[bool, str]:
@@ -256,7 +261,7 @@ class SiddonProjectors:
             return False, "backend='torch'"
         if torch.device(device).type != "cuda":
             return False, "not a CUDA tensor"
-        ok, why = _st.kernels_usable(torch.device(device))
+        ok, why = ray_tracing_kernels.kernels_usable(torch.device(device))
         if not ok and self.backend == "triton":
             raise RuntimeError(f"backend='triton' requested but the Siddon kernels are unusable: {why}")
         return ok, why
@@ -265,44 +270,45 @@ class SiddonProjectors:
         if self.backend == "torch" or t.device.type != "cuda" or t.dtype != torch.float32:
             return False
         key = str(t.device)
-        ok = self._tri_ok.get(key)
+        ok = self._triton_usable.get(key)
         if ok is None:
-            ok = self._tri_ok[key] = self.kernel_status(t.device)[0]
+            ok = self._triton_usable[key] = self.kernel_status(t.device)[0]
         return ok
 
-    def _toward(self, om: Tensor, geom: ConeGeometry, angle: float) -> Tensor:
+    def _toward_panel(self, directions: Tensor, geometry: ConeGeometry, angle: float) -> Tensor:
         """[K] uint8 flags omega . (-n_hat) > 0 with the PyTorch path's expression (cached -n_hat, no upload)."""
-        n_hat = tuple(geom.panel_axes(angle)[2])
-        key = (n_hat, str(om.device), om.dtype)
-        neg = self._neg_normal.get(key)
+        n_hat = tuple(geometry.panel_axes(angle)[2])
+        key = (n_hat, str(directions.device), directions.dtype)
+        neg = self._negative_normals.get(key)
         if neg is None:
-            if len(self._neg_normal) >= 256:
-                self._neg_normal.clear()
-            neg = self._neg_normal[key] = -torch.tensor(n_hat, device=om.device, dtype=om.dtype)
-        return ((om * neg).sum(-1) > 0).view(torch.uint8)
+            if len(self._negative_normals) >= 256:
+                self._negative_normals.clear()
+            neg = self._negative_normals[key] = -torch.tensor(n_hat, device=directions.device, dtype=directions.dtype)
+        return ((directions * neg).sum(-1) > 0).view(torch.uint8)
 
     # ---- core ---------------------------------------------------------------------------------
     def line_integrals(self, volume: Tensor, starts: Tensor, ends: Tensor, grid: Grid) -> Tensor:
         """See module-level `line_integrals`: volume [G, rows, cols, slices], starts/ends [N, 3] -> [G, N]."""
         if self._use_triton(volume):
-            return _st.line_integrals_triton(volume, starts, ends, grid)
+            return ray_tracing_kernels.line_integrals_triton(volume, starts, ends, grid)
         return line_integrals(volume, starts, ends, grid, ray_chunk=self.ray_chunk,
                               element_budget=self.element_budget)
 
     # ---- (a) ----------------------------------------------------------------------------------
-    def upstream_cumulative(self, mu: Tensor, grid: Grid, geom: ConeGeometry, angle: float) -> Tensor:
+    def upstream_cumulative(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float) -> Tensor:
         """Line integral of mu from the focal spot to every voxel center.
 
         mu: [G, rows, cols, slices] (1/cm). Returns tau_up: [G, rows, cols, slices].
         """
         if self._use_triton(mu):
-            return _st.upstream_cumulative(mu, grid, geom, angle)
+            return ray_tracing_kernels.upstream_cumulative(mu, grid, geometry, angle)
         centers = grid.center_coordinates(mu.device, mu.dtype).reshape(-1, 3)
-        src = torch.tensor(geom.source_position(angle), device=mu.device, dtype=mu.dtype)
-        tau = self.line_integrals(mu, src.expand_as(centers), centers, grid)
+        source_position = torch.tensor(geometry.source_position(angle), device=mu.device, dtype=mu.dtype)
+        tau = self.line_integrals(mu, source_position.expand_as(centers), centers, grid)
         return tau.reshape(mu.shape)
 
-    def upstream_to_points(self, mu: Tensor, grid: Grid, geom: ConeGeometry, angle: float, points: Tensor) -> Tensor:
+    def upstream_to_points(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
+                           points: Tensor) -> Tensor:
         """Line integral of mu from the focal spot to each of points [N, 3] (recon frame; the segment is clipped to the
         box of `grid`, so a point outside the box gets the integral of the part of its ray inside it).
 
@@ -310,43 +316,46 @@ class SiddonProjectors:
         float32 CUDA): the cost follows the number of points and the traversal of `grid`.
         """
         pts = points.to(device=mu.device, dtype=mu.dtype).reshape(-1, 3)
-        src = torch.tensor(geom.source_position(angle), device=mu.device, dtype=mu.dtype)
-        return self.line_integrals(mu, src.expand_as(pts), pts, grid)
+        source_position = torch.tensor(geometry.source_position(angle), device=mu.device, dtype=mu.dtype)
+        return self.line_integrals(mu, source_position.expand_as(pts), pts, grid)
 
     # ---- (b) ----------------------------------------------------------------------------------
-    def primary_project(self, mu: Tensor, grid: Grid, geom: ConeGeometry, angle: float,
-                        n_sub: int | None = None) -> Tensor:
+    def primary_project(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
+                        samples_per_pixel_axis: int | None = None) -> Tensor:
         """Line integral of mu from the focal spot to every pixel center.
 
         mu: [G, rows, cols, slices]. Returns [G, num_det_rows, num_det_channels].
-        With n_sub > 1 (per axis), n_sub^2 sub-rays on a regular midpoint lattice inside each pixel
-        are traced and the result is -log(mean(exp(-integral))).
+        With samples_per_pixel_axis > 1 (per axis), samples_per_pixel_axis^2 sub-rays on a regular midpoint lattice
+        inside each pixel are traced and the result is -log(mean(exp(-integral))).
         """
-        n_sub = self.n_sub if n_sub is None else int(n_sub)
+        samples_per_pixel_axis = (self.samples_per_pixel_axis if samples_per_pixel_axis is None
+                                  else int(samples_per_pixel_axis))
         if self._use_triton(mu):
-            return _st.primary_project(mu, grid, geom, angle, n_sub=n_sub)
-        dev, dt = mu.device, mu.dtype
+            return ray_tracing_kernels.primary_project(mu, grid, geometry, angle,
+                                                       samples_per_pixel_axis=samples_per_pixel_axis)
+        device, dtype = mu.device, mu.dtype
         G = mu.shape[0]
-        pix = geom.pixel_centers(angle, dev, dt)  # [Rd, Cd, 3]
-        Rd, Cd = pix.shape[:2]
-        src = torch.tensor(geom.source_position(angle), device=dev, dtype=dt)
-        if n_sub == 1:
-            ends = pix.reshape(-1, 3)
-            tau = self.line_integrals(mu, src.expand_as(ends), ends, grid)
+        pixels = geometry.pixel_centers(angle, device, dtype)  # [Rd, Cd, 3]
+        Rd, Cd = pixels.shape[:2]
+        source_position = torch.tensor(geometry.source_position(angle), device=device, dtype=dtype)
+        if samples_per_pixel_axis == 1:
+            ends = pixels.reshape(-1, 3)
+            tau = self.line_integrals(mu, source_position.expand_as(ends), ends, grid)
             return tau.reshape(G, Rd, Cd)
-        u_hat, v_hat, _ = geom.panel_axes(angle)
-        uh = torch.tensor(u_hat, device=dev, dtype=dt)
-        vh = torch.tensor(v_hat, device=dev, dtype=dt)
-        off = (2 * torch.arange(n_sub, device=dev, dtype=dt) + 1) / (2 * n_sub) - 0.5  # [n]
-        du = off * geom.delta_det_channel
-        dv = off * geom.delta_det_row
-        shift = dv[:, None, None] * vh + du[None, :, None] * uh  # [n_v, n_u, 3]
-        ends = (pix[:, :, None, None, :] + shift).reshape(-1, 3)  # [Rd*Cd*n*n, 3]
-        tau = self.line_integrals(mu, src.expand_as(ends), ends, grid).reshape(G, Rd, Cd, n_sub * n_sub)
-        return -(torch.logsumexp(-tau, dim=-1) - math.log(n_sub * n_sub))
+        u_hat, v_hat, _ = geometry.panel_axes(angle)
+        u_axis = torch.tensor(u_hat, device=device, dtype=dtype)
+        v_axis = torch.tensor(v_hat, device=device, dtype=dtype)
+        n = samples_per_pixel_axis
+        offsets = (2 * torch.arange(n, device=device, dtype=dtype) + 1) / (2 * n) - 0.5  # [n]
+        offset_u = offsets * geometry.delta_det_channel
+        offset_v = offsets * geometry.delta_det_row
+        shift = offset_v[:, None, None] * v_axis + offset_u[None, :, None] * u_axis  # [n_v, n_u, 3]
+        ends = (pixels[:, :, None, None, :] + shift).reshape(-1, 3)  # [Rd*Cd*n*n, 3]
+        tau = self.line_integrals(mu, source_position.expand_as(ends), ends, grid).reshape(G, Rd, Cd, n * n)
+        return -(torch.logsumexp(-tau, dim=-1) - math.log(n * n))
 
     # ---- (c) ----------------------------------------------------------------------------------
-    def downstream_cumulative(self, mu: Tensor, grid: Grid, geom: ConeGeometry, angle: float,
+    def downstream_cumulative(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
                               omegas: Tensor) -> Tensor:
         """Line integral of mu from every voxel center to the panel plane along each direction.
 
@@ -355,37 +364,38 @@ class SiddonProjectors:
         far side of the panel plane (never the case in CT) get 0.
         """
         if self._use_triton(mu):
-            om = omegas.to(device=mu.device, dtype=mu.dtype).reshape(-1, 3).contiguous()
-            return _st.downstream_cumulative(mu, grid, geom, angle, om, toward=self._toward(om, geom, angle))
-        dev, dt = mu.device, mu.dtype
+            directions = omegas.to(device=mu.device, dtype=mu.dtype).reshape(-1, 3).contiguous()
+            return ray_tracing_kernels.downstream_cumulative(mu, grid, geometry, angle, directions,
+                                                             toward=self._toward_panel(directions, geometry, angle))
+        device, dtype = mu.device, mu.dtype
         G = mu.shape[0]
-        omegas = omegas.to(device=dev, dtype=dt).reshape(-1, 3)
+        omegas = omegas.to(device=device, dtype=dtype).reshape(-1, 3)
         K = omegas.shape[0]
-        out = torch.full((K, *mu.shape), math.inf, device=dev, dtype=dt)
-        _, _, n_hat = geom.panel_axes(angle)
-        n = torch.tensor(n_hat, device=dev, dtype=dt)
+        out = torch.full((K, *mu.shape), math.inf, device=device, dtype=dtype)
+        _, _, n_hat = geometry.panel_axes(angle)
+        n = torch.tensor(n_hat, device=device, dtype=dtype)
         toward = (omegas * (-n)).sum(-1) > 0
-        kidx = torch.nonzero(toward).flatten()
-        if kidx.numel() == 0:
+        toward_indices = torch.nonzero(toward).flatten()
+        if toward_indices.numel() == 0:
             return out
-        centers = grid.center_coordinates(dev, dt).reshape(-1, 3)  # [V, 3]
+        centers = grid.center_coordinates(device, dtype).reshape(-1, 3)  # [V, 3]
         V = centers.shape[0]
-        diag = math.sqrt(sum(e * e for e in grid.extent)) * (1 + 1e-9) + 1e-9
+        diagonal = math.sqrt(sum(e * e for e in grid.extent)) * (1 + 1e-9) + 1e-9
         # batches of directions with at most ray_chunk rays keep the endpoint tensors small
-        per = max(1, self.ray_chunk // max(1, V))
-        for s in range(0, kidx.numel(), per):
-            ks = kidx[s:s + per]
-            om = omegas[ks]  # [k, 3]
-            t = geom.panel_distance_along(centers[None, :, :], om[:, None, :], angle)  # [k, V]
-            t = t.clamp(min=0.0, max=diag)  # the box exit precedes `diag` for points inside the box
-            ends = centers[None] + t[..., None] * om[:, None, :]
+        directions_per_batch = max(1, self.ray_chunk // max(1, V))
+        for s in range(0, toward_indices.numel(), directions_per_batch):
+            batch_indices = toward_indices[s:s + directions_per_batch]
+            directions = omegas[batch_indices]  # [k, 3]
+            t = geometry.panel_distance_along(centers[None, :, :], directions[:, None, :], angle)  # [k, V]
+            t = t.clamp(min=0.0, max=diagonal)  # the box exit precedes `diagonal` for points inside the box
+            ends = centers[None] + t[..., None] * directions[:, None, :]
             starts = centers[None].expand_as(ends)
             tau = self.line_integrals(mu, starts.reshape(-1, 3), ends.reshape(-1, 3), grid)
-            out[ks] = tau.reshape(G, ks.numel(), *mu.shape[1:]).transpose(0, 1)
+            out[batch_indices] = tau.reshape(G, batch_indices.numel(), *mu.shape[1:]).transpose(0, 1)
         return out
 
     # ---- (d) ----------------------------------------------------------------------------------
-    def oblique_project(self, field: Tensor, grid: Grid, geom: ConeGeometry, angle: float,
+    def oblique_project(self, field: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
                         omegas: Tensor) -> Tensor:
         """Full line integral of a field along the line through each pixel center with direction omega_k.
 
@@ -394,31 +404,31 @@ class SiddonProjectors:
         on both sides of the pixel center.
         """
         if self._use_triton(field):
-            return _st.oblique_project(field, grid, geom, angle, omegas)
-        dev, dt = field.device, field.dtype
-        omegas = omegas.to(device=dev, dtype=dt).reshape(-1, 3)
+            return ray_tracing_kernels.oblique_project(field, grid, geometry, angle, omegas)
+        device, dtype = field.device, field.dtype
+        omegas = omegas.to(device=device, dtype=dtype).reshape(-1, 3)
         K = omegas.shape[0]
-        pix = geom.pixel_centers(angle, dev, dt)
-        Rd, Cd = pix.shape[:2]
-        p = pix.reshape(-1, 3)  # [Np, 3]
-        lo = torch.tensor(grid.lower_corner(), device=dev, dtype=dt)
-        center = lo + 0.5 * torch.tensor(grid.extent, device=dev, dtype=dt)
+        pixels = geometry.pixel_centers(angle, device, dtype)
+        Rd, Cd = pixels.shape[:2]
+        p = pixels.reshape(-1, 3)  # [Np, 3]
+        lo = torch.tensor(grid.lower_corner(), device=device, dtype=dtype)
+        center = lo + 0.5 * torch.tensor(grid.extent, device=device, dtype=dtype)
         half = 0.5 * math.sqrt(sum(e * e for e in grid.extent)) * (1 + 1e-6) + 1e-6
 
-        def endpoints(om: Tensor) -> tuple[Tensor, Tensor]:
-            # om: [k, 3] -> segments [k*Np, 3] centred on the foot of the box center on each line
-            om2 = (om * om).sum(-1, keepdim=True)  # [k, 1] (omegas need not be exactly unit)
-            tc = ((center - p)[None] * om[:, None, :]).sum(-1) / om2  # [k, Np]
-            h = half / om2.sqrt()  # [k, 1]
-            a = p[None] + (tc - h)[..., None] * om[:, None, :]
-            b = p[None] + (tc + h)[..., None] * om[:, None, :]
+        def endpoints(directions: Tensor) -> tuple[Tensor, Tensor]:
+            # directions: [k, 3] -> segments [k*Np, 3] centred on the foot of the box center on each line
+            omega_squared = (directions * directions).sum(-1, keepdim=True)  # [k, 1] (omegas need not be exactly unit)
+            center_parameter = ((center - p)[None] * directions[:, None, :]).sum(-1) / omega_squared  # [k, Np]
+            h = half / omega_squared.sqrt()  # [k, 1]
+            a = p[None] + (center_parameter - h)[..., None] * directions[:, None, :]
+            b = p[None] + (center_parameter + h)[..., None] * directions[:, None, :]
             return a.reshape(-1, 3), b.reshape(-1, 3)
 
         if field.dim() == 4:
             G = field.shape[0]
             a, b = endpoints(omegas)
-            img = self.line_integrals(field, a, b, grid)  # [G, K*Np]
-            return img.reshape(G, K, Rd, Cd).transpose(0, 1).contiguous()
+            image = self.line_integrals(field, a, b, grid)  # [G, K*Np]
+            return image.reshape(G, K, Rd, Cd).transpose(0, 1).contiguous()
         if field.dim() != 5 or field.shape[0] != K:
             raise ValueError(f"field must be [G, ...] or [K={K}, G, ...], got {tuple(field.shape)}")
         G = field.shape[1]
@@ -426,7 +436,7 @@ class SiddonProjectors:
             raise ValueError(f"field spatial shape {tuple(field.shape[2:])} != grid shape {grid.shape}")
         # all K directions in one traversal: ray block k (Np rays) integrates field[k]
         a, b = endpoints(omegas)
-        kk = torch.arange(K, device=dev).repeat_interleave(p.shape[0])
-        img = line_integrals(field, a, b, grid, ray_chunk=self.ray_chunk, element_budget=self.element_budget,
-                             volume_index=kk)  # [G, K*Np]
-        return img.reshape(G, K, Rd, Cd).transpose(0, 1).contiguous()
+        volume_index = torch.arange(K, device=device).repeat_interleave(p.shape[0])
+        image = line_integrals(field, a, b, grid, ray_chunk=self.ray_chunk, element_budget=self.element_budget,
+                               volume_index=volume_index)  # [G, K*Np]
+        return image.reshape(G, K, Rd, Cd).transpose(0, 1).contiguous()

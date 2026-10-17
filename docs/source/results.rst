@@ -42,7 +42,7 @@ Findings:
    relative RMSE of 0.0389 over the prism and 0.0451 in the core (two-material: 0.0429 / 0.0505), for 8 % more
    scatter time (62.6 s instead of 57.9 s per outer iteration in the same session).
 
-The quick demo setting (``demo/demo_citrus.py --views 36 --delta-voxel 1 --outer 10 --scatter-view-stride 1
+The quick demo setting (``demo/demo_citrus.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1
 --scatter-every 1``: 36 views over a short scan of 202.6 degrees, 1 cm grid, 10 outer iterations) shows the same
 ordering in about two minutes: relative RMSE 0.31 (FDK, Parker-weighted), 0.29 (no correction), 0.064 (CITRUS); over
 a full rotation (``--end-view-angle 360``) 0.32, 0.29 and 0.075 (measured with version 0.1.0 and the data-set format

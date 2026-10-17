@@ -51,7 +51,7 @@ def dense_integral(vol: np.ndarray, grid: Grid, p0, p1, n: int = 100_000) -> flo
 GRID = Grid(shape=(3, 4, 5), delta_voxel=1.0, voxel_row_aspect=1.5, voxel_slice_aspect=0.5, recon_slice_offset=0.3)
 
 
-def small_geom(rows=6, chans=8, d=2.0, **kw) -> ConeGeometry:
+def small_geometry(rows=6, chans=8, d=2.0, **kw) -> ConeGeometry:
     return ConeGeometry(source_iso_dist=20.0, source_detector_dist=30.0, num_det_rows=rows,
                         num_det_channels=chans, delta_det_row=d, delta_det_channel=d, **kw)
 
@@ -84,8 +84,8 @@ def test_line_integrals_uniform_box_vs_chords(device):
     c = 1.7
     vol = torch.full((1, *GRID.shape), c, dtype=F64, device=device)
     got = line_integrals(vol, starts, ends, GRID)[0].cpu().numpy()
-    ref = np.array([c * chord(a, b, lo, hi) for a, b in pts])
-    np.testing.assert_allclose(got, ref, rtol=0, atol=1e-10)
+    reference = np.array([c * chord(a, b, lo, hi) for a, b in pts])
+    np.testing.assert_allclose(got, reference, rtol=0, atol=1e-10)
     # chunking does not change the answer
     got2 = line_integrals(vol, starts, ends, GRID, ray_chunk=7, element_budget=50)[0].cpu().numpy()
     np.testing.assert_allclose(got2, got, rtol=0, atol=1e-12)
@@ -102,9 +102,9 @@ def test_line_integrals_random_volume_vs_dense_sampling(device):
     starts = torch.tensor(np.array([p[0] for p in pts]), dtype=F64, device=device)
     ends = torch.tensor(np.array([p[1] for p in pts]), dtype=F64, device=device)
     got = line_integrals(torch.tensor(vol, device=device)[None], starts, ends, GRID)[0].cpu().numpy()
-    ref = np.array([dense_integral(vol, GRID, a, b) for a, b in pts])
-    np.testing.assert_allclose(got, ref, rtol=0, atol=2e-4)
-    assert np.abs(ref).max() > 1.0
+    reference = np.array([dense_integral(vol, GRID, a, b) for a, b in pts])
+    np.testing.assert_allclose(got, reference, rtol=0, atol=2e-4)
+    assert np.abs(reference).max() > 1.0
 
 
 def test_float32_runs_and_is_close(device):
@@ -124,118 +124,119 @@ UGRID = Grid(shape=(4, 6, 5), delta_voxel=1.0, voxel_slice_aspect=0.8)
 
 @pytest.mark.parametrize("angle", [0.0, 0.7, 2.5])
 def test_upstream_cumulative_uniform_box(device, angle):
-    geom = small_geom()
+    geometry = small_geometry()
     P = SiddonProjectors()
     mus = torch.tensor([0.2, 0.05], dtype=F64, device=device)
     mu = mus[:, None, None, None] * torch.ones(2, *UGRID.shape, dtype=F64, device=device)
-    tau = P.upstream_cumulative(mu, UGRID, geom, angle)
+    tau = P.upstream_cumulative(mu, UGRID, geometry, angle)
     assert tau.shape == (2, *UGRID.shape)
     lo, hi = box_of(UGRID)
-    src = np.array(geom.source_position(angle))
+    source = np.array(geometry.source_position(angle))
     centers = UGRID.center_coordinates(dtype=F64).reshape(-1, 3).numpy()
-    ref = np.array([chord(src, c, lo, hi) for c in centers]).reshape(UGRID.shape)
+    reference = np.array([chord(source, c, lo, hi) for c in centers]).reshape(UGRID.shape)
     if angle == 0.0:
         # analytic: rays enter through the top face y = Y/2; distance = |r - r0| (Y/2 - y)/(SID - y)
         Y2 = UGRID.extent[1] / 2
-        r = np.linalg.norm(centers - src, axis=1)
-        ana = (r * (Y2 - centers[:, 1]) / (geom.source_iso_dist - centers[:, 1])).reshape(UGRID.shape)
-        np.testing.assert_allclose(ref, ana, atol=1e-12)
+        r = np.linalg.norm(centers - source, axis=1)
+        ana = (r * (Y2 - centers[:, 1]) / (geometry.source_iso_dist - centers[:, 1])).reshape(UGRID.shape)
+        np.testing.assert_allclose(reference, ana, atol=1e-12)
     for g in range(2):
-        np.testing.assert_allclose(tau[g].cpu().numpy(), mus[g].item() * ref, rtol=0, atol=1e-10)
+        np.testing.assert_allclose(tau[g].cpu().numpy(), mus[g].item() * reference, rtol=0, atol=1e-10)
 
 
 @pytest.mark.parametrize("angle", [0.0, 1.1])
 def test_primary_project_uniform_box(device, angle):
-    geom = small_geom(det_channel_offset=0.3, det_row_offset=-0.2)
+    geometry = small_geometry(det_channel_offset=0.3, det_row_offset=-0.2)
     P = SiddonProjectors()
     mu = torch.full((1, *UGRID.shape), 0.3, dtype=F64, device=device)
-    tau = P.primary_project(mu, UGRID, geom, angle)
-    assert tau.shape == (1, geom.num_det_rows, geom.num_det_channels)
+    tau = P.primary_project(mu, UGRID, geometry, angle)
+    assert tau.shape == (1, geometry.num_det_rows, geometry.num_det_channels)
     lo, hi = box_of(UGRID)
-    src = np.array(geom.source_position(angle))
-    pix = geom.pixel_centers(angle, dtype=F64).numpy()
-    ref = np.array([[chord(src, pix[r, c], lo, hi) for c in range(pix.shape[1])] for r in range(pix.shape[0])])
-    assert (ref > 0).any() and (ref == 0).any()
-    np.testing.assert_allclose(tau[0].cpu().numpy(), 0.3 * ref, rtol=0, atol=1e-10)
+    source = np.array(geometry.source_position(angle))
+    pix = geometry.pixel_centers(angle, dtype=F64).numpy()
+    reference = np.array([[chord(source, pix[r, c], lo, hi) for c in range(pix.shape[1])] for r in range(pix.shape[0])])
+    assert (reference > 0).any() and (reference == 0).any()
+    np.testing.assert_allclose(tau[0].cpu().numpy(), 0.3 * reference, rtol=0, atol=1e-10)
 
     # sub-pixel sampling: -log(mean(exp(-tau))) over an n x n midpoint lattice of sub-rays
     n = 3
-    tau_s = P.primary_project(mu, UGRID, geom, angle, n_sub=n)[0].cpu().numpy()
-    u_hat, v_hat, _ = (np.array(a) for a in geom.panel_axes(angle))
+    tau_s = P.primary_project(mu, UGRID, geometry, angle, samples_per_pixel_axis=n)[0].cpu().numpy()
+    u_hat, v_hat, _ = (np.array(a) for a in geometry.panel_axes(angle))
     off = (2 * np.arange(n) + 1) / (2 * n) - 0.5
-    ref_s = np.zeros_like(ref)
+    reference_s = np.zeros_like(reference)
     for r in range(pix.shape[0]):
         for c in range(pix.shape[1]):
-            vals = [math.exp(-0.3 * chord(src, pix[r, c] + a * geom.delta_det_row * v_hat
-                                          + b * geom.delta_det_channel * u_hat, lo, hi)) for a in off for b in off]
-            ref_s[r, c] = -math.log(np.mean(vals))
-    np.testing.assert_allclose(tau_s, ref_s, rtol=0, atol=1e-10)
-    assert np.abs(tau_s - 0.3 * ref).max() > 1e-3  # sub-sampling actually changes edge pixels
+            vals = [math.exp(-0.3 * chord(source, pix[r, c] + a * geometry.delta_det_row * v_hat
+                                          + b * geometry.delta_det_channel * u_hat, lo, hi)) for a in off for b in off]
+            reference_s[r, c] = -math.log(np.mean(vals))
+    np.testing.assert_allclose(tau_s, reference_s, rtol=0, atol=1e-10)
+    assert np.abs(tau_s - 0.3 * reference).max() > 1e-3  # sub-sampling actually changes edge pixels
 
 
 @pytest.mark.parametrize("angle", [0.0, 0.4])
 def test_downstream_cumulative_uniform_box(device, angle):
-    geom = small_geom()
+    geometry = small_geometry()
     P = SiddonProjectors()
     mu = torch.full((1, *UGRID.shape), 0.25, dtype=F64, device=device)
-    _, _, n_hat = (np.array(a) for a in geom.panel_axes(angle))
+    _, _, n_hat = (np.array(a) for a in geometry.panel_axes(angle))
     tilt = np.array([0.3, -0.9, 0.2])
     if angle != 0.0:
         c, s = math.cos(angle), math.sin(angle)
         tilt = np.array([c * tilt[0] + s * tilt[1], -s * tilt[0] + c * tilt[1], tilt[2]])
     tilt /= np.linalg.norm(tilt)
-    perp = np.array(geom.panel_axes(angle)[0])
+    perp = np.array(geometry.panel_axes(angle)[0])
     omegas = np.stack([-n_hat, n_hat, tilt, perp])
-    tau = P.downstream_cumulative(mu, UGRID, geom, angle, torch.tensor(omegas, dtype=F64, device=device))
+    tau = P.downstream_cumulative(mu, UGRID, geometry, angle, torch.tensor(omegas, dtype=F64, device=device))
     assert tau.shape == (4, 1, *UGRID.shape)
     assert torch.isinf(tau[1]).all() and torch.isinf(tau[3]).all()
     lo, hi = box_of(UGRID)
     centers = UGRID.center_coordinates(dtype=F64).numpy()
     if angle == 0.0:
-        ref0 = centers[..., 1] + UGRID.extent[1] / 2  # distance to the bottom face y = -Y/2
+        reference0 = centers[..., 1] + UGRID.extent[1] / 2  # distance to the bottom face y = -Y/2
     else:
-        ref0 = np.array([chord(c, c - 100 * n_hat, lo, hi) for c in centers.reshape(-1, 3)]).reshape(UGRID.shape)
-    np.testing.assert_allclose(tau[0, 0].cpu().numpy(), 0.25 * ref0, rtol=0, atol=1e-10)
-    ref2 = np.array([chord(c, c + 100 * tilt, lo, hi) for c in centers.reshape(-1, 3)]).reshape(UGRID.shape)
-    np.testing.assert_allclose(tau[2, 0].cpu().numpy(), 0.25 * ref2, rtol=0, atol=1e-10)
+        reference0 = np.array([chord(c, c - 100 * n_hat, lo, hi) for c in centers.reshape(-1, 3)]).reshape(UGRID.shape)
+    np.testing.assert_allclose(tau[0, 0].cpu().numpy(), 0.25 * reference0, rtol=0, atol=1e-10)
+    reference2 = np.array([chord(c, c + 100 * tilt, lo, hi) for c in centers.reshape(-1, 3)]).reshape(UGRID.shape)
+    np.testing.assert_allclose(tau[2, 0].cpu().numpy(), 0.25 * reference2, rtol=0, atol=1e-10)
 
 
 def test_downstream_stops_at_panel_plane(device):
     # panel cutting through the box (never in CT, but the segment must end at the panel plane)
-    geom = ConeGeometry(source_iso_dist=10.0, source_detector_dist=10.0, num_det_rows=2, num_det_channels=2,
-                        delta_det_row=1.0, delta_det_channel=1.0)  # panel plane y = 0
+    geometry = ConeGeometry(source_iso_dist=10.0, source_detector_dist=10.0, num_det_rows=2, num_det_channels=2,
+                            delta_det_row=1.0, delta_det_channel=1.0)  # panel plane y = 0
     grid = Grid(shape=(4, 2, 2), delta_voxel=1.0)  # y in [-2, 2]
     P = SiddonProjectors()
     mu = torch.ones(1, *grid.shape, dtype=F64, device=device)
-    tau = P.downstream_cumulative(mu, grid, geom, 0.0, torch.tensor([[0.0, -1.0, 0.0]], dtype=F64, device=device))
+    tau = P.downstream_cumulative(mu, grid, geometry, 0.0, torch.tensor([[0.0, -1.0, 0.0]], dtype=F64, device=device))
     y = grid.axis_coordinates(dtype=F64)[1]
-    ref = y.clamp(min=0.0)[:, None, None].expand(grid.shape)
-    torch.testing.assert_close(tau[0, 0].cpu(), ref, rtol=0, atol=1e-12)
+    reference = y.clamp(min=0.0)[:, None, None].expand(grid.shape)
+    torch.testing.assert_close(tau[0, 0].cpu(), reference, rtol=0, atol=1e-12)
 
 
 @pytest.mark.parametrize("angle", [0.0, 0.9])
 def test_oblique_project(device, angle):
-    geom = small_geom(rows=5, chans=7, d=1.3)
+    geometry = small_geometry(rows=5, chans=7, d=1.3)
     P = SiddonProjectors()
     lo, hi = box_of(UGRID)
-    _, _, n_hat = (np.array(a) for a in geom.panel_axes(angle))
-    tilt = geom.view_to_recon(torch.tensor([0.2, -0.95, -0.25], dtype=F64), angle).numpy()  # defined in the view frame
+    _, _, n_hat = (np.array(a) for a in geometry.panel_axes(angle))
+    # defined in the view frame
+    tilt = geometry.view_to_recon(torch.tensor([0.2, -0.95, -0.25], dtype=F64), angle).numpy()
     tilt /= np.linalg.norm(tilt)
     omegas = np.stack([-n_hat, tilt])
-    om_t = torch.tensor(omegas, dtype=F64, device=device)
-    pix = geom.pixel_centers(angle, dtype=F64).numpy()
+    directions_t = torch.tensor(omegas, dtype=F64, device=device)
+    pix = geometry.pixel_centers(angle, dtype=F64).numpy()
 
-    def line_chords(lo_, hi_, om):
-        return np.array([[chord(pix[r, c] - 200 * om, pix[r, c] + 200 * om, lo_, hi_)
+    def line_chords(lo_, hi_, directions):
+        return np.array([[chord(pix[r, c] - 200 * directions, pix[r, c] + 200 * directions, lo_, hi_)
                           for c in range(pix.shape[1])] for r in range(pix.shape[0])])
 
     ones = torch.ones(1, *UGRID.shape, dtype=F64, device=device)
-    img = P.oblique_project(ones, UGRID, geom, angle, om_t)
-    assert img.shape == (2, 1, 5, 7)
+    image = P.oblique_project(ones, UGRID, geometry, angle, directions_t)
+    assert image.shape == (2, 1, 5, 7)
     for k in range(2):
-        ref = line_chords(lo, hi, omegas[k])
-        assert (ref > 0).any()
-        np.testing.assert_allclose(img[k, 0].cpu().numpy(), ref, rtol=0, atol=1e-10)
+        reference = line_chords(lo, hi, omegas[k])
+        assert (reference > 0).any()
+        np.testing.assert_allclose(image[k, 0].cpu().numpy(), reference, rtol=0, atol=1e-10)
 
     # single-voxel field: chord through that voxel's own box
     i, j, kk = 2, 3, 1
@@ -243,30 +244,33 @@ def test_oblique_project(device, angle):
     one[0, i, j, kk] = 1.0
     d = np.array(UGRID.deltas)
     vlo = lo + np.array([j, i, kk]) * d
-    img1 = P.oblique_project(one, UGRID, geom, angle, om_t)
+    image1 = P.oblique_project(one, UGRID, geometry, angle, directions_t)
     for k in range(2):
-        ref = line_chords(vlo, vlo + d, omegas[k])
-        np.testing.assert_allclose(img1[k, 0].cpu().numpy(), ref, rtol=0, atol=1e-10)
+        reference = line_chords(vlo, vlo + d, omegas[k])
+        np.testing.assert_allclose(image1[k, 0].cpu().numpy(), reference, rtol=0, atol=1e-10)
 
     # per-direction fields [K, G, ...] equal the shared-field call direction by direction
     fields = torch.rand(2, 3, *UGRID.shape, dtype=F64, device=device)
-    imgk = P.oblique_project(fields, UGRID, geom, angle, om_t)
+    image_k = P.oblique_project(fields, UGRID, geometry, angle, directions_t)
     for k in range(2):
-        torch.testing.assert_close(imgk[k], P.oblique_project(fields[k], UGRID, geom, angle, om_t[k:k + 1])[0])
+        torch.testing.assert_close(image_k[k],
+                                   P.oblique_project(fields[k], UGRID, geometry, angle, directions_t[k:k + 1])[0])
 
 
 def test_linearity_and_group_batching(device):
-    geom = small_geom()
+    geometry = small_geometry()
     P = SiddonProjectors(ray_chunk=97)
     angle = 0.6
     a = torch.rand(3, *UGRID.shape, dtype=F64, device=device)
     b = torch.rand(3, *UGRID.shape, dtype=F64, device=device)
-    om = torch.nn.functional.normalize(torch.tensor([[0.1, -1.0, 0.05], [-0.3, -0.8, 0.2]], dtype=F64, device=device), dim=-1)
+    directions = torch.nn.functional.normalize(torch.tensor([[0.1, -1.0, 0.05], [-0.3, -0.8, 0.2]], dtype=F64,
+                                                            device=device),
+                                               dim=-1)
     ops = [  # (operation, index of the group axis in its output)
-        (lambda v: P.upstream_cumulative(v, UGRID, geom, angle), 0),
-        (lambda v: P.primary_project(v, UGRID, geom, angle), 0),
-        (lambda v: P.downstream_cumulative(v, UGRID, geom, angle, om), 1),
-        (lambda v: P.oblique_project(v, UGRID, geom, angle, om), 1),
+        (lambda v: P.upstream_cumulative(v, UGRID, geometry, angle), 0),
+        (lambda v: P.primary_project(v, UGRID, geometry, angle), 0),
+        (lambda v: P.downstream_cumulative(v, UGRID, geometry, angle, directions), 1),
+        (lambda v: P.oblique_project(v, UGRID, geometry, angle, directions), 1),
     ]
     for op, gdim in ops:
         torch.testing.assert_close(op(2.0 * a - 0.5 * b), 2.0 * op(a) - 0.5 * op(b))
@@ -284,20 +288,20 @@ def _triton_ray_tracing_ok() -> bool:
 
 
 requires_triton_kernels = pytest.mark.skipif(not _triton_ray_tracing_ok(), reason="Siddon Triton kernels unusable here")
-TRITON_TOL = 1e-5  # relative to the maximum |value| of the reference result
+TRITON_TOLERANCE = 1e-5  # relative to the maximum |value| of the reference result
 
 
-def _assert_close_rel(got: torch.Tensor, ref: torch.Tensor, tol: float = TRITON_TOL) -> float:
-    """Same +inf pattern, finite entries within tol x max|ref|; returns the relative deviation."""
-    assert got.shape == ref.shape and got.dtype == ref.dtype
-    m = torch.isfinite(ref)
+def _assert_close_rel(got: torch.Tensor, reference: torch.Tensor, tolerance: float = TRITON_TOLERANCE) -> float:
+    """Same +inf pattern, finite entries within tolerance x max|reference|; returns the relative deviation."""
+    assert got.shape == reference.shape and got.dtype == reference.dtype
+    m = torch.isfinite(reference)
     assert bool((torch.isfinite(got) == m).all()), "+inf pattern differs"
     if not bool(m.any()):
         return 0.0
-    scale = max(float(ref[m].abs().max()), 1e-30)
-    dev = float((got[m] - ref[m]).abs().max()) / scale
-    assert dev <= tol, f"relative deviation {dev:.2e} > {tol:.0e}"
-    return dev
+    scale = max(float(reference[m].abs().max()), 1e-30)
+    deviation = float((got[m] - reference[m]).abs().max()) / scale
+    assert deviation <= tolerance, f"relative deviation {deviation:.2e} > {tolerance:.0e}"
+    return deviation
 
 
 def _edge_segments(grid: Grid, rng, n_random: int = 200) -> np.ndarray:
@@ -333,12 +337,12 @@ def test_triton_line_integrals_match_torch(G):
     volume index, non-contiguous volumes / end points, a shared (stride-0) start."""
     from citrus.scatter_solver.kernels.ray_tracing_kernels import line_integrals_triton
 
-    dev = torch.device("cuda")
+    device = torch.device("cuda")
     rng = np.random.default_rng(10 + G)
-    segs = torch.tensor(_edge_segments(GRID, rng), dtype=torch.float32, device=dev)
+    segs = torch.tensor(_edge_segments(GRID, rng), dtype=torch.float32, device=device)
     s, e = segs[:, 0], segs[:, 1]  # non-contiguous row views
     assert not s.is_contiguous()
-    vol = torch.rand(G, *GRID.shape, device=dev)
+    vol = torch.rand(G, *GRID.shape, device=device)
     _assert_close_rel(line_integrals_triton(vol, s, e, GRID), line_integrals(vol, s, e, GRID))
     # float64 truth: the kernel is within float32 rounding of it
     r64 = line_integrals(vol.double(), s.double(), e.double(), GRID)
@@ -349,13 +353,13 @@ def test_triton_line_integrals_match_torch(G):
     _assert_close_rel(line_integrals_triton(vol_nc, s, e, GRID), line_integrals(vol, s, e, GRID))
     # stacked volumes with a per-ray index
     K = 3
-    vols = torch.rand(K, G, *GRID.shape, device=dev)
-    kk = torch.tensor(rng.integers(0, K, s.shape[0]), device=dev)
+    vols = torch.rand(K, G, *GRID.shape, device=device)
+    kk = torch.tensor(rng.integers(0, K, s.shape[0]), device=device)
     _assert_close_rel(line_integrals_triton(vols, s, e, GRID, volume_index=kk),
                       line_integrals(vols, s, e, GRID, volume_index=kk))
     # a stride-0 start (one shared point) and an empty ray set
-    src = torch.tensor([0.3, 9.0, -0.4], device=dev).expand_as(e)
-    _assert_close_rel(line_integrals_triton(vol, src, e, GRID), line_integrals(vol, src, e, GRID))
+    source = torch.tensor([0.3, 9.0, -0.4], device=device).expand_as(e)
+    _assert_close_rel(line_integrals_triton(vol, source, e, GRID), line_integrals(vol, source, e, GRID))
     assert line_integrals_triton(vol, s[:0], e[:0], GRID).shape == (G, 0)
     with pytest.raises(ValueError):
         line_integrals_triton(vols, s, e, GRID)  # 5-D volume without volume_index
@@ -363,16 +367,16 @@ def test_triton_line_integrals_match_torch(G):
         line_integrals_triton(vol.double(), s, e, GRID)
 
 
-def _triton_directions(geom: ConeGeometry, angle: float, dev) -> torch.Tensor:
+def _triton_directions(geometry: ConeGeometry, angle: float, device) -> torch.Tensor:
     """Directions for the downstream / oblique checks (recon frame): tilted ones (view frame), exact coordinate
     axes, lattice diagonals, one pointing away from the panel, -n_hat, u_hat (in the panel plane) and +z."""
-    u_hat, _, n_hat = (np.array(a) for a in geom.panel_axes(angle))
+    u_hat, _, n_hat = (np.array(a) for a in geometry.panel_axes(angle))
     view = np.array([[0.2, -1.0, 0.1], [-0.3, -0.8, 0.25], [0.6, -0.5, -0.4], [0.0, -1.0, 0.0], [1.0, -1.0, 1.0],
                      [0.0, -1.0, 1.0], [0.05, 1.0, 0.0]])
     view = view / np.linalg.norm(view, axis=1, keepdims=True)
-    rec = geom.view_to_recon(torch.tensor(view), angle).numpy()
+    record = geometry.view_to_recon(torch.tensor(view), angle).numpy()
     extra = [-n_hat, np.array([0.0, -1.0, 0.0]), np.array([1.0, 0.0, 0.0]), u_hat, np.array([0.0, 0.0, 1.0])]
-    return torch.tensor(np.concatenate([rec, np.stack(extra)]), dtype=torch.float32, device=dev)
+    return torch.tensor(np.concatenate([record, np.stack(extra)]), dtype=torch.float32, device=device)
 
 
 @requires_triton_kernels
@@ -380,43 +384,46 @@ def _triton_directions(geom: ConeGeometry, angle: float, dev) -> torch.Tensor:
 @pytest.mark.parametrize("angle", [0.0, 0.7])
 def test_triton_projector_operations_match_torch(G, angle):
     """SiddonProjectors(backend="triton") == the PyTorch reference path for all four operations (shared and
-    per-direction oblique fields, non-contiguous inputs, n_sub > 1, +inf directions)."""
-    dev = torch.device("cuda")
-    geom = small_geom(det_channel_offset=0.3, det_row_offset=-0.2)
+    per-direction oblique fields, non-contiguous inputs, samples_per_pixel_axis > 1, +inf directions)."""
+    device = torch.device("cuda")
+    geometry = small_geometry(det_channel_offset=0.3, det_row_offset=-0.2)
     T = SiddonProjectors(backend="torch")
     assert T.backend == "torch"
-    gen = torch.Generator(device=dev).manual_seed(5)
-    mu = 0.3 * torch.rand(G, *UGRID.shape, device=dev, generator=gen)
-    om = _triton_directions(geom, angle, dev)
-    K = om.shape[0]
-    ref_down = T.downstream_cumulative(mu, UGRID, geom, angle, om)
-    assert torch.isinf(ref_down[K - 2:]).all() and torch.isinf(ref_down[6]).all()  # u_hat, +z; the away one
-    assert torch.isfinite(ref_down[:6]).all()
+    generator = torch.Generator(device=device).manual_seed(5)
+    mu = 0.3 * torch.rand(G, *UGRID.shape, device=device, generator=generator)
+    directions = _triton_directions(geometry, angle, device)
+    K = directions.shape[0]
+    reference_down = T.downstream_cumulative(mu, UGRID, geometry, angle, directions)
+    assert torch.isinf(reference_down[K - 2:]).all() and torch.isinf(reference_down[6]).all()  # u_hat, +z; the away one
+    assert torch.isfinite(reference_down[:6]).all()
     mu_nc = mu.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
-    om_nc = torch.cat([om, om], dim=1)[:, :3]
-    assert not mu_nc.is_contiguous() and not om_nc.is_contiguous()
+    directions_nc = torch.cat([directions, directions], dim=1)[:, :3]
+    assert not mu_nc.is_contiguous() and not directions_nc.is_contiguous()
     P = SiddonProjectors(backend="triton")
     assert P._use_triton(mu)
-    _assert_close_rel(P.downstream_cumulative(mu, UGRID, geom, angle, om), ref_down)
-    _assert_close_rel(P.downstream_cumulative(mu_nc, UGRID, geom, angle, om_nc), ref_down)
-    _assert_close_rel(P.upstream_cumulative(mu, UGRID, geom, angle), T.upstream_cumulative(mu, UGRID, geom, angle))
-    _assert_close_rel(P.upstream_cumulative(mu_nc, UGRID, geom, angle), T.upstream_cumulative(mu, UGRID, geom, angle))
-    _assert_close_rel(P.primary_project(mu, UGRID, geom, angle), T.primary_project(mu, UGRID, geom, angle))
-    _assert_close_rel(P.primary_project(mu, UGRID, geom, angle, n_sub=3),
-                      T.primary_project(mu, UGRID, geom, angle, n_sub=3))
-    fields = torch.rand(K, G, *UGRID.shape, device=dev, generator=gen)
-    _assert_close_rel(P.oblique_project(fields[0], UGRID, geom, angle, om),
-                      T.oblique_project(fields[0], UGRID, geom, angle, om))
-    _assert_close_rel(P.oblique_project(fields, UGRID, geom, angle, om), T.oblique_project(fields, UGRID, geom, angle, om))
-    pad = torch.zeros(K, G, *UGRID.shape[:2], UGRID.shape[2] + 3, device=dev)
+    _assert_close_rel(P.downstream_cumulative(mu, UGRID, geometry, angle, directions), reference_down)
+    _assert_close_rel(P.downstream_cumulative(mu_nc, UGRID, geometry, angle, directions_nc), reference_down)
+    _assert_close_rel(P.upstream_cumulative(mu, UGRID, geometry, angle), T.upstream_cumulative(mu, UGRID, geometry,
+                                                                                               angle))
+    _assert_close_rel(P.upstream_cumulative(mu_nc, UGRID, geometry, angle), T.upstream_cumulative(mu, UGRID, geometry,
+                                                                                                  angle))
+    _assert_close_rel(P.primary_project(mu, UGRID, geometry, angle), T.primary_project(mu, UGRID, geometry, angle))
+    _assert_close_rel(P.primary_project(mu, UGRID, geometry, angle, samples_per_pixel_axis=3),
+                      T.primary_project(mu, UGRID, geometry, angle, samples_per_pixel_axis=3))
+    fields = torch.rand(K, G, *UGRID.shape, device=device, generator=generator)
+    _assert_close_rel(P.oblique_project(fields[0], UGRID, geometry, angle, directions),
+                      T.oblique_project(fields[0], UGRID, geometry, angle, directions))
+    _assert_close_rel(P.oblique_project(fields, UGRID, geometry, angle, directions),
+                      T.oblique_project(fields, UGRID, geometry, angle, directions))
+    pad = torch.zeros(K, G, *UGRID.shape[:2], UGRID.shape[2] + 3, device=device)
     pad[..., 1:-2] = fields
     f_nc = pad[..., 1:-2]  # [K, G, ...] slice of a padded buffer
     assert not f_nc.is_contiguous()
-    _assert_close_rel(P.oblique_project(f_nc, UGRID, geom, angle, om_nc),
-                      T.oblique_project(fields, UGRID, geom, angle, om))
+    _assert_close_rel(P.oblique_project(f_nc, UGRID, geometry, angle, directions_nc),
+                      T.oblique_project(fields, UGRID, geometry, angle, directions))
     # the generic line_integrals method dispatches too
-    s = torch.randn(50, 3, device=dev, generator=gen) * 4
-    e = torch.randn(50, 3, device=dev, generator=gen) * 4
+    s = torch.randn(50, 3, device=device, generator=generator) * 4
+    e = torch.randn(50, 3, device=device, generator=generator) * 4
     _assert_close_rel(P.line_integrals(mu, s, e, UGRID), T.line_integrals(mu, s, e, UGRID))
 
 
@@ -426,38 +433,41 @@ def test_triton_downstream_wlab_grid_vs_float64():
     within float32 rounding of the float64 PyTorch path."""
     from citrus.utilities import wlab_setup
 
-    dev = torch.device("cuda")
-    grid, geom, rho = wlab_setup(2.0, device=dev)
+    device = torch.device("cuda")
+    grid, geometry, rho = wlab_setup(2.0, device=device)
     mu = torch.stack([0.2 * rho[0] + 0.5 * rho[1], 0.3 * rho[0] + 0.9 * rho[1]])
-    gen = torch.Generator().manual_seed(2)
-    om = torch.nn.functional.normalize(torch.randn(16, 3, generator=gen) * torch.tensor([0.5, 0.3, 0.5])
-                                       - torch.tensor([0.0, 1.0, 0.0]), dim=-1).to(dev)
-    r64 = SiddonProjectors(backend="torch").downstream_cumulative(mu.double(), grid, geom, 0.0, om.double())
-    _assert_close_rel(SiddonProjectors(backend="triton").downstream_cumulative(mu, grid, geom, 0.0, om).double(), r64)
-    _assert_close_rel(SiddonProjectors(backend="torch").downstream_cumulative(mu, grid, geom, 0.0, om).double(), r64)
+    generator = torch.Generator().manual_seed(2)
+    directions = torch.nn.functional.normalize(torch.randn(16, 3, generator=generator) * torch.tensor([0.5, 0.3, 0.5])
+                                               - torch.tensor([0.0, 1.0, 0.0]), dim=-1).to(device)
+    r64 = SiddonProjectors(backend="torch").downstream_cumulative(mu.double(), grid, geometry, 0.0, directions.double())
+    triton_result = SiddonProjectors(backend="triton").downstream_cumulative(mu, grid, geometry, 0.0, directions)
+    _assert_close_rel(triton_result.double(), r64)
+    torch_result = SiddonProjectors(backend="torch").downstream_cumulative(mu, grid, geometry, 0.0, directions)
+    _assert_close_rel(torch_result.double(), r64)
 
 
 @requires_triton_kernels
 def test_triton_backend_selection():
     from citrus.scatter_solver.kernels import ray_tracing_kernels
 
-    dev = torch.device("cuda")
-    geom = small_geom()
-    mu = torch.rand(2, *UGRID.shape, device=dev)
-    om = torch.nn.functional.normalize(torch.tensor([[0.1, -1.0, 0.2]], device=dev), dim=-1)
+    device = torch.device("cuda")
+    geometry = small_geometry()
+    mu = torch.rand(2, *UGRID.shape, device=device)
+    directions = torch.nn.functional.normalize(torch.tensor([[0.1, -1.0, 0.2]], device=device), dim=-1)
     auto = SiddonProjectors(backend="auto")
     assert auto._use_triton(mu) and not auto._use_triton(mu.double()) and not auto._use_triton(mu.cpu())
-    ok, why = auto.kernel_status(dev)
+    ok, why = auto.kernel_status(device)
     assert ok, why
     assert not SiddonProjectors(backend="torch")._use_triton(mu)
     # float64 / CPU on a triton instance run the PyTorch path, bit for bit
     tri = SiddonProjectors(backend="triton")
-    r64 = tri.downstream_cumulative(mu.double(), UGRID, geom, 0.0, om.double())
+    r64 = tri.downstream_cumulative(mu.double(), UGRID, geometry, 0.0, directions.double())
     assert r64.dtype == torch.float64
-    assert torch.equal(r64, SiddonProjectors(backend="torch").downstream_cumulative(mu.double(), UGRID, geom, 0.0,
-                                                                                    om.double()))
-    assert torch.equal(tri.oblique_project(mu.cpu(), UGRID, geom, 0.0, om.cpu()),
-                       SiddonProjectors(backend="torch").oblique_project(mu.cpu(), UGRID, geom, 0.0, om.cpu()))
+    assert torch.equal(r64, SiddonProjectors(backend="torch").downstream_cumulative(mu.double(), UGRID, geometry, 0.0,
+                                                                                    directions.double()))
+    assert torch.equal(tri.oblique_project(mu.cpu(), UGRID, geometry, 0.0, directions.cpu()),
+                       SiddonProjectors(backend="torch").oblique_project(mu.cpu(), UGRID, geometry, 0.0,
+                                                                         directions.cpu()))
     assert ray_tracing_kernels.use_kernels(mu, "auto") and not ray_tracing_kernels.use_kernels(mu, "torch")
     with pytest.raises(ValueError):
         SiddonProjectors(backend="cuda")
@@ -474,42 +484,43 @@ def test_default_backend_is_fused_on_cuda_float32():
     from citrus.scatter_solver.scatter_solver import ScatterSolver
     from citrus.scatter_solver.cross_sections import synthetic_library
 
-    dev = torch.device("cuda")
+    device = torch.device("cuda")
     P = SiddonProjectors()
     assert P.backend == "auto"
-    ok, why = P.kernel_status(dev)
+    ok, why = P.kernel_status(device)
     assert ok, why
     assert P.kernel_status(torch.device("cpu"))[0] is False
-    mu = torch.rand(2, *UGRID.shape, device=dev)
+    mu = torch.rand(2, *UGRID.shape, device=device)
     assert P._use_triton(mu)
     assert not P._use_triton(mu.double()) and not P._use_triton(mu.cpu())
-    geom = small_geom()
-    om = torch.nn.functional.normalize(torch.tensor([[0.1, -1.0, 0.2], [-0.2, -0.9, 0.1]], device=dev), dim=-1)
-    ref = SiddonProjectors(backend="torch")
-    assert torch.equal(P.downstream_cumulative(mu.double(), UGRID, geom, 0.3, om.double()),
-                       ref.downstream_cumulative(mu.double(), UGRID, geom, 0.3, om.double()))
-    assert torch.equal(P.upstream_cumulative(mu.cpu(), UGRID, geom, 0.3),
-                       ref.upstream_cumulative(mu.cpu(), UGRID, geom, 0.3))
-    _assert_close_rel(P.downstream_cumulative(mu, UGRID, geom, 0.3, om),
-                      ref.downstream_cumulative(mu, UGRID, geom, 0.3, om))
-    cfg = SolverConfig(num_groups=2, legendre_order=1)
-    sol = ScatterSolver(synthetic_library(2, 5), cfg, geom, detector=csi_response(), grid_response=no_grid(),
-                       device=dev, dtype=torch.float32)
-    assert isinstance(sol.projectors, SiddonProjectors) and sol.projectors.backend == "auto"
+    geometry = small_geometry()
+    directions = torch.nn.functional.normalize(torch.tensor([[0.1, -1.0, 0.2], [-0.2, -0.9, 0.1]], device=device),
+                                               dim=-1)
+    reference = SiddonProjectors(backend="torch")
+    assert torch.equal(P.downstream_cumulative(mu.double(), UGRID, geometry, 0.3, directions.double()),
+                       reference.downstream_cumulative(mu.double(), UGRID, geometry, 0.3, directions.double()))
+    assert torch.equal(P.upstream_cumulative(mu.cpu(), UGRID, geometry, 0.3),
+                       reference.upstream_cumulative(mu.cpu(), UGRID, geometry, 0.3))
+    _assert_close_rel(P.downstream_cumulative(mu, UGRID, geometry, 0.3, directions),
+                      reference.downstream_cumulative(mu, UGRID, geometry, 0.3, directions))
+    config = SolverConfig(num_groups=2, legendre_order=1)
+    solver = ScatterSolver(synthetic_library(2, 5), config, geometry, detector=csi_response(), grid_response=no_grid(),
+                           device=device, dtype=torch.float32)
+    assert isinstance(solver.projectors, SiddonProjectors) and solver.projectors.backend == "auto"
     with pytest.raises(TypeError):
-        ScatterSolver(synthetic_library(2, 5), cfg, geom, device=dev)
+        ScatterSolver(synthetic_library(2, 5), config, geometry, device=device)
 
 
 def test_triton_ray_tracing_kill_switch(monkeypatch):
     """CITRUS_DISABLE_TRITON=1 (read by the shared probe) sends "auto" to the PyTorch path and makes "triton" raise."""
-    from citrus.scatter_solver.kernels import triton_utils
+    from citrus.scatter_solver.kernels import triton_utilities
     from citrus.scatter_solver.kernels import ray_tracing_kernels
 
-    monkeypatch.setenv(triton_utils.DISABLE_ENV_VAR, "1")
-    monkeypatch.setattr(triton_utils, "_PROBE", None)
+    monkeypatch.setenv(triton_utilities.DISABLE_ENV_VAR, "1")
+    monkeypatch.setattr(triton_utilities, "_PROBE", None)
     monkeypatch.setattr(ray_tracing_kernels, "_SELF_CHECK", {})
     ok, why = ray_tracing_kernels.kernels_usable(torch.device("cuda"))
-    assert not ok and triton_utils.DISABLE_ENV_VAR in why
+    assert not ok and triton_utilities.DISABLE_ENV_VAR in why
     with pytest.raises(RuntimeError):
         SiddonProjectors(backend="triton")
     if torch.cuda.is_available():
@@ -520,7 +531,7 @@ def test_triton_ray_tracing_kill_switch(monkeypatch):
         assert not ray_tracing_kernels.use_kernels(x, "auto")
         with pytest.raises(RuntimeError):
             ray_tracing_kernels.use_kernels(x, "triton")
-        geom = small_geom()
-        assert torch.equal(P.upstream_cumulative(x, UGRID, geom, 0.3),
-                           SiddonProjectors(backend="torch").upstream_cumulative(x, UGRID, geom, 0.3))
-    # monkeypatch restores triton_utils._PROBE to its previous value (the real probe result) afterwards
+        geometry = small_geometry()
+        assert torch.equal(P.upstream_cumulative(x, UGRID, geometry, 0.3),
+                           SiddonProjectors(backend="torch").upstream_cumulative(x, UGRID, geometry, 0.3))
+    # monkeypatch restores triton_utilities._PROBE to its previous value (the real probe result) afterwards

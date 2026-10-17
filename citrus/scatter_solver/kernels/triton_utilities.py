@@ -84,17 +84,18 @@ def launch(kernel, grid: tuple[int, int, int], args: tuple, constexprs: dict, nu
     if not _FAST_LAUNCH:
         kernel[grid](*args, **constexprs, num_warps=num_warps)
         return
-    dev = torch.cuda.current_device()
-    key = (kernel, tuple(constexprs.items()), num_warps, dev)
-    ent = _LAUNCHERS.get(key)
-    if ent is None:
+    device = torch.cuda.current_device()
+    key = (kernel, tuple(constexprs.items()), num_warps, device)
+    entry = _LAUNCHERS.get(key)
+    if entry is None:
         compiled = kernel[grid](*args, **constexprs, num_warps=num_warps)  # compiles / loads, then launches
         names = [p.name for p in kernel.params]
-        cvals = [constexprs[p.name] for p in kernel.params if p.is_constexpr]
-        if len(names) != len(args) + len(cvals) or any(p.is_constexpr for p in kernel.params[:len(args)]):
+        constexpr_values = [constexprs[p.name] for p in kernel.params if p.is_constexpr]
+        if (len(names) != len(args) + len(constexpr_values)
+                or any(p.is_constexpr for p in kernel.params[:len(args)])):
             raise RuntimeError(f"{kernel}: positional arguments must precede the constexprs")
-        _LAUNCHERS[key] = (compiled, cvals)
+        _LAUNCHERS[key] = (compiled, constexpr_values)
         return
-    compiled, cvals = ent
-    compiled.run(grid[0], grid[1], grid[2], torch._C._cuda_getCurrentRawStream(dev), compiled.function,
-                 compiled.packed_metadata, None, None, None, *args, *cvals)
+    compiled, constexpr_values = entry
+    compiled.run(grid[0], grid[1], grid[2], torch._C._cuda_getCurrentRawStream(device), compiled.function,
+                 compiled.packed_metadata, None, None, None, *args, *constexpr_values)

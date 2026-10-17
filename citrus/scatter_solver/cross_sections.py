@@ -108,9 +108,10 @@ class MultigroupLibrary:
         if len(self.materials) != M:
             raise ValueError(f"{len(self.materials)} material names {self.materials} for {M} materials")
         if self.nominal_density is None:
-            d = (NOMINAL_DENSITIES if self.materials == MATERIALS else (1.0, 1.85) if self.materials == ("water", "bone")
-                 else tuple(float(m + 1) for m in range(M)))
-            self.nominal_density = torch.tensor(d, dtype=torch.float64, device=self.mu_t.device)
+            densities = (NOMINAL_DENSITIES if self.materials == MATERIALS
+                         else (1.0, 1.85) if self.materials == ("water", "bone")
+                         else tuple(float(m + 1) for m in range(M)))
+            self.nominal_density = torch.tensor(densities, dtype=torch.float64, device=self.mu_t.device)
         if tuple(self.nominal_density.shape) != (M,):
             raise ValueError(f"nominal_density must be [{M}], got {tuple(self.nominal_density.shape)}")
 
@@ -137,26 +138,26 @@ class MultigroupLibrary:
         return self.mu_s_l[..., 0]
 
     def to(self, device=None, dtype=None) -> "MultigroupLibrary":
-        kw = {}
+        keywords = {}
         if device is not None:
-            kw["device"] = device
+            keywords["device"] = device
         if dtype is not None:
-            kw["dtype"] = dtype
+            keywords["dtype"] = dtype
         return MultigroupLibrary(
-            group_edges=self.group_edges.to(**kw),
-            group_energy=self.group_energy.to(**kw),
-            spectrum_fraction=self.spectrum_fraction.to(**kw),
-            mu_t=self.mu_t.to(**kw),
-            mu_pe=self.mu_pe.to(**kw),
-            mu_s_l=self.mu_s_l.to(**kw),
-            eta_grid=self.eta_grid.to(**kw),
-            mu_s_eta=self.mu_s_eta.to(**kw),
-            fine_energy=self.fine_energy.to(**kw),
-            fine_mu_t=self.fine_mu_t.to(**kw),
-            fine_weight=self.fine_weight.to(**kw),
+            group_edges=self.group_edges.to(**keywords),
+            group_energy=self.group_energy.to(**keywords),
+            spectrum_fraction=self.spectrum_fraction.to(**keywords),
+            mu_t=self.mu_t.to(**keywords),
+            mu_pe=self.mu_pe.to(**keywords),
+            mu_s_l=self.mu_s_l.to(**keywords),
+            eta_grid=self.eta_grid.to(**keywords),
+            mu_s_eta=self.mu_s_eta.to(**keywords),
+            fine_energy=self.fine_energy.to(**keywords),
+            fine_mu_t=self.fine_mu_t.to(**keywords),
+            fine_weight=self.fine_weight.to(**keywords),
             fine_group=self.fine_group.to(device=device) if device is not None else self.fine_group,
             materials=self.materials,
-            nominal_density=self.nominal_density.to(**kw),
+            nominal_density=self.nominal_density.to(**keywords),
         )
 
     def save(self, path: str) -> None:
@@ -167,11 +168,11 @@ class MultigroupLibrary:
         """Load a library written by `save`. Raises KeyError if the file lacks a field (a file written by an older
         version: no fine-energy table, no material names or no nominal densities); `cross_section_library.build_library`
         then rebuilds its cache entry."""
-        d = torch.load(path)
-        missing = [k for k in MultigroupLibrary.__dataclass_fields__ if k not in d]
+        fields = torch.load(path)
+        missing = [k for k in MultigroupLibrary.__dataclass_fields__ if k not in fields]
         if missing:
             raise KeyError(f"library file {path!r} lacks fields {missing} (written by an older version)")
-        return MultigroupLibrary(**d)
+        return MultigroupLibrary(**fields)
 
 
 # ---- compact per-voxel material pairs ----------------------------------------------------------------------
@@ -209,21 +210,21 @@ def material_pairs(rho: Tensor) -> MaterialPairs:
     ValueError otherwise; one host synchronization when M > 2). The nonzero materials keep ascending index order."""
     M = int(rho.shape[0])
     spatial = tuple(rho.shape[1:])
-    nz = rho != 0
+    nonzero = rho != 0
     if M > 2 and rho.numel():
-        worst = int(nz.sum(0).max())
-        if worst > 2:
-            raise ValueError(f"material_pairs: a voxel has {worst} nonzero materials (at most 2 allowed)")
-    ar = torch.arange(M, device=rho.device).reshape((M,) + (1,) * len(spatial)).expand(nz.shape)
-    none = torch.full_like(ar, M)
-    key = torch.where(nz, ar, none)
+        max_count = int(nonzero.sum(0).max())
+        if max_count > 2:
+            raise ValueError(f"material_pairs: a voxel has {max_count} nonzero materials (at most 2 allowed)")
+    material_index = torch.arange(M, device=rho.device).reshape((M,) + (1,) * len(spatial)).expand(nonzero.shape)
+    unused = torch.full_like(material_index, M)
+    key = torch.where(nonzero, material_index, unused)
     first = key.amin(0)
-    second = torch.where(key == first[None], none, key).amin(0)
-    idx = torch.stack([first, second])  # M marks an unused slot
-    used = idx < M
-    idx = torch.where(used, idx, torch.zeros_like(idx))
-    dens = torch.gather(rho, 0, idx) * used.to(rho.dtype)
-    return MaterialPairs(index=idx.to(torch.int32).contiguous(), density=dens.contiguous(), num_materials=M)
+    second = torch.where(key == first[None], unused, key).amin(0)
+    index = torch.stack([first, second])  # M marks an unused slot
+    used = index < M
+    index = torch.where(used, index, torch.zeros_like(index))
+    density = torch.gather(rho, 0, index) * used.to(rho.dtype)
+    return MaterialPairs(index=index.to(torch.int32).contiguous(), density=density.contiguous(), num_materials=M)
 
 
 def max_materials_per_point(rho: Tensor) -> int:
@@ -239,7 +240,7 @@ def material_pairs_if_compact(rho: Tensor) -> Optional[MaterialPairs]:
     None (M <= 2, or some point mixes three or more materials: the first-collision source then evaluates all M
     materials densely). One host synchronization when M > 2. Block means of a density field that obeys the
     two-material convention (`citrus.utilities.attenuation_to_densities`) can mix more materials, so the solver
-    decides per quadrature grid (`scatter_solver.MaterialFields.pairs_quad`)."""
+    decides per quadrature grid (`scatter_solver.MaterialFields.pairs_quadrature`)."""
     if int(rho.shape[0]) <= 2 or max_materials_per_point(rho) > 2:
         return None
     return material_pairs(rho)
@@ -247,12 +248,12 @@ def material_pairs_if_compact(rho: Tensor) -> Optional[MaterialPairs]:
 
 # ---- per-voxel coefficients from density maps ----------------------------------------------------
 
-def mu_t_volume(lib: MultigroupLibrary, rho: Tensor) -> Tensor:
+def mu_t_volume(library: MultigroupLibrary, rho: Tensor) -> Tensor:
     """Total attenuation per group on a grid.
 
     rho: [M, rows, cols, slices] g/cm^3. Returns [G, rows, cols, slices] in 1/cm.
     """
-    mu = lib.mu_t.to(rho.device, rho.dtype)  # [M, G]
+    mu = library.mu_t.to(rho.device, rho.dtype)  # [M, G]
     return torch.einsum("mg,mijk->gijk", mu, rho)
 
 
@@ -260,15 +261,15 @@ def mu_t_volume(lib: MultigroupLibrary, rho: Tensor) -> Tensor:
 _TRANSMISSION_BLOCK = 1 << 22
 
 
-def fine_group_weights(lib: MultigroupLibrary, device=None, dtype=None) -> Tensor:
+def fine_group_weights(library: MultigroupLibrary, device=None, dtype=None) -> Tensor:
     """[G, E] matrix W[g, e] = fine_weight[e] where fine_group[e] == g, else 0 (fine-to-group summation)."""
-    fg = lib.fine_group.to(device=device)
-    w = lib.fine_weight.to(device=device, dtype=dtype)
-    onehot = fg[None, :] == torch.arange(lib.num_groups, device=fg.device)[:, None]
-    return torch.where(onehot, w[None, :], torch.zeros((), device=w.device, dtype=w.dtype))
+    fine_group = library.fine_group.to(device=device)
+    weights = library.fine_weight.to(device=device, dtype=dtype)
+    in_group = fine_group[None, :] == torch.arange(library.num_groups, device=fine_group.device)[:, None]
+    return torch.where(in_group, weights[None, :], torch.zeros((), device=weights.device, dtype=weights.dtype))
 
 
-def group_transmission(lib: MultigroupLibrary, path: Tensor, block: int = _TRANSMISSION_BLOCK,
+def group_transmission(library: MultigroupLibrary, path: Tensor, block: int = _TRANSMISSION_BLOCK,
                        materials: Optional[Sequence[int]] = None) -> Tensor:
     """Group-integrated transmission from material line integrals, exact in energy up to the fine quadrature.
 
@@ -284,54 +285,54 @@ def group_transmission(lib: MultigroupLibrary, path: Tensor, block: int = _TRANS
     present in a volume, `uncollided.present_materials`: an absent material has zero line integrals and adds exactly 0
     to the optical depth); None = all, in library order.
     """
-    dev, dt = path.device, path.dtype
+    device, dtype = path.device, path.dtype
     M = path.shape[0]
     spatial = tuple(path.shape[1:])
-    P = path.reshape(M, -1)
-    N = P.shape[1]
-    mu = lib.fine_mu_t.to(device=dev, dtype=dt)  # [M, E]
+    paths = path.reshape(M, -1)
+    num_rays = paths.shape[1]
+    fine_mu_t = library.fine_mu_t.to(device=device, dtype=dtype)  # [M, E]
     if materials is not None:
-        idx = [int(i) for i in materials]
-        if any(i < 0 or i >= mu.shape[0] for i in idx):
-            raise ValueError(f"material indices {idx} outside the library's {mu.shape[0]} materials")
-        mu = mu[torch.as_tensor(idx, device=dev, dtype=torch.long)]
-    if mu.shape[0] != M:
-        raise ValueError(f"path has {M} materials, the library {mu.shape[0]}")
-    Wg = fine_group_weights(lib, dev, dt)  # [G, E]
-    E = mu.shape[1]
-    out = torch.zeros(Wg.shape[0], N, device=dev, dtype=dt)
-    nb = max(1, min(N, int(block)))
-    eb = max(1, int(block) // nb)
-    for n0 in range(0, N, nb):
-        Pn = P[:, n0:n0 + nb]
-        o = out[:, n0:n0 + nb]
-        for e0 in range(0, E, eb):
-            m = mu[:, e0:e0 + eb]  # [M, e]
-            tau = m[0][:, None] * Pn[0][None, :]
+        indices = [int(i) for i in materials]
+        if any(i < 0 or i >= fine_mu_t.shape[0] for i in indices):
+            raise ValueError(f"material indices {indices} outside the library's {fine_mu_t.shape[0]} materials")
+        fine_mu_t = fine_mu_t[torch.as_tensor(indices, device=device, dtype=torch.long)]
+    if fine_mu_t.shape[0] != M:
+        raise ValueError(f"path has {M} materials, the library {fine_mu_t.shape[0]}")
+    group_weights = fine_group_weights(library, device, dtype)  # [G, E]
+    num_energies = fine_mu_t.shape[1]
+    out = torch.zeros(group_weights.shape[0], num_rays, device=device, dtype=dtype)
+    rays_per_block = max(1, min(num_rays, int(block)))
+    energies_per_block = max(1, int(block) // rays_per_block)
+    for ray_start in range(0, num_rays, rays_per_block):
+        path_block = paths[:, ray_start:ray_start + rays_per_block]
+        out_block = out[:, ray_start:ray_start + rays_per_block]
+        for energy_start in range(0, num_energies, energies_per_block):
+            mu_block = fine_mu_t[:, energy_start:energy_start + energies_per_block]  # [M, e]
+            tau = mu_block[0][:, None] * path_block[0][None, :]
             for k in range(1, M):
-                tau.addcmul_(m[k][:, None], Pn[k][None, :])
-            o.addmm_(Wg[:, e0:e0 + eb], tau.neg_().exp_())
-    return out.reshape(Wg.shape[0], *spatial)
+                tau.addcmul_(mu_block[k][:, None], path_block[k][None, :])
+            out_block.addmm_(group_weights[:, energy_start:energy_start + energies_per_block], tau.neg_().exp_())
+    return out.reshape(group_weights.shape[0], *spatial)
 
 
-def transfer_moments_volume(lib: MultigroupLibrary, rho: Tensor) -> Tensor:
+def transfer_moments_volume(library: MultigroupLibrary, rho: Tensor) -> Tensor:
     """Legendre transfer moments per voxel: [G_in, G_out, L+1, rows, cols, slices] in 1/cm."""
-    t = lib.mu_s_l.to(rho.device, rho.dtype)  # [M, Gi, Go, L+1]
-    return torch.einsum("mabl,mijk->ablijk", t, rho)
+    transfer = library.mu_s_l.to(rho.device, rho.dtype)  # [M, Gi, Go, L+1]
+    return torch.einsum("mabl,mijk->ablijk", transfer, rho)
 
 
-def transfer_eta_at(lib: MultigroupLibrary, rho: Tensor, eta: Tensor) -> Tensor:
+def transfer_eta_at(library: MultigroupLibrary, rho: Tensor, eta: Tensor) -> Tensor:
     """Per-steradian transfer evaluated at cos-angles eta for every voxel.
 
     rho: [M, ...spatial]; eta: [...spatial] broadcastable to rho[0]. Returns [G_in, G_out, ...spatial] (1/cm/sr).
-    Linear interpolation on lib.eta_grid.
+    Linear interpolation on library.eta_grid.
     """
-    grid = lib.eta_grid.to(eta.device, eta.dtype)
-    n = grid.numel()
+    eta_grid = library.eta_grid.to(eta.device, eta.dtype)
+    n = eta_grid.numel()
     pos = (eta.clamp(-1.0, 1.0) + 1.0) / 2.0 * (n - 1)
     i0 = pos.floor().long().clamp(0, n - 2)
     w1 = (pos - i0.to(pos.dtype)).clamp(0.0, 1.0)
-    table = lib.mu_s_eta.to(eta.device, eta.dtype)  # [M, Gi, Go, N]
+    table = library.mu_s_eta.to(eta.device, eta.dtype)  # [M, Gi, Go, N]
     flat0 = i0.reshape(-1)
     v0 = table[..., flat0]  # [M, Gi, Go, P]
     v1 = table[..., (flat0 + 1)]
@@ -341,27 +342,27 @@ def transfer_eta_at(lib: MultigroupLibrary, rho: Tensor, eta: Tensor) -> Tensor:
     return torch.einsum("mab...,m...->ab...", v, rho)
 
 
-def transfer_eta_at_pairs(lib: MultigroupLibrary, pairs: MaterialPairs, eta: Tensor) -> Tensor:
+def transfer_eta_at_pairs(library: MultigroupLibrary, pairs: MaterialPairs, eta: Tensor) -> Tensor:
     """`transfer_eta_at` for the pair representation: the two table rows of each voxel gathered by material index.
 
     pairs: index / density [2, ...spatial]; eta: [...spatial] or [k, ...spatial] (the pairs broadcast over the leading
     direction axis). Returns [G_in, G_out, *eta.shape] (1/cm/sr). Peak memory that of a two-material basis for any M.
     """
-    grid = lib.eta_grid.to(eta.device, eta.dtype)
-    n = grid.numel()
+    eta_grid = library.eta_grid.to(eta.device, eta.dtype)
+    n = eta_grid.numel()
     pos = (eta.clamp(-1.0, 1.0) + 1.0) / 2.0 * (n - 1)
     i0 = pos.floor().long().clamp(0, n - 2)
     w1 = (pos - i0.to(pos.dtype)).clamp(0.0, 1.0)
-    table = lib.mu_s_eta.to(eta.device, eta.dtype)  # [M, Gi, Go, N]
+    table = library.mu_s_eta.to(eta.device, eta.dtype)  # [M, Gi, Go, N]
     flat0 = i0.reshape(-1)
     w1f = w1.reshape(-1)
     out = None
     for p in range(2):
-        mi = pairs.index[p].to(eta.device).long().expand(eta.shape).reshape(-1)
-        rp = pairs.density[p].to(eta.device, eta.dtype).expand(eta.shape).reshape(-1)
-        v0 = table[mi, :, :, flat0]  # [P, Gi, Go]
-        v1 = table[mi, :, :, flat0 + 1]
-        v = (v0 + (v1 - v0) * w1f[:, None, None]) * rp[:, None, None]
+        material_index = pairs.index[p].to(eta.device).long().expand(eta.shape).reshape(-1)
+        slot_density = pairs.density[p].to(eta.device, eta.dtype).expand(eta.shape).reshape(-1)
+        v0 = table[material_index, :, :, flat0]  # [P, Gi, Go]
+        v1 = table[material_index, :, :, flat0 + 1]
+        v = (v0 + (v1 - v0) * w1f[:, None, None]) * slot_density[:, None, None]
         out = v if out is None else out + v
     return out.permute(1, 2, 0).reshape(table.shape[1], table.shape[2], *eta.shape)
 
@@ -394,7 +395,7 @@ def synthetic_library(num_groups: int = 4, legendre_order: int = 5, num_eta: int
     G, L = num_groups, legendre_order
     edges = torch.linspace(125.0, 10.0, G + 1, dtype=torch.float64)
     energy = 0.5 * (edges[:-1] + edges[1:])
-    frac = torch.ones(G, dtype=torch.float64) / G
+    fraction = torch.ones(G, dtype=torch.float64) / G
     eta = torch.linspace(-1.0, 1.0, num_eta, dtype=torch.float64)
     # kernel per (material, g_in, g_out): a * (1 + b eta)/(4 pi) with b depending on the pair (|b|<1 keeps it positive)
     mu_s_eta = torch.zeros(2, G, G, num_eta, dtype=torch.float64)
@@ -408,7 +409,8 @@ def synthetic_library(num_groups: int = 4, legendre_order: int = 5, num_eta: int
                 mu_s_l[m, gi, go, 0] = a  # 2 pi int (a(1+b eta)/4pi) deta = a
                 if L >= 1:
                     mu_s_l[m, gi, go, 1] = a * b / 3.0  # 2 pi int a(1+b eta)/4pi * eta deta = a b /3
-    mu_pe = torch.tensor([[0.05 * (1.5 ** g) for g in range(G)], [0.2 * (1.5 ** g) for g in range(G)]], dtype=torch.float64)
+    mu_pe = torch.tensor([[0.05 * (1.5 ** g) for g in range(G)], [0.2 * (1.5 ** g) for g in range(G)]],
+                         dtype=torch.float64)
     mu_t = mu_pe + mu_s_l[..., 0].sum(dim=2)
     n = int(num_fine_per_group)
     if n < 1:
@@ -417,12 +419,12 @@ def synthetic_library(num_groups: int = 4, legendre_order: int = 5, num_eta: int
     x = 1.0 - 2.0 * torch.arange(n, dtype=torch.float64) / (n - 1) if n > 1 else torch.zeros(1, dtype=torch.float64)
     fine_energy = torch.cat([edges[g + 1] + t * (edges[g] - edges[g + 1]) for g in range(G)])
     fine_group = torch.arange(G).repeat_interleave(n)
-    fine_weight = frac[fine_group] / n
+    fine_weight = fraction[fine_group] / n
     fine_mu_t = mu_t[:, fine_group] * (1.0 + float(fine_spread) * x.repeat(G))[None, :]
     M = int(num_materials)
     if M == 2:
         return MultigroupLibrary(
-            group_edges=edges, group_energy=energy, spectrum_fraction=frac,
+            group_edges=edges, group_energy=energy, spectrum_fraction=fraction,
             mu_t=mu_t, mu_pe=mu_pe, mu_s_l=mu_s_l, eta_grid=eta, mu_s_eta=mu_s_eta,
             fine_energy=fine_energy, fine_mu_t=fine_mu_t, fine_weight=fine_weight, fine_group=fine_group,
             materials=("water", "bone"), nominal_density=torch.tensor([1.0, 1.85], dtype=torch.float64),
@@ -430,20 +432,20 @@ def synthetic_library(num_groups: int = 4, legendre_order: int = 5, num_eta: int
     if M < 2:
         raise ValueError("num_materials must be >= 2")
     if M == len(MATERIALS):
-        st = {"air": (0.90, 0.0), "lung": (0.95, 0.02), "adipose": (0.97, 0.0), "water": (1.0, 0.0),
-              "muscle": (1.0, 0.02), "soft_tissue": (1.0, 0.04), "bone": (1.0, 1.0)}
-        rows_st = [st[n] for n in MATERIALS]
+        blend_coefficients = {"air": (0.90, 0.0), "lung": (0.95, 0.02), "adipose": (0.97, 0.0), "water": (1.0, 0.0),
+                              "muscle": (1.0, 0.02), "soft_tissue": (1.0, 0.04), "bone": (1.0, 1.0)}
+        row_blends = [blend_coefficients[n] for n in MATERIALS]
         names, nominal = MATERIALS, torch.tensor(NOMINAL_DENSITIES, dtype=torch.float64)
     else:
-        rows_st = [(1.0, 0.0), (1.0, 1.0)] + [(1.0 + 0.1 * m, (m - 1) / (M - 1)) for m in range(2, M)]
+        row_blends = [(1.0, 0.0), (1.0, 1.0)] + [(1.0 + 0.1 * m, (m - 1) / (M - 1)) for m in range(2, M)]
         names, nominal = tuple(f"m{m}" for m in range(M)), torch.arange(1, M + 1, dtype=torch.float64)
 
     def blend(a: Tensor) -> Tensor:
         return torch.stack([s * ((1.0 - t) * a[0] + t * a[1]) if t not in (0.0, 1.0) or s != 1.0
-                            else a[int(t)].clone() for s, t in rows_st])
+                            else a[int(t)].clone() for s, t in row_blends])
 
     return MultigroupLibrary(
-        group_edges=edges, group_energy=energy, spectrum_fraction=frac,
+        group_edges=edges, group_energy=energy, spectrum_fraction=fraction,
         mu_t=blend(mu_t), mu_pe=blend(mu_pe), mu_s_l=blend(mu_s_l), eta_grid=eta, mu_s_eta=blend(mu_s_eta),
         fine_energy=fine_energy, fine_mu_t=blend(fine_mu_t), fine_weight=fine_weight, fine_group=fine_group,
         materials=names, nominal_density=nominal,

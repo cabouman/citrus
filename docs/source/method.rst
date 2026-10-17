@@ -43,9 +43,10 @@ The fluence splits into the uncollided part, known in closed form, and the colli
    \sum_{E\in g} w_E \exp\!\Big(-\sum_m P_m(\mathbf r)\, m_m(E)\Big),
    \qquad P_m(\mathbf r) = \int_{\mathbf r_0}^{\mathbf r} \rho_m\, dl,
 
-i.e. one ray trace per material present in the volume (an absent material adds nothing) and a fine-energy table (0.5 keV bins, weights :math:`w_E` of the spectrum):
-exact in energy, without the within-group beam-hardening error of group-averaged attenuation. The collided fluence
-satisfies the same LBTE with the **first-collision source** in place of :math:`q`,
+i.e. one ray trace per material present in the volume (an absent material adds nothing) and a fine-energy table (0.5 keV
+bins, weights :math:`w_E` of the spectrum): exact in energy, without the within-group beam-hardening error of
+group-averaged attenuation. The collided fluence satisfies the same LBTE with the **first-collision source** in place of
+:math:`q`,
 
 .. math::
 
@@ -171,10 +172,11 @@ Source iteration orders the collided fluence by collision number:
    \qquad \phi_{C} = \sum_{n\ge1} \phi^{(n)},
 
 where :math:`\mathcal L^{-1}` is one transport sweep and :math:`\mathcal S` the scattering-source operator. The
-iteration stops when :math:`\|\phi^{(n)}\| / \|\phi_C\| <` ``si_tol`` (default :math:`10^{-3}`, scalar-flux cell means;
-about 16 sweeps for WLAB).
+iteration stops when :math:`\|\phi^{(n)}\| / \|\phi_C\| <` ``source_iteration_tolerance`` (default :math:`10^{-3}`,
+scalar-flux cell means; about 16 sweeps for WLAB).
 
-The first-collision source enters the sweep as LD moments on the transport cells, restricted from samples at the
+The first-collision source enters the sweep as linear-discontinuous moments on the transport cells, restricted from
+samples at the
 :math:`q^3` quadrature points of each cell (mean and the three slopes of the midpoint quadrature, exact for a source
 linear within the cell). Because :math:`S_{FC}` is forward peaked, point samples at the sweep directions
 under-integrate it; each view therefore rescales the samples per quadrature point and group,
@@ -372,12 +374,11 @@ computed views,
    s_v = \max\Big(0,\ \sum_{j\in\mathcal C} w_{vj}\, s_j\Big), \qquad
    \mathrm{SPR}_v = s_v / p_v,
 
-with :math:`p_v` the primary image of view :math:`v` (a projection of the current densities, no transport, so
-cheap; computed for every view) and weights :math:`w_{vj}` that are circular in angle (period :math:`2\pi`) for a full rotation; for a short
-scan they run along the arc (the views beyond the last computed view keep its value; the cubic's ghost nodes at the
-ends are linear extrapolations). With :math:`t\in[0,1)` the
-fractional position of the view between its two bracketing computed views :math:`j_0, j_1`
-(``scatter_view_interp_order``):
+with :math:`p_v` the primary image of view :math:`v` (a projection of the current densities, no transport, so cheap;
+computed for every view) and weights :math:`w_{vj}` that are circular in angle (period :math:`2\pi`) for a full
+rotation; for a short scan they run along the arc (the views beyond the last computed view keep its value; the cubic's
+ghost nodes at the ends are linear extrapolations). With :math:`t\in[0,1)` the fractional position of the view between
+its two bracketing computed views :math:`j_0, j_1` (``scatter_view_interpolation_order``):
 
 - 0: the nearest computed view;
 - 1: linear, :math:`(1-t)\,s_{j_0} + t\,s_{j_1}`;
@@ -393,11 +394,11 @@ fractional position of the view between its two bracketing computed views :math:
 The scatter signal is interpolated rather than the ratio: the solver scatter is smooth on the panel and in angle (99 %
 of each pixel's variation energy lies in about 8-12 harmonics per rotation after a 1 cm low-pass), while the ratio
 carries the object's shadow edges, which move across the panel with the angle. On the 180-view WLAB study (20 outer
-iterations, two-material density model of version 0.0.2) stride 2 costs +0.0014 relative RMSE (0.0443 vs 0.0429) for 51 % of the scatter time and stride 4 +0.008
-(0.0509) for 26 %; Catmull-Rom matches or beats linear interpolation offline (skipped-view scatter error 1.05 / 1.94 %
-vs 1.12 / 2.11 % at strides 2 / 4) at no extra cost. Interpolating the TRUE scatter costs only about +0.0025 at stride
-4, so the in-loop penalty is mostly the slower convergence of the coupled loop on the skipped views, not the
-interpolation error.
+iterations, two-material density model of version 0.0.2) stride 2 costs +0.0014 relative RMSE (0.0443 vs 0.0429) for 51
+% of the scatter time and stride 4 +0.008 (0.0509) for 26 %; Catmull-Rom matches or beats linear interpolation offline
+(skipped-view scatter error 1.05 / 1.94 % vs 1.12 / 2.11 % at strides 2 / 4) at no extra cost. Interpolating the TRUE
+scatter costs only about +0.0025 at stride 4, so the in-loop penalty is mostly the slower convergence of the coupled
+loop on the skipped views, not the interpolation error.
 
 Scatter step every n outer iterations
 -------------------------------------
@@ -409,13 +410,12 @@ iterations (the recursion is unchanged, it is simply advanced less often). An MB
 scatter stage on the WLAB study (0.75 s against 56 s for 180 views), so for a given number of scatter steps the
 additional MBIR iterations are nearly free.
 
-Measured on the 180-view WLAB study (0.5 cm grid, the defaults of version 0.0.3 with the two-material density
-model, relative RMSE over the prism): at a fixed 20
-outer iterations the scatter step at every 2nd / 4th iteration (10 / 5 steps) raises the final error from 0.0429 to
-0.0513 / 0.0700, because between refreshes the MBIR iterations converge towards the solution of a stale correction.
-The same 20 scatter steps spread over 40 (:math:`n = 2`) / 80 (:math:`n = 4`) outer iterations lower it to 0.0310 /
-0.0286 in the same wall time, and at 40 iterations :math:`n = 2` is within 0.0008 of a scatter step at every
-iteration (0.0302) at half the scatter cost. The scatter budget sets the cost; choose ``num_outer`` as :math:`n`
-times the number of scatter steps you can afford. At equal scatter cost, one CITRUS sweep per iteration (0.0429)
-beats a converged scatter solve at every 2nd iteration (0.0501): a fresh partial update is worth more than a
-converged but stale one.
+Measured on the 180-view WLAB study (0.5 cm grid, the defaults of version 0.0.3 with the two-material density model,
+relative RMSE over the prism): at a fixed 20 outer iterations the scatter step at every 2nd / 4th iteration (10 / 5
+steps) raises the final error from 0.0429 to 0.0513 / 0.0700, because between refreshes the MBIR iterations converge
+towards the solution of a stale correction. The same 20 scatter steps spread over 40 (:math:`n = 2`) / 80 (:math:`n =
+4`) outer iterations lower it to 0.0310 / 0.0286 in the same wall time, and at 40 iterations :math:`n = 2` is within
+0.0008 of a scatter step at every iteration (0.0302) at half the scatter cost. The scatter budget sets the cost; choose
+``num_outer_iterations`` as :math:`n` times the number of scatter steps you can afford. At equal scatter cost, one
+CITRUS sweep per iteration (0.0429) beats a converged scatter solve at every 2nd iteration (0.0501): a fresh partial
+update is worth more than a converged but stale one.
