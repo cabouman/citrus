@@ -111,7 +111,7 @@ def _rmse(X, data) -> float:
 @cuda
 def test_citrus_recon_runs_and_beats_no_correction(tiny):
     data, grid, geometry, solver, regularization = tiny
-    config = CitrusConfig(num_outer_iterations=3)
+    config = CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=3)
     seen, mbir_seen = [], []
     X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
                            regularization=regularization,
@@ -175,7 +175,7 @@ def test_citrus_with_true_scatter_is_fixed_spr_mbir(tiny, monkeypatch):
 
     monkeypatch.setattr(citrus_module, "citrus_view_step", fake_step)
     monkeypatch.setattr(citrus_module, "primary_signals", fake_primaries)
-    config = CitrusConfig(num_outer_iterations=3)
+    config = CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=3)
     X_citrus, info = citrus_recon(data["Y"], 1.0e5, angles, grid, geometry, solver, config,
                                   regularization=regularization)
     X_o, _ = mbir_recon(data["Y"], 1.0e5, angles, grid, geometry, config, spr=spr_true, regularization=regularization)
@@ -208,9 +208,11 @@ def test_mbir_iterations_per_outer_iteration(tiny):
     assert float(info["spr"].min()) > 0
     assert info["config"]["mbir_iterations_per_outer_iteration"] == 2
     e_every2 = _rmse(X, data)
-    X2, _ = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, CitrusConfig(num_outer_iterations=2),
+    X2, _ = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver,
+                         CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=2),
                          regularization=regularization)
-    X4, _ = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, CitrusConfig(num_outer_iterations=4),
+    X4, _ = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver,
+                         CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=4),
                          regularization=regularization)
     e2, e4 = _rmse(X2, data), _rmse(X4, data)
     assert e4 < e_every2 < e2 + 1e-3, (e4, e_every2, e2)
@@ -228,7 +230,7 @@ def test_sparse_views_close_to_every_view(tiny):
     data, grid, geometry, solver, regularization = tiny
     e = {}
     for stride in (1, 2, 4):
-        config = CitrusConfig(num_outer_iterations=3, scatter_view_stride=stride)
+        config = CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=3, scatter_view_stride=stride)
         X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
                                regularization=regularization)
         assert bool(torch.isfinite(X).all())
@@ -245,7 +247,8 @@ def test_sparse_views_close_to_every_view(tiny):
         assert abs(e[stride] - e[1]) < 0.01, e
     # order None (diagnostics): the skipped views are not corrected and the error grows well past the bound
     X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver,
-                           CitrusConfig(num_outer_iterations=3, scatter_view_stride=4,
+                           CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=3,
+                                        scatter_view_stride=4,
                                         scatter_view_interpolation_order=None),
                            regularization=regularization)
     skipped = np.setdiff1d(np.arange(16), np.arange(0, 16, 4))
@@ -293,7 +296,8 @@ def test_sparse_views_interpolate_the_scatter_signal(tiny, monkeypatch):
     monkeypatch.setattr(citrus_module, "primary_signals", fake_primaries)
     for order in (1, 3):
         calls.clear()
-        config = CitrusConfig(num_outer_iterations=1, scatter_view_stride=4, scatter_view_interpolation_order=order)
+        config = CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=1, scatter_view_stride=4,
+                              scatter_view_interpolation_order=order)
         _, info = citrus_recon(data["Y"], 1.0e5, angles, grid, geometry, solver, config, regularization=regularization)
         assert calls == ["ViewChunkProjector"] and "primary_seconds" in info["records"][1]
         M = citrus_module.interpolation_weights(angles, computed, order)
@@ -320,7 +324,7 @@ def test_resume_error_sinogram_matches_restart(tiny):
     assert float((out[True] - out[False]).norm() / out[False].norm()) < 1e-5
     for resume in (True, False):
         out[resume], _ = mbir_recon(data["Y"], 1.0e5, data["angles"], grid, geometry,
-                                    CitrusConfig(num_outer_iterations=3,
+                                    CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=3,
                                                  resume_error_sinogram=resume), regularization=regularization)
     assert float((out[True] - out[False]).norm() / out[False].norm()) < 1e-5
 
@@ -339,7 +343,7 @@ def test_citrus_recon_on_short_scan(tiny):
     assert data["meta"]["end_view_angle"] == pytest.approx(math.pi + fan_angle(geometry))
     seen = []
     X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver,
-                           CitrusConfig(num_outer_iterations=2),
+                           CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=2),
                            regularization=regularization, callback=lambda k, X, record: seen.append(_rmse(X, data)))
     y_free = -torch.log(torch.as_tensor(data["P"], device=DEVICE) / 1.0e5)  # scatter-free: isolates the FDK weighting
     model = info["model"]
@@ -349,3 +353,105 @@ def test_citrus_recon_on_short_scan(tiny):
     # itself is checked on a finer problem in tests/test_mbir_bridge.py
     assert e_parker < 0.95 * e_plain, (e_parker, e_plain)
     assert seen[-1] < seen[0] and bool(torch.isfinite(X).all())
+
+
+# ---- adaptive MBIR iterations per outer iteration (version 0.10.0) ---------------------------------------------
+
+
+def test_settings_are_validated():
+    config = CitrusConfig()
+    assert config.num_outer_iterations == "adaptive" and config.mbir_iterations_per_outer_iteration == "adaptive"
+    config.validate()
+    CitrusConfig(num_outer_iterations=3, mbir_iterations_per_outer_iteration=np.int64(2)).validate()
+    CitrusConfig(mbir_stop_relative_improvement=0.01, stop_relative_improvement=0.5).validate()
+    for bad in (0.0, 1.0, -0.1, True, "0.01", None):
+        with pytest.raises(ValueError, match="mbir_stop_relative_improvement"):
+            CitrusConfig(mbir_stop_relative_improvement=bad).validate()
+        with pytest.raises(ValueError, match="stop_relative_improvement"):
+            CitrusConfig(stop_relative_improvement=bad).validate()
+    for bad in (0, -1, 1.5, True, "adaptiv", None):
+        for name in ("num_outer_iterations", "mbir_iterations_per_outer_iteration", "max_outer_iterations",
+                     "max_mbir_iterations_per_outer_iteration"):
+            with pytest.raises(ValueError, match=name):
+                CitrusConfig(**{name: bad}).validate()
+    with pytest.raises(ValueError, match="max_outer_iterations"):
+        CitrusConfig(max_outer_iterations="adaptive").validate()
+
+
+@cuda
+def test_residual_is_recorded_and_the_fixed_count_is_unchanged(tiny):
+    """Without thresholds every outer iteration runs its n MBIR iterations; with the resumed error sinogram the
+    records hold the residual at the start and the end of each outer iteration, decreasing within it."""
+    data, grid, geometry, solver, regularization = tiny
+    config = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration=3)
+    X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
+                           regularization=regularization)
+    records = info["records"][1:]
+    assert [r["mbir_iterations"] for r in records] == [3, 3] and info["mbir_iterations_total"] == 6
+    assert all(0 < r["sinogram_nrmse"] < r["sinogram_nrmse_start"] < 1 for r in records)
+
+
+@cuda
+def test_mbir_iterations_stop_on_a_small_improvement(tiny):
+    """A loose threshold stops every outer iteration after the minimum of two MBIR iterations, a tight one never
+    before the maximum; the loop records what it took and mbir_recon can follow the same schedule."""
+    data, grid, geometry, solver, regularization = tiny
+    loose = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration="adaptive",
+                         max_mbir_iterations_per_outer_iteration=6, mbir_stop_relative_improvement=0.9)
+    X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, loose,
+                           regularization=regularization)
+    assert [r["mbir_iterations"] for r in info["records"][1:]] == [2, 2] and info["mbir_iterations_total"] == 4
+    tight = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration="adaptive",
+                         max_mbir_iterations_per_outer_iteration=3, mbir_stop_relative_improvement=1e-9)
+    X_tight, info_tight = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, tight,
+                                       regularization=regularization)
+    assert [r["mbir_iterations"] for r in info_tight["records"][1:]] == [3, 3]
+    fixed = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration=3)
+    X_fixed, _ = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, fixed,
+                              regularization=regularization)
+    assert float((X_tight - X_fixed).norm() / X_fixed.norm()) < 1e-6  # the same iterations and seeds
+    # mbir_recon follows a schedule: the MBIR iterations per outer iteration, overriding the config
+    schedule = [r["mbir_iterations"] for r in info["records"][1:]]
+    seen = []
+    X_mbir, info_mbir = mbir_recon(data["Y"], 1.0e5, data["angles"], grid, geometry,
+                                   CitrusConfig(num_outer_iterations=7, mbir_iterations_per_outer_iteration=1),
+                                   regularization=regularization, mbir_iterations_schedule=schedule,
+                                   mbir_callback=lambda i, X, r: seen.append(i))
+    assert [r["mbir_iterations"] for r in info_mbir["records"][1:]] == schedule == [2, 2]
+    assert seen == [0, 1, 2, 3, 4] and info_mbir["mbir_iterations_total"] == 4
+    # the schedule also overrides the adaptive defaults (demo 2 passes it with the CITRUS config)
+    _, info_mbir = mbir_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, CitrusConfig(),
+                              regularization=regularization, mbir_iterations_schedule=[1, 3])
+    assert [r["mbir_iterations"] for r in info_mbir["records"][1:]] == [1, 3]
+
+
+@cuda
+def test_outer_loop_stops_on_a_small_improvement(tiny):
+    """A threshold of 0.99 on the outer improvement stops the loop after its second outer iteration (the first
+    comparison); a tiny threshold lets all outer iterations run."""
+    data, grid, geometry, solver, regularization = tiny
+    config = CitrusConfig(num_outer_iterations="adaptive", max_outer_iterations=5,
+                          mbir_iterations_per_outer_iteration=2, stop_relative_improvement=0.99)
+    X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
+                           regularization=regularization)
+    assert len(info["records"]) == 3 and bool(torch.isfinite(X).all())  # the FDK and two outer iterations
+    config = CitrusConfig(num_outer_iterations="adaptive", max_outer_iterations=3,
+                          mbir_iterations_per_outer_iteration=2, stop_relative_improvement=1e-12)
+    X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
+                           regularization=regularization)
+    assert len(info["records"]) == 4
+
+
+@cuda
+def test_residual_without_resume_matches(tiny):
+    """Without the resumed error sinogram the residual comes from a forward projection and agrees with the resumed
+    one to float rounding."""
+    data, grid, geometry, solver, regularization = tiny
+    out = {}
+    for resume in (True, False):
+        config = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration=2,
+                              resume_error_sinogram=resume)
+        _, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
+                               regularization=regularization, mbir_callback=lambda i, X, r: None)
+        out[resume] = [(r["sinogram_nrmse_start"], r["sinogram_nrmse"]) for r in info["records"][1:]]
+    assert np.allclose(out[True], out[False], rtol=1e-4)

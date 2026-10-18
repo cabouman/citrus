@@ -301,7 +301,7 @@ def test_citrus_recon_measures_the_object_and_builds_once(monkeypatch):
     grid = wlab_grid(2.0)
     solver = wlab_solver(2.0, config=config, geometry=geometry, device="cuda", spectrum=SPECTRUM_125KVP)
     X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver,
-                           CitrusConfig(num_outer_iterations=2))
+                           CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=2))
     size, medium = info["grouping_object_size_cm"], dict(info["grouping_medium"])
     assert info["grouping_applied"] and 10.0 <= size <= 20.0 and size == round(size)
     assert len(built) == 1 and built[0].grouping_object_size_cm == size == solver.config.grouping_object_size_cm
@@ -311,7 +311,7 @@ def test_citrus_recon_measures_the_object_and_builds_once(monkeypatch):
     assert info["library_seconds"] >= 0.0 and bool(torch.isfinite(X).all())
     prebuilt = wlab_solver(2.0, config=config, geometry=geometry, library=library, device="cuda")
     _, info2 = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, prebuilt,
-                            CitrusConfig(num_outer_iterations=1, grouping_object_size=11.0))
+                            CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=1, grouping_object_size=11.0))
     assert info2["grouping_object_size_cm"] == 20.0 and not info2["grouping_applied"]
     assert info2["grouping_medium"] == "auto"
     assert len(built) == 1

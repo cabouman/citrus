@@ -15,8 +15,10 @@ Full documentation: [purduecitrus.readthedocs.io](https://purduecitrus.readthedo
 
 The loop starts from the FDK reconstruction X_0 of the uncorrected data. Outer iteration k = 1, ..., N converts
 X_{k-1} into material densities, takes one scatter step per view, corrects the measured counts with the estimated
-scatter-to-primary ratio, `Y_c = Y / (1 + SPR)`, and runs n warm-started MBIR iterations on the corrected data
-(`mbir_iterations_per_outer_iteration`), which give X_k.
+scatter-to-primary ratio, `Y_c = Y / (1 + SPR)`, and runs warm-started MBIR iterations on the corrected data,
+which give X_k. By default both counts are adaptive: the MBIR iterations stop once the fit of the corrected sinogram
+improves by less than a threshold per iteration, and the loop stops once an outer iteration improves it by less than
+another; fixed counts can be given instead.
 
 The scatter step is **age-ordered source iteration**. Per view the solver keeps an accumulator of the collided
 fluence, `Phi_{>1}`, and updates it with one transport sweep `G_k` (scattering plus transport through the densities of
@@ -106,8 +108,7 @@ from citrus.utilities import wlab_solver
 
 spectrum = load_spectrum_txt("spectrum.txt")               # the source spectrum, two columns: keV, photons per keV
 solver = wlab_solver(delta_voxel, geometry=geometry, spectrum=spectrum)   # ScatterSolver, library cached on disk
-recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver,
-                           CitrusConfig(num_outer_iterations=10, mbir_iterations_per_outer_iteration=8))
+recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, CitrusConfig())   # adaptive numbers of iterations
 ```
 
 Tests: `dev_scripts/run_tests.sh` or `python -m pytest -q` (GPU, Triton and MBIRTORCH tests, and those that need the
@@ -124,7 +125,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.9.2},
+  note = {Version 0.10.0},
   year = 2026
 }
 ```

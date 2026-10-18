@@ -76,10 +76,10 @@ def main() -> None:
     parser.add_argument("--transport-cell-cm", type=float, default=1.0,
                         help="transport cell edge length in cm, for the loop's and the truth's solver (default 1; any "
                              "ratio to --delta-voxel)")
-    parser.add_argument("--outer-iterations", type=int, default=10,
-                        help="outer iterations, one scatter correction each (default 10)")
-    parser.add_argument("--mbir-iterations", type=int, default=8,
-                        help="MBIR iterations per outer iteration (default 8)")
+    parser.add_argument("--outer-iterations", type=lambda s: s if s == "adaptive" else int(s), default="adaptive",
+                        help="outer iterations, one scatter correction each: a number or adaptive (default)")
+    parser.add_argument("--mbir-iterations", type=lambda s: s if s == "adaptive" else int(s), default="adaptive",
+                        help="MBIR iterations per outer iteration: a number or adaptive (default)")
     parser.add_argument("--full", action="store_true",
                         help="the report study: 180 views over a FULL rotation (end view angle = start + 360 degrees, "
                              "set explicitly; --end-view-angle is ignored), 0.5 cm grid, 20 outer iterations of one "
@@ -133,8 +133,9 @@ def main() -> None:
                            else int(args.scatter_view_interpolation_order))
     if args.scatter_view_stride < 1:
         raise SystemExit("--scatter-view-stride must be >= 1")
-    if args.mbir_iterations < 1:
-        raise SystemExit("--mbir-iterations must be >= 1")
+    for flag, value in (("--outer-iterations", args.outer_iterations), ("--mbir-iterations", args.mbir_iterations)):
+        if value != "adaptive" and value < 1:
+            raise SystemExit(f"{flag} must be >= 1 or adaptive")
     try:
         materials = check_material_names(tuple(name.strip() for name in args.materials.split(",") if name.strip()))
     except ValueError as exc:
@@ -245,10 +246,8 @@ def main() -> None:
                                                            else f"_order{interpolation_order}")
         print(f"sparse-view scatter: scatter step on {len(range(0, len(angles), args.scatter_view_stride))} of "
               f"{len(angles)} views (stride {args.scatter_view_stride}), interpolation order {interpolation_order}")
-    if args.mbir_iterations > 1:
-        out_tag += f"_mbir{args.mbir_iterations}"
-        print(f"{args.mbir_iterations} MBIR iterations per outer iteration ({args.outer_iterations} scatter steps, "
-              f"{args.outer_iterations * args.mbir_iterations} MBIR iterations)")
+    if args.outer_iterations != "adaptive" or args.mbir_iterations != "adaptive":
+        out_tag += f"_outer{args.outer_iterations}_mbir{args.mbir_iterations}"
 
     # ---- 2. CITRUS ------------------------------------------------------------------------------------------
     citrus_history: list = []
@@ -291,10 +290,10 @@ def main() -> None:
         "truth_grouping_medium": data["meta"].get("grouping_medium"),
         "quadrature_point_spacing_cm": loop_config.quadrature_point_spacing_cm,
         "quadrature_points_per_axis": loop_config.quadrature_points(max(grid.deltas)),
-        "outer": args.outer_iterations,
+        "outer": args.outer_iterations, "outer_iterations_run": len(records),
+        "mbir_iterations_per_outer_iteration": args.mbir_iterations,
         "truth_sweep": [truth_polar, truth_azimuthal], "truth_cone": [cone_polar, cone_azimuthal],
         "scatter_view_stride": args.scatter_view_stride, "scatter_view_interp_order": interpolation_order,
-        "mbir_iterations_per_outer_iteration": args.mbir_iterations,
         "resume_error_sinogram": bool(args.resume_error_sinogram),
         "scatter_steps": len(records),
         "computed_views": [int(v) for v in citrus_info["computed_views"]],
@@ -331,7 +330,7 @@ def main() -> None:
     vols = [("truth", Xt), ("FDK (initialization)", X0), ("MBIR, no correction", X_no_correction), ("CITRUS", X_citrus)]
     figs = {
         "slices": plot_slices(vols, grid, title=f"central slice z = 0 ({len(angles)} views, "
-                                                f"{args.outer_iterations} outer iterations)"),
+                                                f"{len(records)} outer iterations)"),
         "profiles": plot_profiles(vols, grid, title="central row y = 0 (lung -8..-2, air 2..4, bone 6..8 cm)"),
         "rmse": plot_history([("CITRUS", [h["rmse_rel"] for h in citrus_history]),
                               ("MBIR, no correction", [h["rmse_rel"] for h in no_correction_history])],
@@ -343,7 +342,7 @@ def main() -> None:
     r = geometry.num_det_rows // 2
     ax.plot(u, spr_true[0, r], color="k", lw=1.2, label="true SPR")
     ax.plot(u, citrus_info["spr"][0, r].cpu().numpy(), ls="--",
-            label=f"CITRUS estimate (outer iteration {args.outer_iterations})")
+            label=f"CITRUS estimate (outer iteration {len(records)})")
     ax.set_xlabel("u (cm), central detector row, view 0")
     ax.set_ylabel("scatter-to-primary ratio")
     ax.grid(True, alpha=0.3)

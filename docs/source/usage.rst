@@ -120,7 +120,9 @@ against the truth with it).
 The entries of ``info``:
 
 * ``records``: one dict per outer iteration (``records[0]`` for the initial volume X_0, ``records[k]`` for X_k) with
-  ``outer_iteration``, ``mbir_iterations``, ``scatter_seconds``, ``mbir_seconds`` (of all its MBIR iterations),
+  ``outer_iteration``, ``mbir_iterations``, ``sinogram_nrmse_start`` / ``sinogram_nrmse`` (relative RMSE of A X
+  against the corrected sinogram before and after its MBIR iterations, with the resumed error sinogram),
+  ``scatter_seconds``, ``mbir_seconds`` (of all its MBIR iterations),
   ``total_seconds``, ``scatter_change_relative`` (mean absolute change of the scatter-count estimate
   over its mean absolute value) and, on CUDA, ``gpu_peak_allocated_mib``; a record with a scatter stage also holds
   ``negative_fraction`` (voxels clamped by the density model), ``accumulator_change_mean`` /
@@ -144,6 +146,7 @@ view"):
 
 .. code-block:: python
 
+   config = CitrusConfig()                                               # adaptive numbers of iterations
    # 20 outer iterations of 2 MBIR iterations: 20 scatter steps, 40 MBIR iterations
    config = CitrusConfig(num_outer_iterations=20, mbir_iterations_per_outer_iteration=2)
    # scatter step on every 4th view, the others interpolated in angle (Catmull-Rom, order 3, by default)
@@ -151,8 +154,15 @@ view"):
    recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, config)
    info["computed_views"], info["view_interpolated"]                    # [Vc] indices, [V] bool
 
-``mbir_iterations_per_outer_iteration=n`` runs n MBIR iterations on the corrected counts of every outer iteration
-before the next scatter correction. ``scatter_view_interpolation_order``: 3 cubic Catmull-Rom on 4 neighbors
+By default both counts are ``"adaptive"``: the MBIR iterations of an outer iteration stop once the fit of the
+corrected sinogram improves by less than ``mbir_stop_relative_improvement`` per iteration (at most
+``max_mbir_iterations_per_outer_iteration``), and the loop stops once an outer iteration improves the fit by less
+than ``stop_relative_improvement`` (at most ``max_outer_iterations``); see :doc:`method`, "MBIR iterations per outer
+iteration". ``mbir_iterations_per_outer_iteration=n`` runs n MBIR iterations in every outer iteration and
+``num_outer_iterations=N`` runs N outer iterations instead. ``info["mbir_iterations_total"]`` and the records'
+``mbir_iterations`` say what was run, and
+``mbir_recon(..., mbir_iterations_schedule=[r["mbir_iterations"] for r in info["records"][1:]])`` repeats the same
+schedule without the correction. ``scatter_view_interpolation_order``: 3 cubic Catmull-Rom on 4 neighbors
 (default), 2 quadratic (3-point
 Lagrange), 1 linear, 0 nearest computed view; ``None`` leaves the skipped views uncorrected (diagnostics only); ignored
 at ``scatter_view_stride=1``. ``scatter_view_indices``, ``angular_neighbors``, ``interpolation_weights`` and

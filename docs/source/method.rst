@@ -492,6 +492,23 @@ towards each correction; the recursion of the accumulators is unchanged, it is a
 At a fixed total number of MBIR iterations the trade-off reverses: a larger :math:`n` leaves fewer scatter stages, and
 between two of them MBIR converges towards a correction that is no longer refreshed.
 
+The residual :math:`\|A X - y_c\| / \|y_c\|` of the corrected sinogram shows this without a ground truth: within an
+outer iteration it falls quickly for the first MBIR iterations and then flattens, because MBIR has reached the volume
+that best fits the current correction under the prior, and only a new correction can lower it further. The default
+``mbir_iterations_per_outer_iteration = "adaptive"`` stops the MBIR iterations of an outer iteration once the residual
+improves by less than ``mbir_stop_relative_improvement`` per iteration (the mean over the last two iterations, so that
+the random partitions of the coordinate descent do not trigger it on one flat step; at least two iterations run, at
+most ``max_mbir_iterations_per_outer_iteration``). The default ``num_outer_iterations = "adaptive"`` stops the loop
+once an outer iteration lowers the residual by less than ``stop_relative_improvement`` relative to the previous one
+(at most ``max_outer_iterations``), a convergence criterion of the whole reconstruction that needs no truth. Fixed
+counts run as given. With the resumed error sinogram (the default) the residual costs nothing; the records hold it at
+the start and the end of every outer iteration (``sinogram_nrmse_start``, ``sinogram_nrmse``).
+
+Measured against wall time, fixed blocks of four or more MBIR iterations and the adaptive rule follow the same
+error curve (an MBIR iteration is much cheaper than a scatter stage, so the iterations the rule saves buy little),
+so the rule is a stopping criterion rather than a speed-up: it ends the MBIR iterations when the fit has saturated
+and, with the outer rule, the reconstruction when a further scatter correction no longer changes the fit.
+
 Scatter step on every m-th view
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

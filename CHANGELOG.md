@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.10.0 - 2026-10-18
+
+- **Adaptive numbers of iterations by default.** `CitrusConfig.num_outer_iterations` and
+  `mbir_iterations_per_outer_iteration` default to `"adaptive"`: the MBIR iterations of an outer iteration stop once
+  the relative RMSE of A X against the corrected sinogram improves by less than `mbir_stop_relative_improvement`
+  (0.02) per iteration (mean over the last two; at least two, at most `max_mbir_iterations_per_outer_iteration`, 8),
+  and the loop stops once an outer iteration improves that residual by less than `stop_relative_improvement`
+  (0.005; at most `max_outer_iterations`, 40): a convergence criterion without ground truth. Integers run fixed
+  counts as before. The residual is recorded per outer iteration (`sinogram_nrmse_start`, `sinogram_nrmse`)
+  whenever the error sinogram is resumed, `info["mbir_iterations_total"]` counts the MBIR iterations, the verbose
+  line prints the fit, and `mbir_recon(..., mbir_iterations_schedule=...)` repeats a CITRUS run's schedule without
+  the correction (demo 2 does, so its comparison stays matched).
+- The MBIR iterations of an outer iteration keep the resumed error sinogram without the per-iteration shift to and
+  from -A X (one fewer rounding per iteration; results change in the last digits only).
+- `benchmarks/adaptive_mbir_study.py`: fixed 1, 2, 4, 8 MBIR iterations per outer iteration against the adaptive
+  rule on the data of demo 2, error against the truth and against the corrected sinogram over wall time.
+
 ## v0.9.2 - 2026-10-18
 
 - `citrus_recon` and `mbir_recon` take `mbir_callback(i, X, record)`, called for the FDK initialization (i = 0) and
