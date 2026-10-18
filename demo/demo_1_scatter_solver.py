@@ -13,15 +13,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-import citrus.scatter_solver
 from citrus.scatter_solver import (ConeGeometry, ScatterSolver, SolverConfig, build_solver_library, csi_response,
-                                   no_grid)
-from citrus.scatter_solver.cross_section_library import load_spectrum_txt
+                                   load_spectrum_txt, no_grid)
 from citrus.utilities import wlab_grid, wlab_phantom
 
 # ---- Parameters -----------------------------------------------------------------------------------------------
-# Source spectrum: a text file of two columns, photon energy in keV and relative photons per keV.
-spectrum_file = os.path.join(os.path.dirname(citrus.scatter_solver.__file__), "data", "spectrum_125kvp.txt")
+# Source spectrum: the path of a text file of two columns, photon energy in keV and relative photons per keV.
+# demo/spectra has a 125 kVp tube spectrum and a 6 MV linac spectrum (spectrum_6mv.txt).
+spectrum_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spectra", "spectrum_125kvp.txt")
 materials = ["air", "lung", "adipose", "water", "muscle", "soft_tissue", "bone"]  # reference materials
 num_det_rows, num_det_channels = 75, 100   # detector panel size in pixels
 pixel_pitch = 0.4                          # detector pixel pitch in cm

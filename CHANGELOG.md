@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.7.2 - 2026-10-17
+
+- **NIST compounds in the material catalogue.** The 48 compounds and mixtures of NIST's X-ray mass attenuation
+  coefficient tables (Hubbell and Seltzer, Table 2) are catalogue entries with NIST's densities and mass fractions;
+  seven of them were already entries with the same composition (`water`, `muscle`, `soft_tissue`, `brain`, `blood`,
+  `pmma`, `polyethylene`), so 41 names are new, from `a150_tissue_equivalent_plastic` to
+  `tissue_equivalent_gas_propane` (`cross_sections.NIST_COMPOUND_NAMES`; the ICRU-44 tissues carry an `_icru44`
+  suffix, `adipose_icru44`, `bone_cortical_icru44`, `lung_icru44`, ...). Every one builds a library on its own.
+- **`aluminium` and `titanium` are element entries** like the other 96 elements (they were duplicated among the
+  compounds); aluminium's nominal density is now xraylib's 2.6989 g/cm^3 instead of 2.699.
+- **Sample spectra in `demo/spectra/`**: the 125 kVp tube spectrum and the 6 MV linac spectrum of the validation
+  (Mohan et al. 1985, 1 keV nodes to 6 MeV, `spectrum_6mv.txt`) as plain two-column files, read by the demos the way
+  a user reads their own; the package data keep the 125 kVp file as the default spectrum of the API, and a test keeps
+  the two copies equal. `load_spectrum_txt` is exported by `citrus.scatter_solver`; the copy of the 6 MV spectrum in
+  `tests/data` is gone.
+- Docs: the conventions page lists the hand-written entries and the NIST entries in two tables, without the elements.
+
 ## v0.7.1 - 2026-10-17
 
 Style release: the docstrings, the demos and the docs pages. No change of behaviour.

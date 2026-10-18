@@ -218,10 +218,11 @@ Two settings of ``SolverConfig`` shape the library (:doc:`method`, "Uncollided f
 .. code-block:: python
 
    from dataclasses import replace
-   from citrus.scatter_solver.cross_section_library import load_spectrum_txt
+   from citrus.scatter_solver import load_spectrum_txt
 
    config = replace(SolverConfig(), num_groups=12)                       # adaptive table, scattered-fluence groups
-   solver = wlab_solver(0.5, config=config, spectrum=load_spectrum_txt("spectrum_6mv.txt"), device="cuda")
+   spectrum = load_spectrum_txt("demo/spectra/spectrum_6mv.txt")         # a 6 MV linac spectrum
+   solver = wlab_solver(0.5, config=config, spectrum=spectrum, device="cuda")
    legacy = replace(SolverConfig(), angular_table_grid="uniform", group_edges_method="equal_fluence")  # citrus 0.5
 
 ``wlab_solver`` (and ``ScatterSolver(None, config, ...)``) returns a solver whose library is built on first use, so

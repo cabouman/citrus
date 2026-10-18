@@ -16,7 +16,7 @@ from citrus.scatter_solver.config import SolverConfig
 from citrus.scatter_solver.cross_sections import material_table
 from citrus.scatter_solver.geometry import Grid
 
-SPECTRUM_6MV = Path(__file__).parent / "data" / "spectrum_6mv.txt"
+SPECTRUM_6MV = Path(__file__).parents[1] / "demo" / "spectra" / "spectrum_6mv.txt"
 # the equal-fluence edges of version 0.5.1 (read from its cached libraries): 125 kVp with 6 groups, 6 MV with 12
 EQUAL_FLUENCE_125KVP_V051 = [125.0, 85.02386229823114, 69.2307011426586, 59.5472247094453, 51.660740550397065,
                              42.36917410642299, 10.0]

@@ -20,7 +20,7 @@ from citrus.scatter_solver.cross_sections import (ANGULAR_MAP_KNOTS, angular_tab
                                                   material_table, synthetic_angular_map, synthetic_library,
                                                   transfer_eta_at)
 
-SPECTRUM_6MV = Path(__file__).parent / "data" / "spectrum_6mv.txt"  # Mohan et al. (1985), the WLAB 6 MV validation
+SPECTRUM_6MV = Path(__file__).parents[1] / "demo" / "spectra" / "spectrum_6mv.txt"  # Mohan et al. (1985)
 
 
 # ---- the map ------------------------------------------------------------------------------------------------------

@@ -315,7 +315,7 @@ def default_spectrum_125kvp() -> tuple[np.ndarray, np.ndarray]:
     """Load the default kV source spectrum: W anode, 125 kV, 11 degree take-off, 0.89 mm Ti filter.
 
     The spectrum is read from the package data file ``citrus/scatter_solver/data/spectrum_125kvp.txt``, 125 nodes at 1,
-    2, ..., 125 keV, and is piecewise linear between them.
+    2, ..., 125 keV, and is piecewise linear between them (the same file as ``demo/spectra/spectrum_125kvp.txt``).
 
     Returns:
         (np.ndarray, np.ndarray): energies [125] in keV and relative photon density per keV [125], float64.

@@ -20,7 +20,7 @@ from citrus.citrus import DensityModel
 from citrus.scatter_solver.config import SolverConfig
 from citrus.scatter_solver.cross_sections import (BONE, COMPOUND_NAMES, ELEMENT_DENSITIES, ELEMENT_NAMES,
                                                   ELEMENT_SYMBOLS, MATERIAL_CATALOGUE, MATERIAL_TABLE, MATERIALS,
-                                                  NOMINAL_DENSITIES, WATER, material_index,
+                                                  NIST_COMPOUND_NAMES, NOMINAL_DENSITIES, WATER, material_index,
                                                   material_table)
 from citrus.scatter_solver.detector import csi_response, no_grid
 from citrus.scatter_solver.geometry import Grid
@@ -116,7 +116,8 @@ def test_catalogue_and_default_set():
     assert tuple(MATERIAL_CATALOGUE)[:7] == MATERIALS
     assert MATERIALS == ("air", "lung", "adipose", "water", "muscle", "soft_tissue", "bone")
     assert set(MATERIAL_CATALOGUE) >= {"trabecular_bone", "brain", "blood", "cartilage", "skin", "pmma",
-                                       "polyethylene", "aluminium", "titanium", "carbon_fibre"}
+                                       "polyethylene", "carbon_fibre", "aluminium", "titanium", "teflon"}
+    assert len(NIST_COMPOUND_NAMES) == 41 and set(NIST_COMPOUND_NAMES) <= set(COMPOUND_NAMES)
     assert MATERIAL_TABLE == tuple((n, MATERIAL_CATALOGUE[n][0]) for n in MATERIALS)
     assert NOMINAL_DENSITIES == (0.0012, 0.26, 0.95, 1.0, 1.05, 1.06, 1.85) and (WATER, BONE) == (3, 6)
     for name, (density, formula) in MATERIAL_CATALOGUE.items():
@@ -169,8 +170,8 @@ def test_wlab_phantom_by_name():
 
 def test_every_catalogue_entry_parses(library_module):
     """Every catalogue entry (the compounds and the 98 elements) has a positive density and a composition that
-    parses to mass fractions summing to 1; the elements follow the compounds, one per atomic number 1..98 (aluminium
-    and titanium among the compounds), with xraylib's symbols and element densities (NIST's)."""
+    parses to mass fractions summing to 1; the elements follow the compounds, one per atomic number 1..98, with
+    xraylib's symbols and element densities (NIST's)."""
     import xraylib
 
     backend = library_module.resolve_backend()
@@ -186,6 +187,7 @@ def test_every_catalogue_entry_parses(library_module):
         assert library_module.parse_formula(symbol, backend.atomic_mass) == {Z: 1.0}
         assert symbol == xraylib.AtomicNumberToSymbol(Z) and density == xraylib.ElementDensity(Z), name
     assert MATERIAL_CATALOGUE["lead"] == (11.35, "Pb") and MATERIAL_CATALOGUE["tungsten"] == (19.3, "W")
+    assert MATERIAL_CATALOGUE["aluminium"][1] == "Al" and MATERIAL_CATALOGUE["titanium"] == (4.54, "Ti")
     assert ELEMENT_NAMES[-1] == "californium" and "einsteinium" not in MATERIAL_CATALOGUE
     # the compounds of the default set as NIST compounds of xraylib: cortical bone and adipose tissue exactly, lung
     # without the Ca, Fe, Zn traces
@@ -195,6 +197,53 @@ def test_every_catalogue_entry_parses(library_module):
         reference = dict(zip(data["Elements"], data["massFractions"]))
         ours = library_module.parse_formula(MATERIAL_CATALOGUE[name][1], backend.atomic_mass)
         assert max(abs(ours.get(Z, 0.0) - reference.get(Z, 0.0)) for Z in set(ours) | set(reference)) < tolerance
+
+
+def test_nist_compounds_match_xraylib(library_module):
+    """The NIST Table 2 entries that xraylib also carries (its NIST compound list) have the same mass fractions to
+    5e-5 (the two tables round the atomic weights differently); the tissues are the ICRU-44 ones, not xraylib's ICRP
+    ones, and are left out."""
+    import xraylib
+
+    backend = library_module.resolve_backend()
+    in_xraylib = {"alanine": "Alanine", "bakelite": "Bakelite", "cadmium_telluride": "Cadmium Telluride",
+                  "calcium_fluoride": "Calcium Fluoride", "calcium_sulfate": "Calcium Sulfate",
+                  "cesium_iodide": "Cesium Iodide", "gadolinium_oxysulfide": "Gadolinium Oxysulfide",
+                  "gallium_arsenide": "Gallium Arsenide", "glass_lead": "Glass, Lead",
+                  "lithium_fluoride": "Lithium Fluoride", "lithium_tetraborate": "Lithium Tetraborate",
+                  "magnesium_tetraborate": "Magnesium Tetraborate", "mercuric_iodide": "Mercuric Iodide",
+                  "mylar": "Polyethylene Terephthalate (Mylar)", "polystyrene": "Polystyrene",
+                  "teflon": "Polytetrafluoroethylene (Teflon)", "polyvinyl_chloride": "Polyvinyl Chloride",
+                  "soft_tissue_four_component": "Tissue, Soft (ICRU four-component)",
+                  "tissue_equivalent_gas_methane": "Tissue-Equivalent GAS (Methane based)",
+                  "tissue_equivalent_gas_propane": "Tissue-Equivalent GAS (Propane based)",
+                  "a150_tissue_equivalent_plastic": "A-150 Tissue-Equivalent Plastic",
+                  "b100_bone_equivalent_plastic": "B-100 Bone-Equivalent Plastic",
+                  "c552_air_equivalent_plastic": "C-552 Air-Equivalent Plastic",
+                  "plastic_scintillator": "Plastic Scintillator (Vinyltoluene based)",
+                  "glass_borosilicate": "Glass, Pyrex", "air_sea_level": "Air, Dry (near sea level)"}
+    assert set(in_xraylib) <= set(NIST_COMPOUND_NAMES)
+    for name, nist in in_xraylib.items():
+        data = xraylib.GetCompoundDataNISTByName(nist)
+        reference = dict(zip(data["Elements"], data["massFractions"]))
+        ours = library_module.parse_formula(MATERIAL_CATALOGUE[name][1], backend.atomic_mass)
+        assert set(ours) == set(reference), name
+        assert max(abs(ours[Z] - reference[Z]) for Z in ours) < 5e-5, name
+    for name in NIST_COMPOUND_NAMES:  # every NIST entry is written as mass fractions of elements, 6 digits each
+        assert all(len(term.split("*")[0].split(".")[1]) == 6 for term in MATERIAL_CATALOGUE[name][1].split(" + "))
+
+
+def test_demo_spectra(library_module):
+    """The two sample spectra of demo/spectra load with 1 keV nodes, to 125 keV and to 6000 keV; the 125 kVp copy is
+    the package's default spectrum."""
+    spectra = Path(__file__).parents[1] / "demo" / "spectra"
+    for name, maximum in (("spectrum_125kvp.txt", 125.0), ("spectrum_6mv.txt", 6000.0)):
+        energies, weights = library_module.load_spectrum_txt(str(spectra / name))
+        assert energies[0] == 1.0 and energies[-1] == maximum
+        assert np.all(np.diff(energies) == 1.0) and np.all(weights >= 0) and weights.max() > 0
+    e, s = library_module.default_spectrum_125kvp()
+    demo_e, demo_s = library_module.load_spectrum_txt(str(spectra / "spectrum_125kvp.txt"))
+    assert np.array_equal(e, demo_e) and np.array_equal(s, demo_s)
 
 
 # the compounds and a sample of the elements (every 10th atomic number, lead and tungsten): one build each

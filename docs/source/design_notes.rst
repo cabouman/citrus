@@ -18,15 +18,18 @@ XCOM cross section whatever the integral of the shape, and every material of the
 
 **Spectrum, groups and energy quadrature.** The default source is a W-anode 125 kV spectrum (11 degree take-off, 0.89
 mm Ti filter, 1 keV grid, shipped with the package and read by ``default_spectrum_125kvp``; CITRUS does not simulate
-tube spectra); any two-column spectrum can be loaded with
-``load_spectrum_txt``. Spectra are piecewise-linear densities integrated exactly, so characteristic lines are kept. The
+tube spectra); any two-column spectrum can be loaded with ``load_spectrum_txt``. The repository's ``demo/spectra``
+holds two sample spectra, the 125 kVp one and the Mohan et al. (1985) 6 MV linac spectrum (1 keV nodes to 6 MeV, the
+spectrum of the 6 MV validation). Spectra are piecewise-linear densities integrated exactly, so characteristic lines
+are kept. The
 group edges cut the estimated total fluence spectrum (source plus scattered photons) into equal areas. Each group is cut
 into bins of at most 0.5 keV, evaluated at the bin midpoints and weighted with the exact spectrum integral over the
 bin.
 
-The shipped spectrum (``citrus/scatter_solver/data/spectrum_125kvp.txt``, the spectrum of the WLAB validation, 125
+The 125 kVp spectrum (``citrus/scatter_solver/data/spectrum_125kvp.txt``, the spectrum of the WLAB validation, 125
 nodes at 1 to 125 keV) was computed once with XrayPhysics, ``simulateSpectra`` filtered by
-``filterResponse('Ti', 4.506, 0.089)``.
+``filterResponse('Ti', 4.506, 0.089)``. The 6 MV spectrum (``demo/spectra/spectrum_6mv.txt``) is the EGSnrc
+``mohan6`` histogram (24 bins of 0.25 MeV) written at 1 keV nodes, uniform inside each bin.
 
 **Group edges from the scattered fluence.** Equal source photon counts per group resolve the spectrum the source emits,
 but the groups also carry the collided photons, and the multiple-collision scatter consists of downscattered photons.

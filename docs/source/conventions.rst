@@ -105,7 +105,9 @@ Materials
 
 The material catalogue ``cross_sections.MATERIAL_CATALOGUE`` maps a name to (nominal density, composition). The
 nominal density is the density of the material in the body or the scanner; the nominal attenuation is given at the
-spectrum mean of the default 125 kVp spectrum (63 keV). The first seven are the default reference materials.
+spectrum mean of the default 125 kVp spectrum (63 keV). The catalogue has three parts: the compounds and tissues
+below (the first seven are the default reference materials), the compounds of NIST's attenuation tables, and the
+elements.
 
 .. list-table::
    :header-rows: 1
@@ -171,24 +173,196 @@ spectrum mean of the default 125 kVp spectrum (63 keV). The first seven are the 
      - polyethylene (C₂H₄)
      - 0.94
      - 0.1826
-   * - ``aluminium``
-     - Al
-     - 2.699
-     - 0.7027
-   * - ``titanium``
-     - Ti
-     - 4.54
-     - 3.0919
    * - ``carbon_fibre``
      - carbon-fibre epoxy laminate (couch top): 60 % fibre volume, 0.692 C + 0.308 C₂₁H₂₄O₄ by mass
      - 1.56
      - 0.2756
 
-After these compounds the catalogue holds every element Z = 1..98 under its English (IUPAC) name, ``hydrogen`` to
-``californium`` (for example ``lead``, 11.35 g/cm³, and ``tungsten``, 19.3 g/cm³; aluminium and titanium are the
-entries above), with the element as the composition and xraylib's element density (the NIST densities of Hubbell and
-Seltzer, NISTIR 5632; gases at 20 °C and 1 atm) as the nominal density. xraylib has no scattering functions for
-Z = 99, 100.
+The second part (``cross_sections.NIST_COMPOUND_NAMES``) holds the compounds and mixtures of NIST's X-ray mass
+attenuation coefficient tables (Hubbell and Seltzer, NISTIR 5632, `Table 2
+<https://physics.nist.gov/PhysRefData/XrayMassCoef/tab2.html>`_), with NIST's densities and mass fractions. Seven of
+NIST's 48 materials are entries of the first table with the same composition (``water``; ``muscle``, which is Muscle,
+Skeletal (ICRU-44); ``soft_tissue``, which is Tissue, Soft (ICRU-44); ``brain``; ``blood``; ``pmma``, at NIST's
+1.19 g/cm³; and ``polyethylene``, at 0.93 g/cm³), so 41 names are added. The ICRU-44 tissues carry the suffix
+``_icru44`` to tell them from the ICRP compositions of the first table.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 36 12 14
+
+   * - name
+     - NIST Table 2 material
+     - :math:`\rho^{nom}` (g/cm³)
+     - :math:`\mu` at 63 keV (1/cm)
+   * - ``a150_tissue_equivalent_plastic``
+     - A-150 Tissue-Equivalent Plastic
+     - 1.127
+     - 0.2216
+   * - ``adipose_icru44``
+     - Adipose Tissue (ICRU-44)
+     - 0.95
+     - 0.1843
+   * - ``air_sea_level``
+     - Air, Dry (near sea level)
+     - 0.001205
+     - 0.0002
+   * - ``alanine``
+     - Alanine
+     - 1.424
+     - 0.2709
+   * - ``b100_bone_equivalent_plastic``
+     - B-100 Bone-Equivalent Plastic
+     - 1.45
+     - 0.3753
+   * - ``bakelite``
+     - Bakelite
+     - 1.25
+     - 0.2294
+   * - ``bone_cortical_icru44``
+     - Bone, Cortical (ICRU-44)
+     - 1.92
+     - 0.5639
+   * - ``breast_icru44``
+     - Breast Tissue (ICRU-44)
+     - 1.02
+     - 0.2005
+   * - ``c552_air_equivalent_plastic``
+     - C-552 Air-equivalent Plastic
+     - 1.76
+     - 0.3222
+   * - ``cadmium_telluride``
+     - Cadmium Telluride
+     - 6.2
+     - 35.5319
+   * - ``calcium_fluoride``
+     - Calcium Fluoride
+     - 3.18
+     - 1.2494
+   * - ``calcium_sulfate``
+     - Calcium Sulfate
+     - 2.96
+     - 1.0308
+   * - ``ceric_ammonium_sulfate_solution``
+     - 15 mmol/L Ceric Ammonium Sulfate Solution
+     - 1.03
+     - 0.2266
+   * - ``cesium_iodide``
+     - Cesium Iodide
+     - 4.51
+     - 31.3171
+   * - ``concrete_ordinary``
+     - Concrete, Ordinary
+     - 2.3
+     - 0.5781
+   * - ``concrete_barite``
+     - Concrete, Barite (Type BA)
+     - 3.35
+     - 12.2057
+   * - ``eye_lens_icru44``
+     - Eye Lens (ICRU-44)
+     - 1.07
+     - 0.2108
+   * - ``ferrous_sulfate_fricke``
+     - Ferrous Sulfate, Standard Fricke
+     - 1.024
+     - 0.2081
+   * - ``gadolinium_oxysulfide``
+     - Gadolinium Oxysulfide
+     - 7.44
+     - 64.2909
+   * - ``gafchromic_sensor``
+     - Gafchromic Sensor
+     - 1.3
+     - 0.2461
+   * - ``gallium_arsenide``
+     - Gallium Arsenide
+     - 5.31
+     - 9.4925
+   * - ``glass_borosilicate``
+     - Glass, Borosilicate (Pyrex)
+     - 2.23
+     - 0.5126
+   * - ``glass_lead``
+     - Glass, Lead
+     - 6.22
+     - 21.0818
+   * - ``lithium_fluoride``
+     - Lithium Fluoride
+     - 2.635
+     - 0.4593
+   * - ``lithium_tetraborate``
+     - Lithium Tetraborate
+     - 2.44
+     - 0.4266
+   * - ``lung_icru44``
+     - Lung Tissue (ICRU-44)
+     - 1.05
+     - 0.2107
+   * - ``magnesium_tetraborate``
+     - Magnesium Tetraborate
+     - 2.53
+     - 0.4720
+   * - ``mercuric_iodide``
+     - Mercuric Iodide
+     - 6.36
+     - 35.1756
+   * - ``ovary_icru44``
+     - Ovary (ICRU-44)
+     - 1.05
+     - 0.2108
+   * - ``photographic_emulsion_kodak_aa``
+     - Photographic Emulsion (Kodak Type AA)
+     - 2.2
+     - 4.6413
+   * - ``photographic_emulsion_standard_nuclear``
+     - Photographic Emulsion (Standard Nuclear)
+     - 3.815
+     - 12.3398
+   * - ``plastic_scintillator``
+     - Plastic Scintillator, Vinyltoluene
+     - 1.032
+     - 0.1913
+   * - ``mylar``
+     - Polyethylene Terephthalate (Mylar)
+     - 1.38
+     - 0.2531
+   * - ``polystyrene``
+     - Polystyrene
+     - 1.06
+     - 0.1953
+   * - ``teflon``
+     - Polytetrafluoroethylene (Teflon)
+     - 2.25
+     - 0.4112
+   * - ``polyvinyl_chloride``
+     - Polyvinyl Chloride
+     - 1.406
+     - 0.4340
+   * - ``radiochromic_dye_film``
+     - Radiochromic Dye Film, Nylon Base
+     - 1.08
+     - 0.2057
+   * - ``testis_icru44``
+     - Testis (ICRU-44)
+     - 1.04
+     - 0.2087
+   * - ``soft_tissue_four_component``
+     - Tissue, Soft (ICRU Four-Component)
+     - 1
+     - 0.1982
+   * - ``tissue_equivalent_gas_methane``
+     - Tissue-Equivalent Gas, Methane Based
+     - 0.001064
+     - 0.0002
+   * - ``tissue_equivalent_gas_propane``
+     - Tissue-Equivalent Gas, Propane Based
+     - 0.001826
+     - 0.0004
+
+The third part holds every element Z = 1..98 under its English (IUPAC) name, ``hydrogen`` to ``californium`` (for
+example ``aluminium``, 2.6989 g/cm³, ``titanium``, 4.54 g/cm³, ``lead``, 11.35 g/cm³, and ``tungsten``, 19.3 g/cm³),
+with the element as the composition and xraylib's element density (the NIST densities of Hubbell and Seltzer,
+NISTIR 5632; gases at 20 °C and 1 atm) as the nominal density. xraylib has no scattering functions for Z = 99, 100.
 
 A composition is a material string (``cross_section_library.parse_formula``): a chemical formula (``H2O``, a
 stoichiometric compound) or a mixture ``a*F1 + b*F2 + ...`` with a, b the relative mass fractions of the elements or

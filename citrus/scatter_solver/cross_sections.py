@@ -90,19 +90,119 @@ _COMPOUNDS: dict[str, tuple[float, str]] = {
     "skin": (1.09, _SKIN_ICRU44),
     "pmma": (1.18, _PMMA),
     "polyethylene": (0.94, _POLYETHYLENE),
-    "aluminium": (2.699, "Al"),
-    "titanium": (4.54, "Ti"),
     "carbon_fibre": (1.56, _CARBON_FIBRE_EPOXY),
 }
-# the compounds and tissues first, then every element by its English name (aluminium and titanium are already entries
-# of the first part, with the same composition)
+# The compounds and mixtures of NIST's X-ray mass attenuation coefficient tables (Hubbell and Seltzer, NISTIR 5632,
+# Table 2: https://physics.nist.gov/PhysRefData/XrayMassCoef/tab2.html), with NIST's densities and mass fractions.
+# Seven of the 48 are already entries above with the same composition: water, muscle (Muscle, Skeletal ICRU-44),
+# soft_tissue (Tissue, Soft ICRU-44), brain, blood, pmma (NIST density 1.19) and polyethylene (NIST density 0.93).
+_NIST_COMPOUNDS: dict[str, tuple[float, str]] = {
+    # A-150 Tissue-Equivalent Plastic
+    "a150_tissue_equivalent_plastic": (1.127, "0.101330*H + 0.775498*C + 0.035057*N + 0.052315*O + 0.017423*F + "
+                                               "0.018377*Ca"),
+    # Adipose Tissue (ICRU-44)
+    "adipose_icru44": (0.95, "0.114000*H + 0.598000*C + 0.007000*N + 0.278000*O + 0.001000*Na + 0.001000*S + "
+                              "0.001000*Cl"),
+    # Air, Dry (near sea level)
+    "air_sea_level": (0.001205, "0.000124*C + 0.755268*N + 0.231781*O + 0.012827*Ar"),
+    # Alanine
+    "alanine": (1.424, "0.079192*H + 0.404437*C + 0.157213*N + 0.359157*O"),
+    # B-100 Bone-Equivalent Plastic
+    "b100_bone_equivalent_plastic": (1.45, "0.065473*H + 0.536942*C + 0.021500*N + 0.032084*O + 0.167415*F + "
+                                            "0.176585*Ca"),
+    # Bakelite
+    "bakelite": (1.25, "0.057444*H + 0.774589*C + 0.167968*O"),
+    # Bone, Cortical (ICRU-44)
+    "bone_cortical_icru44": (1.92, "0.034000*H + 0.155000*C + 0.042000*N + 0.435000*O + 0.001000*Na + 0.002000*Mg + "
+                                    "0.103000*P + 0.003000*S + 0.225000*Ca"),
+    # Breast Tissue (ICRU-44)
+    "breast_icru44": (1.02, "0.106000*H + 0.332000*C + 0.030000*N + 0.527000*O + 0.001000*Na + 0.001000*P + "
+                             "0.002000*S + 0.001000*Cl"),
+    # C-552 Air-equivalent Plastic
+    "c552_air_equivalent_plastic": (1.76, "0.024681*H + 0.501610*C + 0.004527*O + 0.465209*F + 0.003973*Si"),
+    # Cadmium Telluride
+    "cadmium_telluride": (6.2, "0.468358*Cd + 0.531642*Te"),
+    # Calcium Fluoride
+    "calcium_fluoride": (3.18, "0.486672*F + 0.513328*Ca"),
+    # Calcium Sulfate
+    "calcium_sulfate": (2.96, "0.470081*O + 0.235534*S + 0.294385*Ca"),
+    # 15 mmol L-1 Ceric Ammonium Sulfate Solution
+    "ceric_ammonium_sulfate_solution": (1.03, "0.107694*H + 0.000816*N + 0.875172*O + 0.014279*S + 0.002040*Ce"),
+    # Cesium Iodide
+    "cesium_iodide": (4.51, "0.488451*I + 0.511549*Cs"),
+    # Concrete, Ordinary
+    "concrete_ordinary": (2.3, "0.022100*H + 0.002484*C + 0.574930*O + 0.015208*Na + 0.001266*Mg + 0.019953*Al + "
+                                "0.304627*Si + 0.010045*K + 0.042951*Ca + 0.006435*Fe"),
+    # Concrete, Barite (Type BA)
+    "concrete_barite": (3.35, "0.003585*H + 0.311622*O + 0.001195*Mg + 0.004183*Al + 0.010457*Si + 0.107858*S + "
+                               "0.050194*Ca + 0.047505*Fe + 0.463400*Ba"),
+    # Eye Lens (ICRU-44)
+    "eye_lens_icru44": (1.07, "0.096000*H + 0.195000*C + 0.057000*N + 0.646000*O + 0.001000*Na + 0.001000*P + "
+                               "0.003000*S + 0.001000*Cl"),
+    # Ferrous Sulfate Standard Fricke
+    "ferrous_sulfate_fricke": (1.024, "0.108376*H + 0.878959*O + 0.000022*Na + 0.012553*S + 0.000035*Cl + "
+                                       "0.000055*Fe"),
+    # Gadolinium Oxysulfide
+    "gadolinium_oxysulfide": (7.44, "0.084527*O + 0.084704*S + 0.830769*Gd"),
+    # Gafchromic Sensor
+    "gafchromic_sensor": (1.3, "0.089700*H + 0.605800*C + 0.112200*N + 0.192300*O"),
+    # Gallium Arsenide
+    "gallium_arsenide": (5.31, "0.482030*Ga + 0.517970*As"),
+    # Glass, Borosilicate (Pyrex)
+    "glass_borosilicate": (2.23, "0.040066*B + 0.539559*O + 0.028191*Na + 0.011644*Al + 0.377220*Si + 0.003321*K"),
+    # Glass, Lead
+    "glass_lead": (6.22, "0.156453*O + 0.080866*Si + 0.008092*Ti + 0.002651*As + 0.751938*Pb"),
+    # Lithium Fluoride
+    "lithium_fluoride": (2.635, "0.267585*Li + 0.732415*F"),
+    # Lithium Tetraborate
+    "lithium_tetraborate": (2.44, "0.082081*Li + 0.255715*B + 0.662204*O"),
+    # Lung Tissue (ICRU-44)
+    "lung_icru44": (1.05, "0.103000*H + 0.105000*C + 0.031000*N + 0.749000*O + 0.002000*Na + 0.002000*P + 0.003000*S + "
+                           "0.003000*Cl + 0.002000*K"),
+    # Magnesium Tetraborate
+    "magnesium_tetraborate": (2.53, "0.240870*B + 0.623762*O + 0.135367*Mg"),
+    # Mercuric Iodide
+    "mercuric_iodide": (6.36, "0.558560*I + 0.441440*Hg"),
+    # Ovary (ICRU-44)
+    "ovary_icru44": (1.05, "0.105000*H + 0.093000*C + 0.024000*N + 0.768000*O + 0.002000*Na + 0.002000*P + "
+                            "0.002000*S + 0.002000*Cl + 0.002000*K"),
+    # Photographic Emulsion (Kodak Type AA)
+    "photographic_emulsion_kodak_aa": (2.2, "0.030500*H + 0.210700*C + 0.072100*N + 0.163200*O + 0.222800*Br + "
+                                             "0.300700*Ag"),
+    # Photographic Emulsion (Standard Nuclear)
+    "photographic_emulsion_standard_nuclear": (3.815, "0.014100*H + 0.072261*C + 0.019320*N + 0.066101*O + "
+                                                       "0.001890*S + 0.349104*Br + 0.474105*Ag + 0.003120*I"),
+    # Plastic Scintillator, Vinyltoluene
+    "plastic_scintillator": (1.032, "0.085000*H + 0.915000*C"),
+    # Polyethylene Terephthalate, (Mylar)
+    "mylar": (1.38, "0.041960*H + 0.625016*C + 0.333024*O"),
+    # Polystyrene
+    "polystyrene": (1.06, "0.077421*H + 0.922579*C"),
+    # Polytetrafluoroethylene, (Teflon)
+    "teflon": (2.25, "0.240183*C + 0.759818*F"),
+    # Polyvinyl Chloride
+    "polyvinyl_chloride": (1.406, "0.048382*H + 0.384361*C + 0.567257*Cl"),
+    # Radiochromic Dye Film, Nylon Base
+    "radiochromic_dye_film": (1.08, "0.101996*H + 0.654396*C + 0.098915*N + 0.144693*O"),
+    # Testis (ICRU-44)
+    "testis_icru44": (1.04, "0.106000*H + 0.099000*C + 0.020000*N + 0.766000*O + 0.002000*Na + 0.001000*P + "
+                             "0.002000*S + 0.002000*Cl + 0.002000*K"),
+    # Tissue, Soft (ICRU Four-Component)
+    "soft_tissue_four_component": (1, "0.101174*H + 0.111000*C + 0.026000*N + 0.761826*O"),
+    # Tissue-Equivalent Gas, Methane Based
+    "tissue_equivalent_gas_methane": (0.001064, "0.101873*H + 0.456177*C + 0.035172*N + 0.406778*O"),
+    # Tissue-Equivalent Gas, Propane Based
+    "tissue_equivalent_gas_propane": (0.001826, "0.102676*H + 0.568937*C + 0.035022*N + 0.293365*O"),
+}
+# the compounds and tissues first (the hand-written entries, then NIST's), then every element by its English name
 MATERIAL_CATALOGUE: Mapping[str, tuple[float, str]] = MappingProxyType({
     **_COMPOUNDS,
-    **{name: (density, symbol) for name, symbol, density in zip(ELEMENT_NAMES, ELEMENT_SYMBOLS, ELEMENT_DENSITIES)
-       if name not in _COMPOUNDS},
+    **_NIST_COMPOUNDS,
+    **{name: (density, symbol) for name, symbol, density in zip(ELEMENT_NAMES, ELEMENT_SYMBOLS, ELEMENT_DENSITIES)},
 })
-# the entries that are not single elements (the compounds, tissues and mixtures, plus aluminium and titanium)
-COMPOUND_NAMES: tuple[str, ...] = tuple(_COMPOUNDS)
+# the entries that are not single elements (the compounds, tissues and mixtures), and NIST's part of them
+NIST_COMPOUND_NAMES: tuple[str, ...] = tuple(_NIST_COMPOUNDS)
+COMPOUND_NAMES: tuple[str, ...] = tuple(_COMPOUNDS) + NIST_COMPOUND_NAMES
 
 # The default reference materials, in library order = increasing attenuation at nominal density. Muscle is BELOW soft
 # tissue at
