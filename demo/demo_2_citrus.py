@@ -56,8 +56,7 @@ config = SolverConfig(materials=tuple(materials), transport_cell_cm=transport_ce
                       legendre_order=legendre_order)
 detector, grid_response = ideal_counting_response(), no_grid()  # photon-counting detector, no anti-scatter grid
 
-# ---- Data: loaded from demo/input when a file of this name (views, pitch, angles, panel, spectrum) exists, else ----
-# ---- synthesized once (about 2 minutes on a GPU); delete the file after changing any other setting -----------------
+# ---- Data: loaded when a file of this name exists in demo/input, else synthesized once (about 2 minutes on a GPU) ---
 name = (f"wlab_{num_views}v_{delta_voxel:g}cm_{start_angle:g}-{end_angle:.1f}deg_{num_det_rows}x{num_det_channels}px"
         f"{pixel_pitch:g}cm_{spectrum_name}").replace(".", "p")
 path = os.path.join(demo_dir, "input", name)
