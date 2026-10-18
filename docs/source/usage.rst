@@ -187,6 +187,147 @@ The per-view step is available on its own:
    # the loop's form: prebuilt fields (from X, no density volume), primary computed elsewhere
    scatter, _, state = citrus_view_step(solver, state, fields, angle, primary=False)
 
+Settings
+--------
+
+Every setting of the loop (``CitrusConfig``) and of the solver (``SolverConfig``), with its default; the sections
+above and :doc:`method` explain them, and the API pages (:doc:`api/citrus`, :doc:`api/config`) carry the same
+descriptions. The first setting of each group names the group.
+
+**CitrusConfig**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 16 50
+
+   * - setting
+     - default
+     - meaning
+   * - ``num_outer_iterations`` (loop)
+     - ``"adaptive"``
+     - outer iterations (one scatter correction each): a number, or adaptive on the fit of the corrected sinogram
+   * - ``mbir_iterations_per_outer_iteration``
+     - ``"adaptive"``
+     - MBIR iterations per outer iteration: a number, or adaptive on the same fit
+   * - ``stop_relative_improvement``
+     - ``0.005``
+     - adaptive loop: stop once an outer iteration improves the fit by less than this
+   * - ``mbir_stop_relative_improvement``
+     - ``0.02``
+     - adaptive MBIR: stop once the fit improves by less than this per iteration (mean of the last two)
+   * - ``max_outer_iterations``
+     - ``40``
+     - most outer iterations of the adaptive loop
+   * - ``max_mbir_iterations_per_outer_iteration``
+     - ``8``
+     - most MBIR iterations of an adaptive outer iteration (at least two run)
+   * - ``resume_error_sinogram``
+     - ``True``
+     - keep MBIRTORCH's error sinogram between MBIR iterations instead of recomputing it
+   * - ``base_seed``
+     - ``0``
+     - seed of the partition sequence of MBIR iteration i, ``[base_seed, i]``
+   * - ``verbose``
+     - ``False``
+     - print one line per outer iteration (timings, fit, accumulator change)
+   * - ``scatter_view_stride`` (scatter stage)
+     - ``1``
+     - scatter step on the views 0, n, 2n, ...; the others are interpolated in angle
+   * - ``scatter_view_interpolation_order``
+     - ``3``
+     - interpolation of the skipped views: 3 Catmull-Rom, 2 quadratic, 1 linear, 0 nearest, None none
+   * - ``energy_kev``
+     - ``None``
+     - effective energy of the density model; None for the spectrum mean of the library
+   * - ``grouping_object_size``
+     - ``"auto"``
+     - object size in cm of the solver's scattered-fluence groups; auto measures the FDK volume
+   * - ``primary_views_per_chunk``
+     - ``None``
+     - views per chunk of the primary projections; None keeps one sinogram
+   * - ``min_counts`` (data and memory)
+     - ``1.0``
+     - lower clamp of the (corrected) counts before the log
+   * - ``gpu_state_budget_mib``
+     - ``2600.0``
+     - largest total of the per-view accumulators kept on the GPU, in MiB
+   * - ``pinned_memory_limit_gib``
+     - ``8.0``
+     - largest pinned host allocation for the accumulators, in GiB
+
+**SolverConfig**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 16 50
+
+   * - setting
+     - default
+     - meaning
+   * - ``num_groups`` (energy)
+     - ``6``
+     - energy groups
+   * - ``group_edges_method``
+     - ``"scattered_fluence"``
+     - rule of the group edges: scattered_fluence, equal_fluence or log
+   * - ``group_edges_kev``
+     - ``None``
+     - explicit descending group edges in keV (num_groups + 1 values) instead of the rule
+   * - ``grouping_object_size_cm``
+     - ``20.0``
+     - chord length in cm of the object in the scattered-fluence rule (CITRUS sets it from the FDK)
+   * - ``grouping_medium``
+     - ``"auto"``
+     - medium of that rule: auto (the object's mean densities), a catalogue name or (name, density) pairs
+   * - ``energy_min_kev``
+     - ``10.0``
+     - lowest group edge; photons scattered below it are absorbed
+   * - ``legendre_order``
+     - ``7``
+     - Legendre order L of the scattering kernel
+   * - ``num_eta_table``
+     - ``2001``
+     - nodes of the tabulated transfer in the cosine of the scattering angle
+   * - ``angular_table_grid``
+     - ``"adaptive"``
+     - placement of those nodes: adaptive (by the curvature of the transfer) or uniform
+   * - ``materials`` (materials)
+     - the seven defaults
+     - reference materials of the library and the density model (catalogue names, at least two)
+   * - ``num_polar`` (angle)
+     - ``8``
+     - Gauss-Legendre polar nodes of the sweep quadrature (at least L + 1)
+   * - ``num_azimuthal``
+     - ``16``
+     - equally spaced azimuths of the sweep quadrature (at least 2 L + 1)
+   * - ``transport_cell_cm`` (space)
+     - ``1.0``
+     - edge of the cubic transport cells
+   * - ``quadrature_point_spacing_cm``
+     - ``0.5``
+     - target spacing of the quadrature points of the first-order scatter
+   * - ``uncollided_trace_grid``
+     - ``"quadrature"``
+     - grid the uncollided fluence is traced through: quadrature, coarse or fine
+   * - ``source_iteration_tolerance`` (source iteration)
+     - ``1.0e-3``
+     - stop a converged solve when the last order is below this fraction of the total
+   * - ``max_source_iterations``
+     - ``30``
+     - most sweeps (collision orders) of a converged solve
+   * - ``cone_num_polar`` (scatter image)
+     - ``16``
+     - polar directions of the cone direction set
+   * - ``cone_num_azimuthal``
+     - ``32``
+     - azimuthal directions of the cone direction set
+   * - ``direction_chunk``
+     - ``8``
+     - directions per batch of the scatter image and per octant per sweep chunk
+   * - ``dtype`` (numerics)
+     - ``"float32"``
+     - float32 (production) or float64 (reference and tests)
+
 The scatter solver
 ------------------
 
