@@ -73,8 +73,9 @@ How it works
    iteration's higher-order scatter, divides the measured data by one plus the scatter-to-primary ratio and runs one
    or more warm-started MBIR iterations on the result.
 
-Each outer iteration :math:`k` turns the reconstruction :math:`X_k` into densities of the reference materials, resamples
-them onto the transport cells, and updates the per-view collided fluence :math:`\Phi_v` with one transport sweep
+Each scatter step, at outer iteration :math:`k`, turns the reconstruction :math:`X_k` into densities of the reference
+materials, resamples them onto the transport cells, and updates the per-view collided fluence :math:`\Phi_v` with one
+transport sweep
 :math:`G_k` applied to the newest first-collision term :math:`\phi_1` and to the previous accumulator:
 
 .. math::

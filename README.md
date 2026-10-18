@@ -12,9 +12,10 @@ Full documentation: [purduecitrus.readthedocs.io](https://purduecitrus.readthedo
 
 ## How CITRUS works
 
-Each outer iteration k converts the current reconstruction X_k into material densities, takes one scatter step
-per view, corrects the measured counts with the estimated scatter-to-primary ratio, `Y_c = Y / (1 + SPR)`, and runs
-one warm-started MBIR iteration on the corrected data.
+Each outer iteration k runs one warm-started MBIR iteration on the corrected counts `Y_c = Y / (1 + SPR)`. Every
+n-th outer iteration (`scatter_every`) first refreshes the correction: it converts the current reconstruction X_k
+into material densities, takes one scatter step per view and recomputes the scatter-to-primary ratio SPR; the
+iterations in between reuse the last correction.
 
 The scatter step is **age-ordered source iteration**. Per view the solver keeps an accumulator of the collided
 fluence, `Phi_{>1}`, and updates it with one transport sweep `G_k` (scattering plus transport through the densities of
