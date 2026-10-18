@@ -26,8 +26,10 @@ line: all source photons sit in the fine bin that holds the line, which is evalu
 effective energy and the primary attenuation are exactly those of the line; the groups below it hold the scattered
 photons ("scattered_fluence" or "log" edges; "equal_fluence" needs a continuous spectrum). The
 group edges cut the estimated total fluence spectrum (source plus scattered photons) into equal areas. Each group is cut
-into bins of at most 0.5 keV, evaluated at the bin midpoints and weighted with the exact spectrum integral over the
-bin.
+into at most 100 equal fine bins of at least 0.5 keV (``fine_energy_grid``; a kV group of 20 keV gets 0.5 keV bins, a
+MV group of 1 MeV gets 10 keV bins), evaluated at the bin midpoints and weighted with the exact spectrum integral over
+the bin. The build time is proportional to the number of bins, so this keeps an MV library as cheap as a kV one; a
+uniform width can be forced with ``fine_bin_width_kev``.
 
 The 125 kVp spectrum (``demo/spectra/spectrum_125kvp.txt``, the spectrum of the WLAB validation, 125 nodes at 1 to
 125 keV) was computed once with XrayPhysics, ``simulateSpectra`` filtered by

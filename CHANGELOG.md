@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.1 - 2026-10-17
+
+- **Automatic fine energy grid.** `fine_bin_width_kev` of the library build defaults to None: every group is cut into
+  at most 100 equal bins of at least 0.5 keV (`fine_energy_grid`), so a kV library is unchanged (its groups are
+  narrower than 50 keV) while a 6 MV library has 1200 fine energies instead of 12,000 and builds in about 20 s
+  instead of minutes; the group constants and the transfer at common angles are closer to a 2 keV reference than
+  those of the uniform 5 keV grid of the 6 MV validation. An explicit width still gives a uniform grid. The 6 MV
+  demo run no longer spends minutes in the first scatter stage, and the primary sums over ten times fewer energies.
+- demo 2 shows the 6 MV spectrum and a monoenergetic source as commented-out alternatives of its spectrum line.
+
 ## v0.9.0 - 2026-10-17
 
 - **An outer iteration is one scatter correction followed by n MBIR iterations.** `CitrusConfig.scatter_every` is

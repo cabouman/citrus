@@ -116,8 +116,9 @@ The fluence splits into the uncollided part, known in closed form, and the colli
    \sum_{E\in g} w_E \exp\!\Big(-\sum_m P_m(\mathbf r)\, m_m(E)\Big),
    \qquad P_m(\mathbf r) = \int_{\mathbf r_0}^{\mathbf r} \rho_m\, dl,
 
-i.e. one ray trace per material present in the volume and a fine-energy table (0.5 keV bins, weights :math:`w_E` of the
-spectrum): exact in energy, without the within-group beam-hardening error of group-averaged attenuation. The collided
+i.e. one ray trace per material present in the volume and a fine-energy table (the fine bins of the library, weights
+:math:`w_E` of the spectrum): exact in energy, without the within-group beam-hardening error of group-averaged
+attenuation. The collided
 fluence satisfies the same LBTE with the **first-collision source** in place of :math:`q`,
 
 .. math::

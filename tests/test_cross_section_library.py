@@ -41,6 +41,21 @@ def _group_avg(info: cross_section_library.BuildInfo, kind: str, material: str) 
     return np.array([np.sum(info.fine_weight[info.fine_group == g] * s[info.fine_group == g]) for g in range(ng)])
 
 
+def test_automatic_fine_grid():
+    """Without a width every group is cut into at most 100 bins of at least 0.5 keV: narrow (kV) groups keep 0.5 keV
+    bins, a 1 MeV group gets 10 keV bins; an explicit width is uniform."""
+    edges = np.array([125.0, 85.0, 60.0, 10.0])
+    E, groups, low, high = cross_section_library.fine_energy_grid(edges)
+    assert np.allclose(high - low, 0.5) and E.size == 80 + 50 + 100
+    E_u, _, low_u, high_u = cross_section_library.fine_energy_grid(edges, 0.5)
+    assert np.array_equal(E, E_u) and np.array_equal(low, low_u) and np.array_equal(high, high_u)
+    E, groups, low, high = cross_section_library.fine_energy_grid(np.array([6000.0, 5000.0, 10.0]))
+    assert np.allclose((high - low)[groups == 0], 10.0) and (groups == 0).sum() == 100
+    assert np.allclose((high - low)[groups == 1], 49.9) and (groups == 1).sum() == 100
+    E, groups, low, high = cross_section_library.fine_energy_grid(np.array([6000.0, 5000.0, 10.0]), 5.0)
+    assert np.allclose(high - low, 5.0) and (groups == 1).sum() == 998
+
+
 @pytest.fixture(scope="module")
 def built():
     # equal-fluence groups (the tests below check equal source fractions); the default adaptive eta table

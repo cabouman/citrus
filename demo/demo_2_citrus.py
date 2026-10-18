@@ -15,18 +15,19 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from citrus import CitrusConfig, citrus_recon, mbir_recon
-from citrus.scatter_solver import (ConeGeometry, ScatterSolver, SolverConfig, ideal_counting_response,
-                                   load_spectrum_txt, no_grid)
+from citrus.scatter_solver import (ConeGeometry, ScatterSolver, SolverConfig, ideal_counting_response,  # noqa: F401
+                                   load_spectrum_txt, monoenergetic_spectrum, no_grid)
 from citrus.utilities import (WlabPhantom, load_dataset, plot_profiles, plot_slices, save_dataset,
                               synthesize_cone_beam_data, wlab_grid)
 
 # ---- Parameters -----------------------------------------------------------------------------------------------
-# Source spectrum, (energies in keV, relative photons per keV), with a short name for the data file.  Load a text
-# file of two columns ('#' starts a comment; demo/spectra has a 125 kVp tube spectrum and a 6 MV linac spectrum,
-# spectrum_6mv.txt), or use a monoenergetic source (from citrus.scatter_solver import monoenergetic_spectrum):
-# spectrum, spectrum_name = monoenergetic_spectrum(100.0), "100kev".
+# Source spectrum, (energies in keV, relative photons per keV), with a short name for the data file: a text file of
+# two columns ('#' starts a comment), or a monoenergetic source.  demo/spectra has a 125 kVp tube spectrum and a
+# 6 MV linac spectrum.
 demo_dir = os.path.dirname(os.path.abspath(__file__))
 spectrum, spectrum_name = load_spectrum_txt(os.path.join(demo_dir, "spectra", "spectrum_125kvp.txt")), "125kvp"
+# spectrum, spectrum_name = load_spectrum_txt(os.path.join(demo_dir, "spectra", "spectrum_6mv.txt")), "6mv"
+# spectrum, spectrum_name = monoenergetic_spectrum(100.0), "100kev"
 materials = ["air", "lung_icrp", "adipose_icrp", "water", "muscle_icru44", "soft_tissue_icru44",
              "bone_cortical_icrp"]  # reference materials of the density model
 num_det_rows, num_det_channels = 184, 150  # detector panel size in pixels

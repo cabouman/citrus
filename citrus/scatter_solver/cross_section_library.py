@@ -165,7 +165,8 @@ def material_composition(backend: XcomXraylibBackend,
     return {n: parse_formula(f, backend.atomic_mass) for n, _, f in _material_table(materials)}
 
 
-def _mean_energy(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], fine_bin_width_kev: float,
+def _mean_energy(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray],
+                 fine_bin_width_kev: float | None,
                  backend: Optional[XcomXraylibBackend] = None) -> float:
     """Return the spectrum-mean photon energy over the group structure of ``config`` on the fine energy grid.
 
@@ -175,7 +176,7 @@ def _mean_energy(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], 
     Args:
         config (SolverConfig): solver configuration; sets the group edges.
         spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]).
-        fine_bin_width_kev (float): maximum fine bin width in keV.
+        fine_bin_width_kev (float or None): maximum fine bin width in keV; None for the automatic grid.
         backend (XcomXraylibBackend or None, optional): photon data, needed by the "scattered_fluence" group rule.
             Defaults to None (loaded when needed).
 
@@ -195,7 +196,7 @@ def _mean_energy(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], 
 def sort_material_table(config: SolverConfig, materials: Optional[MaterialTable],
                         spectrum: tuple[np.ndarray, np.ndarray],
                         backend: XcomXraylibBackend | None = None, *,
-                        fine_bin_width_kev: float = 0.5) -> tuple[tuple[str, float, str], ...]:
+                        fine_bin_width_kev: float | None = None) -> tuple[tuple[str, float, str], ...]:
     """Sort a material table by nominal attenuation at the spectrum-mean energy of the build.
 
     The attenuation is ``rho_nom * mu/rho(E_eff)`` with the elemental total mass attenuation of the backend mixed by
@@ -208,7 +209,8 @@ def sort_material_table(config: SolverConfig, materials: Optional[MaterialTable]
         spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]); one node is a
             monoenergetic line.
         backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
-        fine_bin_width_kev (float, optional): maximum fine bin width in keV. Defaults to 0.5.
+        fine_bin_width_kev (float or None, optional): maximum fine bin width in keV; None for the automatic grid
+            (``fine_energy_grid``). Defaults to None.
 
     Returns:
         tuple: the (name, nominal density, formula) entries in order of increasing nominal attenuation.
@@ -227,7 +229,7 @@ def sort_material_table(config: SolverConfig, materials: Optional[MaterialTable]
 def mass_attenuation_preview(config: SolverConfig, names: Sequence[str],
                              spectrum: tuple[np.ndarray, np.ndarray] | None = None,
                              backend: XcomXraylibBackend | None = None, *, energy_kev: float | None = None,
-                             fine_bin_width_kev: float = 0.5) -> tuple[float, np.ndarray]:
+                             fine_bin_width_kev: float | None = None) -> tuple[float, np.ndarray]:
     """Return the total mass attenuation of catalogue materials at the effective energy without building the library.
 
     The effective energy is ``energy_kev`` or the spectrum-mean energy of the build of ``config``; the attenuation mixes
@@ -240,7 +242,8 @@ def mass_attenuation_preview(config: SolverConfig, names: Sequence[str],
             required unless ``energy_kev`` is given. Defaults to None.
         backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
         energy_kev (float or None, optional): effective energy in keV. Defaults to None, the spectrum-mean energy.
-        fine_bin_width_kev (float, optional): maximum fine bin width in keV. Defaults to 0.5.
+        fine_bin_width_kev (float or None, optional): maximum fine bin width in keV; None for the automatic grid
+            (``fine_energy_grid``). Defaults to None.
 
     Returns:
         (float, np.ndarray): the effective energy in keV and the total mass attenuation [len(names)] in cm^2/g there.
@@ -452,7 +455,7 @@ _EDGES_MEMO: dict[str, np.ndarray] = {}
 
 def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray],
                      backend: Optional[XcomXraylibBackend] = None, *,
-                     fine_bin_width_kev: float = 0.5) -> np.ndarray:
+                     fine_bin_width_kev: float | None = None) -> np.ndarray:
     """Return the group edges in keV, descending, from kVp (the upper end of the spectrum) down to ``energy_min_kev``.
 
     The edges are ``config.group_edges_kev`` if given, otherwise placed by ``config.group_edges_method``:
@@ -465,7 +468,8 @@ def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarra
         spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]).
         backend (XcomXraylibBackend or None, optional): photon data for the "scattered_fluence" rule. Defaults to None
             (loaded when needed).
-        fine_bin_width_kev (float, optional): bin width in keV of the "scattered_fluence" balance. Defaults to 0.5.
+        fine_bin_width_kev (float or None, optional): bin width in keV of the "scattered_fluence" balance; None for
+            ``FINE_BIN_WIDTH_FLOOR_KEV``. Defaults to None.
 
     Returns:
         np.ndarray: [G+1] edges in keV, descending.
@@ -498,7 +502,7 @@ def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarra
     backend = resolve_backend() if backend is None else backend
     medium = grouping_medium_densities(config)
     key = hashlib.sha256(json.dumps([backend.name, energy_min, float(config.grouping_object_size_cm), G,
-                                     float(fine_bin_width_kev), [list(m) for m in medium]]).encode()
+                                     fine_bin_width_kev, [list(m) for m in medium]]).encode()
                          + np.ascontiguousarray(spectrum[0], dtype=np.float64).tobytes()
                          + np.ascontiguousarray(spectrum[1], dtype=np.float64).tobytes()).hexdigest()
     if key not in _EDGES_MEMO:
@@ -512,7 +516,8 @@ def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarra
 
 def _within_group_weights(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], backend, E: np.ndarray,
                           fine_groups: np.ndarray, bin_low: np.ndarray, bin_high: np.ndarray,
-                          photons_per_bin: np.ndarray, G: int, fine_bin_width_kev: float) -> tuple[np.ndarray, list]:
+                          photons_per_bin: np.ndarray, G: int,
+                          fine_bin_width_kev: float | None) -> tuple[np.ndarray, list]:
     """Return the weights of the fine bins within their group, and the groups that fell back to a flat weight.
 
     The weight is the source spectrum for explicit edges and the rules "equal_fluence" and "log", and the total fluence
@@ -528,7 +533,7 @@ def _within_group_weights(config: SolverConfig, spectrum: tuple[np.ndarray, np.n
         bin_high (np.ndarray): [K] upper bin edges in keV.
         photons_per_bin (np.ndarray): [K] exact source photons per bin.
         G (int): number of groups.
-        fine_bin_width_kev (float): bin width in keV of the "scattered_fluence" balance.
+        fine_bin_width_kev (float or None): bin width in keV of the "scattered_fluence" balance.
 
     Returns:
         (np.ndarray, list): weights [K] that sum to 1 within each group, and the indices of the flat-weight groups.
@@ -603,7 +608,7 @@ def grouping_medium_densities(config: SolverConfig) -> tuple[tuple[str, float], 
 def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend: Optional[XcomXraylibBackend] = None,
                                *, energy_min_kev: float = 10.0, object_size_cm: float = 20.0,
                                medium: Sequence[tuple[str, float]] = (("water", 1.0),),
-                               fine_bin_width_kev: float = 0.5,
+                               fine_bin_width_kev: float | None = None,
                                max_bins: int = 2000) -> tuple[np.ndarray, np.ndarray]:
     """Estimate the total photon fluence spectrum (source plus scattered photons) inside the object for grouping.
 
@@ -617,7 +622,8 @@ def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend:
         object_size_cm (float, optional): characteristic chord length L of the object in cm. Defaults to 20.0.
         medium (Sequence[tuple[str, float]], optional): (catalogue name, density in g/cm^3) per material of the medium.
             Defaults to (("water", 1.0),).
-        fine_bin_width_kev (float, optional): minimum bin width in keV. Defaults to 0.5.
+        fine_bin_width_kev (float or None, optional): minimum bin width in keV; None for
+            ``FINE_BIN_WIDTH_FLOOR_KEV``. Defaults to None.
         max_bins (int, optional): maximum number of bins; the bins widen to ``(kVp - energy_min_kev) / max_bins`` if
             needed. Defaults to 2000.
 
@@ -632,7 +638,8 @@ def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend:
         raise ValueError(f"spectrum max energy {energy_max} <= energy_min_kev {energy_min}")
     if not object_size_cm > 0:
         raise ValueError(f"object_size_cm must be > 0, got {object_size_cm}")
-    width = max(float(fine_bin_width_kev), (energy_max - energy_min) / int(max_bins))
+    minimum = FINE_BIN_WIDTH_FLOOR_KEV if fine_bin_width_kev is None else float(fine_bin_width_kev)
+    width = max(minimum, (energy_max - energy_min) / int(max_bins))
     n = max(1, int(math.ceil((energy_max - energy_min) / width - 1e-9)))
     bin_edges = np.linspace(energy_min, energy_max, n + 1)
     low, high = bin_edges[:-1], bin_edges[1:]
@@ -668,13 +675,18 @@ def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend:
     return bin_edges, phi
 
 
-def fine_energy_grid(edges: np.ndarray,
-                     fine_bin_width_kev: float = 0.5) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Cut every group into equal bins of width at most ``fine_bin_width_kev``; no bin straddles a group edge.
+FINE_BINS_PER_GROUP = 100  # bins per group of the automatic fine energy grid (``fine_bin_width_kev=None``)
+FINE_BIN_WIDTH_FLOOR_KEV = 0.5  # its narrowest bin
+
+
+def fine_energy_grid(edges: np.ndarray, fine_bin_width_kev: float | None = None
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Cut every group into equal fine energy bins; no bin straddles a group edge.
 
     Args:
         edges (np.ndarray): [G+1] group edges in keV, descending.
-        fine_bin_width_kev (float, optional): maximum bin width in keV. Defaults to 0.5.
+        fine_bin_width_kev (float or None, optional): maximum bin width in keV; None cuts every group into at most
+            ``FINE_BINS_PER_GROUP`` bins of at least ``FINE_BIN_WIDTH_FLOOR_KEV``. Defaults to None.
 
     Returns:
         (np.ndarray, np.ndarray, np.ndarray, np.ndarray): bin midpoints [K] in keV, group index [K] int64, lower edges
@@ -683,7 +695,9 @@ def fine_energy_grid(edges: np.ndarray,
     midpoints, groups, lows, highs = [], [], [], []
     for g in range(edges.size - 1):
         high, low = float(edges[g]), float(edges[g + 1])
-        n = max(1, int(math.ceil((high - low) / fine_bin_width_kev - 1e-9)))
+        width = (fine_bin_width_kev if fine_bin_width_kev is not None
+                 else max(FINE_BIN_WIDTH_FLOOR_KEV, (high - low) / FINE_BINS_PER_GROUP))
+        n = max(1, int(math.ceil((high - low) / width - 1e-9)))
         bin_edges = np.linspace(low, high, n + 1)
         lows.append(bin_edges[:-1])
         highs.append(bin_edges[1:])
@@ -826,7 +840,7 @@ def compute_library(
     spectrum: tuple[np.ndarray, np.ndarray],
     backend: XcomXraylibBackend | None = None,
     *,
-    fine_bin_width_kev: float = 0.5,
+    fine_bin_width_kev: float | None = None,
     gauss_legendre_nodes: int = 32,
     materials: Optional[MaterialTable] = None,
 ) -> tuple[MultigroupLibrary, BuildInfo]:
@@ -838,7 +852,8 @@ def compute_library(
         spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]); one node is a
             monoenergetic line.
         backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
-        fine_bin_width_kev (float, optional): maximum fine energy bin width in keV. Defaults to 0.5.
+        fine_bin_width_kev (float or None, optional): maximum fine energy bin width in keV; None for the automatic
+            grid (``fine_energy_grid``). Defaults to None.
         gauss_legendre_nodes (int, optional): Gauss-Legendre nodes per angular piece. Defaults to 32.
         materials (Sequence or None, optional): (name, nominal density in g/cm^3, formula) per material, in any order
             (sorted by ``sort_material_table``). Defaults to None, the seven default reference materials.
@@ -1197,7 +1212,7 @@ def angular_map(q_nodes: np.ndarray, compton_shapes: np.ndarray, rayleigh_shapes
 
 
 def transfer_at_eta(config: SolverConfig, eta: np.ndarray, spectrum: tuple[np.ndarray, np.ndarray],
-                    backend: Optional[XcomXraylibBackend] = None, *, fine_bin_width_kev: float = 0.5,
+                    backend: Optional[XcomXraylibBackend] = None, *, fine_bin_width_kev: float | None = None,
                     gauss_legendre_nodes: int = 32, materials: Optional[MaterialTable] = None) -> np.ndarray:
     """Return the exact per-steradian transfer at the cosines eta of the library that ``compute_library`` builds.
 
@@ -1209,7 +1224,8 @@ def transfer_at_eta(config: SolverConfig, eta: np.ndarray, spectrum: tuple[np.nd
         spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]); one node is a
             monoenergetic line.
         backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
-        fine_bin_width_kev (float, optional): maximum fine energy bin width in keV. Defaults to 0.5.
+        fine_bin_width_kev (float or None, optional): maximum fine energy bin width in keV; None for the automatic
+            grid (``fine_energy_grid``). Defaults to None.
         gauss_legendre_nodes (int, optional): Gauss-Legendre nodes per angular piece. Defaults to 32.
         materials (Sequence or None, optional): (name, nominal density in g/cm^3, formula) per material. Defaults to
             None, the seven default reference materials.
@@ -1253,14 +1269,15 @@ def transfer_at_eta(config: SolverConfig, eta: np.ndarray, spectrum: tuple[np.nd
 
 
 def _cache_key(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], backend_name: str,
-               fine_bin_width_kev: float, gauss_legendre_nodes: int, materials: Optional[MaterialTable] = None) -> str:
+               fine_bin_width_kev: float | None, gauss_legendre_nodes: int,
+               materials: Optional[MaterialTable] = None) -> str:
     """Return the cache key of a library: a hash of the build version, configuration, spectrum and build inputs.
 
     Args:
         config (SolverConfig): solver configuration.
         spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]).
         backend_name (str): name of the photon data backend.
-        fine_bin_width_kev (float): maximum fine energy bin width in keV.
+        fine_bin_width_kev (float or None): maximum fine energy bin width in keV, None for the automatic grid.
         gauss_legendre_nodes (int): Gauss-Legendre nodes per angular piece.
         materials (Sequence or None, optional): the sorted (name, nominal density, formula) table. Defaults to None,
             the seven default reference materials.
@@ -1281,7 +1298,7 @@ def _cache_key(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], ba
         "grouping_object_size_cm": float(config.grouping_object_size_cm),
         "grouping_medium": [list(m) for m in grouping_medium_densities(config)],
         # the on-disk key names of citrus <= 0.3.0 (renaming them would orphan every cached library)
-        "de_kev": float(fine_bin_width_kev),
+        "de_kev": None if fine_bin_width_kev is None else float(fine_bin_width_kev),
         "n_gl": int(gauss_legendre_nodes),
         "materials": [list(m) for m in _material_table(materials)],  # names, nominal densities and formulas, in order
     }
@@ -1296,7 +1313,7 @@ def build_library(
     spectrum: tuple[np.ndarray, np.ndarray],
     cache_dir: str | None = "default",
     *,
-    fine_bin_width_kev: float = 0.5,
+    fine_bin_width_kev: float | None = None,
     gauss_legendre_nodes: int = 32,
     materials: Optional[MaterialTable] = None,
 ) -> MultigroupLibrary:
@@ -1312,7 +1329,8 @@ def build_library(
             monoenergetic line.
         cache_dir (str or None, optional): cache folder; "default" for ``default_cache_dir()``, None for no cache.
             Defaults to "default".
-        fine_bin_width_kev (float, optional): maximum fine energy bin width in keV. Defaults to 0.5.
+        fine_bin_width_kev (float or None, optional): maximum fine energy bin width in keV; None for the automatic
+            grid (``fine_energy_grid``). Defaults to None.
         gauss_legendre_nodes (int, optional): Gauss-Legendre nodes per angular piece. Defaults to 32.
         materials (Sequence or None, optional): (name, nominal density in g/cm^3, formula) per material, in any order
             (sorted by ``sort_material_table``). Defaults to None, the seven default reference materials.
