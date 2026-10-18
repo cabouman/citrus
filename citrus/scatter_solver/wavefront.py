@@ -1,16 +1,8 @@
 """Wavefront (diagonal-plane) ordering for discrete-ordinates sweeps on a cuboid grid.
 
-For an octant with signs (s_x, s_y, s_z) a cell (i=row, j=col, k=slice) depends only on its upstream
-neighbors along the three axes, so cells on the plane
-
-    p = (j if s_x > 0 else C-1-j) + (i if s_y > 0 else R-1-i) + (k if s_z > 0 else S-1-k)
-
-depend only on planes < p. All 8 octants are swept together: for each plane we store the
-(octant, cell) entries of every octant, and the sweep processes planes in order with one batched
-gather/scatter per plane. Octant code = (s_x<0)*4 + (s_y<0)*2 + (s_z<0) (matches angular_quadrature.Quadrature).
-
-Flat cell index n = (i * C + j) * S + k, i.e. tensor.reshape(-1) of a [rows, cols, slices] volume.
-Axis order for neighbors: 0 -> x (cols), 1 -> y (rows), 2 -> z (slices).
+The module holds the signs of the 8 octants and ``SweepPlan``, which lists for every diagonal plane the (octant, cell)
+entries of all octants with their upstream neighbors, so that the sweep processes the planes in order with one batched
+gather and scatter per plane.
 """
 
 from __future__ import annotations
@@ -29,14 +21,17 @@ OCTANT_SIGNS = torch.tensor(
 
 @dataclass(frozen=True)
 class SweepPlan:
-    """Precomputed sweep ordering for one grid shape.
+    """Precomputed sweep ordering of all 8 octants for one grid shape.
 
-    shape:          (rows, cols, slices)
-    num_planes:     rows + cols + slices - 2
-    plane_offsets:  [num_planes + 1] int64; entries of plane p are [offsets[p], offsets[p+1])
-    octant:         [E] int64 octant code of each entry (E = 8 * num_cells)
-    cell:           [E] int64 flat cell index of each entry
-    upstream:       [E, 3] int64 flat index of the upstream neighbor along x, y, z, or -1 for vacuum
+    Attributes:
+        shape (tuple[int, int, int]): (rows, cols, slices) of the grid.
+        num_planes (int): number of diagonal planes, rows + cols + slices - 2.
+        plane_offsets (Tensor): [num_planes + 1] int64 offsets; the entries of plane p are ``offsets[p]`` to
+            ``offsets[p + 1] - 1``.
+        octant (Tensor): [E] int64 octant code of each entry, ``E = 8 * num_cells``.
+        cell (Tensor): [E] int64 flat cell index ``(i * C + j) * S + k`` (row i, col j, slice k) of each entry.
+        upstream (Tensor): [E, 3] int64 flat index of the upstream neighbor along x (cols), y (rows) and z (slices),
+            or -1 for vacuum.
     """
 
     shape: tuple[int, int, int]
@@ -48,20 +43,45 @@ class SweepPlan:
 
     @property
     def num_cells(self) -> int:
+        """Number of cells rows x cols x slices of the grid."""
         return self.shape[0] * self.shape[1] * self.shape[2]
 
     def to(self, device) -> "SweepPlan":
+        """Copy of the plan with its index tensors on a device.
+
+        Args:
+            device (torch.device): target device.
+
+        Returns:
+            SweepPlan: the plan on ``device``.
+        """
         return SweepPlan(
             self.shape, self.num_planes, self.plane_offsets.to(device),
             self.octant.to(device), self.cell.to(device), self.upstream.to(device),
         )
 
     def plane_entries(self, p: int) -> slice:
+        """Entries of one diagonal plane.
+
+        Args:
+            p (int): plane index.
+
+        Returns:
+            slice: the slice of the entry tensors that holds plane p.
+        """
         return slice(int(self.plane_offsets[p]), int(self.plane_offsets[p + 1]))
 
 
 def build_sweep_plan(shape: tuple[int, int, int], device=None) -> SweepPlan:
-    """Build the wavefront ordering for all 8 octants of a [rows, cols, slices] grid."""
+    """Build the wavefront ordering of all 8 octants of a grid, the entries of a plane grouped by octant.
+
+    Args:
+        shape (tuple[int, int, int]): (rows, cols, slices) of the grid.
+        device (torch.device, optional): device of the index tensors. Defaults to None, the CPU.
+
+    Returns:
+        SweepPlan: the ordering.
+    """
     R, C, S = shape
     row_index, col_index, slice_index = torch.meshgrid(torch.arange(R), torch.arange(C), torch.arange(S), indexing="ij")
     row_index, col_index, slice_index = row_index.reshape(-1), col_index.reshape(-1), slice_index.reshape(-1)

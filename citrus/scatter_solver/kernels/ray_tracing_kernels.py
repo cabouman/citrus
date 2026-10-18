@@ -1,50 +1,10 @@
-"""Fused Triton kernels for the exact (Siddon / Amanatides-Woo) ray tracer of `ray_tracing.py`.
+"""Fused Triton kernels of the exact Siddon ray tracer of :mod:`citrus.scatter_solver.ray_tracing`.
 
-The PyTorch reference (`ray_tracing._trace_chunk`) materializes, per chunk of rays, every plane-crossing parameter of
-every ray ([N, nx + ny + nz - 1]), sorts them, gathers [N, P, G] voxel values and contracts them. This module
-traces each ray in registers instead: one program per block of BLOCK rays, each ray walks its voxel crossings in
-parametric order and accumulates all G groups (a [GP, BLOCK] tile, GP = next power of two >= G, G a compile-time
-constant) while the traversal is shared across the groups. Nothing but the output is written to memory.
-
-Kernels
-  `_ray_kernel` (generic DDA, one ray per lane; MODE selects where the segment end points come from):
-    MODE 0  line_integrals:       p0, p1 read from starts / ends [N, 3] (any strides), optional per-ray volume index
-    MODE 1  oblique_project:      the line through pixel center (r, c) with direction omega_k, clipped to the
-                                  box-centered segment of `ray_tracing.SiddonProjectors.oblique_project` (computed
-                                  in-kernel)
-    MODE 2  upstream_cumulative:  focal spot -> voxel center
-    MODE 3  primary_project:      focal spot -> pixel center (samples_per_pixel_axis = 1; sub-pixel rays use MODE 0)
-    Per ray: slab clipping exactly as the reference ([a_lo, a_hi] in the segment parameter a in [0, 1]), the entry
-    voxel (floor of the entry point; ceil - 1 along axes the ray descends, so a ray starting on a plane enters the
-    voxel it heads into), then the loop: a_next = min(next x / y / z plane parameter, a_hi); acc += vol[voxel]
-    (a_next - a); step the axis with the smallest crossing (ties: x, then y, then z: the tied axis follows with a
-    zero-length segment, as the reference's coincident sorted parameters). The plane parameters are recomputed
-    from the voxel index each step ((lo + k delta - p0) / d, the reference's arithmetic), so no error accumulates.
-    The loop runs to the block maximum of a per-ray bound (1 + sum_a (floor(L_a / delta_a) + 1) + 1 crossings),
-    lanes that are done are masked.
-  `_downstream_shared_kernel` (downstream_cumulative): all rays of a direction start at
-    voxel centers and are parallel, so the distance from the start to the first x / y / z plane is half a voxel
-    for EVERY ray and the whole crossing sequence t_m = (n_a + 1/2) delta_a / |omega_a| is identical for all rays
-    of the direction (Amanatides-Woo with a shared tMax). Each program (direction k, BLOCK consecutive voxels in
-    (row, col, slice) order) runs that scalar sequence once: the axis choice is uniform across the block (no
-    divergence, no per-ray plane arithmetic), each ray only offsets its voxel index by the shared step, and the
-    loads of a step are a contiguous strip of the volume shifted by the shared offset (coalesced). The ray stops
-    at its box exit (per-ray index limits) or at the panel plane (per-ray t_end = clamp(panel distance, 0, diag),
-    the reference's end point), so the result is exact for any direction (axis-aligned, through edges / corners).
-    Directions with omega . (-n_hat) <= 0 give +inf; the decision is taken with the reference's own torch
-    expression (passed in as a [K] flag tensor) so it is bit-identical for grazing directions.
-
-Numerics: float32. Each ray's integral equals the reference up to float32 rounding of the crossing parameters and
-the summation order, the same order as the float32 reference's own deviation from its float64 evaluation;
-tests/test_ray_tracing.py asserts 1e-5. No atomics: results are bitwise reproducible.
-
-Availability (the pattern of `uncollided_kernels.py` / `sweep_kernels.py`): `triton_available()` is the shared
-probe of `triton_utilities` (kill switch CITRUS_DISABLE_TRITON=1); `kernels_usable(device)` additionally runs
-every operation against the PyTorch path on a tiny problem once per device and caches the verdict;
-`SiddonProjectors(backend="auto")` falls back to PyTorch on any failure. The kernels are compiled without value or
-alignment specialization so the fast launch path of `triton_utilities.launch` (direct CompiledKernel.run,
-triton 3.8) reuses one binary per (kernel, constexprs, num_warps, device); `warmup(device, G)` compiles the
-variants of one group count ahead of timing.
+``_ray_kernel`` traces one ray per lane in registers and accumulates all groups at once; its ``MODE`` selects the
+segment end points (given segments, oblique lines through the pixel centers, focal spot to voxel centers, focal spot
+to pixel centers). ``_downstream_shared_kernel`` computes the downstream optical depth with one crossing sequence
+shared by all rays of a direction. The public wrappers mirror the ``SiddonProjectors`` operations on float32 CUDA
+tensors, and ``kernels_usable`` checks them against the PyTorch path once per device.
 """
 
 from __future__ import annotations
@@ -77,14 +37,25 @@ MODE_GENERIC, MODE_OBLIQUE, MODE_UPSTREAM, MODE_PRIMARY = 0, 1, 2, 3
 # ================================================================================================
 
 def triton_available() -> tuple[bool, str]:
-    """(usable, reason): the shared Triton probe of `triton_utilities` (honours CITRUS_DISABLE_TRITON=1)."""
+    """Report whether Triton kernels can run on this machine (the shared probe of ``triton_utilities``).
+
+    Returns:
+        (bool, str): whether Triton is usable, and the reason.
+    """
     return triton_utilities.triton_available()
 
 
 def kernels_usable(device: torch.device) -> tuple[bool, str]:
-    """(usable, reason): triton_available() and every kernel of this module reproduces the PyTorch Siddon path on
-    `device` for a tiny random problem (all four projector operations, line_integrals with a stacked volume index;
-    cached per device, never raises)."""
+    """Report whether Triton is available and every kernel of this module reproduces the PyTorch path on ``device``.
+
+    The self-check runs once per device on a tiny random problem; the verdict is cached and the function never raises.
+
+    Args:
+        device (torch.device): the CUDA device to check.
+
+    Returns:
+        (bool, str): whether the kernels are usable, and the reason.
+    """
     ok, why = triton_available()
     if not ok:
         return ok, why
@@ -98,9 +69,19 @@ def kernels_usable(device: torch.device) -> tuple[bool, str]:
 
 
 def use_kernels(t: Tensor, backend: str) -> bool:
-    """Whether a SiddonProjectors operation on tensor `t` should run the kernels under `backend`
-    ("auto" | "torch" | "triton"). float64 and non-CUDA tensors always use PyTorch. Raises for backend="triton"
-    when the kernels are unusable on a float32 CUDA tensor, and for an unknown backend."""
+    """Decide whether a ``SiddonProjectors`` operation on ``t`` runs the kernels; float64 and CPU tensors never do.
+
+    Args:
+        t (Tensor): the input tensor of the operation.
+        backend (str): "auto", "torch" or "triton".
+
+    Returns:
+        bool: True for a float32 CUDA tensor on a device where the kernels are usable, unless ``backend`` is "torch".
+
+    Raises:
+        ValueError: for an unknown ``backend``.
+        RuntimeError: for backend "triton" when the kernels are unusable on a float32 CUDA tensor.
+    """
     if backend not in ("auto", "torch", "triton"):
         raise ValueError("backend must be 'auto', 'torch' or 'triton'")
     if backend == "torch" or t.device.type != "cuda" or t.dtype != torch.float32:
@@ -112,10 +93,14 @@ def use_kernels(t: Tensor, backend: str) -> bool:
 
 
 def _self_check(device: torch.device) -> tuple[bool, str]:
-    """Kernels vs the PyTorch Siddon path on a 5 x 7 x 6 grid (anisotropic voxels), G = 2, at view angle 0.3:
-    upstream, primary (samples_per_pixel_axis 1 and 2), downstream (directions incl. an axis-aligned one and one
-    pointing away from the panel), oblique (shared and per-direction fields) and line_integrals (random segments, a
-    stacked volume index)."""
+    """Compare every kernel operation with the PyTorch Siddon path on a tiny random problem.
+
+    Args:
+        device (torch.device): the CUDA device to check.
+
+    Returns:
+        (bool, str): whether the largest relative deviation is within ``SELF_CHECK_REL_TOL``, and a message.
+    """
     from ..geometry import ConeGeometry, Grid
     from ..ray_tracing import SiddonProjectors, line_integrals
 
@@ -180,13 +165,38 @@ if triton is not None:
 
     @triton.jit
     def _plane_param(lo, delta, idx, dpos, p0, inv, nz):
-        """Parameter of the next plane crossing along one axis for voxel index idx (_BIG_C if the axis is constant)."""
+        """Segment parameter of the next plane crossing along one axis from voxel index ``idx``.
+
+        Args:
+            lo: lower corner of the grid box along the axis in cm.
+            delta: voxel size along the axis in cm.
+            idx: [BLOCK] int32 current voxel index along the axis.
+            dpos: [BLOCK] bool, the ray ascends along the axis.
+            p0: [BLOCK] segment start coordinate along the axis in cm.
+            inv: [BLOCK] reciprocal of the segment extent along the axis (1 where it is zero).
+            nz: [BLOCK] bool, the segment extent along the axis is nonzero.
+
+        Returns:
+            [BLOCK] parameter of the next crossing, ``BIG`` where the axis is constant along the ray.
+        """
         k = idx + dpos.to(tl.int32)
         return tl.where(nz, (lo + k.to(tl.float32) * delta - p0) * inv, _BIG_C)
 
     @triton.jit
     def _entry_index(p0, d, a, lo, delta, n):
-        """Voxel index along one axis at parameter a (floor; ceil - 1 when descending), clamped to [0, n - 1]."""
+        """Voxel index along one axis at segment parameter ``a`` (floor; ceil - 1 when descending), clamped to the grid.
+
+        Args:
+            p0: [BLOCK] segment start coordinate along the axis in cm.
+            d: [BLOCK] segment extent ``p1 - p0`` along the axis in cm.
+            a: [BLOCK] segment parameter of the entry point.
+            lo: lower corner of the grid box along the axis in cm.
+            delta: voxel size along the axis in cm.
+            n: number of voxels along the axis.
+
+        Returns:
+            [BLOCK] int32 voxel index in [0, n - 1].
+        """
         f = (p0 + a * d - lo) / delta
         i = tl.where(d < 0, tl.ceil(f) - 1.0, tl.floor(f))
         return tl.minimum(tl.maximum(i, 0.0), (n - 1).to(tl.float32)).to(tl.int32)
@@ -195,10 +205,41 @@ if triton is not None:
     def _trace(volume_ptr, vbase, p0x, p0y, p0z, p1x, p1y, p1z, live, sG, sR, sC, sS,
                lox, loy, loz, hix, hiy, hiz, ddx, ddy, ddz, NX, NY, NZ,
                G: tl.constexpr, GP: tl.constexpr, BLOCK: tl.constexpr):
-        """Exact integral of the voxel field along p0 -> p1 for a block of rays.
+        """Exact integral of the voxel field along ``p0 -> p1`` for a block of rays, all groups at once.
 
-        p0*, p1*: [BLOCK] end points; live [BLOCK]: lanes holding a ray; vbase [BLOCK] int64 offsets of each ray's
-        volume. Returns [GP, BLOCK] (rows g >= G are zero)."""
+        Args:
+            volume_ptr: float32 voxel field, addressed with the strides below.
+            vbase: [BLOCK] int64 element offset of each ray's volume.
+            p0x: [BLOCK] x of the segment starts in cm.
+            p0y: [BLOCK] y of the segment starts in cm.
+            p0z: [BLOCK] z of the segment starts in cm.
+            p1x: [BLOCK] x of the segment ends in cm.
+            p1y: [BLOCK] y of the segment ends in cm.
+            p1z: [BLOCK] z of the segment ends in cm.
+            live: [BLOCK] bool, the lane holds a ray.
+            sG: element stride of the group axis.
+            sR: element stride of the row (y) axis.
+            sC: element stride of the column (x) axis.
+            sS: element stride of the slice (z) axis.
+            lox: x of the lower box corner in cm.
+            loy: y of the lower box corner in cm.
+            loz: z of the lower box corner in cm.
+            hix: x of the upper box corner in cm.
+            hiy: y of the upper box corner in cm.
+            hiz: z of the upper box corner in cm.
+            ddx: voxel size along x in cm.
+            ddy: voxel size along y in cm.
+            ddz: voxel size along z in cm.
+            NX: number of columns (voxels along x).
+            NY: number of rows (voxels along y).
+            NZ: number of slices (voxels along z).
+            G (constexpr): number of energy groups.
+            GP (constexpr): next power of two >= G.
+            BLOCK (constexpr): rays per program.
+
+        Returns:
+            [GP, BLOCK] float32 line integrals in units of the field times cm; rows g >= G are zero.
+        """
         dX = p1x - p0x
         dY = p1y - p0y
         dZ = p1z - p0z
@@ -282,7 +323,68 @@ if triton is not None:
                     rmid, cmid, drow, dch, rowoff, choff, bcx, bcy, bcz, half,
                     MODE: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, HAS_VOLUME_INDEX: tl.constexpr,
                     BLOCK: tl.constexpr):
-        """One block of rays (program_id 0) of direction / major index k (program_id 1); out[(k G + g) M + m]."""
+        """Trace one block of rays (program_id 0) of direction or volume index k (program_id 1) into ``out``.
+
+        Writes ``out[(k G + g) M + m]``, with m the segment (MODE 0), the pixel ``r * Cd + c`` (MODE 1, 3) or the
+        flat voxel index (MODE 2).
+
+        Args:
+            volume_ptr: float32 voxel field [G, rows, cols, slices] per volume, any strides.
+            out_ptr: [K, G, M] float32 line integrals.
+            a_ptr: [M, 3] float32 segment starts in cm (MODE 0).
+            b_ptr: [M, 3] float32 segment ends in cm (MODE 0).
+            volume_index_ptr: [M] int64 volume index per ray (MODE 0 with HAS_VOLUME_INDEX).
+            direction_ptr: [K, 3] float32 directions (MODE 1).
+            M: rays per direction or volume index.
+            sa_n: element stride between the rows of ``a_ptr``.
+            sa_c: element stride between the coordinates of ``a_ptr``.
+            sb_n: element stride between the rows of ``b_ptr``.
+            sb_c: element stride between the coordinates of ``b_ptr``.
+            sK: element stride between volumes (0 for one shared volume).
+            sG: element stride of the group axis.
+            sR: element stride of the row (y) axis.
+            sC: element stride of the column (x) axis.
+            sS: element stride of the slice (z) axis.
+            NX: number of columns (voxels along x).
+            NY: number of rows (voxels along y).
+            NZ: number of slices (voxels along z).
+            Rd: number of detector rows.
+            Cd: number of detector channels.
+            lox: x of the lower box corner in cm.
+            loy: y of the lower box corner in cm.
+            loz: z of the lower box corner in cm.
+            hix: x of the upper box corner in cm.
+            hiy: y of the upper box corner in cm.
+            hiz: z of the upper box corner in cm.
+            ddx: voxel size along x in cm.
+            ddy: voxel size along y in cm.
+            ddz: voxel size along z in cm.
+            zoff: slice offset of the grid (``recon_slice_offset``) in cm.
+            qx: x of the panel center (MODE 1, 3) or of the focal spot (MODE 2) in cm.
+            qy: y of the panel center (MODE 1, 3) or of the focal spot (MODE 2) in cm.
+            qz: z of the panel center (MODE 1, 3) or of the focal spot (MODE 2) in cm.
+            ux_: x component of the panel axis ``u_hat``.
+            uy_: y component of the panel axis ``u_hat``.
+            uz_: z component of the panel axis ``u_hat``.
+            vx_: x component of the panel axis ``v_hat``.
+            vy_: y component of the panel axis ``v_hat``.
+            vz_: z component of the panel axis ``v_hat``.
+            rmid: center detector row index ``(Rd - 1) / 2``.
+            cmid: center detector channel index ``(Cd - 1) / 2``.
+            drow: detector row spacing in cm.
+            dch: detector channel spacing in cm.
+            rowoff: detector row offset in cm.
+            choff: detector channel offset in cm.
+            bcx: x of the box center (MODE 1) or of the focal spot (MODE 3) in cm.
+            bcy: y of the box center (MODE 1) or of the focal spot (MODE 3) in cm.
+            bcz: z of the box center (MODE 1) or of the focal spot (MODE 3) in cm.
+            half: half length of the oblique segment about the box center in cm (MODE 1).
+            MODE (constexpr): end points: 0 given segments, 1 oblique pixel lines, 2 upstream, 3 primary.
+            G (constexpr): number of energy groups.
+            GP (constexpr): next power of two >= G.
+            HAS_VOLUME_INDEX (constexpr): read ``volume_index_ptr`` (MODE 0).
+            BLOCK (constexpr): rays per program.
+        """
         k = tl.program_id(1)
         m = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         live = m < M
@@ -362,8 +464,39 @@ if triton is not None:
     def _downstream_shared_kernel(mu_ptr, direction_ptr, toward_ptr, out_ptr, V, sG, sR, sC, sS, NX, NY, NZ,
                                   ddx, ddy, ddz, zoff, qx, qy, qz, nx_, ny_, nz_, diag,
                                   G: tl.constexpr, GP: tl.constexpr, BLOCK: tl.constexpr):
-        """tau_down of BLOCK consecutive voxels (program_id 0) for direction k (program_id 1) with the shared
-        crossing sequence of the direction (module docstring); out[(k G + g) V + v]."""
+        """Downstream optical depth of BLOCK consecutive voxels (program_id 0) along direction k (program_id 1).
+
+        All rays of the direction share one crossing sequence (docs/source/design_notes.rst, "Ray tracing and
+        kernels"); writes ``out[(k G + g) V + v]``, +inf for a direction that does not head toward the panel.
+
+        Args:
+            mu_ptr: [G, rows, cols, slices] float32 attenuation coefficient in cm^-1, any strides.
+            direction_ptr: [K, 3] float32 directions.
+            toward_ptr: [K] uint8 flags, nonzero for a direction toward the panel.
+            out_ptr: [K, G, V] float32 downstream optical depth.
+            V: number of voxels.
+            sG: element stride of the group axis.
+            sR: element stride of the row (y) axis.
+            sC: element stride of the column (x) axis.
+            sS: element stride of the slice (z) axis.
+            NX: number of columns (voxels along x).
+            NY: number of rows (voxels along y).
+            NZ: number of slices (voxels along z).
+            ddx: voxel size along x in cm.
+            ddy: voxel size along y in cm.
+            ddz: voxel size along z in cm.
+            zoff: slice offset of the grid (``recon_slice_offset``) in cm.
+            qx: x of the panel center in cm.
+            qy: y of the panel center in cm.
+            qz: z of the panel center in cm.
+            nx_: x component of the panel normal ``n_hat``.
+            ny_: y component of the panel normal ``n_hat``.
+            nz_: z component of the panel normal ``n_hat``.
+            diag: upper bound of the path length (the box diagonal) in cm.
+            G (constexpr): number of energy groups.
+            GP (constexpr): next power of two >= G.
+            BLOCK (constexpr): voxels per program.
+        """
         k = tl.program_id(1)
         m = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         live = m < V
@@ -437,6 +570,14 @@ if triton is not None:
 # ================================================================================================
 
 def _next_pow2(n: int) -> int:
+    """Return the smallest power of two >= ``n``.
+
+    Args:
+        n (int): a positive integer.
+
+    Returns:
+        int: the smallest power of two >= ``n`` (1 for ``n <= 1``).
+    """
     p = 1
     while p < n:
         p *= 2
@@ -444,7 +585,14 @@ def _next_pow2(n: int) -> int:
 
 
 def _grid_scalars(grid) -> tuple:
-    """(lox, loy, loz, hix, hiy, hiz, dx, dy, dz) as Python floats (the reference's box tensors in float64)."""
+    """Return the box corners and voxel sizes of a grid as Python floats, computed like the PyTorch reference.
+
+    Args:
+        grid (Grid): the grid.
+
+    Returns:
+        tuple: (lox, loy, loz, hix, hiy, hiz, dx, dy, dz), the lower and upper corners and voxel sizes in cm.
+    """
     lo = grid.lower_corner()
     d = grid.deltas
     n = (grid.num_cols, grid.num_rows, grid.num_slices)
@@ -453,6 +601,12 @@ def _grid_scalars(grid) -> tuple:
 
 
 def _check_cuda_f32(t: Tensor, name: str) -> None:
+    """Raise a ValueError unless ``t`` is a float32 CUDA tensor.
+
+    Args:
+        t (Tensor): the tensor to check.
+        name (str): its name in the error message.
+    """
     if t.device.type != "cuda" or t.dtype != torch.float32:
         raise ValueError(f"the Siddon kernels need a float32 CUDA {name}, got {t.dtype} on {t.device}")
 
@@ -461,10 +615,24 @@ def _launch_ray(volume: Tensor, out: Tensor, num_rays: int, num_major: int, mode
                 a: Optional[Tensor] = None, b: Optional[Tensor] = None, volume_index: Optional[Tensor] = None,
                 directions: Optional[Tensor] = None, volume_stride: int = 0,
                 geometry_scalars: Optional[dict] = None) -> None:
-    """Launch `_ray_kernel` over num_major x ceil(num_rays / BLOCK_RAYS) programs (see its docstring).
+    """Launch ``_ray_kernel`` over ``num_major`` x ceil(``num_rays`` / ``BLOCK_RAYS``) programs.
 
-    volume: [..., G, R, C, S] view whose last four strides are used (volume_stride: per major / volume index);
-    geometry_scalars: mode-specific scalars (q, u, v, pixel parameters, box center)."""
+    Args:
+        volume (Tensor): [..., G, rows, cols, slices] float32 CUDA field; its last four strides are used.
+        out (Tensor): [num_major, G, num_rays] float32 output, written in place.
+        num_rays (int): rays per direction or volume index.
+        num_major (int): number of directions or volume indices (program_id 1).
+        mode (int): the kernel's ``MODE`` (``MODE_GENERIC``, ``MODE_OBLIQUE``, ``MODE_UPSTREAM``, ``MODE_PRIMARY``).
+        G (int): number of energy groups.
+        grid (Grid): the grid of ``volume``.
+        a (Tensor, optional): [N, 3] segment starts in cm (MODE 0). Defaults to None.
+        b (Tensor, optional): [N, 3] segment ends in cm (MODE 0). Defaults to None.
+        volume_index (Tensor, optional): [N] int64 volume index per ray (MODE 0). Defaults to None.
+        directions (Tensor, optional): [K, 3] float32 contiguous directions (MODE 1). Defaults to None.
+        volume_stride (int, optional): element stride between volumes. Defaults to 0.
+        geometry_scalars (dict, optional): mode-specific scalars with keys "q", "u", "v", "Rd", "Cd", "pixel",
+            "box_center" and "half"; missing keys are zero (1 for "Rd", "Cd"). Defaults to None.
+    """
     geometry_scalars = geometry_scalars or {}
     sG, sR, sC, sS = (int(x) for x in volume.stride()[-4:])
     dummy = volume
@@ -496,12 +664,19 @@ def _launch_ray(volume: Tensor, out: Tensor, num_rays: int, num_major: int, mode
 
 def line_integrals_triton(volume: Tensor, starts: Tensor, ends: Tensor, grid, *,
                           volume_index: Optional[Tensor] = None) -> Tensor:
-    """Fused `ray_tracing.line_integrals`: exact line integrals of a voxel field along segments starts -> ends.
+    """Fused ``ray_tracing.line_integrals``: line integrals of a voxel field along the segments ``starts -> ends``.
 
-    volume: [G, rows, cols, slices], or [K, G, rows, cols, slices] with volume_index [N] (ray n integrates
-    volume[volume_index[n]]); float32 CUDA, any strides (no copy). starts, ends: [N, 3] (x, y, z) recon frame cm,
-    any strides (a stride-0 row broadcasts one point). Returns [G, N] float32 (volume x cm); the volume is zero
-    outside the grid box.
+    Args:
+        volume (Tensor): [G, rows, cols, slices] float32 CUDA field, zero outside the grid box, any strides; or
+            [K, G, rows, cols, slices] with ``volume_index``.
+        starts (Tensor): [N, 3] segment starts (x, y, z) in the recon frame in cm, any strides.
+        ends (Tensor): [N, 3] segment ends (x, y, z) in the recon frame in cm, any strides.
+        grid (Grid): the grid of ``volume``.
+        volume_index (Tensor, optional): [N] integers in [0, K): ray n integrates ``volume[volume_index[n]]``.
+            Defaults to None.
+
+    Returns:
+        Tensor: [G, N] float32 line integrals in units of the field times cm.
     """
     _check_cuda_f32(volume, "volume")
     device = volume.device
@@ -541,7 +716,16 @@ def line_integrals_triton(volume: Tensor, starts: Tensor, ends: Tensor, grid, *,
 
 
 def _pixel_geometry_scalars(geometry, angle: float) -> dict:
-    """Scalars of ConeGeometry.pixel_centers: panel center, axes and the pixel-coordinate parameters."""
+    """Collect the scalars of ``ConeGeometry.pixel_centers`` for ``_launch_ray``.
+
+    Args:
+        geometry (ConeGeometry): the cone-beam geometry.
+        angle (float): view angle in radians.
+
+    Returns:
+        dict: "q" panel center, "u" and "v" panel axes, "Rd", "Cd" detector size and "pixel" (center row, center
+        channel, row spacing, channel spacing, row offset, channel offset) in cm.
+    """
     u_hat, v_hat, _ = geometry.panel_axes(angle)
     return dict(q=geometry.panel_center(angle), u=u_hat, v=v_hat, Rd=geometry.num_det_rows,
                 Cd=geometry.num_det_channels,
@@ -550,9 +734,17 @@ def _pixel_geometry_scalars(geometry, angle: float) -> dict:
 
 
 def upstream_cumulative(mu: Tensor, grid, geometry, angle: float) -> Tensor:
-    """Fused `SiddonProjectors.upstream_cumulative`: line integral of mu from the focal spot to every voxel center.
+    """Fused ``SiddonProjectors.upstream_cumulative``: integral of ``mu`` from the focal spot to every voxel center.
 
-    mu: [G, rows, cols, slices] float32 CUDA (any strides). Returns tau_up [G, rows, cols, slices]."""
+    Args:
+        mu (Tensor): [G, rows, cols, slices] float32 CUDA attenuation coefficient in cm^-1, any strides.
+        grid (Grid): the grid of ``mu``.
+        geometry (ConeGeometry): the cone-beam geometry.
+        angle (float): view angle in radians.
+
+    Returns:
+        Tensor: [G, rows, cols, slices] upstream optical depth ``tau_up``.
+    """
     _check_cuda_f32(mu, "mu")
     G = mu.shape[0]
     V = grid.num_voxels
@@ -562,11 +754,21 @@ def upstream_cumulative(mu: Tensor, grid, geometry, angle: float) -> Tensor:
 
 
 def primary_project(mu: Tensor, grid, geometry, angle: float, samples_per_pixel_axis: int = 1) -> Tensor:
-    """Fused `SiddonProjectors.primary_project`: line integral of mu from the focal spot to every pixel center.
+    """Fused ``SiddonProjectors.primary_project``: line integral of ``mu`` from the focal spot to every pixel center.
 
-    mu: [G, rows, cols, slices] float32 CUDA. Returns [G, num_det_rows, num_det_channels]. samples_per_pixel_axis > 1:
-    samples_per_pixel_axis^2 sub-rays per pixel on the reference's midpoint lattice, combined as
-    -log(mean(exp(-integral)))."""
+    With ``n = samples_per_pixel_axis > 1``, ``n * n`` sub-rays on the reference's midpoint lattice are combined as
+    ``-log(mean(exp(-tau)))``.
+
+    Args:
+        mu (Tensor): [G, rows, cols, slices] float32 CUDA attenuation coefficient in cm^-1.
+        grid (Grid): the grid of ``mu``.
+        geometry (ConeGeometry): the cone-beam geometry.
+        angle (float): view angle in radians.
+        samples_per_pixel_axis (int, optional): sub-rays per pixel axis. Defaults to 1.
+
+    Returns:
+        Tensor: [G, num_det_rows, num_det_channels] optical depth per pixel.
+    """
     _check_cuda_f32(mu, "mu")
     device, dtype = mu.device, mu.dtype
     G = mu.shape[0]
@@ -593,7 +795,16 @@ def primary_project(mu: Tensor, grid, geometry, angle: float, samples_per_pixel_
 
 
 def toward_flags(omegas: Tensor, geometry, angle: float) -> Tensor:
-    """[K] uint8: omega_k . (-n_hat) > 0, evaluated with the reference's torch expression (bit-identical)."""
+    """Flag the directions that head toward the panel, ``omega_k . (-n_hat) > 0``, as the PyTorch path computes it.
+
+    Args:
+        omegas (Tensor): [K, 3] directions (recon frame).
+        geometry (ConeGeometry): the cone-beam geometry.
+        angle (float): view angle in radians.
+
+    Returns:
+        Tensor: [K] uint8 flags, 1 for a direction toward the panel.
+    """
     _, _, n_hat = geometry.panel_axes(angle)
     n = torch.tensor(n_hat, device=omegas.device, dtype=omegas.dtype)
     return ((omegas * (-n)).sum(-1) > 0).to(torch.uint8)
@@ -601,12 +812,19 @@ def toward_flags(omegas: Tensor, geometry, angle: float) -> Tensor:
 
 def downstream_cumulative(mu: Tensor, grid, geometry, angle: float, omegas: Tensor,
                           toward: Optional[Tensor] = None) -> Tensor:
-    """Fused `SiddonProjectors.downstream_cumulative`: line integral of mu from every voxel center to the panel
-    plane along each direction (+inf where omega . (-n_hat) <= 0).
+    """Fused ``SiddonProjectors.downstream_cumulative``: line integral of ``mu`` from every voxel center to the panel.
 
-    mu: [G, rows, cols, slices] float32 CUDA (any strides); omegas: [K, 3]. Returns [K, G, rows, cols, slices].
-    One `_downstream_shared_kernel` launch (one crossing sequence per direction). toward: optional precomputed
-    `toward_flags(omegas, geometry, angle)`.
+    Args:
+        mu (Tensor): [G, rows, cols, slices] float32 CUDA attenuation coefficient in cm^-1, any strides.
+        grid (Grid): the grid of ``mu``.
+        geometry (ConeGeometry): the cone-beam geometry.
+        angle (float): view angle in radians.
+        omegas (Tensor): [K, 3] unit directions (recon frame).
+        toward (Tensor, optional): [K] uint8 flags from ``toward_flags``, computed here when None. Defaults to None.
+
+    Returns:
+        Tensor: [K, G, rows, cols, slices] downstream optical depth ``tau_down``; +inf where
+        ``omega . (-n_hat) <= 0``.
     """
     _check_cuda_f32(mu, "mu")
     device = mu.device
@@ -634,11 +852,18 @@ def downstream_cumulative(mu: Tensor, grid, geometry, angle: float, omegas: Tens
 
 
 def oblique_project(field: Tensor, grid, geometry, angle: float, omegas: Tensor) -> Tensor:
-    """Fused `SiddonProjectors.oblique_project`: full line integral of a field along the line through each pixel
-    center with direction omega_k (clipped to the box).
+    """Fused ``SiddonProjectors.oblique_project``: line integrals through each pixel center along each direction.
 
-    field: [K, G, rows, cols, slices] or [G, rows, cols, slices] (shared over K), float32 CUDA, any strides;
-    omegas: [K, 3]. Returns [K, G, num_det_rows, num_det_channels] (field x cm).
+    Args:
+        field (Tensor): [K, G, rows, cols, slices], or [G, rows, cols, slices] shared by all directions; float32 CUDA,
+            any strides.
+        grid (Grid): the grid of ``field``.
+        geometry (ConeGeometry): the cone-beam geometry.
+        angle (float): view angle in radians.
+        omegas (Tensor): [K, 3] directions (recon frame).
+
+    Returns:
+        Tensor: [K, G, num_det_rows, num_det_channels] line integrals in units of field times cm.
     """
     _check_cuda_f32(field, "field")
     device = field.device
@@ -671,8 +896,12 @@ def oblique_project(field: Tensor, grid, geometry, angle: float, omegas: Tensor)
 
 
 def warmup(device: torch.device, num_groups: int) -> None:
-    """Compile (or load from Triton's disk cache) every kernel variant used by SiddonProjectors for `num_groups`
-    groups on `device`, on a tiny problem, so that the first timed call does not pay the compilation."""
+    """Compile (or load from Triton's disk cache) every kernel variant of ``SiddonProjectors`` for one group count.
+
+    Args:
+        device (torch.device): the CUDA device.
+        num_groups (int): number of energy groups G.
+    """
     from ..geometry import ConeGeometry, Grid
 
     grid = Grid(shape=(3, 4, 5), delta_voxel=1.0)

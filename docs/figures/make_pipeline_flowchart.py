@@ -1,12 +1,13 @@
-"""Build docs/figures/citrus_pipeline.pptx, the flowchart of the scatter-corrected MBIR pipeline of CITRUS (one
-16:9 slide, editable in PowerPoint), and export it to docs/source/_static/citrus_pipeline.png with PowerPoint.
+"""Build the flowchart of the CITRUS pipeline, docs/figures/citrus_pipeline.pptx, and export it to a PNG.
 
-    python docs/figures/make_pipeline_flowchart.py            # exports the existing .pptx to .png (PowerPoint, Windows)
-    python docs/figures/make_pipeline_flowchart.py --rebuild  # regenerates the .pptx from this script first
+The flowchart is one 16:9 slide, editable in PowerPoint; PowerPoint (Windows) exports it to
+docs/source/_static/citrus_pipeline.png. The slide is edited by hand and is not tracked by git (the PNG is), so the
+default run only re-exports it; ``--rebuild`` discards the hand edits and regenerates the slide from this script.
 
-The slide is edited by hand in PowerPoint and is not tracked by git (the exported PNG is); the default run only
-re-exports it, so hand edits are never overwritten.
-``--rebuild`` discards them and regenerates the slide from the layout code below.
+Usage::
+
+    python docs/figures/make_pipeline_flowchart.py            # export the existing .pptx to .png
+    python docs/figures/make_pipeline_flowchart.py --rebuild  # regenerate the .pptx first
 """
 from __future__ import annotations
 
@@ -40,11 +41,38 @@ EMU_PER_INCH = 914400
 
 
 def rgb(hex6: str) -> RGBColor:
+    """Color from a hex string.
+
+    Args:
+        hex6 (str): six hex digits, e.g. ``"2F5597"``.
+
+    Returns:
+        RGBColor: the color.
+    """
     return RGBColor.from_string(hex6)
 
 
 def add_box(slide, x, y, w, h, text, role, *, size=11, bold_first=True, shape=MSO_SHAPE.ROUNDED_RECTANGLE,
             dashed=False, fill=True):
+    """Add a box with centered text in the colors of a role.
+
+    Args:
+        slide (Slide): the slide.
+        x (float): left edge in inches.
+        y (float): top edge in inches.
+        w (float): width in inches.
+        h (float): height in inches.
+        text (str): the text, one paragraph per line.
+        role (str): color role, a key of ``STYLE``.
+        size (float): font size in pt. Defaults to 11.
+        bold_first (bool): set the first line in bold. Defaults to True.
+        shape (MSO_SHAPE): the auto shape. Defaults to ``MSO_SHAPE.ROUNDED_RECTANGLE``.
+        dashed (bool): dashed border. Defaults to False.
+        fill (bool): fill with the role's color, else no fill. Defaults to True.
+
+    Returns:
+        Shape: the box.
+    """
     fill_c, line_c, text_c = STYLE[role]
     s = slide.shapes.add_shape(shape, Inches(x), Inches(y), Inches(w), Inches(h))
     if shape == MSO_SHAPE.ROUNDED_RECTANGLE:
@@ -78,6 +106,24 @@ def add_box(slide, x, y, w, h, text, role, *, size=11, bold_first=True, shape=MS
 
 
 def add_label(slide, x, y, w, h, text, color="404040", size=10, bold=False, align=PP_ALIGN.LEFT, italic=False):
+    """Add a borderless text box.
+
+    Args:
+        slide (Slide): the slide.
+        x (float): left edge in inches.
+        y (float): top edge in inches.
+        w (float): width in inches.
+        h (float): height in inches.
+        text (str): the text, one paragraph per line.
+        color (str): hex text color. Defaults to ``"404040"``.
+        size (float): font size in pt. Defaults to 10.
+        bold (bool): bold text. Defaults to False.
+        align (PP_ALIGN): paragraph alignment. Defaults to ``PP_ALIGN.LEFT``.
+        italic (bool): italic text. Defaults to False.
+
+    Returns:
+        Shape: the text box.
+    """
     tb = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
     tf = tb.text_frame
     tf.word_wrap = True
@@ -97,11 +143,33 @@ def add_label(slide, x, y, w, h, text, color="404040", size=10, bold=False, alig
 
 
 def _arrow_end(line_elm, kind="triangle"):
+    """Add an arrowhead at the end of a line.
+
+    Args:
+        line_elm (LineFormat): the line format of a connector.
+        kind (str): DrawingML arrowhead type. Defaults to ``"triangle"``.
+    """
     ln = line_elm._get_or_add_ln()
     ln.append(ln.makeelement(qn("a:tailEnd"), {"type": kind, "w": "med", "len": "med"}))
 
 
 def add_arrow(slide, x1, y1, x2, y2, color="595959", width=1.5, head=True, dashed=False):
+    """Add a straight connector from (x1, y1) to (x2, y2).
+
+    Args:
+        slide (Slide): the slide.
+        x1 (float): start x in inches.
+        y1 (float): start y in inches.
+        x2 (float): end x in inches.
+        y2 (float): end y in inches.
+        color (str): hex line color. Defaults to ``"595959"``.
+        width (float): line width in pt. Defaults to 1.5.
+        head (bool): arrowhead at the end. Defaults to True.
+        dashed (bool): dashed line. Defaults to False.
+
+    Returns:
+        Connector: the connector.
+    """
     c = slide.shapes.add_connector(MSO_CONNECTOR.STRAIGHT, Inches(x1), Inches(y1), Inches(x2), Inches(y2))
     c.line.color.rgb = rgb(color)
     c.line.width = Pt(width)
@@ -114,37 +182,98 @@ def add_arrow(slide, x1, y1, x2, y2, color="595959", width=1.5, head=True, dashe
 
 
 def add_polyline_arrow(slide, points, color="595959", width=1.5, dashed=False):
-    """Axis-aligned segments through `points` [(x, y), ...] in inches; the last segment carries the arrowhead."""
+    """Add straight segments through ``points``; the last segment carries the arrowhead.
+
+    Args:
+        slide (Slide): the slide.
+        points (list[tuple[float, float]]): the (x, y) vertices in inches.
+        color (str): hex line color. Defaults to ``"595959"``.
+        width (float): line width in pt. Defaults to 1.5.
+        dashed (bool): dashed lines. Defaults to False.
+    """
     for i in range(len(points) - 1):
         (x1, y1), (x2, y2) = points[i], points[i + 1]
         add_arrow(slide, x1, y1, x2, y2, color=color, width=width, head=(i == len(points) - 2), dashed=dashed)
 
 
 def left(s):
+    """Left edge of a shape.
+
+    Args:
+        s (Shape): the shape.
+
+    Returns:
+        float: the position in inches.
+    """
     return s.left / EMU_PER_INCH
 
 
 def top(s):
+    """Top edge of a shape.
+
+    Args:
+        s (Shape): the shape.
+
+    Returns:
+        float: the position in inches.
+    """
     return s.top / EMU_PER_INCH
 
 
 def right(s):
+    """Right edge of a shape.
+
+    Args:
+        s (Shape): the shape.
+
+    Returns:
+        float: the position in inches.
+    """
     return Emu(s.left + s.width).inches
 
 
 def bottom(s):
+    """Bottom edge of a shape.
+
+    Args:
+        s (Shape): the shape.
+
+    Returns:
+        float: the position in inches.
+    """
     return Emu(s.top + s.height).inches
 
 
 def cx(s):
+    """Horizontal center of a shape.
+
+    Args:
+        s (Shape): the shape.
+
+    Returns:
+        float: the position in inches.
+    """
     return Emu(s.left + s.width // 2).inches
 
 
 def cy(s):
+    """Vertical center of a shape.
+
+    Args:
+        s (Shape): the shape.
+
+    Returns:
+        float: the position in inches.
+    """
     return Emu(s.top + s.height // 2).inches
 
 
 def build() -> str:
+    """Build the flowchart slide and save it to ``PPTX``.
+
+    Returns:
+        str: path of the saved .pptx file.
+    """
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
@@ -256,7 +385,16 @@ def build() -> str:
 
 
 def export_png(pptx_path: str, png_path: str, width_px: int = 2400) -> bool:
-    """Export slide 1 to PNG with PowerPoint (Windows COM via PowerShell). Returns True on success."""
+    """Export slide 1 to PNG with PowerPoint (Windows COM via PowerShell), at the slide's own aspect ratio.
+
+    Args:
+        pptx_path (str): the .pptx file.
+        png_path (str): the PNG file to write.
+        width_px (int): image width in pixels. Defaults to 2400.
+
+    Returns:
+        bool: True on success, False on another platform or on failure.
+    """
     if sys.platform != "win32":
         return False
     os.makedirs(os.path.dirname(png_path), exist_ok=True)

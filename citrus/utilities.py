@@ -1,93 +1,9 @@
-"""Common utilities of CITRUS: the WLAB phantom and its geometry, the attenuation <-> density model, synthetic
-cone-beam data with scatter, a GPU memory cap and small plotting helpers.
+"""Common utilities of CITRUS.
 
-WLAB phantom
-------------
-A 20 x 30 x 40 cm^3 water prism (1.0 g/cm^3) with full-length (40 cm along z) inserts of lung (6 x 6 cm^2,
-0.26 g/cm^3), air (2 x 2 cm^2, 1.205e-3 g/cm^3) and bone (2 x 2 cm^2, 1.85 g/cm^3). The phantom is given in the
-material basis of a library (rho [M, ...], `library.materials`; default the seven `cross_sections.MATERIALS`) but uses
-only two of its rows, looked up by name: lung and air are modeled as water of the stated density (the "water" row),
-bone as cortical bone (the "bone" row); a set of reference materials without water or bone cannot hold it.
-Orientation (source on +y at angle 0): 30 cm along x (cols), 20 cm along y (rows, the source-detector axis at angle 0),
-40 cm along z (slices), centered at the isocenter. Default insert centers: lung at (x, y) = (-5, 0), air at (+3, 0),
-bone at (+7, 0) cm (keyword arguments of `wlab_phantom`). Outside the prism the density is 0 (vacuum).
-
-Attenuation <-> density model
------------------------------
-MBIR reconstructs ONE monoenergetic attenuation map X (1/cm) at an effective energy E_eff (the spectrum mean, 63.03 keV
-for the default 125 kVp spectrum); the scatter solver needs the densities rho [M, ...] (g/cm^3) of its library's M
-REFERENCE materials (`library.materials`, chosen from `cross_sections.MATERIAL_CATALOGUE` with `SolverConfig.materials`;
-default M = 7: air, lung, adipose, water, muscle, soft tissue, cortical bone, `cross_sections.MATERIALS`).
-
-    forward  X = sum_m rho_m m_m(E_eff)                                     (exact, linear)
-
-The inverse is the interpolating model between the reference materials. Every reference material m has a NOMINAL
-density rho_m^nom (`library.nominal_density`) and a nominal attenuation mu_m = rho_m^nom m_m(E_eff); the reference
-materials are taken in the fixed library order, in which mu_m increases at every library energy (the builder sorts
-them; `material_order` checks it).
-For each voxel:
-
-    mu_a <= X < mu_b (consecutive reference materials a, b):   f = (X - mu_a) / (mu_b - mu_a),
-                                                    rho_a = (1 - f) rho_a^nom,   rho_b = f rho_b^nom
-    X < mu_first (air by default):   the lowest reference material alone, density X / m_first (reduced density)
-    X >= mu_last (bone by default):  the highest reference material alone, density X / m_last (denser than nominal)
-    X < 0 clamps to 0.
-
-At E_eff = 63.03 keV the nominal attenuations of the default reference materials are 0.00022 (air), 0.0520 (lung),
-0.1847 (adipose), 0.2014 (water), 0.2102 (muscle), 0.2123 (soft tissue), 0.5365 (bone) /cm (the other catalogue
-materials: `cross_sections` module docstring). With the reference materials air, water, bone a voxel between water and
-bone becomes a water / bone mixture, one between air and water an air / water mixture (lung tissue is then water of
-reduced density mixed with air). The model is exact in attenuation at E_eff
-(densities_to_attenuation(library, attenuation_to_densities(library, X)) == max(X, 0)), gives the pure material m at
-X = mu_m (a WLAB water voxel is pure water, a bone voxel pure bone at 1.85 g/cm^3) and at most two nonzero materials
-per voxel, the pair representation of the solver's first-collision source (`cross_sections.material_pairs`).
-`attenuation_to_density(library, X, m)` evaluates ONE material's map, equal bit for bit to
-`attenuation_to_densities(library, X)[m]` without forming the others: the CITRUS loop resamples the densities material
-by material and never holds the [M, R, C, S] fine-grid volume (`ScatterSolver.material_fields_from_attenuation`).
-m_m(E) are the library's fine-energy total mass attenuation coefficients (`library.fine_mu_t`, cm^2/g), interpolated
-linearly in (log E, log m).
-
-Object size and medium of the energy groups
--------------------------------------------
-The default group rule ("scattered_fluence", `SolverConfig.group_edges_method`) needs the object's mean chord and mean
-composition. `object_mask(X, reference)` keeps the voxels above the attenuation midway between air and water at E_eff
-(`air_water_threshold`); `object_size_cm` is 4 V / S of that mask (V its volume, S the area of its exposed voxel faces;
-cavities count as outside), rounded to whole centimetres; `grouping_medium_estimate` averages the density model's
-densities over the mask. All three take a library or a solver; for a lazy solver whose library is not built yet the
-nominal attenuations come from the photon data directly, so `citrus_recon` can use them on the FDK volume before it
-builds the library.
-
-Synthetic cone-beam data
-------------------------
-`synthesize_cone_beam_data` (any density volume) and `synthesize_wlab_dataset` (the WLAB phantom):
-
-    X_true    = densities_to_attenuation(library, rho_true, E_eff)       [R, C, S] 1/cm, E_eff = spectrum mean
-    angles    = start + (end - start) i / V, i = 0..V-1 (`view_angles`; synthesize_wlab_dataset's default is the
-                short scan end = start + pi + fan angle of the panel, `fan_angle`)
-    l         = A X_true  (MBIRTORCH ConeBeamModel forward projection)   [V, Rd, Cd] line integrals
-    P         = I0 exp(-l)                                               primary counts per pixel
-    SPR       = s_sol / p_sol per view: s_sol the solver's scatter PLANAR fluence image (ScatterSolver.solve_view on
-                rho_true, fully converged source iteration; photon counting: no detector or grid response unless the
-                solver has one), p_sol its primary planar fluence image with the primary model of the CITRUS loop:
-                MBIRTORCH's pixel-averaged per-material line integrals of rho_true through the solver's polychromatic
-                transmission (`citrus.citrus.primary_signals`; meta records primary_projector "mbirtorch" and
-                data_format 2). Data sets of format 1 used the solver's Siddon primary of solve_view (one ray to each
-                pixel centre) instead.
-    S         = SPR P,   Y_mean = P + S,   Y = Poisson(Y_mean) (noise=True) or Y_mean
-
-Units. The solver's images are photons/cm^2 per source photon/sr; its primary carries the inverse-square and
-obliquity factors of the point source and the polychromatic transmission. MBIRTORCH's model is the flat,
-monochromatic line integral l = A X at E_eff with I0 the flat-field count, which absorbs the inverse-square / obliquity
-factor phi_air (the solver's unattenuated primary, saved). The data tie the two models through the dimensionless
-per-pixel SPR, S = SPR x P: the scatter-to-primary ratio of the data equals the solver's physical SPR exactly, and the
-CITRUS correction Y / (1 + SPR(X)) is independent of I0 and of the mono / poly primary mismatch.
-
-Inverse crime (intentional): the primary uses MBIRTORCH's own projector at E_eff and the truth lives on the
-reconstruction grid, so the only model errors the reconstruction sees are the scatter and the noise; the scatter
-truth comes from the same solver as the correction (use a finer angular discretization for the truth solver to
-expose the solver's own discretization error). Reproducibility: the Poisson draws use torch.Generator(seed), but the
-rates vary between runs at the float32 ulp level (atomic accumulation in MBIRTORCH's and the solver's CUDA kernels),
-which flips a few draws; save and reuse the data when bitwise identity matters.
+The module holds the WLAB phantom (a water prism with lung, air and bone inserts) with its grid and scan geometries,
+the interpolating attenuation <-> density model between the library's reference materials, the object size and mean
+composition that set the energy groups, view angles, synthetic cone-beam data with scatter, a GPU memory cap and small
+plotting helpers.
 """
 
 from __future__ import annotations
@@ -107,7 +23,7 @@ from .scatter_solver.config import SolverConfig
 from .scatter_solver.cross_sections import MATERIALS, MultigroupLibrary, material_index
 from .scatter_solver.detector import ideal_counting_response, no_grid
 from .scatter_solver.geometry import ConeGeometry, Grid
-from .scatter_solver.scatter_solver import ScatterSolver, build_solver_library
+from .scatter_solver.scatter_solver import ScatterSolver
 
 __all__ = [
     "WLAB_SIZE_XYZ",
@@ -162,21 +78,42 @@ RHO_BONE = 1.85
 
 
 def _in_interval(c: Tensor, center: float, width: float) -> Tensor:
-    """Half-open membership [center - width/2, center + width/2) of coordinates c."""
+    """Test the half-open membership ``center - width/2 <= c < center + width/2``.
+
+    Args:
+        c (Tensor): coordinates in cm.
+        center (float): center of the interval in cm.
+        width (float): width of the interval in cm.
+
+    Returns:
+        Tensor: boolean mask of the shape of ``c``.
+    """
     return (c >= center - width / 2) & (c < center + width / 2)
 
 
 def wlab_phantom(grid: Grid, *, lung_center: tuple[float, float] = (-5.0, 0.0),
                  air_center: tuple[float, float] = (3.0, 0.0), bone_center: tuple[float, float] = (7.0, 0.0),
                  materials: Optional[Sequence[str]] = None, device=None, dtype=torch.float32) -> Tensor:
-    """Rasterize the WLAB phantom by voxel-center membership (half-open intervals).
+    """Rasterize the WLAB phantom on a grid by voxel-center membership (half-open intervals).
 
-    grid must cover the 30 x 20 x 40 cm prism (centered at the isocenter). Insert centers are (x, y) in cm (module
-    docstring). materials: the material names of the library the densities are for (`library.materials`; None: the
-    seven default reference materials `cross_sections.MATERIALS`). Returns rho [M, rows, cols, slices] in g/cm^3, M =
-    len(materials): the "water" row (`cross_sections.material_index(materials, "water")`, 3 for the default set) holds
-    the water prism and the lung and air inserts (water of reduced density), the "bone" row (6 for the default set) the
-    bone insert; the other rows are zero. Raises ValueError if water or bone is not among the materials.
+    The "water" row holds the water prism with the lung and air inserts as water of reduced density, the "bone" row the
+    bone insert; every other row is zero.
+
+    Args:
+        grid (Grid): grid that covers the 30 x 20 x 40 cm prism centered at the isocenter.
+        lung_center (tuple[float, float]): (x, y) center of the lung insert in cm. Defaults to (-5.0, 0.0).
+        air_center (tuple[float, float]): (x, y) center of the air insert in cm. Defaults to (3.0, 0.0).
+        bone_center (tuple[float, float]): (x, y) center of the bone insert in cm. Defaults to (7.0, 0.0).
+        materials (Sequence[str], optional): material names of the library, which must include water and bone.
+            Defaults to None, the seven ``cross_sections.MATERIALS``.
+        device (torch.device, optional): device of the result. Defaults to None.
+        dtype (torch.dtype): dtype of the result. Defaults to torch.float32.
+
+    Returns:
+        Tensor: [M, rows, cols, slices] densities rho in g/cm^3, M = len(materials).
+
+    Raises:
+        ValueError: if water or bone is missing, the grid does not cover the prism, or the inserts leave it or overlap.
     """
     names = MATERIALS if materials is None else tuple(materials)
     water_row = _phantom_row(names, "water")
@@ -209,13 +146,21 @@ def wlab_phantom(grid: Grid, *, lung_center: tuple[float, float] = (-5.0, 0.0),
 
 @dataclass(frozen=True)
 class WlabPhantom:
-    """The WLAB phantom as a density model that rasterizes ONE material map at a time (`MaterialDensityModel`:
-    `material(X, m)`, X ignored), so that a fine grid never holds the [M, R, C, S] volume: the ground-truth data
-    (`synthesize_cone_beam_data`) and the solver (`ScatterSolver.material_fields_from_attenuation`) take the maps one
-    by one. `wlab_phantom` stacks them for small grids. grid must cover the 30 x 20 x 40 cm prism; materials: the
-    library's material names (water and bone must be among them, `wlab_phantom`); the insert centres as in
-    `wlab_phantom`. `attenuation(library)` is X_true = sum_m rho_m m_m(E_eff), accumulated map by map; `densities()`
-    the stacked [M, R, C, S] volume."""
+    """The WLAB phantom as a density model that rasterizes one material map at a time.
+
+    ``material(X, m)`` gives one map (X ignored), so a fine grid never holds the [M, R, C, S] volume; ``wlab_phantom``
+    stacks the maps for small grids.
+
+    Attributes:
+        grid (Grid): grid that covers the 30 x 20 x 40 cm prism.
+        materials (tuple[str, ...]): material names of the library, which must include water and bone. Defaults to
+            ``cross_sections.MATERIALS``.
+        lung_center (tuple[float, float]): (x, y) center of the lung insert in cm. Defaults to (-5.0, 0.0).
+        air_center (tuple[float, float]): (x, y) center of the air insert in cm. Defaults to (3.0, 0.0).
+        bone_center (tuple[float, float]): (x, y) center of the bone insert in cm. Defaults to (7.0, 0.0).
+        device (object): device of the maps. Defaults to None.
+        dtype (torch.dtype): dtype of the maps. Defaults to torch.float32.
+    """
 
     grid: Grid
     materials: tuple[str, ...] = MATERIALS
@@ -226,16 +171,22 @@ class WlabPhantom:
     dtype: torch.dtype = torch.float32
 
     def __post_init__(self) -> None:
+        """Store the materials as a tuple and check that water and bone are among them."""
         object.__setattr__(self, "materials", tuple(self.materials))
         _phantom_row(self.materials, "water")
         _phantom_row(self.materials, "bone")
 
     @property
     def num_materials(self) -> int:
+        """Number of materials M of the library."""
         return len(self.materials)
 
     def _masks(self):
-        """(prism, lung, air, bone) boolean masks [R, C, S] (broadcast products of the 1-D axis intervals)."""
+        """Boolean masks of the prism and of the three inserts.
+
+        Returns:
+            (Tensor, Tensor, Tensor, Tensor): (prism, lung, air, bone) boolean masks [R, C, S].
+        """
         size_x, size_y, size_z = WLAB_SIZE_XYZ
         x, y, z = self.grid.axis_coordinates(self.device, torch.float64)
         xx, yy, zz = x[None, :, None], y[:, None, None], z[None, None, :]
@@ -248,9 +199,18 @@ class WlabPhantom:
             column(self.bone_center, BONE_SIZE_XY)
 
     def material(self, X, m: int) -> Tensor:
-        """Density map [R, C, S] (g/cm^3, `dtype`) of library material m; X is ignored (a phantom has no
-        reconstruction). The water row holds the prism with the lung and air inserts as water of reduced density, the
-        bone row the bone insert; every other material is zero."""
+        """Density map of one library material.
+
+        The water row holds the prism with the lung and air inserts as water of reduced density, the bone row the bone
+        insert; every other material is zero.
+
+        Args:
+            X: ignored (a phantom has no reconstruction).
+            m (int): library index of the material.
+
+        Returns:
+            Tensor: [R, C, S] density in g/cm^3, in ``dtype``.
+        """
         rho = torch.zeros(*self.grid.shape, device=self.device, dtype=self.dtype)
         water_row = _phantom_row(self.materials, "water")
         bone_row = _phantom_row(self.materials, "bone")
@@ -267,8 +227,18 @@ class WlabPhantom:
         return rho
 
     def attenuation(self, library: MultigroupLibrary, energy_kev: Optional[float] = None) -> Tensor:
-        """X_true [R, C, S] (1/cm) = sum_m rho_m m_m(E), accumulated one material map at a time (E: `energy_kev`,
-        None = E_eff)."""
+        """Attenuation ``X_true = sum_m rho_m m_m(E)`` of the phantom, accumulated one material map at a time.
+
+        Args:
+            library (MultigroupLibrary): library with the phantom's materials.
+            energy_kev (float, optional): energy E in keV. Defaults to None, the effective energy E_eff.
+
+        Returns:
+            Tensor: [R, C, S] attenuation in 1/cm.
+
+        Raises:
+            ValueError: if the library's materials are not the phantom's.
+        """
         if tuple(library.materials) != self.materials:
             raise ValueError(f"the phantom's materials {self.materials} are not the library's {library.materials}")
         m_at = mass_attenuation_at(library, effective_energy(library) if energy_kev is None else float(energy_kev))
@@ -278,27 +248,62 @@ class WlabPhantom:
         return X
 
     def densities(self) -> Tensor:
-        """The stacked [M, R, C, S] volume (`wlab_phantom`; for grids small enough to hold it)."""
+        """Stack the maps of all materials, as ``wlab_phantom`` (for grids small enough to hold the volume).
+
+        Returns:
+            Tensor: [M, R, C, S] densities in g/cm^3.
+        """
         return torch.stack([self.material(None, m) for m in range(self.num_materials)])
 
 
 class StackedDensities:
-    """A density volume rho [M, R, C, S] as a `MaterialDensityModel` (`material(X, m)` = rho[m], X ignored): lets
-    `synthesize_cone_beam_data` take an explicit volume through the same one-map-at-a-time path as a phantom."""
+    """A density volume as a density model whose ``material(X, m)`` is ``rho[m]`` (X ignored).
+
+    It lets ``synthesize_cone_beam_data`` take an explicit volume through the same one-map-at-a-time path as a phantom.
+
+    Attributes:
+        rho (Tensor): [M, R, C, S] densities in g/cm^3.
+    """
 
     def __init__(self, rho: Tensor) -> None:
+        """Wrap a density volume.
+
+        Args:
+            rho (Tensor): [M, R, C, S] densities in g/cm^3.
+        """
         self.rho = rho
 
     @property
     def num_materials(self) -> int:
+        """Number of materials M of the volume."""
         return int(self.rho.shape[0])
 
     def material(self, X, m: int) -> Tensor:
+        """Density map of one material.
+
+        Args:
+            X: ignored.
+            m (int): material index.
+
+        Returns:
+            Tensor: [R, C, S] density ``rho[m]`` in g/cm^3.
+        """
         return self.rho[m]
 
 
 def _phantom_row(materials: Sequence[str], name: str) -> int:
-    """Row of `name` among the materials of the WLAB phantom, with an error that says what the phantom needs."""
+    """Row of a material among the materials of the WLAB phantom.
+
+    Args:
+        materials (Sequence[str]): material names of the library.
+        name (str): name of the material.
+
+    Returns:
+        int: index of ``name`` in ``materials``.
+
+    Raises:
+        ValueError: if the material is absent, with a message that says what the phantom needs.
+    """
     try:
         return material_index(materials, name)
     except ValueError:
@@ -307,7 +312,14 @@ def _phantom_row(materials: Sequence[str], name: str) -> int:
 
 
 def wlab_grid(delta_voxel: float) -> Grid:
-    """Grid that exactly tiles the 30 x 20 x 40 cm WLAB box (cols x rows x slices) at pitch delta_voxel (cm)."""
+    """Grid that exactly tiles the 30 x 20 x 40 cm WLAB box (cols x rows x slices).
+
+    Args:
+        delta_voxel (float): voxel pitch in cm; it must divide every extent of the box.
+
+    Returns:
+        Grid: grid of [20, 30, 40] / ``delta_voxel`` voxels (rows, cols, slices).
+    """
     size_x, size_y, size_z = WLAB_SIZE_XYZ
     n = []
     for length in (size_y, size_x, size_z):
@@ -319,25 +331,42 @@ def wlab_grid(delta_voxel: float) -> Grid:
 
 
 def wlab_geometry() -> ConeGeometry:
-    """Full-fan kV CBCT geometry of the WLAB setup: 100 cm source-axis, 150 cm source-detector distance, centered
-    40 x 30 cm^2 panel of 100 x 75 pixels of 4 mm (the prism's lateral and z ends fall outside the field of view)."""
+    """Full-fan kV cone-beam geometry of the WLAB setup.
+
+    The source-axis distance is 100 cm and the source-detector distance 150 cm; the centered 40 x 30 cm^2 panel has
+    100 x 75 pixels of 4 mm, so the prism's lateral and z ends fall outside the field of view.
+
+    Returns:
+        ConeGeometry: the scan geometry.
+    """
     return ConeGeometry(source_iso_dist=100.0, source_detector_dist=150.0, num_det_rows=75, num_det_channels=100,
                         delta_det_row=0.4, delta_det_channel=0.4)
 
 
 def full_field_wlab_geometry() -> ConeGeometry:
-    """`wlab_geometry` with a 150 x 184 panel (60 x 73.6 cm): the whole 30 x 20 x 40 cm prism projects inside the panel
-    at every view angle (needed for reconstruction). Channels: the prism's transaxial half-diagonal 18.03 cm subtends
-    |u| <= 150 tan(asin(18.03 / 100)) = 27.5 cm (>= 138 channels). Rows: the z-ends (|z| = 20) of the prism edge
-    nearest to the source are magnified by up to 150 / (100 - 18.03) = 1.83: |v| <= 36.6 cm, i.e. >= 183 rows."""
+    """``wlab_geometry`` with a 150 x 184 panel (60 x 73.6 cm) on which the whole prism projects at every view angle.
+
+    Returns:
+        ConeGeometry: the scan geometry of the reconstructions.
+    """
     return replace(wlab_geometry(), num_det_channels=150, num_det_rows=184)
 
 
 def wlab_setup(delta_voxel: float = 1.0, device=None, dtype=torch.float32,
                materials: Optional[Sequence[str]] = None) -> tuple[Grid, ConeGeometry, Tensor]:
-    """(grid, geometry, rho) of the WLAB scatter study: `wlab_grid(delta_voxel)`, `wlab_geometry()`,
-    `wlab_phantom(materials=materials)` (rho [M, R, C, S] for the given material names, default the seven
-    `cross_sections.MATERIALS`)."""
+    """Grid, geometry and densities of the WLAB scatter study.
+
+    Args:
+        delta_voxel (float): voxel pitch in cm. Defaults to 1.0.
+        device (torch.device, optional): device of the densities. Defaults to None.
+        dtype (torch.dtype): dtype of the densities. Defaults to torch.float32.
+        materials (Sequence[str], optional): material names of the library. Defaults to None, the seven
+            ``cross_sections.MATERIALS``.
+
+    Returns:
+        (Grid, ConeGeometry, Tensor): ``wlab_grid(delta_voxel)``, ``wlab_geometry()`` and the densities
+        rho [M, R, C, S] in g/cm^3 of ``wlab_phantom``.
+    """
     grid = wlab_grid(delta_voxel)
     return grid, wlab_geometry(), wlab_phantom(grid, materials=materials, device=device, dtype=dtype)
 
@@ -347,15 +376,33 @@ def wlab_setup(delta_voxel: float = 1.0, device=None, dtype=torch.float32,
 # =====================================================================================================
 
 def effective_energy(library: MultigroupLibrary) -> float:
-    """Spectrum-mean photon energy sum_e fine_weight[e] fine_energy[e] / sum_e fine_weight[e] (keV); 63.03 keV for the
-    default 125 kVp spectrum."""
+    """Spectrum-mean photon energy ``E_eff = sum_e w[e] E[e] / sum_e w[e]`` over the library's fine energies E.
+
+    Args:
+        library (MultigroupLibrary): the library, with fine weights w.
+
+    Returns:
+        float: E_eff in keV.
+    """
     w = library.fine_weight.to(torch.float64)
     return float((w * library.fine_energy.to(torch.float64)).sum() / w.sum())
 
 
 def mass_attenuation_at(library: MultigroupLibrary, energy_kev: float) -> Tensor:
-    """Total mass attenuation [M] (cm^2/g) of the basis materials at `energy_kev`: log-log linear interpolation of
-    library.fine_mu_t on the sorted fine energies (float64, CPU). Raises outside the table's energy range."""
+    """Total mass attenuation coefficients of the library's materials at one energy.
+
+    The coefficients are interpolated linearly in (log E, log mu) in ``library.fine_mu_t`` on the sorted fine energies.
+
+    Args:
+        library (MultigroupLibrary): the library.
+        energy_kev (float): energy in keV.
+
+    Returns:
+        Tensor: [M] mass attenuation coefficients in cm^2/g, float64 on the CPU.
+
+    Raises:
+        ValueError: if the energy is outside the library's fine-energy range.
+    """
     E = library.fine_energy.detach().to("cpu", torch.float64)
     mu = library.fine_mu_t.detach().to("cpu", torch.float64)
     order = torch.argsort(E)
@@ -371,23 +418,45 @@ def mass_attenuation_at(library: MultigroupLibrary, energy_kev: float) -> Tensor
 
 
 def nominal_densities(library: MultigroupLibrary) -> Tensor:
-    """[M] nominal densities (g/cm^3, float64 CPU) of the library's materials (`library.nominal_density`)."""
+    """Nominal densities of the library's materials (``library.nominal_density``).
+
+    Args:
+        library (MultigroupLibrary): the library.
+
+    Returns:
+        Tensor: [M] nominal densities in g/cm^3, float64 on the CPU.
+    """
     return library.nominal_density.detach().to("cpu", torch.float64)
 
 
 def nominal_attenuation(library: MultigroupLibrary, energy_kev: Optional[float] = None) -> Tensor:
-    """[M] attenuation (1/cm, float64 CPU) of each material at its nominal density at `energy_kev` (None: E_eff);
-    0.00022, 0.0520, 0.1847, 0.2014, 0.2102, 0.2123, 0.5365 /cm for the seven default reference materials at 63.03
-    keV."""
+    """Attenuation of each material of the library at its nominal density.
+
+    Args:
+        library (MultigroupLibrary): the library.
+        energy_kev (float, optional): energy in keV. Defaults to None, the effective energy E_eff.
+
+    Returns:
+        Tensor: [M] nominal attenuations in 1/cm, float64 on the CPU.
+    """
     e = effective_energy(library) if energy_kev is None else float(energy_kev)
     return nominal_densities(library) * mass_attenuation_at(library, e)
 
 
 def material_order(library: MultigroupLibrary) -> list[int]:
-    """The fixed bracketing order of the density model: material indices sorted by nominal attenuation at E_eff (the
-    library order, [0, 1, ..., M-1], for a library built by `cross_section_library.build_library`). Raises ValueError
-    if that order is not the same at every fine energy of the library (two materials cross; the library builder
-    already refuses such a table)."""
+    """Bracketing order of the density model: the material indices sorted by nominal attenuation at E_eff.
+
+    For a library built by ``cross_section_library.build_library`` this is the library order ``[0, 1, ..., M-1]``.
+
+    Args:
+        library (MultigroupLibrary): the library.
+
+    Returns:
+        list[int]: [M] material indices in increasing nominal attenuation.
+
+    Raises:
+        ValueError: if the order is not the same at every fine energy of the library.
+    """
     order = torch.argsort(nominal_attenuation(library)).tolist()
     a = (nominal_densities(library)[:, None] * library.fine_mu_t.detach().to("cpu", torch.float64))[order]
     if a.shape[0] > 1 and not bool((torch.diff(a, dim=0) > 0).all()):
@@ -396,13 +465,31 @@ def material_order(library: MultigroupLibrary) -> list[int]:
 
 
 def _mass_attenuation_coefficients(library: MultigroupLibrary, energy_kev: Optional[float], like: Tensor) -> Tensor:
+    """Mass attenuation coefficients at an energy, on the device and in the dtype of a tensor.
+
+    Args:
+        library (MultigroupLibrary): the library.
+        energy_kev (float, optional): energy in keV; None for the effective energy E_eff.
+        like (Tensor): tensor whose device and dtype the result takes.
+
+    Returns:
+        Tensor: [M] mass attenuation coefficients in cm^2/g.
+    """
     e = effective_energy(library) if energy_kev is None else float(energy_kev)
     return mass_attenuation_at(library, e).to(device=like.device, dtype=like.dtype)
 
 
 def densities_to_attenuation(library: MultigroupLibrary, rho: Tensor, energy_kev: Optional[float] = None) -> Tensor:
-    """X = sum_m rho[m] m_m(E) (1/cm). rho [M, ...] g/cm^3 (M = the library's materials, `library.materials`; 7 for
-    the default reference materials) -> X [...], same device/dtype. energy_kev None: `effective_energy(library)`."""
+    """Attenuation ``X = sum_m rho[m] m_m(E)`` of a density volume.
+
+    Args:
+        library (MultigroupLibrary): library of the M materials.
+        rho (Tensor): [M, ...] densities in g/cm^3, rows in the order of ``library.materials``.
+        energy_kev (float, optional): energy E in keV. Defaults to None, the effective energy E_eff.
+
+    Returns:
+        Tensor: [...] attenuation in 1/cm, on the device and in the dtype of ``rho``.
+    """
     M = library.num_materials
     if rho.shape[0] != M:
         raise ValueError(f"rho must be [{M}, ...] for the library's materials {tuple(library.materials)}, got "
@@ -415,13 +502,20 @@ def densities_to_attenuation(library: MultigroupLibrary, rho: Tensor, energy_kev
 
 
 def attenuation_to_densities(library: MultigroupLibrary, X: Tensor, energy_kev: Optional[float] = None) -> Tensor:
-    """The interpolating density model (module docstring): rho [M, ...] (g/cm^3, same device/dtype) of X [...] (1/cm)
-    at the energy (None: E_eff), M = the library's reference materials (`library.materials`, any set of at least two).
-    The two reference materials whose nominal attenuations bracket X get (1 - f) rho_a^nom and f rho_b^nom,
-    f = (X - mu_a) / (mu_b - mu_a); below the lowest reference material that reference material alone at X / m_first,
-    above the highest that
-    reference material alone at X / m_last; X < 0 gives 0. Exact in attenuation, at most two nonzero materials per
-    voxel."""
+    """Interpolating density model: densities of the reference materials that reproduce an attenuation volume.
+
+    The two reference materials whose nominal attenuations bracket X get ``(1 - f) rho_a^nom`` and ``f rho_b^nom`` with
+    ``f = (X - mu_a) / (mu_b - mu_a)``; below the lowest (above the highest) nominal attenuation that material alone
+    gets the density ``X / m``, and ``X < 0`` gives 0.
+
+    Args:
+        library (MultigroupLibrary): library of the M reference materials (any set of at least two).
+        X (Tensor): [...] attenuation in 1/cm.
+        energy_kev (float, optional): energy in keV. Defaults to None, the effective energy E_eff.
+
+    Returns:
+        Tensor: [M, ...] densities in g/cm^3 (at most two nonzero per voxel), on the device and in the dtype of ``X``.
+    """
     M = library.num_materials
     order = material_order(library)
     num_dims = X.dim()
@@ -455,19 +549,23 @@ def attenuation_to_densities(library: MultigroupLibrary, X: Tensor, energy_kev: 
 
 def attenuation_to_density(library: MultigroupLibrary, X: Tensor, material: int,
                            energy_kev: Optional[float] = None) -> Tensor:
-    """ONE material's density map of the interpolating model: rho_m [...] (g/cm^3, same shape, device and dtype as X
-    [...], 1/cm) equal bit for bit to `attenuation_to_densities(library, X, energy_kev)[material]` (library index
-    `material`), without forming the maps of the other materials.
+    """One material's density map of the interpolating model, without forming the maps of the other materials.
 
-    With the material in slot s of the bracketing order (`material_order`) and mu the nominal attenuations in that
-    order (ascending), the map is f rho^nom on mu[s-1] <= X < mu[s] (the upper end of the bracket [s-1, s],
-    f = (X - mu[s-1]) / (mu[s] - mu[s-1])), (1 - f) rho^nom on mu[s] <= X < mu[s+1] (f = (X - mu[s]) / (mu[s+1] -
-    mu[s])), X / m for the first material below mu[0] and for the last material from mu[M-1] on, and 0 elsewhere (X < 0
-    counts as 0). The scalars are 0-dim tensors on X's device in X's dtype and every voxel value is formed by the same
-    floating-point operations as in `attenuation_to_densities` (in place: x - y, then / span, * rho^nom, 1 - f as
-    -f + 1). Temporaries of X's shape: the result, one interpolation weight and two boolean masks, never [M, ...]
-    (`citrus.citrus.DensityModel.material` evaluates it slab by slab, so that only the result is a full map). The
-    bracket tests use X itself: every nominal attenuation is positive, so X >= mu[k] implies X > 0."""
+    The map equals ``attenuation_to_densities(library, X, energy_kev)[material]`` bit for bit; its only temporaries of
+    the shape of X are the result, one interpolation weight and two boolean masks.
+
+    Args:
+        library (MultigroupLibrary): library of the M reference materials.
+        X (Tensor): [...] attenuation in 1/cm.
+        material (int): library index of the material.
+        energy_kev (float, optional): energy in keV. Defaults to None, the effective energy E_eff.
+
+    Returns:
+        Tensor: [...] density of the material in g/cm^3, on the device and in the dtype of ``X``.
+
+    Raises:
+        ValueError: if ``material`` is not an index of the library's materials.
+    """
     M = library.num_materials
     material_index = int(material)
     if not 0 <= material_index < M:
@@ -512,16 +610,25 @@ def wlab_solver(delta_voxel: float, *, config: Optional[SolverConfig] = None,
                 library: Optional[MultigroupLibrary] = None,
                 geometry: Optional[ConeGeometry] = None, device=None,
                 cache_dir: Optional[str] = "default", spectrum=None) -> ScatterSolver:
-    """ScatterSolver for the WLAB data: the given config (default SolverConfig(): 1 cm transport cells,
-    `SolverConfig.transport_cell_cm`, whatever the fine voxel size `delta_voxel`, which only names the grid the solver
-    will be used with), the full-field WLAB geometry (default), an ideal counting detector and no grid, float32.
-    Library: `library` if given; else a LAZY solver whose library (the real one for the reference materials
-    config.materials and `spectrum`, None the default 125 kVp spectrum) is built on first use (`ScatterSolver.library`;
-    cached in `cache_dir`, "default" is $CITRUS_CACHE_DIR or ~/.cache/citrus, None no disk cache; needs the photon
-    data, `photon_data`),
-    so that citrus_recon / synthesize_cone_beam_data can still set config.grouping_object_size_cm before the build. The
-    WLAB phantom for this solver is `wlab_phantom(grid, materials=solver.materials)` (water and bone must be among the
-    reference materials)."""
+    """Scatter solver for the WLAB data, with an ideal counting detector, no grid and float32.
+
+    Without ``library`` the solver is lazy: its library (for ``config.materials`` and ``spectrum``) is built on first
+    use, so ``citrus_recon`` and ``synthesize_cone_beam_data`` can still set ``config.grouping_object_size_cm`` first.
+
+    Args:
+        delta_voxel (float): voxel size in cm of the fine grid the solver will be used with; the solver ignores it.
+        config (SolverConfig, optional): solver configuration. Defaults to None, ``SolverConfig()``.
+        library (MultigroupLibrary, optional): prebuilt library. Defaults to None, a lazy library.
+        geometry (ConeGeometry, optional): scan geometry. Defaults to None, ``full_field_wlab_geometry()``.
+        device (torch.device, optional): device. Defaults to None, CUDA when available, else the CPU.
+        cache_dir (str, optional): disk cache of a lazy library; "default" is ``$CITRUS_CACHE_DIR`` or
+            ``~/.cache/citrus``, None no disk cache. Defaults to "default".
+        spectrum (tuple[np.ndarray, np.ndarray], optional): ([K] energies in keV, [K] photons per keV) of a lazy
+            library. Defaults to None, the default 125 kVp spectrum.
+
+    Returns:
+        ScatterSolver: the solver.
+    """
     config = config if config is not None else SolverConfig()
     device = (torch.device(device) if device is not None
               else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
@@ -538,12 +645,18 @@ def wlab_solver(delta_voxel: float, *, config: Optional[SolverConfig] = None,
 
 def air_water_threshold(reference: Union[MultigroupLibrary, ScatterSolver],
                         energy_kev: Optional[float] = None) -> float:
-    """Attenuation (1/cm) midway between the nominal attenuations of air and water at E_eff, the threshold of the
-    object mask of `object_size_cm`. reference: a library (E_eff = energy_kev or `effective_energy(library)`; its "air"
-    and "water" rows when it has them, an absent air row counts as 0, an absent water row is computed from the
-    catalogue) or a solver (its library when built; for a lazy solver whose library is not built yet, the catalogue's
-    air and water from the photon data at the spectrum-mean energy of its config,
-    `cross_section_library.mass_attenuation_preview`, so the library is not built)."""
+    """Attenuation midway between the nominal attenuations of air and water at E_eff, the threshold of ``object_mask``.
+
+    A library without an air row counts air as 0 and takes water from the catalogue if it has no water row; a lazy
+    solver takes both from the photon data (``cross_section_library.mass_attenuation_preview``) without a build.
+
+    Args:
+        reference (MultigroupLibrary or ScatterSolver): library, or solver whose library (built or not) is used.
+        energy_kev (float, optional): energy in keV. Defaults to None, the effective energy E_eff.
+
+    Returns:
+        float: threshold in 1/cm.
+    """
     from .scatter_solver.cross_sections import MATERIAL_CATALOGUE
 
     if isinstance(reference, ScatterSolver):
@@ -571,18 +684,35 @@ def air_water_threshold(reference: Union[MultigroupLibrary, ScatterSolver],
 
 def object_mask(X: Tensor, reference: Union[MultigroupLibrary, ScatterSolver, float], *,
                 energy_kev: Optional[float] = None) -> Tensor:
-    """The object voxels of an attenuation volume X [R, C, S] (1/cm): bool [R, C, S], max(X, 0) above the attenuation
-    midway between air and water at E_eff (`air_water_threshold(reference, energy_kev)`; a float `reference` is the
-    threshold itself, 1/cm). The mask of `object_size_cm` and `grouping_medium_estimate`."""
+    """Object voxels of an attenuation volume: ``max(X, 0)`` above the attenuation midway between air and water.
+
+    Args:
+        X (Tensor): [R, C, S] attenuation in 1/cm.
+        reference (MultigroupLibrary or ScatterSolver or float): library or solver for ``air_water_threshold``, or
+            the threshold itself in 1/cm.
+        energy_kev (float, optional): energy in keV of the threshold. Defaults to None, the effective energy E_eff.
+
+    Returns:
+        Tensor: [R, C, S] boolean object mask.
+    """
     threshold = float(reference) if isinstance(reference, (int, float)) else air_water_threshold(reference, energy_kev)
     return X.clamp_min(0) > threshold
 
 
 def _reference_attenuation(reference: Union[MultigroupLibrary, ScatterSolver],
                            energy_kev: Optional[float]) -> tuple[tuple[str, ...], np.ndarray, np.ndarray, float]:
-    """(names in library order, nominal densities [M] g/cm^3, mass attenuations [M] cm^2/g at E_eff, E_eff keV) of the
-    reference materials of a library or a solver; a lazy solver whose library is not built yet takes the catalogue
-    densities and `cross_section_library.mass_attenuation_preview` (no build)."""
+    """Nominal densities and mass attenuations of the reference materials of a library or a solver.
+
+    A lazy solver takes the catalogue densities and ``cross_section_library.mass_attenuation_preview``, without a build.
+
+    Args:
+        reference (MultigroupLibrary or ScatterSolver): library or solver.
+        energy_kev (float, optional): energy in keV; None for the effective energy E_eff.
+
+    Returns:
+        (names, nominal, mass, energy): the material names in library order, the [M] nominal densities in g/cm^3,
+        the [M] mass attenuations in cm^2/g at the energy and the energy in keV.
+    """
     from .scatter_solver.cross_sections import MATERIAL_CATALOGUE
 
     if isinstance(reference, ScatterSolver) and not reference.library_built:
@@ -601,12 +731,21 @@ def _reference_attenuation(reference: Union[MultigroupLibrary, ScatterSolver],
 def grouping_medium_estimate(X: Tensor, reference: Union[MultigroupLibrary, ScatterSolver], *,
                              energy_kev: Optional[float] = None,
                              mask: Optional[Tensor] = None) -> Optional[tuple[tuple[str, float], ...]]:
-    """The object's mean composition for `SolverConfig.grouping_medium`: the interpolating density model
-    (`attenuation_to_densities`: the two reference materials whose nominal attenuations at E_eff bracket a voxel)
-    applied to the object voxels of X [R, C, S] (1/cm; `object_mask`, or the given bool mask) and averaged over them,
-    per reference material: ((name, mean density g/cm^3), ...) for the materials with a nonzero mean, in library order.
-    None for an empty mask. reference: a library or a solver (a lazy solver's library is not built: the nominal
-    attenuations come from `cross_section_library.mass_attenuation_preview`)."""
+    """Mean composition of the object for ``SolverConfig.grouping_medium``.
+
+    The interpolating density model is applied to the object voxels of X and averaged over them per reference
+    material; a lazy solver's library is not built.
+
+    Args:
+        X (Tensor): [R, C, S] attenuation in 1/cm.
+        reference (MultigroupLibrary or ScatterSolver): library or solver of the reference materials.
+        energy_kev (float, optional): energy in keV. Defaults to None, the effective energy E_eff.
+        mask (Tensor, optional): [R, C, S] boolean object mask. Defaults to None, ``object_mask``.
+
+    Returns:
+        tuple[tuple[str, float], ...] or None: ((name, mean density in g/cm^3), ...) of the materials with a nonzero
+        mean, in library order; None for an empty mask.
+    """
     names, nominal, mass, energy = _reference_attenuation(reference, energy_kev)
     mask = object_mask(X, reference, energy_kev=energy) if mask is None else mask
     values = X[mask].clamp_min(0).to(torch.float64)
@@ -635,15 +774,22 @@ def grouping_medium_estimate(X: Tensor, reference: Union[MultigroupLibrary, Scat
 
 def object_size_cm(X: Tensor, grid: Grid, reference: Union[MultigroupLibrary, ScatterSolver, float], *,
                    energy_kev: Optional[float] = None, default: float = 20.0) -> float:
-    """Characteristic chord length of the object in the attenuation volume X [R, C, S] (1/cm) on `grid`, for
-    `SolverConfig.grouping_object_size_cm`: the mean chord 4 V / S of the object mask, rounded to the nearest
-    centimetre (at least 1 cm; `default` when the mask is empty).
+    """Characteristic chord length of the object for ``SolverConfig.grouping_object_size_cm``.
 
-    Mask: max(X, 0) above the threshold (1/cm) midway between the nominal attenuations of air and water at E_eff
-    (`air_water_threshold(reference, energy_kev)`; a float `reference` is the threshold itself). V = number of mask
-    voxels x voxel volume; S = number of exposed voxel faces x face area, a face being exposed when the neighbour
-    across it is outside the mask or outside the grid. Cavities (air, lung below the threshold) are holes of the mask
-    and add their walls to S. For a convex body 4 V / S is the mean length of the chords of isotropic random lines."""
+    The length is the mean chord ``4 V / S`` of ``object_mask``, with V its volume and S the area of its exposed voxel
+    faces (cavities add their walls), rounded to whole centimetres and at least 1 cm.
+
+    Args:
+        X (Tensor): [R, C, S] attenuation in 1/cm.
+        grid (Grid): grid of X.
+        reference (MultigroupLibrary or ScatterSolver or float): library or solver for ``air_water_threshold``, or
+            the threshold itself in 1/cm.
+        energy_kev (float, optional): energy in keV of the threshold. Defaults to None, the effective energy E_eff.
+        default (float): size in cm returned for an empty mask. Defaults to 20.0.
+
+    Returns:
+        float: object size in cm.
+    """
     mask = object_mask(X, reference, energy_kev=energy_kev)
     count = int(mask.sum())
     if count == 0:
@@ -659,19 +805,35 @@ def object_size_cm(X: Tensor, grid: Grid, reference: Union[MultigroupLibrary, Sc
 
 
 def fan_angle(geometry: ConeGeometry) -> float:
-    """In-plane fan angle of the panel (rad): the full angle subtended at the source by the detector's channel extent,
-    2 atan(0.5 num_det_channels delta_det_channel / SDD) (the channel offset is ignored). 22.6 degrees for the
-    full-field WLAB panel (150 channels of 0.4 cm at SDD 150 cm), 15.2 degrees for the 100-channel panel."""
+    """In-plane fan angle ``2 atan(0.5 num_det_channels delta_det_channel / SDD)`` of the panel (offset ignored).
+
+    Args:
+        geometry (ConeGeometry): scan geometry.
+
+    Returns:
+        float: fan angle in rad.
+    """
     half = 0.5 * float(geometry.num_det_channels) * float(geometry.delta_det_channel)
     return 2.0 * math.atan(half / float(geometry.source_detector_dist))
 
 
 def view_angles(num_views: int, geometry: Optional[ConeGeometry] = None, start_view_angle: float = 0.0,
                 end_view_angle: Optional[float] = None) -> np.ndarray:
-    """View angles (rad, float64 [num_views], MBIRTORCH's angle convention) evenly spaced over
-    [start_view_angle, end_view_angle), endpoint excluded: start + (end - start) i / num_views. end_view_angle None:
-    the short scan end = start + pi + fan_angle(geometry) (half a rotation plus the in-plane fan angle of the panel, the
-    smallest range in which every in-plane ray is measured at least once). A full rotation is end = start + 2 pi."""
+    """View angles evenly spaced over ``[start_view_angle, end_view_angle)``: ``start + (end - start) i / num_views``.
+
+    Args:
+        num_views (int): number of views V, at least 1.
+        geometry (ConeGeometry, optional): scan geometry, needed for the default end. Defaults to None.
+        start_view_angle (float): first view angle in rad. Defaults to 0.0.
+        end_view_angle (float, optional): end of the range in rad (excluded); ``start + 2 pi`` is a full rotation.
+            Defaults to None, the short scan end ``start + pi + fan_angle(geometry)``.
+
+    Returns:
+        np.ndarray: [V] float64 view angles in rad (MBIRTORCH's angle convention).
+
+    Raises:
+        ValueError: if num_views < 1, the default end has no geometry, or the end does not exceed the start.
+    """
     n = int(num_views)
     if n < 1:
         raise ValueError("num_views must be >= 1")
@@ -691,31 +853,31 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
                               I0: float = 1.0e5, noise: bool = True, seed: int = 0, *,
                               energy_kev: Optional[float] = None, device=None,
                               progress: Optional[Callable[[int, float], None]] = None) -> dict:
-    """Cone-beam counts with scatter for any density volume (module docstring, "Synthetic cone-beam data").
+    """Cone-beam counts with scatter, ``Y = Poisson(I0 exp(-A X_true) (1 + SPR))``, for any density volume.
 
-    densities: the true object, either a density model that gives one material map at a time (`material(X, m)` ->
-    [R, C, S] g/cm^3 of library material m with X ignored, e.g. `WlabPhantom`) or a volume rho [M, R, C, S] of the
-    solver library's M materials (`solver.library.materials`; wrapped in `StackedDensities`), on `grid` (the
-    reconstruction grid, the solver's fine grid). The fine grid never holds more than X and one material map at a
-    time (`ScatterSolver.material_fields_from_attenuation`, built once and shared by every view), so the truth of a
-    fine reconstruction grid fits the GPU like the reconstruction itself. geometry: the scan (used by MBIRTORCH and
-    must be the solver's geometry); angles [V] (rad); solver: the ScatterSolver that defines the scatter truth (one
-    fully converged solve per view); I0: flat-field counts per pixel; noise: Poisson(Y_mean) with
-    torch.Generator(seed), else Y = Y_mean; energy_kev: E_eff (None: the spectrum mean of the solver's library).
-    A lazy solver (library not built yet) whose config uses the "scattered_fluence" group rule first gets
-    grouping_object_size_cm = `object_size_cm` of the truth's attenuation (the phantom's own size) and, for
-    grouping_medium "auto", the true mean densities of the reference materials over the object (meta records both as
-    grouping_object_size_cm and grouping_medium), then builds its library.
-    progress(view_index, seconds) is called after every solved view. The SPR's denominator is always the primary model
-    of the CITRUS loop (MBIRTORCH's per-material line integrals through the solver's transmission,
-    `citrus.citrus.primary_signals`); meta records primary_projector "mbirtorch" and data_format 2.
+    The primary is MBIRTORCH's projection of the true attenuation and SPR the solver's scatter-to-primary ratio of one
+    fully converged solve per view; a lazy solver with the "scattered_fluence" group rule first takes its grouping
+    object size and medium from the true object, then builds its library.
 
-    Returns a dict of numpy arrays (float32 unless noted): X_true [R, C, S] (1/cm), angles [V] (float64),
-    line_integrals, P, S, Y, Y_mean, SPR [V, Rd, Cd], solver_primary, solver_scatter [V, Rd, Cd] (planar fluence
-    summed over groups, photons/cm^2 per source photon/sr), phi_air [Rd, Cd] (solver primary of an empty volume),
-    view_seconds [V], si_iterations [V] (int), I0, energy_kev, mass_attenuation [M] (the materials' mass attenuation
-    at E_eff, cm^2/g) and meta (dict: geometry, grid, solver config, materials, angular range, versions, timings,
-    statistics). The density volume itself is not stored (it is M fine volumes; `WlabPhantom` rebuilds it).
+    Args:
+        densities: true object on ``grid``: a density model with ``material(X, m)`` (e.g. ``WlabPhantom``) or a
+            [M, R, C, S] volume in g/cm^3 of the solver library's materials.
+        grid (Grid): reconstruction grid, the solver's fine grid.
+        geometry (ConeGeometry): scan geometry; it must be the solver's geometry.
+        angles (array-like): [V] view angles in rad.
+        solver (ScatterSolver): solver that defines the scatter truth.
+        I0 (float): flat-field counts per pixel. Defaults to 1.0e5.
+        noise (bool): draw ``Y = Poisson(Y_mean)`` with ``torch.Generator(seed)``, else Y = Y_mean. Defaults to True.
+        seed (int): seed of the Poisson draws. Defaults to 0.
+        energy_kev (float, optional): effective energy in keV. Defaults to None, the spectrum mean of the library.
+        device (torch.device, optional): device. Defaults to None, the solver's device.
+        progress (Callable[[int, float], None], optional): called as ``progress(view_index, seconds)`` after every
+            solved view. Defaults to None.
+
+    Returns:
+        dict: numpy arrays (float32 unless noted) X_true [R, C, S] in 1/cm, angles [V] (float64), line_integrals, P,
+        S, Y, Y_mean, SPR, solver_primary, solver_scatter [V, Rd, Cd], phi_air [Rd, Cd], view_seconds [V],
+        si_iterations [V] (int), I0, energy_kev, mass_attenuation [M] in cm^2/g, and meta (setup and statistics).
     """
     from .recon.mbir_bridge import forward_project, make_cone_model, mbirtorch_version
 
@@ -839,11 +1001,21 @@ _ON_DISK_SOLVER_CONFIG_KEYS = {"source_iteration_tolerance": "si_tol", "max_sour
 
 def _set_grouping_object_size(solver: ScatterSolver, densities, grid: Grid, energy_kev: Optional[float],
                               device) -> float:
-    """For a lazy solver with the "scattered_fluence" group rule: set solver.config.grouping_object_size_cm to the
-    `object_size_cm` of the attenuation of the true object `densities` (one material map at a time, mass attenuations
-    from `cross_section_library.mass_attenuation_preview`, so the library is not built) and, when grouping_medium is
-    "auto", grouping_medium to the TRUE mean densities of the reference materials over the object mask. Returns the
-    size in the solver's config afterwards."""
+    """Set the grouping object size and medium of a lazy solver from the true object, without building its library.
+
+    With the "scattered_fluence" group rule ``grouping_object_size_cm`` becomes ``object_size_cm`` of the true
+    attenuation and, for grouping_medium "auto", ``grouping_medium`` the true mean densities over the object mask.
+
+    Args:
+        solver (ScatterSolver): the solver; its config is replaced.
+        densities: density model of the true object with ``material(X, m)``.
+        grid (Grid): grid of the densities.
+        energy_kev (float, optional): energy in keV; None for the spectrum-mean energy of the solver's config.
+        device (torch.device): device of the attenuation volume.
+
+    Returns:
+        float: grouping object size in cm in the solver's config afterwards.
+    """
     config = solver.config
     if solver.library_built or config.group_edges_method != "scattered_fluence" or config.group_edges_kev is not None:
         return float(config.grouping_object_size_cm)
@@ -868,7 +1040,14 @@ def _set_grouping_object_size(solver: ScatterSolver, densities, grid: Grid, ener
 
 
 def _solver_config_record(config: SolverConfig) -> dict:
-    """`config.to_dict()` with the data-set keys of the renamed fields (`_ON_DISK_SOLVER_CONFIG_KEYS`)."""
+    """Solver configuration as recorded in a data set's meta.
+
+    Args:
+        config (SolverConfig): the configuration.
+
+    Returns:
+        dict: ``config.to_dict()`` with the on-disk keys of the renamed fields (``_ON_DISK_SOLVER_CONFIG_KEYS``).
+    """
     return {_ON_DISK_SOLVER_CONFIG_KEYS.get(k, k): v for k, v in config.to_dict().items()}
 
 
@@ -879,17 +1058,34 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
                             end_view_angle: Optional[float] = None,
                             progress: Optional[Callable[[int, float], None]] = None,
                             geometry: Optional[ConeGeometry] = None) -> dict:
-    """`synthesize_cone_beam_data` for the WLAB phantom on `wlab_grid(delta_voxel)` (0.5 cm: 40 x 60 x 80 voxels),
-    num_views angles evenly spaced over [start_view_angle, end_view_angle) (`view_angles`; default end: the short scan
-    start + pi + fan angle of the panel, 202.6 degrees for the full-field panel; end = start + 2 pi for a full
-    rotation), the solver `wlab_solver(delta_voxel, config=config, library=library, geometry=geometry)` (default:
-    SolverConfig() with 1 cm transport cells, the full-field geometry `full_field_wlab_geometry()`, ideal counting
-    detector, no grid). The library's materials follow config.materials (the reference materials of
-    `SolverConfig.materials`;
-    default the seven of `cross_sections.MATERIALS`) unless `library` is given; the phantom is placed in the library's
-    water and bone rows (`WlabPhantom`, one material map at a time; both must be in the set). meta also records
-    delta_voxel, start_view_angle and end_view_angle. out_path: if given, the data are written with `save_dataset`
-    (<out_path>.npz and <out_path>.json)."""
+    """Synthetic cone-beam data of the WLAB phantom (``synthesize_cone_beam_data``), optionally written to disk.
+
+    The phantom is placed on ``wlab_grid(delta_voxel)`` in the water and bone rows of the library of ``wlab_solver``;
+    meta also records delta_voxel, start_view_angle, end_view_angle and short_scan.
+
+    Args:
+        num_views (int): number of views. Defaults to 180.
+        delta_voxel (float): voxel pitch in cm. Defaults to 0.5.
+        I0 (float): flat-field counts per pixel. Defaults to 1.0e5.
+        noise (bool): draw Poisson noise. Defaults to True.
+        seed (int): seed of the Poisson draws. Defaults to 0.
+        out_path (str or os.PathLike, optional): base path of the ``save_dataset`` files. Defaults to None, not
+            written.
+        energy_kev (float, optional): effective energy in keV. Defaults to None, the spectrum mean.
+        config (SolverConfig, optional): solver configuration. Defaults to None, ``SolverConfig()``.
+        library (MultigroupLibrary, optional): prebuilt library. Defaults to None, a lazy library of
+            ``config.materials``, which must include water and bone.
+        device (torch.device, optional): device. Defaults to None, CUDA when available, else the CPU.
+        start_view_angle (float): first view angle in rad. Defaults to 0.0.
+        end_view_angle (float, optional): end of the angular range in rad (excluded). Defaults to None, the short scan
+            end ``start + pi + fan_angle(geometry)``.
+        progress (Callable[[int, float], None], optional): called as ``progress(view_index, seconds)`` after every
+            view. Defaults to None.
+        geometry (ConeGeometry, optional): scan geometry. Defaults to None, ``full_field_wlab_geometry()``.
+
+    Returns:
+        dict: the data set, as returned by ``synthesize_cone_beam_data``.
+    """
     device = (torch.device(device) if device is not None
               else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     geometry = full_field_wlab_geometry() if geometry is None else geometry
@@ -909,8 +1105,15 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
 
 
 def save_dataset(data: dict, out_path: Union[str, os.PathLike]) -> list[str]:
-    """Write a dataset dict (numpy arrays plus `meta`) to <out_path>.npz (meta as a JSON string `meta_json`) and
-    <out_path>.json (meta). Returns the two file names (also stored in data["meta"]["files"])."""
+    """Write a data set to ``<out_path>.npz`` (meta as the JSON string ``meta_json``) and ``<out_path>.json`` (meta).
+
+    Args:
+        data (dict): numpy arrays plus ``meta``; ``meta["files"]`` is set to the two file names.
+        out_path (str or os.PathLike): base path; a trailing .npz or .json is removed.
+
+    Returns:
+        list[str]: the two file names.
+    """
     base = str(out_path)
     for ext in (".npz", ".json"):
         if base.endswith(ext):
@@ -926,7 +1129,14 @@ def save_dataset(data: dict, out_path: Union[str, os.PathLike]) -> list[str]:
 
 
 def load_dataset(path: Union[str, os.PathLike]) -> dict:
-    """Read a dataset written by `save_dataset` (<path>.npz): dict of numpy arrays plus `meta`."""
+    """Read a data set written by ``save_dataset``.
+
+    Args:
+        path (str or os.PathLike): path of the .npz file; the extension may be omitted.
+
+    Returns:
+        dict: numpy arrays plus ``meta``.
+    """
     p = str(path)
     if not p.endswith(".npz"):
         p += ".npz"
@@ -941,7 +1151,12 @@ def load_dataset(path: Union[str, os.PathLike]) -> dict:
 # =====================================================================================================
 
 def set_memory_cap(mib: float = 4400.0, device: int = 0) -> None:
-    """Cap the PyTorch CUDA allocator of `device` at `mib` MiB (no-op without CUDA or for mib <= 0)."""
+    """Cap the PyTorch CUDA allocator of a device (no-op without CUDA or for mib <= 0).
+
+    Args:
+        mib (float): cap in MiB. Defaults to 4400.0.
+        device (int): CUDA device index. Defaults to 0.
+    """
     if torch.cuda.is_available() and mib > 0:
         total = torch.cuda.get_device_properties(device).total_memory
         torch.cuda.set_per_process_memory_fraction(min(1.0, mib * 2 ** 20 / total), device)
@@ -952,25 +1167,51 @@ def set_memory_cap(mib: float = 4400.0, device: int = 0) -> None:
 # =====================================================================================================
 
 def _to_numpy(x) -> np.ndarray:
+    """Convert a tensor (as float32 on the CPU) or an array-like to a numpy array.
+
+    Args:
+        x (Tensor or array-like): the values.
+
+    Returns:
+        np.ndarray: the values as a numpy array.
+    """
     return x.detach().float().cpu().numpy() if isinstance(x, Tensor) else np.asarray(x)
 
 
 def central_slice(X) -> np.ndarray:
-    """Central z slice [rows, cols] of a volume [rows, cols, slices] (mean of the two middle slices for an even
-    count)."""
+    """Central z slice of a volume (the mean of the two middle slices for an even count).
+
+    Args:
+        X (Tensor or np.ndarray): [rows, cols, slices] volume.
+
+    Returns:
+        np.ndarray: [rows, cols] slice.
+    """
     X = _to_numpy(X)
     S = X.shape[2]
     return X[:, :, S // 2] if S % 2 else 0.5 * (X[:, :, S // 2 - 1] + X[:, :, S // 2])
 
 
 def central_row(image_slice) -> np.ndarray:
-    """Central row [cols] of a slice [rows, cols] (mean of the two middle rows for an even count)."""
+    """Central row of a slice (the mean of the two middle rows for an even count).
+
+    Args:
+        image_slice (Tensor or np.ndarray): [rows, cols] slice.
+
+    Returns:
+        np.ndarray: [cols] row.
+    """
     image_slice = _to_numpy(image_slice)
     R = image_slice.shape[0]
     return image_slice[R // 2] if R % 2 else 0.5 * (image_slice[R // 2 - 1] + image_slice[R // 2])
 
 
 def _pyplot():
+    """Import matplotlib.pyplot lazily; the caller chooses the backend.
+
+    Returns:
+        module: ``matplotlib.pyplot``.
+    """
     import matplotlib.pyplot as plt  # the caller chooses the backend (e.g. matplotlib.use("Agg") in scripts)
 
     return plt
@@ -978,8 +1219,19 @@ def _pyplot():
 
 def plot_slices(images: Sequence[tuple[str, np.ndarray]], grid: Grid, path: Optional[str] = None,
                 vmin: float = 0.0, vmax: float = 0.3, title: Optional[str] = None):
-    """Side-by-side central z slices: images = [(label, volume [R, C, S] or slice [R, C])]; extent from `grid` (cm).
-    Saved to `path` if given. Returns the matplotlib figure."""
+    """Plot central z slices side by side on a shared gray scale with one colorbar.
+
+    Args:
+        images (Sequence[tuple[str, np.ndarray]]): (label, volume [R, C, S] or slice [R, C]) pairs in 1/cm.
+        grid (Grid): grid of the images, for the extent in cm.
+        path (str, optional): file the figure is saved to. Defaults to None, not saved.
+        vmin (float): lower end of the gray scale in 1/cm. Defaults to 0.0.
+        vmax (float): upper end of the gray scale in 1/cm. Defaults to 0.3.
+        title (str, optional): figure title. Defaults to None.
+
+    Returns:
+        matplotlib.figure.Figure: the figure.
+    """
     plt = _pyplot()
     n = len(images)
     fig, axes = plt.subplots(1, n, figsize=(3.4 * n, 2.9), squeeze=False)
@@ -1004,8 +1256,18 @@ def plot_slices(images: Sequence[tuple[str, np.ndarray]], grid: Grid, path: Opti
 
 def plot_profiles(profiles: Sequence[tuple[str, np.ndarray]], grid: Grid, path: Optional[str] = None,
                   ylabel: str = "attenuation (1/cm)", title: Optional[str] = None):
-    """Central-row profiles (row y = 0 of the central z slice) along x: profiles = [(label, volume [R, C, S])].
-    Saved to `path` if given. Returns the matplotlib figure."""
+    """Plot central-row profiles along x (row y = 0 of the central z slice).
+
+    Args:
+        profiles (Sequence[tuple[str, np.ndarray]]): (label, volume [R, C, S]) pairs.
+        grid (Grid): grid of the volumes, for the x coordinates in cm.
+        path (str, optional): file the figure is saved to. Defaults to None, not saved.
+        ylabel (str): label of the y axis. Defaults to "attenuation (1/cm)".
+        title (str, optional): axes title. Defaults to None.
+
+    Returns:
+        matplotlib.figure.Figure: the figure.
+    """
     plt = _pyplot()
     fig, ax = plt.subplots(figsize=(8.0, 3.2))
     x = grid.axis_coordinates(dtype=torch.float64)[0].numpy()
@@ -1027,7 +1289,19 @@ def plot_profiles(profiles: Sequence[tuple[str, np.ndarray]], grid: Grid, path: 
 def plot_history(curves: Sequence[tuple[str, Sequence[float]]], path: Optional[str] = None,
                  ylabel: str = "relative RMSE", xlabel: str = "outer iteration (0 = FDK)", logy: bool = True,
                  title: Optional[str] = None):
-    """Convergence curves: curves = [(label, values per iteration)]. Saved to `path` if given. Returns the figure."""
+    """Plot convergence curves against the iteration number.
+
+    Args:
+        curves (Sequence[tuple[str, Sequence[float]]]): (label, values per iteration) pairs.
+        path (str, optional): file the figure is saved to. Defaults to None, not saved.
+        ylabel (str): label of the y axis. Defaults to "relative RMSE".
+        xlabel (str): label of the x axis. Defaults to "outer iteration (0 = FDK)".
+        logy (bool): logarithmic y axis. Defaults to True.
+        title (str, optional): axes title. Defaults to None.
+
+    Returns:
+        matplotlib.figure.Figure: the figure.
+    """
     plt = _pyplot()
     fig, ax = plt.subplots(figsize=(5.5, 3.4))
     styles = ["-", "--", "-.", ":"]

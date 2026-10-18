@@ -1,26 +1,8 @@
 """Linear-discontinuous Galerkin cell equations on a cuboid and their closed-form solve.
 
-Derivation: docs/source/method.rst, "Linear-discontinuous cells" (verified against a dense Galerkin assembly to
-float64 rounding, tests/test_linear_discontinuous_cell.py).
-
-For one direction with signs s_a = sign(Omega_a) and c_a = |Omega_a| / Delta_a, a in {x, y, z},
-the four linear-discontinuous unknowns (psi_0, psi_x, psi_y, psi_z) of a cell satisfy
-
-    (E0)  (sum_a c_a + mu) psi_0 + sum_a s_a c_a psi_a        = R_0
-    (Ea)  -3 s_a c_a psi_0 + d_a psi_a                           = R_a,   d_a = 3 c_a + sum_{b != a} c_b + mu
-
-with
-    R_0 = S_0 + sum_a c_a psibar_in_a
-    R_a = S_a - 3 s_a c_a psibar_in_a + sum_{b != a} c_b psi_a[N_b]
-
-where psibar_in_a = psi_0[N_a] + s_a psi_a[N_a] is the face-averaged incoming fluence on the a-face
-(N_a = upstream neighbor along a, zero for vacuum) and psi_a[N_b] is the a-moment of the upstream
-neighbor along b (transverse coupling). Solution:
-
-    psi_0 = (R_0 - sum_a s_a c_a R_a / d_a) / (sum_a c_a + mu + 3 sum_a c_a^2 / d_a)
-    psi_a = (R_a + 3 s_a c_a psi_0) / d_a
-
-Axis order everywhere: a = 0 -> x (cols), 1 -> y (rows), 2 -> z (slices).
+The module forms the right-hand sides of the four-moment cell system of one direction from the source and the upstream
+neighbor moments, solves the system in closed form and builds its dense 4 x 4 matrix for tests. The equations are
+derived in docs/source/method.rst, "Linear-discontinuous cells"; axis a = 0, 1, 2 is x (cols), y (rows), z (slices).
 """
 
 from __future__ import annotations
@@ -36,17 +18,20 @@ def cell_right_hand_sides(
     neighbor_psi0: Tensor,
     neighbor_psia: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    """Right-hand sides R_0, R_a from the source moments and upstream neighbor moments.
+    """Right-hand sides R_0 and R_a of the cell system from the source moments and the upstream neighbor moments.
 
-    c, s:          [D, 3]            direction coefficients |Omega_a|/Delta_a and signs (+-1), or
-                   [D, ..., 3, N]    (any c.dim() != 2) already shaped to broadcast against neighbor_psi0, e.g.
-                                     [D, 1, 3, N] when c and s vary per cell (sweeps of several octants)
-    source:        [D, ..., 4, N]    linear-discontinuous moments of the source for each direction (axis order
-                                     0, x, y, z)
-    neighbor_psi0: [D, ..., 3, N]    psi_0 of the upstream neighbor along a (index a), zero for vacuum
-    neighbor_psia: [D, ..., 3, 3, N] psi_b of the upstream neighbor along a: index [a, b]
-    D directions, N cells. Returns (R_0 [D, ..., N], R_a [D, ..., 3, N]).
-    The "..." dims (e.g. groups) are shared; c and s broadcast over them.
+    The "..." dimensions (such as groups) are shared; c and s broadcast over them.
+
+    Args:
+        c (Tensor): [D, 3] direction coefficients ``|Omega_a| / Delta_a`` in 1/cm, or (when not 2-D) already shaped
+            [D, ..., 3, N] to broadcast, e.g. [D, 1, 3, N] when they vary per cell.
+        s (Tensor): signs (+1 or -1) of the direction components, shaped like ``c``.
+        source (Tensor): [D, ..., 4, N] linear-discontinuous source moments (0, x, y, z) of D directions in N cells.
+        neighbor_psi0 (Tensor): [D, ..., 3, N] psi_0 of the upstream neighbor along each axis a, zero for vacuum.
+        neighbor_psia (Tensor): [D, ..., 3, 3, N] moment b of the upstream neighbor along axis a at index [a, b].
+
+    Returns:
+        (Tensor, Tensor): R_0 [D, ..., N] and R_a [D, ..., 3, N].
     """
     if c.dim() == 2:
         num_dims = source.dim() - 2  # number of leading dims before (4, N): D plus "..."
@@ -72,12 +57,18 @@ def cell_right_hand_sides(
 
 
 def cell_solve(c: Tensor, s: Tensor, mu: Tensor, r0: Tensor, ra: Tensor) -> tuple[Tensor, Tensor]:
-    """Closed-form solve of the linear-discontinuous cell system.
+    """Closed-form solve of the linear-discontinuous cell system for the moments psi_0 and psi_a.
 
-    c, s: [D, 3], or (c.dim() != 2) already shaped [D, ..., 3, N] broadcastable against ra (see
-    cell_right_hand_sides);
-    mu: [..., N] broadcastable to r0; r0: [D, ..., N]; ra: [D, ..., 3, N].
-    Returns (psi_0 [D, ..., N], psi_a [D, ..., 3, N]).
+    Args:
+        c (Tensor): [D, 3] direction coefficients in 1/cm, or already shaped [D, ..., 3, N] as in
+            ``cell_right_hand_sides``.
+        s (Tensor): signs (+1 or -1) of the direction components, shaped like ``c``.
+        mu (Tensor): [..., N] or [..., 1, N] total attenuation mu in 1/cm, broadcastable to ``r0``.
+        r0 (Tensor): [D, ..., N] right-hand side R_0.
+        ra (Tensor): [D, ..., 3, N] right-hand sides R_a.
+
+    Returns:
+        (Tensor, Tensor): psi_0 [D, ..., N] and psi_a [D, ..., 3, N].
     """
     num_dims = r0.dim()
     if c.dim() == 2:
@@ -97,7 +88,16 @@ def cell_solve(c: Tensor, s: Tensor, mu: Tensor, r0: Tensor, ra: Tensor) -> tupl
 
 
 def cell_matrix(c: Tensor, s: Tensor, mu: float) -> Tensor:
-    """Dense 4x4 linear-discontinuous cell matrix for one direction (reference / testing). c, s: [3]."""
+    """Dense 4 x 4 linear-discontinuous cell matrix of one direction, for reference and tests.
+
+    Args:
+        c (Tensor): [3] direction coefficients in 1/cm.
+        s (Tensor): [3] signs (+1 or -1) of the direction components.
+        mu (float): total attenuation in 1/cm.
+
+    Returns:
+        Tensor: [4, 4] matrix in the moment order (0, x, y, z).
+    """
     A = torch.zeros(4, 4, dtype=c.dtype, device=c.device)
     A[0, 0] = c.sum() + mu
     for a in range(3):

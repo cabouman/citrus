@@ -1,50 +1,10 @@
-"""Angular quadratures, spherical harmonics and the scattering-source operator.
+"""Angular quadratures, real spherical harmonics and the scattering-source operator.
 
-Contents
---------
-* Direction sets (`Quadrature`): the Gauss-Legendre x equal-azimuth product set of the sweep and the cone product
-  sets of the collapsed-cone scatter image (`hemisphere_quadrature`).
-* Legendre polynomials and real orthonormal spherical harmonics (`legendre_polynomials`,
-  `real_spherical_harmonics`, `spherical_harmonic_degree_index`).
-* Moment <-> ordinate transforms (`SphericalHarmonicBasis`, `moments_from_ordinates`, `ordinates_from_moments`).
-* The scattering-source operator (`scatter_source_moments`, `scatter_source_at_directions`):
-
-      S_g(Omega) = sum_{g'} sum_n mu_s,l(n)^{g' -> g} phi_n,g' Y_n(Omega)
-
-Conventions (docs/source/conventions.rst, "Scattering convention", and docs/source/design_notes.rst)
-----------------------------------------------------------------------------------------------------
-Real orthonormal spherical harmonics, polar axis +z, polar angle theta from +z, azimuth phi from +x
-toward +y, NO Condon-Shortley phase:
-
-    Y_l0      = N_l0 P_l(cos theta)
-    Y_l,+k    = sqrt(2) N_lk P_l^k(cos theta) cos(k phi)      (k = 1..l)
-    Y_l,-k    = sqrt(2) N_lk P_l^k(cos theta) sin(k phi)      (k = 1..l)
-    N_lk      = sqrt((2l+1)/(4 pi) (l-k)!/(l+k)!)
-
-with P_l^k the associated Legendre function WITHOUT the (-1)^k Condon-Shortley factor
-(so P_1^1 = +sin theta and Y_1,+1 = sqrt(3/(4 pi)) x, Y_1,-1 = sqrt(3/(4 pi)) y, Y_1,0 = sqrt(3/(4 pi)) z).
-Flat index n = l*l + (k + l), n = 0..(L+1)^2 - 1. Orthonormal: int_{S^2} Y_n Y_n' dOmega = delta_nn'.
-
-Relation to the complex harmonics of scipy (which include the Condon-Shortley phase):
-Y_l,+k = sqrt(2) (-1)^k Re Y_l^k,  Y_l,-k = sqrt(2) (-1)^k Im Y_l^k  (k > 0),  Y_l0 = Y_l^0.
-
-Scattering-source normalization (derivation; confirmed numerically in tests/test_angular.py)
------------------------------------------------------------------------------------------
-Convention: mu_s(Omega' -> Omega) = sum_l (2l+1)/(4 pi) mu_s_l P_l(Omega . Omega').
-Addition theorem for orthonormal real spherical harmonics: P_l(Omega . Omega') = 4 pi/(2l+1) sum_k Y_lk(Omega)
-Y_lk(Omega'). Hence
-
-    S(Omega) = int mu_s(Omega' -> Omega) psi(Omega') dOmega'
-             = sum_l (2l+1)/(4 pi) mu_s_l * 4 pi/(2l+1) sum_k Y_lk(Omega) int Y_lk(Omega') psi(Omega') dOmega'
-             = sum_n mu_s_l(n) phi_n Y_n(Omega),          phi_n = int Y_n psi dOmega ~ sum_m w_m Y_n(Omega_m) psi_m
-
-i.e. the (2l+1)/(4 pi) factor of the Legendre expansion cancels exactly against the addition theorem,
-and NO extra factor appears in the moment-space operator. Summing over source groups g' gives the operator above.
-
-Octant code
------------
-octant = (omega_x < 0) * 4 + (omega_y < 0) * 2 + (omega_z < 0), an int64 in 0..7. A zero component
-counts as non-negative. Octant 0 is (+,+,+), octant 7 is (-,-,-).
+The module holds the direction sets of the transport sweep (Gauss-Legendre times equal-azimuth product sets) and of the
+collapsed-cone scatter image (cone product sets), the Legendre polynomials and real orthonormal spherical harmonics,
+and the transforms between angular ordinates and spherical-harmonic moments. The scattering-source operator computes
+``S_g(Omega) = sum_g' sum_n mu_s_l(n) phi_n,g' Y_n(Omega)``. The conventions are listed in docs/source/conventions.rst,
+"Scattering convention".
 """
 
 from __future__ import annotations
@@ -83,9 +43,15 @@ _DeviceLike = Union[torch.device, str, None]
 # =====================================================================================================
 
 def octant_of(omega: Tensor) -> Tensor:
-    """Octant code of directions omega [..., 3] -> int64 [...].
+    """Octant code of each direction, ``(omega_x < 0) * 4 + (omega_y < 0) * 2 + (omega_z < 0)``.
 
-    octant = (omega_x < 0) * 4 + (omega_y < 0) * 2 + (omega_z < 0); zero components count as >= 0.
+    A zero component counts as non-negative.
+
+    Args:
+        omega (Tensor): [..., 3] directions.
+
+    Returns:
+        Tensor: [...] int64 octant codes in 0..7.
     """
     neg = (omega < 0).to(torch.int64)
     return neg[..., 0] * 4 + neg[..., 1] * 2 + neg[..., 2]
@@ -93,20 +59,16 @@ def octant_of(omega: Tensor) -> Tensor:
 
 @dataclass(frozen=True, eq=False)
 class Quadrature:
-    """A discrete direction set.
+    """A discrete set of directions with quadrature weights.
 
-    Attributes
-    ----------
-    omega  : [M, 3] unit directions in the recon frame.
-    weight : [M] quadrature weights in steradians (sum to 4 pi for a full-sphere set, to the cone
-             solid angle for a cone set).
-    octant : [M] int64 in 0..7, (omega_x<0)*4 + (omega_y<0)*2 + (omega_z<0) (see `octant_of`).
-    cell_width : optional [M, 2] (collapsed-cone sets built with tangent axes, e.g. by
-             scatter_image.panel_direction_set):
-             effective widths of the solid-angle cell each direction stands for, in the gnomonic coordinates
-             (alpha, beta) = (d.u / d.a, d.v / d.a) about the cone axis a along the two tangent axes u, v; width =
-             sqrt(12) x the solid-angle-weighted standard deviation of alpha (beta) over the cell (= the exact side
-             length for a gnomonic rectangle cell). Used by the finite-cone footprint of the scatter image.
+    Attributes:
+        omega (Tensor): [M, 3] unit directions in the reconstruction frame.
+        weight (Tensor): [M] quadrature weights in sr; they sum to 4 pi for a full-sphere set and to the cone solid
+            angle for a cone set.
+        octant (Tensor): [M] int64 octant codes in 0..7, see
+            :func:`~citrus.scatter_solver.angular_quadrature.octant_of`.
+        cell_width (Tensor, optional): [M, 2] gnomonic widths of the solid-angle cell of each direction along the two
+            tangent axes of a cone set, used by the finite-cone footprint of the scatter image. Defaults to None.
     """
 
     omega: Tensor
@@ -116,7 +78,15 @@ class Quadrature:
 
     @staticmethod
     def from_directions(omega: Tensor, weight: Tensor) -> "Quadrature":
-        """Build from omega [M, 3] and weight [M]; computes the octant codes."""
+        """Build a quadrature from directions and weights and compute the octant codes.
+
+        Args:
+            omega (Tensor): [M, 3] unit directions.
+            weight (Tensor): [M] quadrature weights in sr.
+
+        Returns:
+            Quadrature: the direction set, without ``cell_width``.
+        """
         if omega.dim() != 2 or omega.shape[1] != 3:
             raise ValueError(f"omega must be [M, 3], got {tuple(omega.shape)}")
         if weight.shape != omega.shape[:1]:
@@ -125,43 +95,67 @@ class Quadrature:
 
     @property
     def num_directions(self) -> int:
+        """Number of directions M."""
         return int(self.omega.shape[0])
 
     @property
     def device(self) -> torch.device:
+        """Device of the direction tensors."""
         return self.omega.device
 
     @property
     def dtype(self) -> torch.dtype:
+        """Floating dtype of the direction tensors."""
         return self.omega.dtype
 
     def octant_counts(self) -> Tensor:
-        """Number of directions per octant, int64 [8] on the quadrature's device."""
+        """Count the directions in each octant.
+
+        Returns:
+            Tensor: [8] int64 number of directions per octant, on the device of the quadrature.
+        """
         return torch.bincount(self.octant, minlength=8)
 
     def by_octant(self) -> tuple[Tensor, Tensor]:
-        """Permutation grouping the directions by octant.
+        """Permutation that groups the directions by octant, keeping the original order within an octant.
 
-        Returns (perm [M] int64, counts [8] int64): `omega[perm]` lists octant 0 first, then 1, ...,
-        and within an octant the original order is kept (stable). `counts[o]` is the number of
-        directions in octant o, so octant o occupies perm[sum(counts[:o]) : sum(counts[:o+1])].
+        Returns:
+            (perm, counts): perm is the [M] int64 permutation with ``omega[perm]`` listing octant 0 first, counts is
+            the [8] int64 number of directions per octant; octant o is ``perm[sum(counts[:o]):sum(counts[:o+1])]``.
         """
         perm = torch.sort(self.octant, stable=True).indices
         return perm, self.octant_counts()
 
     @property
     def directions_per_octant(self) -> Optional[int]:
-        """Common per-octant count if every octant holds the same number of directions, else None."""
+        """Number of directions per octant if every octant holds the same number, else None."""
         counts = self.octant_counts().tolist()
         return int(counts[0]) if all(c == counts[0] for c in counts) else None
 
     def reordered(self, perm: Tensor) -> "Quadrature":
-        """The same set with directions permuted by perm [M]."""
+        """Return the same direction set with the directions permuted.
+
+        Args:
+            perm (Tensor): [M] int64 permutation of the directions.
+
+        Returns:
+            Quadrature: the permuted set (``cell_width`` permuted too).
+        """
         cell_width = None if self.cell_width is None else self.cell_width[perm.to(self.cell_width.device)]
         return Quadrature(omega=self.omega[perm], weight=self.weight[perm], octant=self.octant[perm],
                           cell_width=cell_width)
 
     def to(self, device: _DeviceLike = None, dtype: Optional[torch.dtype] = None) -> "Quadrature":
+        """Return a copy on another device and/or with another floating dtype.
+
+        Args:
+            device (torch.device | str, optional): target device. Defaults to None (unchanged).
+            dtype (torch.dtype, optional): target dtype of ``omega``, ``weight`` and ``cell_width``. Defaults to None
+                (unchanged).
+
+        Returns:
+            Quadrature: the converted copy; the octant codes stay int64.
+        """
         keywords = {}
         if device is not None:
             keywords["device"] = device
@@ -174,7 +168,14 @@ class Quadrature:
 
 
 def _gauss_legendre(n: int) -> tuple[np.ndarray, np.ndarray]:
-    """Gauss-Legendre nodes (ascending) and weights on [-1, 1], float64 numpy."""
+    """Gauss-Legendre nodes and weights on [-1, 1].
+
+    Args:
+        n (int): number of points, at least 1.
+
+    Returns:
+        (nodes, weights): [n] float64 numpy nodes in ascending order and [n] float64 numpy weights.
+    """
     if n < 1:
         raise ValueError("number of Gauss-Legendre points must be >= 1")
     x, w = np.polynomial.legendre.leggauss(n)
@@ -187,15 +188,19 @@ def product_quadrature(
     device: _DeviceLike = None,
     dtype: torch.dtype = torch.float64,
 ) -> Quadrature:
-    """Gauss-Legendre (in mu = cos theta, polar from +z) x equal-azimuth product set on the sphere.
+    """Gauss-Legendre in ``mu = cos(theta)`` times equal-azimuth product set on the full sphere.
 
-    mu_i: the num_polar Gauss-Legendre nodes on [-1, 1]; phi_j = (j + 1/2) 2 pi / num_azimuthal;
-    weight_ij = w_GL_i * 2 pi / num_azimuthal (sum = 4 pi). Flat index m = i * num_azimuthal + j.
-    Exact for spherical harmonics products Y_n Y_n' up to degree L when num_polar >= L+1 and
-    num_azimuthal >= 2L+1. With even num_polar and num_azimuthal divisible by 4, no direction lies
-    on a coordinate plane and every octant holds num_polar*num_azimuthal/8 directions (asserted).
+    The azimuths are ``phi_j = (j + 1/2) 2 pi / num_azimuthal`` and the weights ``w_i 2 pi / num_azimuthal`` sum to
+    4 pi; with even ``num_polar`` and ``num_azimuthal`` divisible by 4 every octant holds the same number of directions.
 
-    Returns a Quadrature with omega [M, 3], weight [M], M = num_polar * num_azimuthal.
+    Args:
+        num_polar (int): number of Gauss-Legendre nodes in ``cos(theta)``, theta measured from +z.
+        num_azimuthal (int): number of equally spaced azimuths, phi measured from +x toward +y.
+        device (torch.device | str, optional): device of the tensors. Defaults to None (CPU).
+        dtype (torch.dtype, optional): floating dtype. Defaults to torch.float64.
+
+    Returns:
+        Quadrature: ``M = num_polar * num_azimuthal`` directions with flat index ``m = i * num_azimuthal + j``.
     """
     if num_azimuthal < 1:
         raise ValueError("num_azimuthal must be >= 1")
@@ -221,6 +226,14 @@ def product_quadrature(
 # ---- cone sets of the collapsed-cone scatter image ------------------------------------------------
 
 def _unit_vector(v: Union[Tensor, Sequence[float]]) -> Tensor:
+    """Normalize a 3-vector to unit length.
+
+    Args:
+        v (Tensor | Sequence[float]): [3] non-zero vector.
+
+    Returns:
+        Tensor: [3] float64 unit vector on the CPU.
+    """
     t = torch.as_tensor(v, dtype=torch.float64).detach().to("cpu").reshape(-1)
     if t.numel() != 3:
         raise ValueError("axis must have 3 components")
@@ -231,10 +244,16 @@ def _unit_vector(v: Union[Tensor, Sequence[float]]) -> Tensor:
 
 
 def _local_frame(axis: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    """Deterministic right-handed orthonormal frame (e1, e2, a) about the unit vector axis [3] (float64).
+    """Deterministic right-handed orthonormal frame (e1, e2, a) about a unit axis.
 
-    The helper vector is the coordinate axis least aligned with `axis` (lowest index on ties);
-    e1 = normalize(helper - (helper . a) a), e2 = a x e1.
+    The helper vector is the coordinate axis least aligned with ``axis`` (lowest index on ties), with
+    ``e1 = normalize(helper - (helper . a) a)`` and ``e2 = a x e1``.
+
+    Args:
+        axis (Tensor): [3] float64 unit vector a.
+
+    Returns:
+        (e1, e2, a): three [3] float64 unit vectors.
     """
     a = axis
     least_aligned = int(torch.argmin(a.abs()))
@@ -249,7 +268,17 @@ def _local_frame(axis: Tensor) -> tuple[Tensor, Tensor, Tensor]:
 def _cone_product(
     axis: Tensor, num_polar: int, num_azimuthal: int, max_polar_angle: float
 ) -> tuple[Tensor, Tensor]:
-    """float64 CPU cone product set. Returns (omega [M,3], weight [M])."""
+    """Cone product set about an axis: Gauss-Legendre in ``cos(theta)`` times equal azimuths.
+
+    Args:
+        axis (Tensor): [3] float64 unit cone axis on the CPU.
+        num_polar (int): number of polar nodes, ordered from the axis outward.
+        num_azimuthal (int): number of equally spaced azimuths in the frame of ``_local_frame``.
+        max_polar_angle (float): cone half-angle in radians, in (0, pi].
+
+    Returns:
+        (omega, weight): [M, 3] unit directions and [M] weights in sr, float64 on the CPU.
+    """
     if not (0.0 < max_polar_angle <= math.pi):
         raise ValueError("max_polar_angle must be in (0, pi]")
     if num_azimuthal < 1:
@@ -286,21 +315,28 @@ def hemisphere_quadrature(
     tangent_axes: Optional[tuple] = None,
     subsamples: int = 16,
 ) -> Quadrature:
-    """Product set on the cone of half-angle max_polar_angle about `axis` (collapsed-cone direction set).
+    """Product set on the cone of half-angle ``max_polar_angle`` about ``axis``, the direction set of the scatter image.
 
-    Polar angle theta is measured from `axis`: Gauss-Legendre in cos(theta) on [cos(max_polar_angle), 1]
-    times num_azimuthal equally spaced azimuths phi_j = (j + 1/2) 2 pi / num_azimuthal about `axis` in the
-    deterministic local frame of `_local_frame`. Weights sum to the cone solid angle
-    2 pi (1 - cos(max_polar_angle)) (2 pi for the default hemisphere). Flat index m = i * num_azimuthal + j
-    with i = 0 the polar node closest to `axis`.
+    Gauss-Legendre nodes in ``cos(theta)`` on [cos(max_polar_angle), 1], theta measured from ``axis``, times equal
+    azimuths ``phi_j = (j + 1/2) 2 pi / num_azimuthal`` in the frame of ``_local_frame``; the weights sum to the cone
+    solid angle ``2 pi (1 - cos(max_polar_angle))``.
 
-    For the panel of `ConeGeometry`, the directions reaching the panel are about axis = -n_hat
-    (n_hat from `panel_axes` points toward the source).
+    Args:
+        axis (Tensor | Sequence[float]): [3] cone axis, need not be normalized (for the panel, ``-n_hat`` of
+            ``panel_axes``).
+        num_polar (int): number of polar nodes.
+        num_azimuthal (int): number of azimuths.
+        max_polar_angle (float, optional): cone half-angle in radians, in (0, pi]. Defaults to pi / 2 (hemisphere).
+        device (torch.device | str, optional): device of the tensors. Defaults to None (the device of ``axis`` if it
+            is a tensor, else the CPU).
+        dtype (torch.dtype, optional): floating dtype. Defaults to torch.float64.
+        tangent_axes (tuple, optional): (u_axis, v_axis), two [3] tangent axes; when given, ``cell_width`` is filled.
+            Defaults to None.
+        subsamples (int, optional): samples per cell side for the cell widths. Defaults to 16.
 
-    axis: [3] (tensor or sequence, need not be normalized). Returns omega [M, 3], weight [M].
-    tangent_axes: optional (u_axis, v_axis); when given, `cell_width` [M, 2] is filled (the cell of node (i, j) is
-      [c_{i+1/2}, c_{i-1/2}] x [phi_j -+ dphi/2] in (cos theta, phi), cos edges at the cumulative Gauss weights, its
-      widths measured on a subsamples^2 equal-area lattice; `_cone_cell_widths`).
+    Returns:
+        Quadrature: ``M = num_polar * num_azimuthal`` directions with flat index ``m = i * num_azimuthal + j``, i = 0
+        the polar node closest to ``axis``.
     """
     if device is None and isinstance(axis, Tensor):
         device = axis.device
@@ -316,7 +352,16 @@ def hemisphere_quadrature(
 
 
 def _tangent_frame(a: Tensor, u_axis, v_axis) -> tuple[Tensor, Tensor]:
-    """u, v: u_axis and v_axis Gram-Schmidt orthonormalized against the unit axis a (float64 CPU)."""
+    """Gram-Schmidt orthonormalize two tangent axes against a unit axis.
+
+    Args:
+        a (Tensor): [3] float64 unit axis.
+        u_axis (Tensor | Sequence[float]): [3] first tangent axis.
+        v_axis (Tensor | Sequence[float]): [3] second tangent axis.
+
+    Returns:
+        (u, v): two [3] float64 unit vectors orthogonal to a and to each other.
+    """
     u = _unit_vector(u_axis)
     u = u - (u @ a) * a
     u = u / torch.linalg.norm(u)
@@ -327,11 +372,24 @@ def _tangent_frame(a: Tensor, u_axis, v_axis) -> tuple[Tensor, Tensor]:
 
 def _cone_cell_widths(a: Tensor, u: Tensor, v: Tensor, num_polar: int, num_azimuthal: int, max_polar_angle: float,
                       subsamples: int) -> Tensor:
-    """Cell widths of the cone product set (`_cone_product` order): node (i, j) owns [c_{i+1/2}, c_{i-1/2}] x
-    [j dphi, (j+1) dphi] in (cos theta, phi) about a (frame `_local_frame`), cos edges at the cumulative Gauss weights,
-    so the cell's solid angle is its weight. Sampled on a subsamples x subsamples midpoint lattice in (cos theta, phi)
-    (equal area). Returns float64 width [M, 2] = sqrt(12) x std of the gnomonic coordinates (alpha, beta) =
-    (d.u / d.a, d.v / d.a) over the cell."""
+    """Gnomonic widths of the solid-angle cell of every direction of a cone product set.
+
+    Node (i, j) owns the cell between the cumulative-Gauss-weight edges in ``cos(theta)`` and the azimuths
+    ``[j dphi, (j+1) dphi]``, so its solid angle is its weight; the width is ``sqrt(12)`` times the standard deviation
+    of the gnomonic coordinates ``(d.u / d.a, d.v / d.a)`` over an equal-area lattice in the cell.
+
+    Args:
+        a (Tensor): [3] float64 unit cone axis.
+        u (Tensor): [3] float64 first tangent axis.
+        v (Tensor): [3] float64 second tangent axis.
+        num_polar (int): number of polar nodes.
+        num_azimuthal (int): number of azimuths.
+        max_polar_angle (float): cone half-angle in radians.
+        subsamples (int): samples per cell side in ``(cos(theta), phi)``.
+
+    Returns:
+        Tensor: [M, 2] float64 widths along u and v, in the order of ``_cone_product``.
+    """
     float64 = torch.float64
     num_subsamples = int(subsamples)
     fractions = (torch.arange(num_subsamples, dtype=float64) + 0.5) / num_subsamples
@@ -368,9 +426,14 @@ def _cone_cell_widths(a: Tensor, u: Tensor, v: Tensor, num_polar: int, num_azimu
 # =====================================================================================================
 
 def legendre_polynomials(L: int, x: Tensor) -> Tensor:
-    """Legendre polynomials P_0..P_L at x [...] -> [..., L+1] (same device/dtype as x).
+    """Legendre polynomials P_0 to P_L by the recurrence ``(l+1) P_{l+1} = (2l+1) x P_l - l P_{l-1}``.
 
-    Three-term recurrence (l+1) P_{l+1} = (2l+1) x P_l - l P_{l-1}.
+    Args:
+        L (int): maximum degree, at least 0.
+        x (Tensor): [...] arguments in [-1, 1].
+
+    Returns:
+        Tensor: [..., L+1] values, on the device and dtype of x.
     """
     if L < 0:
         raise ValueError("L must be >= 0")
@@ -383,29 +446,42 @@ def legendre_polynomials(L: int, x: Tensor) -> Tensor:
 
 
 def num_spherical_harmonics(L: int) -> int:
-    """Number of real spherical harmonics up to degree L: (L+1)^2."""
+    """Number of real spherical harmonics up to degree L.
+
+    Args:
+        L (int): maximum degree.
+
+    Returns:
+        int: ``(L+1)^2``.
+    """
     return (L + 1) * (L + 1)
 
 
 def spherical_harmonic_degree_index(L: int, device: _DeviceLike = None) -> Tensor:
-    """Degree l of each flat spherical-harmonic index n = l*l + (k+l): int64 [(L+1)^2]."""
+    """Degree l of every flat spherical-harmonic index ``n = l*l + (k + l)``.
+
+    Args:
+        L (int): maximum degree.
+        device (torch.device | str, optional): device of the result. Defaults to None (CPU).
+
+    Returns:
+        Tensor: [(L+1)^2] int64 degrees.
+    """
     return torch.cat([torch.full((2 * l + 1,), l, dtype=torch.int64) for l in range(L + 1)]).to(device)
 
 
 def real_spherical_harmonics(L: int, omega: Tensor) -> Tensor:
-    """Real orthonormal spherical harmonics Y [M, (L+1)^2] at unit directions omega [M, 3] (any leading dims).
+    """Real orthonormal spherical harmonics at unit directions, polar axis +z, no Condon-Shortley phase.
 
-    Convention in the module docstring (polar axis +z, no Condon-Shortley phase, flat index
-    n = l*l + (k + l)). Evaluated without trigonometric functions or division by sin(theta):
+    They are evaluated without trigonometric functions by stable normalized recurrences in z and ``(x + i y)^k``; the
+    flat index is ``n = l*l + (k + l)``.
 
-        Y_l,+k = sqrt(2) Q_lk(z) Re((x + i y)^k),   Y_l,-k = sqrt(2) Q_lk(z) Im((x + i y)^k),   Y_l0 = Q_l0(z)
+    Args:
+        L (int): maximum degree, at least 0.
+        omega (Tensor): [..., 3] unit directions (not renormalized).
 
-    where Q_lk = N_lk P_l^k / sin^k(theta) is a polynomial in z computed with the stable normalized
-    recurrences
-        Q_00 = 1/sqrt(4 pi),  Q_kk = sqrt((2k+1)/(2k)) Q_{k-1,k-1},  Q_{k+1,k} = sqrt(2k+3) z Q_kk,
-        Q_lk = a_lk (z Q_{l-1,k} - b_lk Q_{l-2,k}),
-        a_lk = sqrt((4l^2 - 1)/(l^2 - k^2)),  b_lk = sqrt(((l-1)^2 - k^2)/(4(l-1)^2 - 1)).
-    omega is assumed unit-norm (not renormalized). Same device/dtype as omega.
+    Returns:
+        Tensor: [..., (L+1)^2] values ``Y_n(omega)``, on the device and dtype of omega.
     """
     if L < 0:
         raise ValueError("L must be >= 0")
@@ -449,12 +525,13 @@ def real_spherical_harmonics(L: int, omega: Tensor) -> Tensor:
 
 @dataclass(frozen=True, eq=False)
 class SphericalHarmonicBasis:
-    """Real spherical-harmonic tables on a quadrature.
+    """Real spherical-harmonic tables on the directions of a quadrature.
 
-    L                : max degree; N = (L+1)^2 moments, M directions.
-    Y                : [M, N]  Y_n(Omega_m).
-    Y_weighted       : [M, N]  w_m Y_n(Omega_m) (w_m the quadrature weights).
-    degree_of_moment : [N] int64 degree l of each flat index n.
+    Attributes:
+        L (int): maximum degree; there are ``N = (L+1)^2`` moments.
+        Y (Tensor): [M, N] values ``Y_n(Omega_m)``.
+        Y_weighted (Tensor): [M, N] values ``w_m Y_n(Omega_m)`` with the quadrature weights ``w_m`` in sr.
+        degree_of_moment (Tensor): [N] int64 degree l of each flat index n.
     """
 
     L: int
@@ -464,27 +541,53 @@ class SphericalHarmonicBasis:
 
     @property
     def num_moments(self) -> int:
+        """Number of spherical-harmonic moments N."""
         return int(self.Y.shape[1])
 
     @property
     def num_directions(self) -> int:
+        """Number of directions M."""
         return int(self.Y.shape[0])
 
 
 def spherical_harmonic_basis(L: int, quadrature: Quadrature) -> SphericalHarmonicBasis:
-    """Build the spherical-harmonic tables for degree L on `quadrature` (device/dtype of quadrature)."""
+    """Build the spherical-harmonic tables of degree L on the directions of a quadrature.
+
+    Args:
+        L (int): maximum degree.
+        quadrature (Quadrature): direction set.
+
+    Returns:
+        SphericalHarmonicBasis: the tables, on the device and dtype of the quadrature.
+    """
     Y = real_spherical_harmonics(L, quadrature.omega)
     return SphericalHarmonicBasis(L=L, Y=Y, Y_weighted=quadrature.weight[:, None] * Y,
                                   degree_of_moment=spherical_harmonic_degree_index(L, quadrature.omega.device))
 
 
 def moments_from_ordinates(psi: Tensor, basis: SphericalHarmonicBasis) -> Tensor:
-    """phi_n = sum_m w_m Y_n(Omega_m) psi_m.  psi [..., M] -> phi [..., N]."""
+    """Spherical-harmonic moments of angular ordinates, ``phi_n = sum_m w_m Y_n(Omega_m) psi_m``.
+
+    Args:
+        psi (Tensor): [..., M] values at the quadrature directions.
+        basis (SphericalHarmonicBasis): tables of the quadrature.
+
+    Returns:
+        Tensor: [..., N] moments phi.
+    """
     return psi @ basis.Y_weighted
 
 
 def ordinates_from_moments(phi: Tensor, basis: SphericalHarmonicBasis) -> Tensor:
-    """psi(Omega_m) = sum_n phi_n Y_n(Omega_m).  phi [..., N] -> psi [..., M]."""
+    """Angular ordinates from spherical-harmonic moments, ``psi_m = sum_n phi_n Y_n(Omega_m)``.
+
+    Args:
+        phi (Tensor): [..., N] moments.
+        basis (SphericalHarmonicBasis): tables of the quadrature.
+
+    Returns:
+        Tensor: [..., M] values psi at the quadrature directions.
+    """
     return phi @ basis.Y.T
 
 
@@ -493,27 +596,22 @@ def ordinates_from_moments(phi: Tensor, basis: SphericalHarmonicBasis) -> Tensor
 # =====================================================================================================
 
 def scatter_source_moments(mu_s_l_volume: Tensor, phi: Tensor, *, moment_major: bool = False) -> Tensor:
-    """Spherical-harmonic moments of the scattering source: T[g, n] = sum_{g_in} mu_s_l_volume[g_in, g, l(n)] *
-    phi[g_in, n].
+    """Spherical-harmonic moments T of the scattering source from the flux moments and the Legendre transfer moments.
 
-    mu_s_l_volume : [G_in, G_out, L+1, *spatial]   Legendre transfer moments per voxel (1/cm), e.g. from
-                    `cross_sections.transfer_moments_volume`; convention mu_s(Omega'->Omega) = sum_l (2l+1)/(4pi)
-                    mu_s_l P_l.
-    phi           : [G_in, N, *rest]   spherical-harmonic flux moments, N = (L_phi+1)^2 with L_phi <= L; *rest is
-                    either *spatial or (4, *spatial) (linear-discontinuous moments; the transfer broadcasts over that
-                    axis). May be a non-contiguous view (e.g. phi[:, :, 0] of linear-discontinuous moments).
-    moment_major  : False (default): return a contiguous [G_out, N, *rest] tensor.
-                    True: allocate the result moment-major, [N, G_out, *rest], and return the [G_out, N, *rest]
-                    view `buffer.movedim(0, 1)` (non-contiguous; `T.movedim(1, 0)` is contiguous). This is the layout
-                    `source_iteration.scatter_source_function` contracts over without a copy.
-    Returns T     : [G_out, N, *rest], so that S(Omega) = sum_n T[:, n] Y_n(Omega) (no extra factor; see the
-                    module docstring for the derivation).
+    ``T[g, n] = sum_g' mu_s_l_volume[g', g, l(n)] phi[g', n]``, so that ``S_g(Omega) = sum_n T[g, n] Y_n(Omega)``; the
+    all-zero transfer blocks (upscatter) are skipped.
 
-    Implementation (memory-lean): the output buffer is allocated once and every non-zero transfer block
-    (g_in, g_out) is accumulated into it in place, `out[g_out] += mu_s_l_volume[g_in, g_out, l(n)] * phi[g_in]`,
-    so the only temporary is one [N, *spatial] gather of the transfer. Zero blocks (upscatter) are skipped
-    (one host sync to find them). Peak extra memory ~ N |spatial| values instead of the
-    [G_in, G_out, N, *spatial] gather plus an output-sized term of a broadcast implementation.
+    Args:
+        mu_s_l_volume (Tensor): ``[G_in, G_out, L+1, *spatial]`` Legendre transfer moments ``mu_s_l`` per voxel in
+            cm^-1.
+        phi (Tensor): ``[G_in, N, *rest]`` flux moments, ``N = (L_phi+1)^2`` with ``L_phi <= L``; rest is spatial or
+            ``(4, *spatial)`` (linear-discontinuous moments), and phi may be a non-contiguous view.
+        moment_major (bool, optional): allocate the result moment-major, ``[N, G_out, *rest]``, and return its
+            ``movedim(0, 1)`` view (the layout ``scatter_source_function`` contracts without a copy). Defaults to False.
+
+    Returns:
+        Tensor: ``[G_out, N, *rest]`` source moments T in cm^-1 times the unit of phi, contiguous unless
+        ``moment_major``.
     """
     G_in, G_out, num_legendre = mu_s_l_volume.shape[:3]
     spatial = tuple(mu_s_l_volume.shape[3:])
@@ -551,10 +649,15 @@ def scatter_source_moments(mu_s_l_volume: Tensor, phi: Tensor, *, moment_major: 
 
 
 def scatter_source_at_directions(T: Tensor, Y_selected: Tensor) -> Tensor:
-    """Scattering source at K directions: S[k, g, ...] = sum_n Y_selected[k, n] T[g, n, ...].
+    """Scattering source at K directions, ``S[k, g, ...] = sum_n Y_selected[k, n] T[g, n, ...]``.
 
-    T: [G, N, *rest] (from `scatter_source_moments`); Y_selected: [K, N] (rows of SphericalHarmonicBasis.Y).
-    Returns [K, G, *rest].
+    Args:
+        T (Tensor): ``[G, N, *rest]`` source moments from
+            :func:`~citrus.scatter_solver.angular_quadrature.scatter_source_moments`.
+        Y_selected (Tensor): [K, N] rows of ``SphericalHarmonicBasis.Y`` at the K directions.
+
+    Returns:
+        Tensor: ``[K, G, *rest]`` source per direction.
     """
     if T.shape[1] != Y_selected.shape[1]:
         raise ValueError(f"T has {T.shape[1]} moments, Y_selected has {Y_selected.shape[1]}")

@@ -1,59 +1,9 @@
-"""Fused Triton kernel for the first-collision source evaluation (`uncollided.first_collision_source_at_directions`).
+"""Fused Triton kernel of the first-collision source (``uncollided.first_collision_source_at_directions``).
 
-The PyTorch body of `first_collision_source_at_directions` materializes the interpolated per-voxel transfer table
-`T [G_in, G_out, k, V]` (and its two gathered end points `[M, G_in, G_out, k V]`) for every sub-chunk of
-directions before contracting it with phi_uncollided. This module computes the result directly:
-
-    S[k, g, v] = sum_{g' <= g} sum_m rho_m(v) lerp(table[m, g', g], eta_k(v)) phi_UC,g'(v)
-    eta_k(v)   = Omega_UC(v) . omega_k,   Omega_UC(v) = (r_v - r0) / |r_v - r0|
-
-Kernel `_first_collision_kernel`, per program (block of BLOCK flattened voxels, block of KB directions):
-  - pair mode (PAIR = True): loads the compact pair representation `cross_sections.MaterialPairs` of an M-material
-    volume once, densities [2, V] and material indices [2, V] int32 (at most two nonzero materials per point);
-    dense mode (PAIR = False): reads the densities of all MT materials [MT, V], slot m = material m (any MT >= 1, a
-    compile-time constant; used where points mix more than two materials, e.g. block means of a seven-material field
-    on the quadrature grid, and for libraries with M <= 2). It evaluates the voxel centers from the 1-D axis
-    coordinates of the grid (x[cols], y[rows], z[slices]) and Omega_UC with IEEE sqrt / division (no [V, 3] Omega_UC
-    tensor is formed);
-  - for each of its directions: eta and its fractional index in the table, the arithmetic of
-    `cross_sections.angular_table_position`: for a uniform table (MAPPED False; lo, hi = eta_grid[0], eta_grid[-1] =
-    -1, 1) pos = (clamp(eta, lo, hi) - lo) / (hi - lo) (N - 1); for an adaptive table (MAPPED True) the map lookup
-    q = sqrt(max((1 - eta) / 2, 0)), p = q (KM - 1), k0 = clamp(floor(p), 0, KM - 2), a = clamp(p - k0, 0, 1),
-    u = map[k0] + (map[k0 + 1] - map[k0]) a, pos = u (N - 1) (map: `MultigroupLibrary.eta_map`, KM = 512 float32
-    values that stay in L1); then i0 = clamp(floor(pos), 0, N-2), w = clamp(pos - i0, 0, 1); then for g' = 0..G-1
-    (unrolled) a
-    [GP, BLOCK] gather of the two table rows (all output groups at once) per material slot (two in pair mode; MT in
-    dense mode, an unrolled loop that re-reads the slot densities from cache), mixed with rho, times phi_UC,g'(v),
-    accumulated into acc [GP, BLOCK];
-  - writes acc to out[k, :G, v] (coalesced along v).
-The table is re-laid out once per (library tensor, device) as tab [N, G_in, M, GP] float32 (GP = next power of
-two >= G) with zeros where g_out < g_in (the no-upscatter mask) or g_out >= G (padding), so for a given voxel all
-entries it needs lie in two contiguous G M GP-float rows (one per eta node). The table (N G M GP floats) is small
-enough to stay L2 resident; neighboring voxels hit neighboring eta rows.
-In pair mode the material slot offset (index x GP) is per voxel; the gathers per (voxel, direction, g_in) are four,
-so the cost is close to that of a two-material basis for any M (only the larger table and the per-voxel offsets
-add). Dense mode gathers 2 MT rows per (voxel, direction, g_in) at the constant offsets m GP: about MT / 2 times the
-pair-mode cost per point.
-
-Memory: the kernel reads rho, phi_uncollided (and the tiny axis/direction/table inputs) and writes the [K, G, V] output;
-no temporaries. The `chunk` argument of the PyTorch path is irrelevant here (all K directions in one launch).
-
-Tile: BLOCK_V = 64 voxels x GP output groups with 8 warps (about 2 elements per thread), the best of the block sizes
-and warp counts tried; the kernel is bound by the table gathers, not by DRAM (docs/source/design_notes.rst).
-
-Numerics: float32 only (float64 and CPU tensors use the PyTorch path, which stays the reference). The result
-equals the PyTorch path up to float32 rounding of Omega_UC / eta and the summation order of the (identical) terms.
-Where a steep part of the table is hit (the real library's Rayleigh forward peak, eta -> 1), one float32 ulp of eta
-moves the interpolation point (by ~1e-4 cells of a uniform table; near eta = 1 an ulp of eta is a step of q =
-sqrt((1 - eta) / 2) of up to 2e-4, several cells of an adaptive table there), and BOTH float32 paths then deviate from a
-float64 evaluation (and from each other) by more than that rounding (tests/test_uncollided.py asserts 1e-5 between the
-paths on the synthetic tables and on the WLAB solver problems).
-
-Availability: `triton_utilities.triton_available()` (shared probe, kill switch `CITRUS_DISABLE_TRITON=1`) and a
-per-device self-check of the kernel against the PyTorch path on a tiny random problem (rho = 0 voxels, directions
-parallel / antiparallel to Omega_UC; dense mode with 2 materials and with 7 materials mixed in most voxels, pair
-mode; each with a uniform and with an adaptive table), cached per device; `backend="auto"` falls back to the PyTorch
-path on any failure.
+``_first_collision_kernel`` evaluates the first-collision source of every voxel and direction directly from the
+transfer table, without forming the interpolated table, in a pair mode (two materials per point, gathered by index) or
+a dense mode (all materials). ``prepared_table`` lays out the transfer table for the kernel, and ``kernel_usable``
+checks the kernel against the PyTorch path once per device.
 """
 
 from __future__ import annotations
@@ -85,14 +35,25 @@ tl = triton_utilities.tl
 # ================================================================================================
 
 def triton_available() -> tuple[bool, str]:
-    """(usable, reason): the shared Triton probe of `triton_utilities` (honours CITRUS_DISABLE_TRITON=1)."""
+    """Report whether Triton kernels can run on this machine (the shared probe of ``triton_utilities``).
+
+    Returns:
+        (bool, str): whether Triton is usable, and the reason.
+    """
     return triton_utilities.triton_available()
 
 
 def kernel_usable(device: torch.device) -> tuple[bool, str]:
-    """(usable, reason): triton_available() and the fused kernel reproduces the PyTorch path of
-    `uncollided.first_collision_source_at_directions` on `device` for a tiny random problem (cached per device, never
-    raises)."""
+    """Report whether Triton is available and the fused kernel reproduces the PyTorch path on ``device``.
+
+    The self-check runs once per device on a tiny random problem; the verdict is cached and the function never raises.
+
+    Args:
+        device (torch.device): the CUDA device to check.
+
+    Returns:
+        (bool, str): whether the kernel is usable, and the reason.
+    """
     ok, why = triton_available()
     if not ok:
         return ok, why
@@ -106,9 +67,19 @@ def kernel_usable(device: torch.device) -> tuple[bool, str]:
 
 
 def use_kernel(t: Tensor, backend: str) -> bool:
-    """Whether `first_collision_source_at_directions` should run the kernel for phi_uncollided-like tensor `t` under
-    `backend` ("auto" | "torch" | "triton"). float64 and non-CUDA tensors always use the PyTorch path. Raises for
-    backend="triton" when the kernel is unusable on a float32 CUDA tensor, and for an unknown backend."""
+    """Decide whether ``first_collision_source_at_directions`` runs the kernel; float64 and CPU tensors never do.
+
+    Args:
+        t (Tensor): the uncollided fluence, or a tensor on its device with its dtype.
+        backend (str): "auto", "torch" or "triton".
+
+    Returns:
+        bool: True for a float32 CUDA tensor on a device where the kernel is usable, unless ``backend`` is "torch".
+
+    Raises:
+        ValueError: for an unknown ``backend``.
+        RuntimeError: for backend "triton" when the kernel is unusable on a float32 CUDA tensor.
+    """
     if backend not in ("auto", "torch", "triton"):
         raise ValueError("backend must be 'auto', 'torch' or 'triton'")
     if backend == "torch" or t.device.type != "cuda" or t.dtype != torch.float32:
@@ -120,10 +91,14 @@ def use_kernel(t: Tensor, backend: str) -> bool:
 
 
 def _self_check(device: torch.device) -> tuple[bool, str]:
-    """Kernel vs the PyTorch path on a 5 x 7 x 6 grid, G = 4 (synthetic library), 6 directions including the
-    directions parallel and antiparallel to Omega_UC of one voxel (eta = +-1 exactly), rho = 0 in some voxels; dense
-    mode (2 materials; 7 materials with up to 7 nonzero per voxel) and pair mode (7 materials, random pairs), each with
-    a uniform table and with an adaptive one (`cross_sections.synthetic_angular_map`)."""
+    """Compare the kernel with the PyTorch path in dense and pair mode, with a uniform and with an adaptive table.
+
+    Args:
+        device (torch.device): the CUDA device to check.
+
+    Returns:
+        (bool, str): whether every comparison is within ``SELF_CHECK_REL_TOL``, and a message.
+    """
     worst = 0.0
     for grid_kind in ("uniform", "adaptive"):
         ok, deviation = _self_check_table(device, grid_kind)
@@ -135,7 +110,15 @@ def _self_check(device: torch.device) -> tuple[bool, str]:
 
 
 def _self_check_table(device: torch.device, angular_table_grid: str) -> tuple[bool, object]:
-    """One table kind of `_self_check`: (True, max relative deviation) or (False, reason)."""
+    """Compare the kernel with the PyTorch path on a tiny random problem for one kind of angular table.
+
+    Args:
+        device (torch.device): the CUDA device to check.
+        angular_table_grid (str): "uniform" or "adaptive".
+
+    Returns:
+        (bool, object): (True, largest relative deviation) or (False, reason).
+    """
     from ..cross_sections import material_pairs, synthetic_library
     from ..geometry import ConeGeometry, Grid
     from ..uncollided import (_first_collision_source_torch, _first_collision_source_torch_pairs,
@@ -194,11 +177,38 @@ if triton is not None:
                                 V, C, S, K, N, KM, r0x, r0y, r0z, eta_lo, eta_hi,
                                 G: tl.constexpr, GP: tl.constexpr, KB: tl.constexpr, BLOCK: tl.constexpr,
                                 MT: tl.constexpr, PAIR: tl.constexpr, MAPPED: tl.constexpr):
-        """Table row layout [G_in, MT, GP] (MT = materials of the table). Dense mode (PAIR False): rho_ptr holds the
-        densities of all MT materials [MT, V] (slot m = material m at table offset m GP). Pair mode: rho_ptr the two
-        slot densities, index_ptr the two slot material indices (int32 [2, V]); the slot offsets ia GP, ib GP are per
-        voxel. MAPPED: an adaptive table, positions through the KM-knot map map_ptr (float32 [KM]); else uniform in
-        eta (map_ptr unused)."""
+        """First-collision source of BLOCK voxels (program_id 0) for KB directions (program_id 1).
+
+        Args:
+            rho_ptr: float32 densities in g/cm^3, [MT, V] in dense mode or [2, V] slot densities in pair mode.
+            index_ptr: [2, V] int32 material index of each slot (pair mode).
+            phi_ptr: [G, V] float32 uncollided fluence.
+            x_axis_ptr: [C] float32 x of the voxel centers (columns) in cm.
+            y_axis_ptr: [R] float32 y of the voxel centers (rows) in cm.
+            z_axis_ptr: [S] float32 z of the voxel centers (slices) in cm.
+            direction_ptr: [K, 3] float32 unit directions.
+            table_ptr: [N, G, MT, GP] float32 transfer table from ``prepared_table``.
+            map_ptr: [KM] float32 node map of an adaptive table (MAPPED).
+            out_ptr: [K, G, V] float32 first-collision source.
+            V: number of voxels.
+            C: number of columns.
+            S: number of slices.
+            K: number of directions.
+            N: number of eta nodes of the table.
+            KM: number of knots of the node map.
+            r0x: x of the focal spot in cm.
+            r0y: y of the focal spot in cm.
+            r0z: z of the focal spot in cm.
+            eta_lo: first node of the eta grid.
+            eta_hi: last node of the eta grid.
+            G (constexpr): number of energy groups.
+            GP (constexpr): next power of two >= G.
+            KB (constexpr): directions per program.
+            BLOCK (constexpr): voxels per program.
+            MT (constexpr): number of materials of the table.
+            PAIR (constexpr): pair mode (two materials per voxel by index) instead of dense mode.
+            MAPPED (constexpr): adaptive table read through ``map_ptr``; else uniform in eta.
+        """
         pid_v = tl.program_id(0)
         pid_k = tl.program_id(1)
         v = pid_v * BLOCK + tl.arange(0, BLOCK)
@@ -280,6 +290,14 @@ if triton is not None:
 # ================================================================================================
 
 def _next_pow2(n: int) -> int:
+    """Return the smallest power of two >= ``n``.
+
+    Args:
+        n (int): a positive integer.
+
+    Returns:
+        int: the smallest power of two >= ``n`` (1 for ``n <= 1``).
+    """
     p = 1
     while p < n:
         p *= 2
@@ -287,13 +305,16 @@ def _next_pow2(n: int) -> int:
 
 
 def prepared_table(library, device: torch.device) -> tuple[Tensor, float, float, Optional[Tensor]]:
-    """Kernel layout of the eta table of `library`, the ends of its eta grid and its node map.
+    """Lay out the transfer table of ``library`` for the kernel, cached per table, device and tensor versions.
 
-    library.mu_s_eta [M, G_in, G_out, N] (any device/dtype) -> kernel_table [N, G_in, M, GP] float32 contiguous on
-    `device`, GP = next power of two >= G, zero where g_out < g_in (no upscatter) or g_out >= G (padding); plus
-    (eta_lo, eta_hi) = (library.eta_grid[0], library.eta_grid[-1]) as Python floats and the map of an adaptive table,
-    library.eta_map [KM] as float32 contiguous on `device` (None for a uniform table). Cached per (source tensor,
-    device, tensor versions), so the host reads the grid ends once per library and device.
+    Args:
+        library (MultigroupLibrary): the library; uses ``mu_s_eta`` [M, G, G, N], ``eta_grid`` [N] and ``eta_map``.
+        device (torch.device): the CUDA device.
+
+    Returns:
+        (table, eta_lo, eta_hi, map): table is the [N, G_in, M, GP] float32 transfer table in cm^2/g/sr, zero where
+        ``g_out < g_in`` or ``g_out >= G``; eta_lo and eta_hi the ends of the eta grid; map the [KM] float32 node map
+        (None for a uniform table).
     """
     source_table = library.mu_s_eta
     eta_map = getattr(library, "eta_map", None)
@@ -323,8 +344,16 @@ def prepared_table(library, device: torch.device) -> tuple[Tensor, float, float,
 
 
 def _directions_per_program(K: int, num_vblocks: int, device: torch.device) -> int:
-    """KB: directions handled by one program. Enough programs to fill the GPU (>= 8 per SM), then as many
-    directions per program as possible (up to 8; rho and Omega_UC are loaded once per program)."""
+    """Choose the directions per program: as many as possible (up to 8) while keeping at least 8 programs per SM.
+
+    Args:
+        K (int): number of directions.
+        num_vblocks (int): number of voxel blocks.
+        device (torch.device): the CUDA device.
+
+    Returns:
+        int: directions per program, a power of two in [1, 8].
+    """
     num_multiprocessors = torch.cuda.get_device_properties(device).multi_processor_count
     target = 8 * num_multiprocessors
     per_program = 1
@@ -334,9 +363,17 @@ def _directions_per_program(K: int, num_vblocks: int, device: torch.device) -> i
 
 
 def kernel_supports(library, rho: Tensor, phi_uncollided: Tensor, pairs=None) -> bool:
-    """Shape preconditions of the kernel: a [M, G, G, N] table matching phi_uncollided's G and either the densities of
-    all M
-    materials (dense mode, pairs None) or the pair representation of an M-material volume."""
+    """Check the shape preconditions of the kernel.
+
+    Args:
+        library (MultigroupLibrary): the library; ``mu_s_eta`` must be [M, G, G, N] with N >= 2.
+        rho (Tensor): [M, rows, cols, slices] densities of all M materials in g/cm^3.
+        phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence.
+        pairs (MaterialPairs, optional): pair representation of ``rho`` for an M-material library. Defaults to None.
+
+    Returns:
+        bool: True when the table matches the groups of ``phi_uncollided`` and the materials of ``rho`` or ``pairs``.
+    """
     G = phi_uncollided.shape[0]
     t = library.mu_s_eta
     if tuple(t.shape[1:3]) != (G, G) or t.shape[3] < 2:
@@ -348,16 +385,21 @@ def kernel_supports(library, rho: Tensor, phi_uncollided: Tensor, pairs=None) ->
 
 def first_collision_source(library, rho: Tensor, phi_uncollided: Tensor, grid, geometry, angle: float, omegas: Tensor,
                            pairs=None) -> Tensor:
-    """Fused evaluation of `uncollided.first_collision_source_at_directions` (float32 CUDA only; no availability check
-    here).
+    """Fused ``uncollided.first_collision_source_at_directions`` on float32 CUDA tensors, without availability check.
 
-    library: MultigroupLibrary (uses mu_s_eta [M, G, G, N], the ends of eta_grid [N] and eta_map: a uniform table
-    for eta_map None, else an adaptive one, `cross_sections.angular_table_position`);
-    rho: [M, rows, cols, slices]; pairs: the `cross_sections.MaterialPairs` of rho (pair mode: the kernel gathers the
-    two table rows of each voxel by index) or None (dense mode: all M table rows per voxel, about M / 2 times the cost
-    of the pair mode); phi_uncollided: [G, rows, cols, slices]
-    float32 CUDA; omegas: [K, 3] unit vectors (recon frame). Returns [K, G, rows, cols, slices] float32 on
-    phi_uncollided's device.
+    Args:
+        library (MultigroupLibrary): the library; uses ``mu_s_eta`` [M, G, G, N], ``eta_grid`` and ``eta_map``.
+        rho (Tensor): [M, rows, cols, slices] densities in g/cm^3.
+        phi_uncollided (Tensor): [G, rows, cols, slices] float32 CUDA uncollided fluence.
+        grid (Grid): the grid of ``rho`` and ``phi_uncollided``.
+        geometry (ConeGeometry): the cone-beam geometry.
+        angle (float): view angle in radians.
+        omegas (Tensor): [K, 3] unit directions (recon frame).
+        pairs (MaterialPairs, optional): pair representation of ``rho`` (pair mode), or None for dense mode.
+            Defaults to None.
+
+    Returns:
+        Tensor: [K, G, rows, cols, slices] float32 first-collision source in photons/(cm^3 sr) per source photon/sr.
     """
     device, dtype = phi_uncollided.device, phi_uncollided.dtype
     if device.type != "cuda" or dtype != torch.float32:
@@ -401,9 +443,22 @@ def first_collision_source(library, rho: Tensor, phi_uncollided: Tensor, grid, g
 def first_collision_source_or_none(library, rho: Tensor, phi_uncollided: Tensor, grid, geometry, angle: float,
                                    omegas: Tensor,
                                    backend: str, pairs=None) -> Optional[Tensor]:
-    """`first_collision_source(...)` when the kernel applies (`use_kernel(phi_uncollided, backend)` and
-    `kernel_supports`), else None
-    (the caller then runs the PyTorch path)."""
+    """Run ``first_collision_source`` when ``use_kernel`` and ``kernel_supports`` allow it, else return None.
+
+    Args:
+        library (MultigroupLibrary): the library.
+        rho (Tensor): [M, rows, cols, slices] densities in g/cm^3.
+        phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence.
+        grid (Grid): the grid of ``rho`` and ``phi_uncollided``.
+        geometry (ConeGeometry): the cone-beam geometry.
+        angle (float): view angle in radians.
+        omegas (Tensor): [K, 3] unit directions (recon frame).
+        backend (str): "auto", "torch" or "triton".
+        pairs (MaterialPairs, optional): pair representation of ``rho``, or None for dense mode. Defaults to None.
+
+    Returns:
+        Tensor | None: [K, G, rows, cols, slices] first-collision source, or None when the PyTorch path must run.
+    """
     if not use_kernel(phi_uncollided, backend) or not kernel_supports(library, rho, phi_uncollided, pairs):
         return None
     return first_collision_source(library, rho, phi_uncollided, grid, geometry, angle, omegas, pairs=pairs)

@@ -37,7 +37,6 @@ def library_module():
 
 @pytest.fixture(scope="module")
 def spectra(library_module):
-    backend = library_module.resolve_backend()
     return {"125kvp": (library_module.default_spectrum_125kvp(), 6),
             "6mv": (library_module.load_spectrum_txt(str(SPECTRUM_6MV)), 12)}
 

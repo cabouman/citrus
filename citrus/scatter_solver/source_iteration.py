@@ -1,23 +1,8 @@
 """Source iteration over collision order and the multiple-collision source.
 
-    phi^(1)   = sweep(first-collision source)                                  (n = 1)
-    phi^(n)   = sweep(S^(n)),  S^(n)(Omega_m) = sum_n' T^(n)[:, n'] Y_n'(Omega_m),
-                T^(n) = scatter_source_moments(mu_s_l, phi^(n-1))              (n >= 2)
-    phi_total = sum_n phi^(n)
-
-phi^(n) is the n-times-collided fluence; the multiple-collision source of the scatter image is the scattering
-source of phi_total, S_MC(r, Omega) = sum_n T[:, n](r) Y_n(Omega) with T = scatter_source_moments(mu_s_l, phi_total).
-
-stopped when ||phi^(n)[:, 0, 0]|| / ||phi_total[:, 0, 0]|| < tolerance (Frobenius norms of the scalar-flux
-cell averages over all groups and cells) or after max_iterations sweeps. Each phi^(n) is the spherical-harmonic /
-linear-discontinuous moment field [G, (L+1)^2, 4, R, C, S] of the n-times-collided fluence (G energy groups, (L+1)^2
-spherical-harmonic moments up to degree L, 4 linear-discontinuous moments, R x C x S transport cells).
-
-Memory: the scattering-source moments are formed by `scatter_moments`, i.e.
-`angular_quadrature.scatter_source_moments(..., moment_major=True)`, accumulated pair by pair (g_in, g_out) directly
-into a moment-major buffer, so the only temporary is one [(L+1)^2, *spatial] transfer gather. Peak during an iteration:
-phi_total + T + the sweep's accumulator (3 fields of G (L+1)^2 4 N values) + the sweep buffers
-(2 x 8 Dc N 4G values).
+Each sweep transports the scattering source of the previous collision order, starting from the first-collision source,
+until the newest order is small against the sum of all orders; the scattering source of that sum is the
+multiple-collision source of the scatter image.
 """
 
 from __future__ import annotations
@@ -42,15 +27,16 @@ __all__ = [
 
 @dataclass
 class SourceIterationResult:
-    """Result of `source_iteration`.
+    """Result of ``source_iteration``.
 
-    phi_total      : [G, (L+1)^2, 4, R, C, S] sum over collision orders of the spherical-harmonic /
-                     linear-discontinuous moments of the collided fluence (linear-discontinuous layout [0, x, y, z]).
-    num_iterations : number of sweeps performed (= collision orders included).
-    history        : relative change ||phi_n[:, 0, 0]|| / ||phi_total[:, 0, 0]|| after each iteration
-                     (history[0] == 1 unless the first-collision fluence vanishes).
-    phi_norms      : ||phi_n[:, 0, 0]|| per iteration.
-    converged      : True if the last relative change was < tolerance.
+    Attributes:
+        phi_total (Tensor): [G, (L+1)^2, 4, R, C, S] spherical-harmonic / linear-discontinuous moments of the collided
+            fluence, summed over collision orders.
+        num_iterations (int): number of sweeps performed (collision orders included).
+        history (list[float]): relative change ``||phi_n|| / ||phi_total||`` of the scalar-flux cell means after each
+            sweep. Defaults to [].
+        phi_norms (list[float]): norm ``||phi_n||`` of the scalar-flux cell means after each sweep. Defaults to [].
+        converged (bool): True if the last relative change was below the tolerance. Defaults to False.
     """
 
     phi_total: Tensor
@@ -61,16 +47,17 @@ class SourceIterationResult:
 
 
 def scatter_moments(mu_s_l_volume: Tensor, phi: Tensor) -> Tensor:
-    """Scattering-source spherical-harmonic moments T[g, n] = sum_{g_in} mu_s_l_volume[g_in, g, l(n)] phi[g_in, n].
+    """Scattering-source spherical-harmonic moments ``T[g, n] = sum_g_in mu_s_l_volume[g_in, g, l(n)] phi[g_in, n]``.
 
-    Thin wrapper: `angular_quadrature.scatter_source_moments(mu_s_l_volume, phi, moment_major=True)` (the single,
-    memory-lean implementation of the operator).
-    mu_s_l_volume : [G_in, G_out, L+1, *spatial] Legendre transfer moments (1/cm).
-    phi           : [G_in, N, *rest], N = (L_phi+1)^2 with L_phi <= L; *rest = *spatial or (4, *spatial).
-    Returns T [G_out, N, *rest] as a (non-contiguous) view of a moment-major buffer [N, G_out, *rest], so
-    T.movedim(1, 0) is contiguous (what `scatter_source_function` and
-    `angular_quadrature.scatter_source_at_directions` contract over without copying). Zero transfer blocks (e.g.
-    upscatter) are skipped.
+    Zero transfer blocks (such as upscatter) are skipped, and ``T.movedim(1, 0)`` is contiguous, so
+    ``scatter_source_function`` contracts over it without a copy.
+
+    Args:
+        mu_s_l_volume (Tensor): ``[G_in, G_out, L+1, *spatial]`` Legendre transfer moments in 1/cm.
+        phi (Tensor): ``[G_in, N, *rest]`` moments, N = (L_phi+1)^2 with L_phi <= L, rest = spatial or (4, spatial).
+
+    Returns:
+        Tensor: ``[G_out, N, *rest]`` moments T, a non-contiguous view of a moment-major ``[N, G_out, *rest]`` buffer.
     """
     return scatter_source_moments(mu_s_l_volume, phi, moment_major=True)
 
@@ -78,13 +65,19 @@ def scatter_moments(mu_s_l_volume: Tensor, phi: Tensor) -> Tensor:
 def scatter_source_function(sweep_context: SweepContext, T: Tensor) -> SourceFunction:
     """Source function for the sweep from the spherical-harmonic moments T of a scattering source.
 
-    T: [G, (L+1)^2, 4, R, C, S] (from scatter_moments / scatter_source_moments). The returned callable maps
-    reordered direction indices direction_index [Dsel] (Dsel selected directions) to the linear-discontinuous source
-    moments [Dsel, G, 4, R, C, S] = sum_n Y[direction_index, n] T[:, n], i.e.
-    angular_quadrature.scatter_source_at_directions(T, sweep_context.basis.Y[direction_index]). A moment-major copy of
-    T is made once (none if T came from `scatter_moments`), so each call is one GEMM. The callable accepts `out=` (a
-    contiguous [Dsel, G, 4, R, C, S] buffer, e.g. lent by `sweep`) to write the GEMM result into instead of allocating
-    it.
+    The callable maps reordered direction indices to the linear-discontinuous source moments
+    ``sum_n Y[direction_index, n] T[:, n]`` with one matrix product, written into ``out`` when a buffer is given.
+
+    Args:
+        sweep_context (SweepContext): sweep context with the spherical-harmonic basis Y of the sweep directions.
+        T (Tensor): [G, (L+1)^2, 4, R, C, S] moments; one moment-major copy is made unless they come from
+            ``scatter_moments``.
+
+    Returns:
+        SourceFunction: callable ``source(direction_index [Dsel], out=None)`` returning [Dsel, G, 4, R, C, S] moments.
+
+    Raises:
+        ValueError: if T does not have the context's number of spherical-harmonic moments.
     """
     if T.shape[1] != sweep_context.num_moments:
         raise ValueError(f"T has {T.shape[1]} spherical-harmonic moments, context has {sweep_context.num_moments}")
@@ -105,19 +98,31 @@ def scatter_source_function(sweep_context: SweepContext, T: Tensor) -> SourceFun
 
 
 def multiple_collision_source_moments(mu_s_l_volume_coarse: Tensor, phi_total: Tensor) -> Tensor:
-    """Spherical-harmonic moments of the multiple-collision source: the scatter operator applied to phi_total.
+    """Spherical-harmonic moments of the multiple-collision source, the scattering operator applied to ``phi_total``.
 
-    mu_s_l_volume_coarse : [G_in, G_out, L+1, R, C, S] Legendre transfer moments on the coarse grid (1/cm).
-    phi_total            : [G, (L+1)^2, 4, R, C, S] total collided fluence moments (SourceIterationResult.phi_total),
-                           with degree <= the transfer's Legendre order.
-    Returns T [G, (L+1)^2, 4, R, C, S] (view of moment-major storage, see `scatter_moments`);
-    S_MC(r, Omega) = sum_n T[:, n] Y_n(Omega): evaluate with angular_quadrature.scatter_source_at_directions at the
-    collapsed-cone directions.
+    The source ``S_MC(r, Omega) = sum_n T[:, n] Y_n(Omega)`` is evaluated at the collapsed-cone directions with
+    ``angular_quadrature.scatter_source_at_directions``.
+
+    Args:
+        mu_s_l_volume_coarse (Tensor): [G_in, G_out, L+1, R, C, S] Legendre transfer moments on the coarse grid in 1/cm.
+        phi_total (Tensor): [G, (L+1)^2, 4, R, C, S] total collided fluence moments
+            (``SourceIterationResult.phi_total``) of degree at most the transfer's Legendre order.
+
+    Returns:
+        Tensor: [G, (L+1)^2, 4, R, C, S] moments T, a view of moment-major storage (``scatter_moments``).
     """
     return scatter_moments(mu_s_l_volume_coarse, phi_total)
 
 
 def _scalar_norm(phi: Tensor) -> float:
+    """Frobenius norm of the scalar-flux cell means over all groups and cells.
+
+    Args:
+        phi (Tensor): [G, (L+1)^2, 4, R, C, S] moments.
+
+    Returns:
+        float: norm of ``phi[:, 0, 0]``.
+    """
     return float(torch.linalg.vector_norm(phi[:, 0, 0]))
 
 
@@ -131,23 +136,29 @@ def source_iteration(
     direction_chunk: Optional[int] = None,
     callback: Optional[Callable[[int, Tensor, float], None]] = None,
 ) -> SourceIterationResult:
-    """Source iteration over collision order (module docstring).
+    """Source iteration over collision order, starting from the first-collision source.
 
-    sweep_context        : the `transport_sweep.SweepContext` of the coarse grid and the sweep quadrature.
-    mu_t_coarse          : [G, R, C, S] total attenuation on the coarse (sweep) grid, 1/cm.
-    mu_s_l_volume_coarse : [G_in, G_out, L_x+1, R, C, S] Legendre transfer moments (L_x >= sweep_context.L).
-    first_collision_source_function : reordered direction indices [Dsel] -> first-collision linear-discontinuous
-                           source moments [Dsel, G, 4, R, C, S] (e.g.
-                           uncollided.restrict_to_linear_discontinuous_moments
-                           evaluated at sweep_context.quadrature.omega[direction_index]).
-    tolerance            : stop when ||phi_n[:, 0, 0]|| / ||phi_total[:, 0, 0]|| < tolerance.
-    max_iterations       : maximum number of sweeps (collision orders).
-    direction_chunk      : passed to `sweep`.
-    callback             : optional callback(n, phi_n, relative_change) after each iteration (n starts at 1);
-                           phi_n must not be modified.
+    The sweeps stop when ``||phi_n|| / ||phi_total||`` of the scalar-flux cell means falls below ``tolerance`` or after
+    ``max_iterations`` sweeps.
 
-    Returns SourceIterationResult (phi_total [G, (L+1)^2, 4, R, C, S], num_iterations, history, phi_norms,
-    converged).
+    Args:
+        sweep_context (SweepContext): sweep context of the coarse grid and the sweep quadrature.
+        mu_t_coarse (Tensor): [G, R, C, S] total attenuation mu_t on the coarse grid in 1/cm.
+        mu_s_l_volume_coarse (Tensor): [G_in, G_out, L_x+1, R, C, S] Legendre transfer moments in 1/cm, with
+            L_x >= ``sweep_context.L``.
+        first_collision_source_function (SourceFunction): maps reordered direction indices [Dsel] to the
+            first-collision linear-discontinuous source moments [Dsel, G, 4, R, C, S].
+        tolerance (float): stopping tolerance of the relative change.
+        max_iterations (int): maximum number of sweeps (collision orders).
+        direction_chunk (int, optional): passed to ``sweep``. Defaults to None.
+        callback (Callable[[int, Tensor, float], None], optional): called as ``callback(n, phi_n, relative_change)``
+            after each sweep (n from 1); it must not modify phi_n. Defaults to None.
+
+    Returns:
+        SourceIterationResult: the summed moments, the number of sweeps, the history and the convergence flag.
+
+    Raises:
+        ValueError: if max_iterations < 1.
     """
     if max_iterations < 1:
         raise ValueError("max_iterations must be >= 1")

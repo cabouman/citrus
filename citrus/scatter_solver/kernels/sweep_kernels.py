@@ -1,38 +1,9 @@
-"""Fused Triton kernel for the per-plane linear-discontinuous cell solve of the discrete-ordinates sweep
-(`transport_sweep.py`).
+"""Fused Triton kernel of the linear-discontinuous cell solve of one wavefront plane of the transport sweep.
 
-The PyTorch plane step (`transport_sweep._plane_step`) issues about 15 kernels per wavefront plane (gathers, the
-broadcasting elementwise linear-discontinuous algebra of `linear_discontinuous_cell.py` and the scatter), each reading
-and writing [Dc, G, ., E] temporaries. This module replaces the whole plane step by ONE kernel launch:
-
-    _linear_discontinuous_plane_kernel   for every (entry e of the plane, chunk direction d, group g):
-        o, n, (u_x, u_y, u_z) = octant, cell, upstream cells of entry e   (vacuum -> the zero cell N)
-        nbr_a[0..3]  = store[o, d, u_a, 4g : 4g+4]          a = x, y, z   (one 16-byte vector load each)
-        S[0..3]      = source[o, d, n, 4g : 4g+4]
-        mu           = mu_cells[n, g];  c_a = c[o, d, a];  s_a = +-1 from the octant code bits
-        R_0, R_a     exactly as linear_discontinuous_cell.cell_right_hand_sides; psi_0, psi_a exactly as
-        linear_discontinuous_cell.cell_solve
-        store[o, d, n, 4g : 4g+4] = (psi_0, psi_x, psi_y, psi_z)              (one 16-byte vector store)
-
-Program grid: one lane per (entry, direction, group) of the plane, flattened with the group fastest
-(lanes of a warp then read contiguous 4G-value rows of the cell-major storage), BLOCK lanes per program.
-The data layout is the PyTorch path's ([8, Dc, N + 1, 4G] storage with the zero vacuum cell, [8, Dc, N, 4G]
-source, [N, G] attenuation), so the source fill and the moment GEMM are shared.
-Entries of a plane never read each other (their upstream cells lie on earlier planes), so a plane needs no
-synchronization inside the kernel; the planes are ordered by the stream (one launch per plane).
-
-Plane entries are read from a flat, plane-sorted int32 copy of the sweep plan (`FlatPlaneIndex`, built by
-`transport_sweep.make_sweep_context` for CUDA contexts), addressed by (plane start, plane size) launch arguments
-that are not specialized (one compiled variant per (G, Dc)).
-
-Numerics: float32 only (the PyTorch path serves float64 and CPU tensors). The per-lane arithmetic follows
-`linear_discontinuous_cell.py` term by term, so the result equals the PyTorch path up to float32 rounding (see
-tests/test_transport_sweep.py).
-
-Availability: `triton_available()` (shared, from `triton_utilities`: probe kernel, cached per
-process; `CITRUS_DISABLE_TRITON=1` is the kill switch) and `kernels_usable(device)`, which additionally runs
-the fused plane loop against the PyTorch plane step on a small heterogeneous problem once per device
-(two direction chunks) and reports a tolerance breach as unusable.
+``_linear_discontinuous_plane_kernel`` solves every (entry, direction, group) of a diagonal plane in one launch, on
+the storage layout of the PyTorch path of :mod:`citrus.scatter_solver.transport_sweep`. ``FlatPlaneIndex`` holds the
+plane-sorted entry tables it reads, ``sweep_planes`` runs the planes in order, and ``kernels_usable`` checks the
+kernel against the PyTorch plane step once per device.
 """
 
 from __future__ import annotations
@@ -72,10 +43,11 @@ _SELF_CHECK: dict[str, tuple[bool, str]] = {}
 class FlatPlaneIndex:
     """Plane-sorted flat entry tables of a sweep plan for the fused kernel (int32, on the sweep device).
 
-    octant  : [E_tot]      octant code of each entry (E_tot = 8 * num_cells), sorted by plane
-    cell    : [E_tot]      flat cell index
-    up      : [E_tot * 3]  upstream neighbor along x, y, z (row-major [E_tot, 3]); vacuum -> num_cells
-    offsets : (num_planes + 1) host ints; the entries of plane p are [offsets[p], offsets[p + 1])
+    Attributes:
+        octant (Tensor): [E_tot] octant code of each entry (E_tot = 8 * num_cells), sorted by plane.
+        cell (Tensor): [E_tot] flat cell index of each entry.
+        upstream (Tensor): [E_tot * 3] upstream neighbor along x, y, z (row-major [E_tot, 3]), num_cells for vacuum.
+        offsets (tuple[int, ...]): num_planes + 1 host ints; the entries of plane p are [offsets[p], offsets[p + 1]).
     """
 
     octant: Tensor
@@ -85,8 +57,17 @@ class FlatPlaneIndex:
 
 
 def build_flat_index(octant: Tensor, cell: Tensor, upstream_cell: Tensor, offsets: list[int]) -> FlatPlaneIndex:
-    """FlatPlaneIndex from the plane-sorted plan tables octant [E_tot], cell [E_tot], upstream_cell [E_tot, 3]
-    (vacuum already replaced by num_cells) and the plane offsets (host ints, length num_planes + 1)."""
+    """Build a ``FlatPlaneIndex`` from the plane-sorted tables of a sweep plan.
+
+    Args:
+        octant (Tensor): [E_tot] octant code of each entry.
+        cell (Tensor): [E_tot] flat cell index of each entry.
+        upstream_cell (Tensor): [E_tot, 3] upstream neighbor along x, y, z, with vacuum already replaced by num_cells.
+        offsets (list[int]): num_planes + 1 plane offsets.
+
+    Returns:
+        FlatPlaneIndex: the int32 contiguous tables on the device of the inputs.
+    """
     return FlatPlaneIndex(
         octant=octant.to(torch.int32).contiguous(),
         cell=cell.to(torch.int32).contiguous(),
@@ -100,8 +81,16 @@ def build_flat_index(octant: Tensor, cell: Tensor, upstream_cell: Tensor, offset
 # ================================================================================================
 
 def kernels_usable(device: torch.device) -> tuple[bool, str]:
-    """(usable, reason): triton_available() and the fused plane loop reproduces the PyTorch plane step on
-    `device` (small heterogeneous problem, two chunk sizes; cached per device, never raises)."""
+    """Report whether Triton is available and the fused plane loop reproduces the PyTorch plane step on ``device``.
+
+    The self-check runs once per device on a small problem; the verdict is cached and the function never raises.
+
+    Args:
+        device (torch.device): the device to check.
+
+    Returns:
+        (bool, str): whether the kernel is usable, and the reason.
+    """
     ok, why = triton_available()
     if not ok:
         return ok, why
@@ -118,8 +107,14 @@ def kernels_usable(device: torch.device) -> tuple[bool, str]:
 
 
 def _self_check(device: torch.device) -> tuple[bool, str]:
-    """Fused plane loop vs `transport_sweep._sweep_chunk` (PyTorch) on a 3 x 4 x 5 grid, product_quadrature(4, 8),
-    G = 3, random mu and (partly negative) sources, chunks Dc = 4 and 3."""
+    """Compare the fused plane loop with the PyTorch ``transport_sweep._sweep_chunk`` on a small random problem.
+
+    Args:
+        device (torch.device): the CUDA device to check.
+
+    Returns:
+        (bool, str): whether the largest relative deviation is within ``SELF_CHECK_REL_TOL``, and a message.
+    """
     from ..angular_quadrature import product_quadrature
     from ..geometry import Grid
     from ..transport_sweep import _sweep_chunk, make_sweep_context
@@ -152,7 +147,17 @@ if triton is not None:
 
     @triton.jit
     def _load4(ptr, off, mask, BLOCK: tl.constexpr):
-        """Four consecutive values ptr[off + 0..3] per lane (one vector load) -> four [BLOCK] tensors."""
+        """Load four consecutive values ``ptr[off + 0..3]`` per lane with one vector load.
+
+        Args:
+            ptr: float32 tensor to read.
+            off: [BLOCK] int64 element offset of the first value of each lane.
+            mask: [BLOCK] bool, the lane is active (inactive lanes read zeros).
+            BLOCK (constexpr): lanes per program.
+
+        Returns:
+            (v0, v1, v2, v3): four [BLOCK] tensors.
+        """
         k = tl.arange(0, 4)
         v = tl.load(ptr + off[:, None] + k[None, :], mask=mask[:, None], other=0.0)  # [BLOCK, 4]
         lo, hi = tl.split(tl.reshape(v, [BLOCK, 2, 2]))  # lo = (v0, v2), hi = (v1, v3)
@@ -164,7 +169,26 @@ if triton is not None:
     def _linear_discontinuous_plane_kernel(store_ptr, source_ptr, mu_ptr, c_ptr, octant_ptr, cell_ptr, upstream_ptr,
                                            start, E, N,
                                            G: tl.constexpr, DC: tl.constexpr, BLOCK: tl.constexpr):
-        """One wavefront plane: lanes over (entry, direction, group), group fastest. See module docstring."""
+        """Solve one wavefront plane in place, one lane per (entry, direction, group) with the group fastest.
+
+        Follows ``linear_discontinuous_cell`` term by term (docs/source/design_notes.rst, "Transport sweep and source
+        iteration").
+
+        Args:
+            store_ptr: [8, DC, N + 1, 4G] float32 angular fluence moments; cell N is the zero vacuum cell.
+            source_ptr: [8, DC, N, 4G] float32 source moments.
+            mu_ptr: [N, G] float32 total attenuation per cell in cm^-1.
+            c_ptr: [8, DC, 3] float32 ``c_a = |Omega_a| / Delta_a`` in cm^-1.
+            octant_ptr: [E_tot] int32 octant code of each entry.
+            cell_ptr: [E_tot] int32 cell index of each entry.
+            upstream_ptr: [E_tot * 3] int32 upstream cell along x, y, z of each entry.
+            start: index of the first entry of the plane.
+            E: number of entries of the plane.
+            N: number of cells.
+            G (constexpr): number of energy groups.
+            DC (constexpr): directions per octant of the chunk.
+            BLOCK (constexpr): lanes per program.
+        """
         Q: tl.constexpr = 4 * G
         i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         mask = i < E.to(tl.int64) * (DC * G)
@@ -230,12 +254,14 @@ if triton is not None:
 # ================================================================================================
 
 def sweep_planes(index: FlatPlaneIndex, store: Tensor, source: Tensor, mu_cells: Tensor, c: Tensor) -> None:
-    """Run the fused plane kernel for every plane of `index` in order (one launch per plane), in place.
+    """Run the fused plane kernel for every plane of ``index`` in order (one launch per plane), in place.
 
-    store    : [8, Dc, N + 1, 4G] float32 CUDA, contiguous; cell N (the vacuum cell) must be zero
-    source   : [8, Dc, N, 4G]     float32, contiguous: source linear-discontinuous moments of the chunk
-    mu_cells : [N, G]             float32, contiguous: total attenuation per cell
-    c        : [8, Dc, 3]         float32, contiguous: |Omega_a| / Delta_a of the chunk directions
+    Args:
+        index (FlatPlaneIndex): the plane-sorted entry tables.
+        store (Tensor): [8, Dc, N + 1, 4G] float32 CUDA contiguous angular fluence moments; cell N must be zero.
+        source (Tensor): [8, Dc, N, 4G] float32 contiguous source linear-discontinuous moments of the chunk.
+        mu_cells (Tensor): [N, G] float32 contiguous total attenuation per cell in cm^-1.
+        c (Tensor): [8, Dc, 3] float32 contiguous ``|Omega_a| / Delta_a`` of the chunk directions in cm^-1.
     """
     _, Dc, num_cells_plus_vacuum, Q = store.shape
     N = num_cells_plus_vacuum - 1

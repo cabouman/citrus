@@ -1,39 +1,9 @@
-"""Bridge between the scatter solver's geometry (Grid, ConeGeometry) and MBIRTORCH's ConeBeamModel.
+"""Bridge between the scatter solver's geometry (``Grid``, ``ConeGeometry``) and MBIRTORCH's ``ConeBeamModel``.
 
-MBIRTORCH and CITRUS use the same frames (docs/source/conventions.rst adopts MBIRTORCH's verbatim), so the bridge is
-a parameter copy; verified against mbirtorch 0.1.2 `cone_beam.py` (tests/test_mbir_bridge.py):
-
-    recon [rows, cols, slices], col -> x, row -> y, slice -> z, voxel centers at (index - (n - 1)/2) * pitch
-    (+ recon_slice_offset along z); view frame x_v = cos(a) x - sin(a) y, y_v = sin(a) x + cos(a) y;
-    per-voxel magnification 1 / (1/M - y_v/SDD) = SDD / (SID - y_v)  (source on +y_v);
-    channel n = (u + det_channel_offset) / delta_det_channel + (num_channels - 1)/2 with u = mag * x_v,
-    row     m = (v + det_row_offset) / delta_det_row + (num_rows - 1)/2 with v = mag * z,
-    i.e. exactly our `ConeGeometry.pixel_uv` (u = (c - (Nc-1)/2) dc - det_channel_offset, same for v).
-
-The ConeBeamModel projector is a separable-footprint (distance-driven-like) model of the pixel-averaged line
-integral (units: value x ALU; with ALU = cm and volumes in 1/cm the sinogram is the dimensionless line integral).
-
-MBIRTORCH's default region-of-reconstruction mask is the ellipse inscribed in the recon (x, y) box; the WLAB grid
-tiles the prism exactly, so the mask would drop the prism corners. `make_cone_model` therefore sets
-use_ror_mask=False by default (all voxels projected and updated).
-
-Device handling: MBIRTORCH accepts torch tensors (any device) and places them as float32 on the model device with
-`torch.as_tensor` (no copy when they already are float32 on that device). All functions here return torch tensors on
-the model device (`output_sharded=True` on a single-device model), never numpy.
-
-Projections in chunks of views (`ViewChunkProjector`): a ConeBeamModel projects a volume onto ALL its views at once.
-To project onto a subset of consecutive views (e.g. the CITRUS loop's per-material primary path lengths, which must
-not grow to [M', V, Rd, Cd]), a sub-model over those angles is built with `make_cone_model` (cheap to build; its
-first projection compiles, later ones cost the same per view as the full model). The projections of a sub-model equal
-the matching views of the full model to float rounding.
-
-Resuming MBIR (`mbir_iterations(..., error_sinogram=e, return_checkpoint=True)`): MBIRTORCH's public `recon` (0.1.2)
-recomputes the error sinogram e = y - A x_init on every call (one forward projection) and does not forward the
-`init_error_sinogram` / `return_checkpoint` arguments of its engine `_vcd_recon`. With them, `mbir_iterations`
-replicates `recon` (the same `initialize_recon` call: partitions, partition sequence from `first_iteration`, input
-checks, regularization; then `_vcd_recon` under torch.no_grad, `close_log_file` and the same recon_dict) and passes a
-caller-kept error sinogram consistent with init_recon (trusted, not checked; MBIRTORCH updates it in place, and
-init_recon too). Without those arguments the plain `recon` path runs.
+It builds the MBIRTORCH model of a scan, projects and back-projects with it, runs FDK with short-scan (Parker) weights,
+runs warm-started and resumable MBIR iterations, and projects volumes onto chunks of views. MBIRTORCH is imported
+lazily, and the functions return torch tensors on the model device. The coupling is described in
+docs/source/design_notes.rst, "MBIRTORCH coupling", and the shared frames in docs/source/conventions.rst.
 """
 
 from __future__ import annotations
@@ -65,12 +35,25 @@ DeviceLike = Union[torch.device, str, None]
 
 
 def mbirtorch_version() -> str:
+    """Version of the installed MBIRTORCH.
+
+    Returns:
+        str: ``mbirtorch.__version__``.
+    """
     import mbirtorch
 
     return str(mbirtorch.__version__)
 
 
 def _angles_array(angles) -> np.ndarray:
+    """View angles as a flat float64 array.
+
+    Args:
+        angles (Sequence[float], ndarray or Tensor): [V] view angles in rad.
+
+    Returns:
+        ndarray: [V] view angles in rad.
+    """
     if isinstance(angles, Tensor):
         angles = angles.detach().cpu().numpy()
     return np.asarray(angles, dtype=np.float64).reshape(-1)
@@ -79,18 +62,26 @@ def _angles_array(angles) -> np.ndarray:
 def make_cone_model(grid: Grid, geometry: ConeGeometry, angles: Union[Sequence[float], np.ndarray, Tensor], *,
                     device: DeviceLike = None, use_ror_mask: bool = False, compile_mode: Optional[str] = None,
                     verbose: int = 0, **params):
-    """MBIRTORCH `ConeBeamModel` whose forward projection of a volume [R, C, S] on `grid` lands on the panel of
-    `geometry` with our pixel indexing (rows along +z, channels along +x_view, same offsets), one view per angle (rad).
+    """MBIRTORCH ``ConeBeamModel`` whose projections of a volume on ``grid`` land on the panel of ``geometry``.
 
-    Sets: sinogram_shape (V, num_det_rows, num_det_channels), source_iso_dist, source_detector_dist (constructor);
-    delta_det_channel, delta_det_row, det_channel_offset, det_row_offset, recon_shape = grid.shape,
-    delta_voxel, voxel_row_aspect, voxel_slice_aspect, recon_slice_offset (set_params), use_ror_mask (default False:
-    every voxel of the grid is projected / updated), verbose (default 0: no per-iteration logging).
-    device: the model's single device (default: cuda if available, else cpu); pinned with
-    `configure_devices(devices=[device])`, which also switches off MBIRTORCH's automatic multi-GPU layout.
-    compile_mode: None -> 'auto' (torch.compile) on CUDA, 'off' on CPU (torch.compile on CPU needs a C++ toolchain).
-    **params: further `set_params` entries (e.g. snr_db, sharpness, positivity_flag, granularity,
-    partition_sequence).
+    The model copies the distances, pixel pitches and offsets of ``geometry`` and the shape, voxel size, aspects and
+    slice offset of ``grid``, with one view per angle, and is pinned to one device.
+
+    Args:
+        grid (Grid): reconstruction grid of the volumes [R, C, S].
+        geometry (ConeGeometry): cone-beam geometry of the scan.
+        angles (Sequence[float], ndarray or Tensor): [V] view angles in rad.
+        device (torch.device or str, optional): the model's single device. Defaults to None (CUDA if available, else
+            CPU).
+        use_ror_mask (bool, optional): MBIRTORCH's region-of-reconstruction mask; False projects and updates every
+            voxel. Defaults to False.
+        compile_mode (str, optional): MBIRTORCH's ``compile_mode``. Defaults to None (``"auto"`` on CUDA, ``"off"`` on
+            CPU).
+        verbose (int, optional): MBIRTORCH's verbosity. Defaults to 0.
+        **params: passed to ``ConeBeamModel.set_params`` (e.g. ``snr_db``, ``sharpness``, ``positivity_flag``).
+
+    Returns:
+        ConeBeamModel: the MBIRTORCH model.
     """
     import mbirtorch
 
@@ -118,19 +109,40 @@ def make_cone_model(grid: Grid, geometry: ConeGeometry, angles: Union[Sequence[f
 
 
 def forward_project(model, volume: Tensor) -> Tensor:
-    """MBIRTORCH forward projection A x: volume [R, C, S] (1/cm) -> sinogram [views, rows, channels] (line
-    integrals), float32 torch tensor on the model device."""
+    """MBIRTORCH forward projection ``A x`` of a volume.
+
+    Args:
+        model (ConeBeamModel): MBIRTORCH model.
+        volume (Tensor): [R, C, S] volume, e.g. attenuation in 1/cm.
+
+    Returns:
+        Tensor: [V, Rd, Cd] float32 line integrals on the model device.
+    """
     return model.forward_project(volume, output_sharded=True)
 
 
 def back_project(model, sinogram: Tensor) -> Tensor:
-    """MBIRTORCH back projection A^T y: sinogram [views, rows, channels] -> volume [R, C, S] on the model device."""
+    """MBIRTORCH back projection ``A^T y`` of a sinogram.
+
+    Args:
+        model (ConeBeamModel): MBIRTORCH model.
+        sinogram (Tensor): [V, Rd, Cd] sinogram.
+
+    Returns:
+        Tensor: [R, C, S] float32 volume on the model device.
+    """
     return model.back_project(sinogram, output_sharded=True)
 
 
 def scan_range(angles) -> float:
-    """Angular range (rad) covered by views evenly spaced over [start, end) with the endpoint excluded:
-    (a[-1] - a[0]) V / (V - 1) (2 pi for a full rotation of V views; 0 for a single view)."""
+    """Angular range of views evenly spaced over [start, end): ``abs(a[-1] - a[0]) V / (V - 1)``.
+
+    Args:
+        angles (Sequence[float], ndarray or Tensor): [V] view angles in rad.
+
+    Returns:
+        float: range in rad (2 pi for a full rotation, 0 for fewer than two views).
+    """
     a = _angles_array(angles)
     if a.size < 2:
         return 0.0
@@ -138,28 +150,32 @@ def scan_range(angles) -> float:
 
 
 def is_short_scan(angles, tolerance: float = 1e-6) -> bool:
-    """True when the evenly spaced views cover less than a full rotation (`scan_range` < 2 pi)."""
+    """Whether evenly spaced views cover less than a full rotation (``scan_range`` below 2 pi).
+
+    Args:
+        angles (Sequence[float], ndarray or Tensor): [V] view angles in rad.
+        tolerance (float, optional): tolerance in rad. Defaults to 1e-6.
+
+    Returns:
+        bool: True for a short scan.
+    """
     return scan_range(angles) < 2.0 * np.pi - tolerance
 
 
 def short_scan_weights(geometry: ConeGeometry, angles, device: DeviceLike = None) -> Optional[Tensor]:
-    """FDK redundancy weights [V, 1, Cd] (float32) for views evenly spaced over a range Lambda < 2 pi, or None for a
-    full rotation (MBIRTORCH's FDK is then exact as is).
+    """FDK redundancy (Parker) weights of a short scan, or None for a full rotation.
 
-    MBIRTORCH's `recon_fdk` applies no short-scan weighting: it scales every view by pi / V, the full-scan weight
-    (1/2) (2 pi / V). For a short scan this method multiplies the line integrals before the FDK by
-    Lambda / pi * w(beta, gamma) with the Parker weights in the generalized form of Wesarg et al. (Med. Phys. 29, 2002;
-    an overscan delta = (Lambda - pi) / 2 >= gamma_m allowed), beta = (i + 1/2) Lambda / V the view position in the
-    arc and gamma = -atan(u / SDD) the in-plane fan angle of channel u (the sign of MBIRTORCH's frame, tested):
+    The weights are the overscan form of Wesarg et al. times ``Lambda / pi`` for the range Lambda of the views; a range
+    shorter than pi plus the fan angle issues a RuntimeWarning and gets no weights.
 
-        w = sin^2(pi/4 beta / (delta - gamma))              0 <= beta < 2 (delta - gamma)
-            1                                               2 (delta - gamma) <= beta < pi - 2 gamma
-            sin^2(pi/4 (pi + 2 delta - beta) / (delta + gamma))     pi - 2 gamma <= beta <= pi + 2 delta
+    Args:
+        geometry (ConeGeometry): cone-beam geometry (panel channels and source-detector distance).
+        angles (Sequence[float], ndarray or Tensor): [V] view angles in rad.
+        device (torch.device or str, optional): device of the weights. Defaults to None (torch's default device).
 
-    so that the weights of the two measurements of every in-plane line sum to 1. The weights need delta >= gamma_m,
-    i.e. Lambda >= pi + fan angle; for a shorter range a RuntimeWarning is issued and None returned (plain MBIRTORCH
-    FDK: incomplete data, shading). The weights act per channel (the in-plane Parker weighting of the cone-beam FDK,
-    approximate off the central plane like FDK itself)."""
+    Returns:
+        Tensor or None: [V, 1, Cd] float32 weights, or None for a full rotation or a range too short for the weights.
+    """
     a = _angles_array(angles)
     V = a.size
     arc = scan_range(a)
@@ -200,11 +216,19 @@ _PARKER_SIGN = -1.0  # gamma = -atan(u / SDD): orientation relative to the rotat
 
 def fdk(model, sinogram: Tensor, filter_name: str = "ramp", *, geometry: Optional[ConeGeometry] = None,
         angles=None) -> Tensor:
-    """FDK reconstruction (`ConeBeamModel.recon_fdk` = `recon_direct`: ramp filter with the FDK cosine pre-weight,
-    then the adjoint of the forward projector) of line integrals [views, rows, channels] -> volume [R, C, S] (1/cm)
-    on the model device. MBIRTORCH's FDK assumes a full rotation (no short-scan weighting); given the scan `geometry`
-    and `angles` of a short scan (`is_short_scan`), the line integrals are first multiplied by the Parker weights of
-    `short_scan_weights` (without them a half-rotation FDK carries the usual short-scan shading and a wrong scale)."""
+    """FDK reconstruction of line integrals with MBIRTORCH, with Parker weights for a short scan.
+
+    Args:
+        model (ConeBeamModel): MBIRTORCH model of the scan.
+        sinogram (Tensor): [V, Rd, Cd] line integrals.
+        filter_name (str, optional): MBIRTORCH's FDK filter. Defaults to "ramp".
+        geometry (ConeGeometry, optional): scan geometry; with ``angles``, a short scan gets ``short_scan_weights``.
+            Defaults to None.
+        angles (Sequence[float] or ndarray, optional): [V] view angles in rad. Defaults to None.
+
+    Returns:
+        Tensor: [R, C, S] volume in 1/cm on the model device.
+    """
     if geometry is not None and angles is not None:
         w = short_scan_weights(geometry, angles, device=sinogram.device if isinstance(sinogram, Tensor) else None)
         if w is not None:
@@ -216,31 +240,34 @@ def mbir_iterations(model, sinogram: Tensor, init_recon: Union[Tensor, np.ndarra
                     num_iterations: int = 1, weights: Optional[Tensor] = None,
                     stop_threshold_change_pct: float = 0.0, *, error_sinogram: Optional[Tensor] = None,
                     hessian: Optional[Tensor] = None, return_checkpoint: bool = False):
-    """`num_iterations` warm-started VCD iterations from `init_recon` at schedule position `first_iteration`
-    (the recipe verified in tests/test_mbir_bridge.py):
+    """Warm-started VCD iterations of MBIRTORCH from ``init_recon`` at position ``first_iteration`` of the schedule.
 
-        model.recon(sinogram, weights, init_recon=init_recon, max_iterations=first_iteration + num_iterations,
-                    first_iteration=first_iteration, stop_threshold_change_pct=0, ...)
+    It runs ``model.recon`` with ``max_iterations = first_iteration + num_iterations``; with ``error_sinogram``,
+    ``hessian`` or ``return_checkpoint`` it runs MBIRTORCH's engine directly, resuming from the given error sinogram.
 
-    `recon` builds the full partition sequence of length max_iterations and DROPS its first `first_iteration`
-    entries, so `max_iterations` must be the END position (first_iteration + num_iterations): `max_iterations=1,
-    first_iteration=k >= 1` runs ZERO iterations. The error sinogram is recomputed as sinogram - A init_recon (no
-    rescaling of a user init), the Hessian diagonal from `weights`, and the regularization is re-estimated from
-    `sinogram` unless `freeze_regularization(model)` was called. The partitions are redrawn from numpy's global RNG
-    at every call (the granularity of iteration k is the k-th of the default schedule; the random subsets differ
-    from those of one continuous run). init_recon is not modified.
+    Args:
+        model (ConeBeamModel): MBIRTORCH model.
+        sinogram (Tensor): [V, Rd, Cd] line integrals.
+        init_recon (Tensor or ndarray): [R, C, S] initial volume in 1/cm; updated in place by the engine path (pass a
+            copy).
+        first_iteration (int): position k >= 0 of the first iteration in the partition schedule.
+        num_iterations (int, optional): number of iterations. Defaults to 1.
+        weights (Tensor, optional): [V, Rd, Cd] weights. Defaults to None (all ones).
+        stop_threshold_change_pct (float, optional): MBIRTORCH's stopping threshold in percent. Defaults to 0.0.
+        error_sinogram (Tensor, optional): [V, Rd, Cd] error sinogram ``sinogram - A init_recon`` of an earlier call,
+            trusted and updated in place. Defaults to None (recomputed).
+        hessian (Tensor, optional): forward-model Hessian diagonal of an earlier call with the same weights and model.
+            Defaults to None (recomputed).
+        return_checkpoint (bool, optional): also return the checkpoint ``{"error_sinogram", "fm_hessian"}``. Defaults
+            to False.
 
-    sinogram, weights: [views, rows, channels] line integrals and weights (None = 1). Returns (recon [R, C, S]
-    torch on the model device, recon_dict with recon_params['partition_sequence'], ['num_iterations'], ...).
+    Returns:
+        tuple: reconstruction [R, C, S] on the model device, MBIRTORCH's recon_dict and, with ``return_checkpoint``,
+            the checkpoint dict of the final error sinogram and Hessian.
 
-    Resume (module docstring): error_sinogram [views, rows, channels] = sinogram - A init_recon, kept by the caller
-    from an earlier call (its checkpoint), skips the initializing forward projection; MBIRTORCH trusts the pair and
-    updates BOTH error_sinogram and init_recon in place (pass a copy of init_recon to keep it). hessian: the
-    forward-model Hessian diagonal of an earlier call with the same weights and model (None: computed, one back
-    projection). return_checkpoint: also return {'error_sinogram': e = sinogram - A recon, 'fm_hessian': ...}, the
-    loop's own device tensors (no copy), as a third element. Any of the three switches runs MBIRTORCH's engine as
-    `recon` would (same partitions and partition sequence for the same numpy RNG state, same regularization), so a
-    resumed call equals the plain one up to the float rounding of the carried error sinogram.
+    Raises:
+        ValueError: if ``first_iteration`` < 0, ``num_iterations`` < 1, or ``error_sinogram`` comes without
+            ``init_recon``.
     """
     k = int(first_iteration)
     n = int(num_iterations)
@@ -265,9 +292,23 @@ def mbir_iterations(model, sinogram: Tensor, init_recon: Union[Tensor, np.ndarra
 
 def _vcd_recon_resumable(model, sinogram, weights, init_recon, max_iterations: int, first_iteration: int,
                          stop_threshold_change_pct: float, error_sinogram, hessian):
-    """MBIRTORCH 0.1.2 `TomographyModel.recon` (tomography_model.py) step by step, with `_vcd_recon`'s
-    init_error_sinogram / fm_hessian / return_checkpoint arguments, which `recon` does not forward. Returns (recon
-    [R, C, S] on the model device, recon_dict as `recon` builds it, checkpoint {'error_sinogram', 'fm_hessian'})."""
+    """MBIRTORCH's ``TomographyModel.recon`` step by step, passing the error sinogram and Hessian to its engine.
+
+    Args:
+        model (ConeBeamModel): MBIRTORCH model.
+        sinogram (Tensor): [V, Rd, Cd] line integrals.
+        weights (Tensor or None): [V, Rd, Cd] weights; None for all ones.
+        init_recon (Tensor or ndarray): [R, C, S] initial volume, updated in place.
+        max_iterations (int): end position in the partition schedule.
+        first_iteration (int): start position in the partition schedule.
+        stop_threshold_change_pct (float): MBIRTORCH's stopping threshold in percent.
+        error_sinogram (Tensor or None): [V, Rd, Cd] error sinogram ``sinogram - A init_recon``; None recomputes it.
+        hessian (Tensor or None): forward-model Hessian diagonal; None recomputes it.
+
+    Returns:
+        (Tensor, dict, dict): reconstruction [R, C, S], recon_dict as ``recon`` builds it, and the checkpoint
+            ``{"error_sinogram", "fm_hessian"}``.
+    """
     import datetime
 
     from mbirtorch import _sharding
@@ -296,19 +337,33 @@ def _vcd_recon_resumable(model, sinogram, weights, init_recon, max_iterations: i
 
 
 def freeze_regularization(model) -> dict[str, float]:
-    """Keep the current sigma_y, sigma_x, sigma_prox in every later `recon` call (auto_regularize_flag=False; by
-    default every `recon` call re-estimates them from the sinogram it is given). Returns the frozen values."""
+    """Freeze the model's current regularization for every later ``recon`` call (``auto_regularize_flag`` False).
+
+    Args:
+        model (ConeBeamModel): MBIRTORCH model.
+
+    Returns:
+        dict[str, float]: the frozen ``sigma_y``, ``sigma_x`` and ``sigma_prox``.
+    """
     model.set_params(auto_regularize_flag=False)
     names = ["sigma_y", "sigma_x", "sigma_prox"]
     return {k: float(v) for k, v in zip(names, model.get_params(names))}
 
 
 class ViewChunkProjector:
-    """MBIRTORCH forward projections of volumes on `grid` onto the views of a scan (`geometry`, `angles` [V] rad), in
-    chunks of consecutive views (module docstring): `project(volume, start, stop)` -> [stop - start, Rd, Cd] line
-    integrals (value x cm). The views [0, V) use `model` when it is given (the reconstruction's own ConeBeamModel over
-    all angles); any other range uses a sub-model over angles[start:stop] (`make_cone_model`, built on first use and
-    kept in an LRU of `max_models` entries). `chunks(n)` lists the (start, stop) ranges of n views each."""
+    """MBIRTORCH forward projections of volumes on ``grid`` onto chunks of consecutive views of a scan.
+
+    The full view range uses ``model`` when it is given; any other range uses a sub-model over its angles
+    (``make_cone_model``), kept in a least-recently-used cache.
+
+    Args:
+        grid (Grid): reconstruction grid.
+        geometry (ConeGeometry): cone-beam geometry of the scan.
+        angles (Sequence[float], ndarray or Tensor): [V] view angles in rad.
+        model (ConeBeamModel, optional): the model over all angles. Defaults to None.
+        device (torch.device or str, optional): device of the sub-models. Defaults to None (CUDA if available).
+        max_models (int, optional): number of sub-models kept. Defaults to 8.
+    """
 
     def __init__(self, grid: Grid, geometry: ConeGeometry, angles, *, model=None, device: DeviceLike = None,
                  max_models: int = 8) -> None:
@@ -322,15 +377,34 @@ class ViewChunkProjector:
 
     @property
     def num_views(self) -> int:
+        """Number of views V."""
         return int(self.angles.size)
 
     def chunks(self, views_per_chunk: int) -> list[tuple[int, int]]:
-        """[(start, stop), ...] covering [0, V) in runs of `views_per_chunk` views (the last one shorter)."""
+        """Ranges (start, stop) covering the views [0, V) in runs of ``views_per_chunk`` views.
+
+        Args:
+            views_per_chunk (int): views per chunk (at least 1); the last chunk may be shorter.
+
+        Returns:
+            list[tuple[int, int]]: the (start, stop) ranges.
+        """
         n = max(1, int(views_per_chunk))
         return [(a, min(a + n, self.num_views)) for a in range(0, self.num_views, n)]
 
     def model_for(self, start: int, stop: int):
-        """The ConeBeamModel of the views [start, stop)."""
+        """MBIRTORCH model of the views [start, stop).
+
+        Args:
+            start (int): first view.
+            stop (int): end view (excluded).
+
+        Returns:
+            ConeBeamModel: ``model`` for all views, else the cached or new sub-model.
+
+        Raises:
+            ValueError: if the range is empty or outside [0, V).
+        """
         start, stop = int(start), int(stop)
         if not 0 <= start < stop <= self.num_views:
             raise ValueError(f"view range [{start}, {stop}) outside [0, {self.num_views})")
@@ -348,7 +422,15 @@ class ViewChunkProjector:
         return model
 
     def project(self, volume: Tensor, start: int = 0, stop: Optional[int] = None) -> Tensor:
-        """Forward projection of volume [R, C, S] onto the views [start, stop) (default all): [stop - start, Rd, Cd]
-        float32 on the model device."""
+        """Forward projection of a volume onto the views [start, stop).
+
+        Args:
+            volume (Tensor): [R, C, S] volume.
+            start (int, optional): first view. Defaults to 0.
+            stop (int, optional): end view (excluded). Defaults to None (all views).
+
+        Returns:
+            Tensor: [stop - start, Rd, Cd] float32 line integrals on the model device.
+        """
         stop = self.num_views if stop is None else int(stop)
         return forward_project(self.model_for(start, stop), volume)

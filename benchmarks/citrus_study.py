@@ -1,77 +1,22 @@
-"""Demo: CITRUS on the WLAB phantom (synthetic cone-beam data with scatter and Poisson noise).
+"""CITRUS study on the WLAB phantom: synthetic cone-beam data with scatter and Poisson noise, CITRUS and the
+uncorrected MBIR loop, figures and a summary JSON.
 
-    python demo/demo_citrus.py                     # 180 views over a short scan, 0.5 cm grid, 80 outer iterations
-                                                   # with the scatter step on every 8th view and at every 8th outer
-                                                   # iteration (10 scatter steps)
-    python demo/demo_citrus.py --full              # the report study: 180 views over a FULL rotation, 0.5 cm grid,
-                                                   # 20 outer iterations, scatter step on every view and at every
-                                                   # outer iteration (about 30 min)
-    python demo/demo_citrus.py --end-view-angle 360                     # the default over a full rotation
-    python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 \\
-        --scatter-every 1
-                                                   # a quick run (about 2 minutes)
-    python demo/demo_citrus.py --transport-cell-cm 0.5                  # 0.5 cm transport cells (default: 1 cm)
-    python demo/demo_citrus.py --materials air,water,bone               # three reference materials in the density model
-    python demo/demo_citrus.py --truth-sweep 16x32 --truth-cone 32x64   # truth finer than the loop's solver
+The data sets are cached in demo/input and the figures, the summary JSON and (with ``--save-recon``) the CITRUS volume
+are written to demo/output, under names that record the settings. The flags and the output are described in
+docs/source/usage.rst, "CITRUS studies".
 
-1. Data (citrus.utilities.synthesize_wlab_dataset, cached in demo/input/). The WLAB phantom (30 x 20 x 40 cm water
-   prism with lung, air and bone inserts) is rasterized on the reconstruction grid; full-field panel (150 x 184
-   pixels of 0.4 cm, the whole prism in the field at every view). Views: evenly spaced over [start, end) (endpoint
-   excluded; ``--start-view-angle`` / ``--end-view-angle`` in degrees, MBIRTORCH's angle convention); the default end
-   is the short scan start + 180 degrees + the in-plane fan angle of the panel, 2 atan(0.5 x 150 x 0.4 cm / 150 cm) =
-   22.6 degrees, i.e. 202.6 degrees; ``--end-view-angle 360`` (with start 0) is a full rotation. ``--full`` keeps the
-   report's full rotation (end = start + 360 degrees, set explicitly) and its scatter step on every view at every
-   outer iteration.
-   - Primary: P = I0 exp(-A X_true) with A the MBIRTORCH projector and X_true the attenuation of the true densities at
-     the effective energy (spectrum mean, 63 keV); I0 = flat-field counts per pixel.
-   - Ground-truth scatter: for every view, the LBTE scatter solver is run on the TRUE densities with a fully converged
-     source iteration (``ScatterSolver.solve_view``, tolerance 1e-3), giving the solver's scatter planar fluence image
-     s (ideal photon-counting detector, no anti-scatter grid); p is the solver's primary planar fluence image of the
-     true densities with the primary model of the loop: MBIRTORCH's pixel-averaged per-material line integrals through
-     the solver's polychromatic transmission. The truth is stored as the per-pixel scatter-to-primary ratio
-     SPR = s / p and applied to the MBIRTORCH primary counts: S = SPR x P. The truth solver always uses the seven
-     default reference materials (the phantom is water and bone only, so the data do not depend on ``--materials``,
-     which
-     sets the loop's density model).
-   - Cache names: ``demo/input/<tag>.npz`` with the data-set format in the tag, ``..._v2`` (citrus >= 0.3.0: SPR with
-     the MBIRTORCH primary). Data sets and outputs named ``..._v1...`` are those of citrus <= 0.2.0 (SPR with the
-     solver's Siddon primary) and are never loaded; ``..._v2_primary-siddon`` data sets (the Siddon option of citrus
-     0.3.0 and 0.4.0) are not loaded either.
-   - Measured counts: Y = Poisson(P + S) (``--no-noise``: Y = P + S).
-   This is an intentional inverse crime for the scatter: the truth comes from the same solver (same physics, same
-   discretization by default) that CITRUS uses for its correction, so the study measures how well the coupled loop
-   converges, not the accuracy of the scatter model. (The primary is an inverse crime too: MBIRTORCH's own projector,
-   monoenergetic, on the reconstruction grid.) To expose the solver's angular discretization error, generate the
-   truth with finer direction sets than the loop: ``--truth-sweep`` (discrete-ordinates quadrature, polar x
-   azimuthal, loop default 8x16; recommended 16x32) and ``--truth-cone`` (collapsed-cone directions, loop default
-   16x32; recommended 32x64, or 48x96 as a reference). The defaults equal the loop's for speed; 16x32 / 32x64 make the
-   data synthesis about 4x slower. ``--transport-cell-cm`` sets the transport cell size of both solvers (cm, any
-   ratio to the voxel pitch; default 1 cm); the data set's cache name records it when it differs from 1 cm.
-2. CITRUS (citrus.citrus_recon): FDK initialization (Parker-weighted for a short scan: MBIRTORCH's FDK has no
-   short-scan weighting, recon.mbir_bridge.short_scan_weights), then per outer iteration one scatter step per view and
-   one warm-started MBIR iteration on Y / (1 + SPR). ``--scatter-view-stride n`` runs the scatter step on every n-th
-   view only and interpolates the other views' scatter signal in angle (``--scatter-view-interpolation-order``,
-   default 3: Catmull-Rom; default stride 8); ``--scatter-every n`` runs the scatter step at every n-th outer iteration
-   only and reuses the scatter-to-primary ratio in between (default 8). The output files carry ``_stride<n>`` and
-   ``_every<n>`` suffixes for values other than 1 (``_stride<n>_order<k>`` for interpolation orders other than 3).
-   The primary signal of every view comes from MBIRTORCH projections of the material maps (the reconstruction's own
-   operator), and MBIR resumes from its error sinogram between outer iterations (CitrusConfig.resume_error_sinogram;
-   ``--no-resume-error-sinogram`` restarts it from the sinogram every iteration, suffix ``_restart``; the
-   reconstructions agree to float rounding). ``--materials`` (comma-separated names of
-   citrus.scatter_solver.cross_sections.MATERIAL_CATALOGUE, at least two; default the seven air, lung, adipose,
-   water, muscle, soft_tissue, bone) sets the reference materials of the loop's density model (SolverConfig.materials;
-   the library is built once per set and cached; output suffix ``_materials-<names>`` for a set other than the
-   default). ``--save-recon`` also writes the CITRUS volume (``citrus_<tag>_recon.npy``). The energy groups of the
-   loop's library follow the object size measured on the FDK volume (CitrusConfig.grouping_object_size "auto"; the
-   library is built after the FDK; the medium of the grouping balance too), those of the truth the size and the mean
-   composition of the phantom. The summary JSON records the reference materials, both object sizes and media and the
-   peak allocated GPU memory of the CITRUS run
-   (``torch.cuda.max_memory_allocated``, MiB: whole run and largest outer iteration).
-3. The same MBIR loop without scatter correction (citrus.mbir_recon), for comparison.
-Both reconstructions use the same frozen regularization (MBIRTORCH's automatic estimate on the scatter-free
-sinogram), the same FDK initialization, weights and partition sequence, so they differ only by the scatter
-correction. Figures (demo/output/): central slices, central-row profiles, relative RMSE vs outer iteration, and the
-estimated vs true scatter-to-primary ratio of view 0.
+Usage::
+
+    python benchmarks/citrus_study.py                  # 180 views over a short scan, 0.5 cm grid, 80 outer iterations,
+                                                       # scatter step on every 8th view at every 8th outer iteration
+    python benchmarks/citrus_study.py --full           # 180 views over a full rotation, 0.5 cm grid, 20 outer
+                                                       # iterations, scatter step on every view at every iteration
+    python benchmarks/citrus_study.py --end-view-angle 360                     # the default over a full rotation
+    python benchmarks/citrus_study.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 \
+        --scatter-every 1                              # a quick run
+    python benchmarks/citrus_study.py --transport-cell-cm 0.5                  # 0.5 cm transport cells
+    python benchmarks/citrus_study.py --materials air,water,bone               # three reference materials
+    python benchmarks/citrus_study.py --truth-sweep 16x32 --truth-cone 32x64   # truth finer than the loop's solver
 """
 
 from __future__ import annotations
@@ -100,15 +45,18 @@ from citrus.utilities import (full_field_wlab_geometry, load_dataset,  # noqa: E
                               nominal_attenuation, plot_history, plot_profiles, plot_slices, set_memory_cap,
                               synthesize_wlab_dataset, wlab_grid, wlab_solver)
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+# the data sets and the outputs live next to the demos: demo/input and demo/output
+DEMO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "demo")
 
 
 def _box(grid, device, half) -> torch.Tensor:
+    """Mask [rows, cols, slices] of the voxels with |x|, |y|, |z| below the half-widths ``half`` (cm)."""
     x, y, z = grid.axis_coordinates(device)
     return (x[None, :, None].abs() < half[0]) & (y[:, None, None].abs() < half[1]) & (z[None, None, :].abs() < half[2])
 
 
 def _counts(text: str, what: str) -> tuple[int, int]:
+    """Parse a POLARxAZIMUTHAL direction count such as 16x32 given to the flag ``what``."""
     try:
         p, a = (int(v) for v in text.lower().split("x"))
     except ValueError:
@@ -117,6 +65,7 @@ def _counts(text: str, what: str) -> tuple[int, int]:
 
 
 def main() -> None:
+    """Parse the flags, load or synthesize the data, run CITRUS and the uncorrected loop, write the outputs."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--views", type=int, default=180, help="number of views over the angular range (default 180)")
     parser.add_argument("--delta-voxel", type=float, default=0.5, help="voxel pitch in cm (default 0.5)")
@@ -167,8 +116,8 @@ def main() -> None:
     parser.add_argument("--memory-cap-mib", type=float, default=None,
                         help="PyTorch CUDA allocator cap in MiB (default: 85 percent of the device's memory, which "
                              "keeps Windows from spilling into system memory; 0: none)")
-    parser.add_argument("--input", default=os.path.join(HERE, "input"))
-    parser.add_argument("--out", default=os.path.join(HERE, "output"))
+    parser.add_argument("--input", default=os.path.join(DEMO, "input"))
+    parser.add_argument("--out", default=os.path.join(DEMO, "output"))
     args = parser.parse_args()
     if args.full:
         args.views, args.delta_voxel, args.outer_iterations = 180, 0.5, 20
@@ -187,7 +136,7 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(f"--materials: {exc}")
     if not torch.cuda.is_available():
-        raise SystemExit("this demo needs a CUDA GPU (MBIRTORCH and the scatter solver run on the GPU)")
+        raise SystemExit("this study needs a CUDA GPU (MBIRTORCH and the scatter solver run on the GPU)")
     device = torch.device("cuda")
     if args.memory_cap_mib is None and torch.cuda.is_available():
         args.memory_cap_mib = 0.85 * torch.cuda.get_device_properties(0).total_memory / 2 ** 20
@@ -309,6 +258,7 @@ def main() -> None:
     print("reference materials of the density model (nominal attenuation at E_eff, 1/cm): "
           + ", ".join(f"{name} {mu:.4g}" for name, mu
                       in zip(reference_materials, nominal_attenuation(solver.library).tolist())))
+
     def medium_text(medium) -> str:
         return medium if isinstance(medium, str) or medium is None else ", ".join(f"{n} {d:.3g}" for n, d in medium)
 

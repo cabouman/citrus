@@ -63,7 +63,8 @@ Repository
 ----------
 
 ``demo/``
-    ``demo_scatter_solver.py`` (one view of the WLAB phantom) and ``demo_citrus.py`` (CITRUS vs uncorrected MBIR).
+    Two quick-start scripts: ``demo_1_scatter_solver.py`` (the scatter solver on one view of the WLAB phantom) and
+    ``demo_2_citrus.py`` (CITRUS vs uncorrected MBIR on synthetic data).
 ``tests/``
     The test suite (``python -m pytest -q``), including oracle tests: a 1-D slab linear-discontinuous solution,
     particle balance, dense Galerkin assembly, Beer's law, brute-force point-to-point scatter integrals, and the
@@ -73,5 +74,5 @@ Repository
     ``clean_install_all.sh``, ``remove_build.sh``, ``deep_clean.sh``, ``run_tests.sh`` (``--slow`` for the slow tests),
     ``build_docs.sh``, ``check_cuda.sh`` (PyTorch / CUDA / Triton availability and the kernel self-checks).
 ``benchmarks/``
-    Benchmarks of the sweep, the first-collision source kernel and the ray tracer, and a per-stage profile of the
-    CITRUS step.
+    Benchmarks of the sweep, the first-collision source kernel and the ray tracer, a per-stage profile of the CITRUS
+    step, and ``citrus_study.py``, the CITRUS study script with every setting as a flag (:doc:`usage`).

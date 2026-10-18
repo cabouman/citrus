@@ -47,7 +47,13 @@ On a machine without internet access, download the archive elsewhere and point t
 
 .. code-block:: bash
 
-   export CITRUS_XCOM_ARCHIVE=/path/to/XCOM.tar.gz      # Windows: set CITRUS_XCOM_ARCHIVE=C:\path	o\XCOM.tar.gz
+   export CITRUS_XCOM_ARCHIVE=/path/to/XCOM.tar.gz      # Windows: set CITRUS_XCOM_ARCHIVE=C:\path\to\XCOM.tar.gz
+
+The data are looked for in this order: the archive or folder named by ``CITRUS_XCOM_ARCHIVE``; the parsed cache
+``xcom_elements.npz``; the archive ``XCOM.tar.gz`` in the cache folder; a download into the cache folder. Only the
+element tables and ``ATWTS.DAT`` are read, in memory, from the archive; nothing is written outside the cache folder.
+The parsed cache holds every element's grid, its five cross sections, its edges and the tables below the K edge,
+with the SHA-256 of the source it was parsed from; a cache whose source does not match is parsed again.
 
 When neither the variable, the cache nor the network is available, building a library raises an error that names the
 URL and the variable. XCOM is a NIST Standard Reference Database; its use is subject to NIST's terms for Standard
@@ -70,8 +76,9 @@ public launch path.
 GPU memory
 ----------
 
-On Windows, VRAM oversubscription silently spills into system memory and runs much slower; the demos therefore cap the
-PyTorch allocator (``citrus.utilities.set_memory_cap``, default 4400 MiB, ``--memory-cap-mib``).
+On Windows, VRAM oversubscription silently spills into system memory and runs much slower; the study script
+therefore caps the PyTorch allocator (``citrus.utilities.set_memory_cap``; ``--memory-cap-mib``, default 85 percent
+of the device memory).
 
 Tests
 -----

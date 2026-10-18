@@ -1,96 +1,11 @@
-"""Build the multigroup cross-section library of the scatter solver.
+"""Build the multigroup cross-section library of the scatter solver from point-wise photon interaction data.
 
-Fills a :class:`citrus.scatter_solver.cross_sections.MultigroupLibrary` for the reference materials of the density model
-(any subset of ``cross_sections.MATERIAL_CATALOGUE``, ``SolverConfig.materials``; by default the seven of
-``cross_sections.MATERIALS``: air, lung, adipose, water, muscle, soft tissue, cortical bone) from point-wise photon
-interaction data.
-
-Data: the integrated cross sections and atomic weights of NIST XCOM (downloaded from NIST on first use and cached) and
-the angular shapes of xraylib, loaded by ``resolve_backend()`` (module ``photon_data``: sources, citations, XCOM's
-interpolation, the download, the cache and ``$CITRUS_XCOM_ARCHIVE`` for offline machines).
-
-Physics summary (all coefficients per unit density, cm^2/g):
-  * Groups g = 0..G-1 from HIGHEST to LOWEST energy; ``group_edges`` [G+1] descending.
-  * Group edges (``make_group_edges``): explicit edges if given, else the rule ``SolverConfig.group_edges_method``:
-    equal area under an estimate of the total (source plus scattered) photon fluence spectrum in a water object of
-    chord ``grouping_object_size_cm`` (``scattered_fluence_spectrum``; the default), equal source photon counts
-    ("equal_fluence") or geometric spacing ("log").
-  * Within-group weight w(E), normalized to 1 within each group: the source spectrum, or for the "scattered_fluence"
-    rule the estimated total fluence of that rule (``_within_group_weights``). A group with zero weight falls back to
-    a flat weight (a ``RuntimeWarning`` is raised and the group is listed in ``BuildInfo.flat_fallback_groups``).
-  * Fine energy grid: each group is cut into equal bins of width <= ``fine_bin_width_kev`` (default 0.5 keV);
-    every quantity is evaluated at the bin midpoint and weighted by the exact integral of w(E)
-    over the bin (midpoint rule in E; the spectrum is integrated exactly as a piecewise-linear
-    function, so characteristic lines are not lost).
-  * Total attenuation mu_t = coherent + incoherent + photoelectric + pair production (nuclear and electron field),
-    XCOM's total with coherent scattering; mu_t - (Compton + Rayleigh) is absorption, so pair production is absorbed
-    locally (no annihilation photons).
-  * Element mixing is done here, NOT with compound data of a library:
-        d mu_x/dOmega (E, eta) = sum_i w_i sigma_x(Z_i, E) pdf_x,i(E, eta),   x in {C, R}
-    with w_i mass fractions, sigma_x the elemental mass cross section (XCOM) and pdf_x,i the elemental
-    angular shape (xraylib) normalized numerically to 2 pi int pdf d eta = 1 (reference quadrature below), so the
-    group transfer integrates to the XCOM cross section whatever the integral of xraylib's shape.
-  * Compton kinematics without Doppler broadening: E'(E, eta) = E / (1 + (E/m_e c^2)(1 - eta)).
-    For each fine energy E the eta boundaries of every energy group are computed analytically,
-    eta_edge = 1 - m_e c^2 (1/E_edge - 1/E), and the eta integral is done piecewise with
-    Gauss-Legendre (``gauss_legendre_nodes`` nodes per piece, default 32), in the variable
-    q = sin(theta/2) = sqrt((1 - eta)/2) (d eta = 4 q dq), which resolves the forward structure
-    of the form factor / incoherent scattering function. Pieces are additionally split at fixed
-    q breakpoints (``_Q_BREAKPOINTS``) that are dense near q = 0.
-  * BELOW-CUTOFF CONVENTION: Compton scatter whose outgoing energy E' falls below the lowest
-    group edge (``energy_min_kev`` unless explicit edges are given) leaves the group structure.
-    It is NOT put in ``mu_s_l``/``mu_s_eta``; it stays in ``mu_t``, so the solver treats it as
-    absorption (local deposition). Its magnitude is reported in ``BuildInfo.compton_below_cutoff``
-    and satisfies, per material and source group,
-        sum_{g_out} mu_s_l[m, g, g_out, 0] + compton_below_cutoff[m, g] = <sigma_CS + sigma_RS>_g.
-    With E_min = 10 keV it is only nonzero for E < ~10.4 keV (backscatter limit).
-  * Rayleigh is within-group only (no energy loss).
-  * ``mu_s_eta`` is tabulated directly on ``eta_grid`` (not reconstructed from moments): Compton
-    with the same kinematic indicator evaluated at each table eta, plus within-group Rayleigh.
-    At fixed eta the indicator is a cut in E at E_b = 1/(1/E_edge - (1-eta)/m_e c^2); each fine
-    energy bin contributes the fraction of its width on the right side of the cut, so the table
-    is continuous in eta instead of a 0.5 keV staircase.
-  * Table nodes (``SolverConfig.angular_table_grid``): "uniform" places the ``num_eta_table`` nodes equally in eta;
-    "adaptive" (default) places them by a map u = h(eta) built from the transfer curves of the catalogue's water and
-    cortical bone (``ANGULAR_MAP_MATERIALS``, whatever the library's materials, so that every material set shares the
-    nodes and a material's rows do not depend on the set) in the library's groups (``angular_map``): the node density
-    follows max over the curves of sqrt(|d^2 f / d q^2| / max f) in
-    q = sin(theta/2), the density that equalizes the relative error of linear interpolation, plus a floor, so the
-    Rayleigh and Compton forward peaks (a few 1e-7 wide in 1 - eta at MeV energies) are resolved with the same node
-    count. The map is stored as ``eta_map`` and evaluated by ``cross_sections.angular_table_position``.
-  * Fine-energy attenuation table (``fine_energy``, ``fine_mu_t``, ``fine_weight``, ``fine_group``):
-    the same fine quadrature, i.e. the total mass attenuation of each material at every bin midpoint
-    and the exact spectrum integral over every bin normalized to 1 over the whole group structure
-    (bins with zero spectrum are dropped), so sum over a group's bins = ``spectrum_fraction[g]``.
-    The uncollided fluence and the primary use it instead of the group-averaged ``mu_t`` (exact in
-    energy: no within-group beam hardening error; docs/source/design_notes.rst, "Cross sections").
-
-Materials. The compositions and nominal densities of every material the builder knows are in
-``cross_sections.MATERIAL_CATALOGUE`` (sources there); ``MATERIAL_FORMULAS`` maps each name to its composition. A
-library is built for a table of (name, nominal density, formula) entries, ``materials=`` (default: the seven default
-reference materials; ``build_solver_library`` uses ``cross_sections.material_table(config.materials)``). The builder
-sorts the
-table by nominal attenuation at the spectrum-mean energy (``sort_material_table``; a table already in that order is
-unchanged) and asserts at every fine energy that the order holds (``check_material_order``: no two materials cross).
-The cache key holds the sorted table (names, nominal densities, formulas), so different sets never share a cache entry.
-The default seven:
-  * air     = '78.084*N2 + 20.946*O2 + 0.9340*Ar + 0.0397*CO2', 0.0012 g/cm^3: the volume percentages of dry air
-              read as mass fractions of the compounds (N 0.7808, O 0.2097, Ar 0.0093, C 0.0001 by mass; NIST's dry
-              air, xraylib's 'Air, Dry (near sea level)', has N 0.7553, O 0.2318, Ar 0.0128), kept as the air of the
-              WLAB validation.
-  * lung    = ICRP lung without its Ca, Fe and Zn traces (renormalized; every mass fraction within 4e-4 of xraylib's
-              'Lung (ICRP)'), 0.26 g/cm^3 (the WLAB lung).
-  * adipose = ICRP adipose tissue, the mass fractions of xraylib's 'Adipose Tissue (ICRP)', 0.95 g/cm^3 (NIST lists
-              0.92).
-  * water   = 'H2O' -> with XCOM's atomic weights (H 1.00794, O 15.9994): H 0.111898, O 0.888102; 1.0 g/cm^3.
-  * muscle  = ICRU-44 skeletal muscle mass fractions, 1.05 g/cm^3.
-  * soft_tissue = ICRU-44 soft tissue mass fractions, 1.06 g/cm^3. Muscle lies BELOW soft tissue at every energy
-              of the library, hence the order.
-  * bone    = ICRP cortical bone, the mass fractions of xraylib's 'Bone, Cortical (ICRP)' (1.85 g/cm^3), mass
-    fractions H 0.047234, C 0.144330, N 0.041990, O 0.446096, Mg 0.002200, P 0.104970,
-    S 0.003150, Ca 0.209930, Zn 0.000100 (sum 1.000000). Note this is ICRP (not ICRU-44) cortical bone; its mu/rho
-    differs slightly from ICRU-44.
-Other tables (any number of materials) can be passed as ``materials=`` (name, nominal density, formula).
+:func:`build_library` fills a :class:`~citrus.scatter_solver.cross_sections.MultigroupLibrary` for a table of
+catalogue materials from the integrated cross sections of NIST XCOM and the angular shapes of xraylib (``photon_data``)
+and caches it on disk. The module also holds the steps of the build: material formulas, the source spectrum, the group
+edges, the fine energy grid, the angular quadratures and the node placement of adaptive angular tables. The physics
+and the conventions are described in the documentation pages "Design notes" (section "Cross sections") and
+"Conventions".
 """
 
 from __future__ import annotations
@@ -156,13 +71,24 @@ MaterialTable = Sequence[tuple[str, float, str]]  # (name, nominal density g/cm^
 
 
 def default_material_table() -> tuple[tuple[str, float, str], ...]:
-    """The seven default reference materials as (name, nominal density, formula):
-    ``cross_sections.material_table(MATERIALS)``
-    (``cross_sections.MATERIAL_TABLE`` with ``MATERIAL_FORMULAS``)."""
+    """Return the seven default reference materials as (name, nominal density, formula) entries.
+
+    Returns:
+        tuple: (name, nominal density in g/cm^3, formula) per material, ``cross_sections.material_table(MATERIALS)``.
+    """
     return material_table(MATERIALS)
 
 
 def _material_table(materials: Optional[MaterialTable]) -> tuple[tuple[str, float, str], ...]:
+    """Check a material table, or return the default one for None.
+
+    Args:
+        materials (Sequence or None): (name, nominal density in g/cm^3, formula) per material; None for the seven
+            default reference materials.
+
+    Returns:
+        tuple: the table as (str, float, str) entries.
+    """
     t = default_material_table() if materials is None else tuple((str(n), float(d), str(f)) for n, d, f in materials)
     if not t:
         raise ValueError("empty material table")
@@ -185,13 +111,17 @@ _DEFAULT_SPECTRUM_FILE = "spectrum_125kvp.txt"  # package data, citrus/scatter_s
 # =============================================================================================
 
 def parse_formula(formula: str, atomic_mass: Callable[[int], float]) -> dict[int, float]:
-    """Parse a material string into element mass fractions {Z: w_Z} (sum 1).
+    """Parse a material formula into element mass fractions that sum to 1.
 
-    Accepts 'H2O' or mixtures 'a*F1 + b*F2 + ...' where a, b are (relative) mass fractions of
-    the compounds; compound element counts are converted to mass fractions with ``atomic_mass``.
-    A term's number is the mass fraction of its compound even when the compound is a molecule (so
-    '78.084*N2 + ...' weighs N2 by 78.084, not 78.084 molecules). atomic_mass: Z -> g/mol (the builder passes XCOM's
-    atomic weights, ``XcomXraylibBackend.atomic_mass``).
+    A formula is a compound such as ``H2O`` or a mixture ``a*F1 + b*F2 + ...`` in which a, b are the relative mass
+    fractions of the compounds F1, F2, also for molecules (``78.084*N2`` weighs N2 by 78.084).
+
+    Args:
+        formula (str): the material formula.
+        atomic_mass (Callable[[int], float]): atomic weight in g/mol of an atomic number Z.
+
+    Returns:
+        dict[int, float]: mass fraction per atomic number Z, sorted by Z.
     """
     text = formula.replace(" ", "")
     terms = text.split("+")
@@ -223,17 +153,36 @@ def parse_formula(formula: str, atomic_mass: Callable[[int], float]) -> dict[int
 
 def material_composition(backend: XcomXraylibBackend,
                          materials: Optional[MaterialTable] = None) -> dict[str, dict[int, float]]:
-    """Element mass fractions per material (table order; default the seven default reference materials), keyed by
-    name."""
+    """Return the element mass fractions of every material of a table.
+
+    Args:
+        backend (XcomXraylibBackend): photon data; supplies the atomic weights.
+        materials (Sequence or None, optional): (name, nominal density, formula) per material. Defaults to None, the
+            seven default reference materials.
+
+    Returns:
+        dict[str, dict[int, float]]: mass fraction per atomic number Z of each material, keyed by name in table order.
+    """
     return {n: parse_formula(f, backend.atomic_mass) for n, _, f in _material_table(materials)}
 
 
 def _mean_energy(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], fine_bin_width_kev: float,
                  backend: Optional[XcomXraylibBackend] = None) -> float:
-    """Spectrum-mean photon energy (keV) over the group structure of ``config`` on the fine energy quadrature of the
-    build: sum_e w_e E_e / sum_e w_e with w_e the exact spectrum integral over fine bin e, the effective energy of the
-    library's density model (``citrus.utilities.effective_energy``, about 63 keV for the default 125 kVp spectrum).
-    backend: needed by the "scattered_fluence" group rule (None loads one when needed)."""
+    """Return the spectrum-mean photon energy over the group structure of ``config`` on the fine energy grid.
+
+    The mean is ``sum_e w_e E_e / sum_e w_e`` with ``w_e`` the exact spectrum integral over fine bin e, the effective
+    energy of the library's density model.
+
+    Args:
+        config (SolverConfig): solver configuration; sets the group edges.
+        spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]).
+        fine_bin_width_kev (float): maximum fine bin width in keV.
+        backend (XcomXraylibBackend or None, optional): photon data, needed by the "scattered_fluence" group rule.
+            Defaults to None (loaded when needed).
+
+    Returns:
+        float: mean energy in keV.
+    """
     edges = make_group_edges(config, spectrum, backend, fine_bin_width_kev=fine_bin_width_kev)
     E, _, bin_low, bin_high = fine_energy_grid(edges, fine_bin_width_kev)
     density = _Spectrum(*spectrum)
@@ -247,12 +196,23 @@ def sort_material_table(config: SolverConfig, materials: Optional[MaterialTable]
                         spectrum: tuple[np.ndarray, np.ndarray] | None = None,
                         backend: XcomXraylibBackend | None = None, *,
                         fine_bin_width_kev: float = 0.5) -> tuple[tuple[str, float, str], ...]:
-    """The material table ((name, nominal density g/cm^3, formula) per material; None: the seven default reference
-    materials)
-    sorted by nominal attenuation rho^nom mu/rho(E_eff) at the spectrum-mean energy E_eff of the build
-    (``_mean_energy``; elemental total mass attenuation of the backend mixed by mass fraction; a stable sort, so a
-    table already in that order is returned as it is). Whether the order holds at every energy of the library is
-    checked by the build (``check_material_order``). Needs the backend (XCOM and xraylib)."""
+    """Sort a material table by nominal attenuation at the spectrum-mean energy of the build.
+
+    The attenuation is ``rho_nom * mu/rho(E_eff)`` with the elemental total mass attenuation of the backend mixed by
+    mass fraction; the sort is stable, so a table already in that order is returned unchanged.
+
+    Args:
+        config (SolverConfig): solver configuration; sets the group structure and so the mean energy.
+        materials (Sequence or None, optional): (name, nominal density in g/cm^3, formula) per material. Defaults to
+            None, the seven default reference materials.
+        spectrum (tuple[np.ndarray, np.ndarray] or None, optional): (energies [K] in keV, photon density per keV [K]).
+            Defaults to None, the default 125 kVp spectrum.
+        backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
+        fine_bin_width_kev (float, optional): maximum fine bin width in keV. Defaults to 0.5.
+
+    Returns:
+        tuple: the (name, nominal density, formula) entries in order of increasing nominal attenuation.
+    """
     table = _material_table(materials)
     backend = resolve_backend() if backend is None else backend
     spectrum_arrays = _spectrum_or_default(spectrum)
@@ -268,11 +228,22 @@ def mass_attenuation_preview(config: SolverConfig, names: Sequence[str],
                              spectrum: tuple[np.ndarray, np.ndarray] | None = None,
                              backend: XcomXraylibBackend | None = None, *, energy_kev: float | None = None,
                              fine_bin_width_kev: float = 0.5) -> tuple[float, np.ndarray]:
-    """(E_eff keV, total mass attenuation [len(names)] cm^2/g at E_eff) of catalogue materials WITHOUT building the
-    library: E_eff = energy_kev, or the spectrum-mean energy of the build of `config` (``_mean_energy``, the value
-    ``citrus.utilities.effective_energy`` gives for the built library); the attenuation from the backend's elemental
-    cross sections mixed by mass fraction at E_eff (the library interpolates its fine table there instead: the two
-    agree closely). For decisions taken before a lazy solver builds its library (``citrus.utilities.object_size_cm``).
+    """Return the total mass attenuation of catalogue materials at the effective energy without building the library.
+
+    The effective energy is ``energy_kev`` or the spectrum-mean energy of the build of ``config``; the attenuation mixes
+    the backend's elemental cross sections by mass fraction at that energy.
+
+    Args:
+        config (SolverConfig): solver configuration; sets the group structure and so the mean energy.
+        names (Sequence[str]): catalogue material names.
+        spectrum (tuple[np.ndarray, np.ndarray] or None, optional): (energies [K] in keV, photon density per keV [K]).
+            Defaults to None, the default 125 kVp spectrum.
+        backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
+        energy_kev (float or None, optional): effective energy in keV. Defaults to None, the spectrum-mean energy.
+        fine_bin_width_kev (float, optional): maximum fine bin width in keV. Defaults to 0.5.
+
+    Returns:
+        (float, np.ndarray): the effective energy in keV and the total mass attenuation [len(names)] in cm^2/g there.
     """
     backend = resolve_backend() if backend is None else backend
     spectrum_arrays = _spectrum_or_default(spectrum)
@@ -287,9 +258,18 @@ def mass_attenuation_preview(config: SolverConfig, names: Sequence[str],
 
 
 def check_material_order(fine_mu_t: np.ndarray, nominal_density: np.ndarray, names=None) -> None:
-    """Raise ValueError unless the nominal attenuations rho_m^nom m_m(E) [M, E] increase strictly with the material
-    index at EVERY fine energy (the fixed bracketing order of the density model,
-    ``citrus.utilities.attenuation_to_densities``)."""
+    """Check that the nominal attenuations increase strictly with the material index at every fine energy.
+
+    This is the fixed bracketing order of the density model (``citrus.utilities.attenuation_to_densities``).
+
+    Args:
+        fine_mu_t (np.ndarray): [M, E] total mass attenuation in cm^2/g at the fine energies.
+        nominal_density (np.ndarray): [M] nominal densities in g/cm^3.
+        names (Sequence[str] or None, optional): material names for the error message. Defaults to None (indices).
+
+    Raises:
+        ValueError: if two consecutive materials cross at some energy.
+    """
     attenuation = np.asarray(nominal_density, dtype=np.float64)[:, None] * np.asarray(fine_mu_t, dtype=np.float64)
     bad = np.nonzero(~(np.diff(attenuation, axis=0) > 0).all(axis=1))[0]
     if bad.size:
@@ -304,9 +284,16 @@ def check_material_order(fine_mu_t: np.ndarray, nominal_density: np.ndarray, nam
 # =============================================================================================
 
 def load_spectrum_txt(path: str) -> tuple[np.ndarray, np.ndarray]:
-    """Load a two-column text spectrum (energy keV, photon density per keV); '#' comments.
+    """Load a two-column text spectrum of energy in keV and photon density per keV.
 
-    Commas or whitespace separate columns. Returns (energies [K] ascending, weights [K]) float64.
+    Columns are separated by commas, semicolons or whitespace; ``#`` starts a comment and lines that do not parse are
+    skipped.
+
+    Args:
+        path (str): path of the text file.
+
+    Returns:
+        (np.ndarray, np.ndarray): energies [K] in keV, ascending, and photon densities per keV [K], float64.
     """
     rows: list[tuple[float, float]] = []
     with open(path, "r", encoding="utf-8") as file:
@@ -325,14 +312,13 @@ def load_spectrum_txt(path: str) -> tuple[np.ndarray, np.ndarray]:
 
 
 def default_spectrum_125kvp() -> tuple[np.ndarray, np.ndarray]:
-    """Default kV source: W anode, 125 kV, 11 deg take-off, 0.89 mm Ti filter (the spectrum of the WLAB validation).
+    """Load the default kV source spectrum: W anode, 125 kV, 11 degree take-off, 0.89 mm Ti filter.
 
-    Read from the package data file ``citrus/scatter_solver/data/spectrum_125kvp.txt`` (``load_spectrum_txt``): 125
-    nodes E = 1, 2, ..., 125 keV and the relative photon density per keV at each (simulated once with XrayPhysics'
-    ``simulateSpectra`` x ``filterResponse('Ti', 4.506, 0.089)``; CITRUS does not simulate tube spectra, any other
-    spectrum is loaded with ``load_spectrum_txt``).
-    Returns (energies_kev [125], weights [125]) float64, weights a photon density per keV (arbitrary scale),
-    piecewise-linear between the nodes.
+    The spectrum is read from the package data file ``citrus/scatter_solver/data/spectrum_125kvp.txt``, 125 nodes at 1,
+    2, ..., 125 keV, and is piecewise linear between them.
+
+    Returns:
+        (np.ndarray, np.ndarray): energies [125] in keV and relative photon density per keV [125], float64.
     """
     from importlib import resources
 
@@ -341,9 +327,21 @@ def default_spectrum_125kvp() -> tuple[np.ndarray, np.ndarray]:
 
 
 class _Spectrum:
-    """Piecewise-linear spectral density s(E) (zero outside the samples) with exact integrals."""
+    """Piecewise-linear spectral density s(E), zero outside the samples, with exact integrals.
+
+    Attributes:
+        energies (np.ndarray): [K] sample energies in keV, ascending.
+        weights (np.ndarray): [K] density at the samples, negative values clipped to 0.
+        cumulative (np.ndarray): [K] integral of s from the first sample to each sample.
+    """
 
     def __init__(self, energies: np.ndarray, weights: np.ndarray) -> None:
+        """Sort the samples and tabulate the cumulative integral.
+
+        Args:
+            energies (np.ndarray): [K] sample energies in keV, K >= 2.
+            weights (np.ndarray): [K] spectral density at the samples.
+        """
         energies = np.asarray(energies, dtype=np.float64).ravel()
         weights = np.asarray(weights, dtype=np.float64).ravel()
         if energies.size != weights.size or energies.size < 2:
@@ -354,10 +352,25 @@ class _Spectrum:
         self.cumulative = np.concatenate([[0.0], np.cumsum(seg)])
 
     def __call__(self, E: np.ndarray) -> np.ndarray:
+        """Evaluate the density by linear interpolation.
+
+        Args:
+            E (np.ndarray): energies in keV.
+
+        Returns:
+            np.ndarray: s(E), same shape as ``E``, 0 outside the samples.
+        """
         return np.interp(E, self.energies, self.weights, left=0.0, right=0.0)
 
     def cumulative_integral(self, E: np.ndarray) -> np.ndarray:
-        """int_{-inf}^{E} s(E') dE' (exact for the piecewise-linear interpolant)."""
+        """Return the exact integral of s from minus infinity to E.
+
+        Args:
+            E (np.ndarray): upper limits in keV.
+
+        Returns:
+            np.ndarray: the integrals, same shape as ``E``.
+        """
         E = np.clip(np.asarray(E, dtype=np.float64), self.energies[0], self.energies[-1])
         i = np.clip(np.searchsorted(self.energies, E, side="right") - 1, 0, self.energies.size - 2)
         x0, x1 = self.energies[i], self.energies[i + 1]
@@ -367,7 +380,11 @@ class _Spectrum:
         return self.cumulative[i] + y0 * t + 0.5 * slope * t * t
 
     def max_energy(self) -> float:
-        """Upper end of the support of s (first zero sample after the last positive one)."""
+        """Return the upper end of the support of s, the first zero sample after the last positive one.
+
+        Returns:
+            float: energy in keV.
+        """
         pos = np.nonzero(self.weights > 0)[0]
         if pos.size == 0:
             raise ValueError("spectrum is identically zero")
@@ -377,9 +394,19 @@ class _Spectrum:
 
 def _equal_area_edges(grid: np.ndarray, cumulative: np.ndarray, G: int, energy_min: float,
                       energy_max: float) -> np.ndarray:
-    """Descending edges [G + 1] that cut the area of a nonnegative density into G equal parts: grid [n] ascending
-    energies (keV) with grid[0] = energy_min and grid[-1] = energy_max, cumulative [n] the integral of the density from
-    energy_min to each grid energy (linear interpolation in between)."""
+    """Return descending group edges that cut the area under a nonnegative density into G equal parts.
+
+    Args:
+        grid (np.ndarray): [n] ascending energies in keV, from ``energy_min`` to ``energy_max``.
+        cumulative (np.ndarray): [n] integral of the density from ``energy_min`` to each grid energy (linear in
+            between).
+        G (int): number of groups.
+        energy_min (float): lowest edge in keV.
+        energy_max (float): highest edge in keV.
+
+    Returns:
+        np.ndarray: [G+1] edges in keV, descending.
+    """
     if cumulative[-1] <= 0:
         raise ValueError("spectrum has no photons in [energy_min_kev, kVp]")
     targets = cumulative[-1] * np.arange(1, G) / G
@@ -398,26 +425,22 @@ _EDGES_MEMO: dict[str, np.ndarray] = {}
 def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray],
                      backend: Optional[XcomXraylibBackend] = None, *,
                      fine_bin_width_kev: float = 0.5) -> np.ndarray:
-    """Group edges [G+1] in keV, descending, spanning [energy_min_kev, kVp] (kVp = upper end of the spectrum support).
+    """Return the group edges in keV, descending, from kVp (the upper end of the spectrum) down to ``energy_min_kev``.
 
-    ``config.group_edges_kev`` if given (must be strictly descending). Otherwise ``config.group_edges_method``:
+    The edges are ``config.group_edges_kev`` if given, otherwise placed by ``config.group_edges_method``:
+    "scattered_fluence" (equal areas under the total fluence estimate of ``scattered_fluence_spectrum``),
+    "equal_fluence" (equal source photon counts) or "log" (geometric spacing).
 
-    * "scattered_fluence" (default): equal area per group under the TOTAL photon fluence spectrum phi(E), source plus
-      scattered photons, of an object of chord L = ``config.grouping_object_size_cm`` made of the medium
-      ``grouping_medium_densities(config)`` (``scattered_fluence_spectrum``; needs the backend, None loads one). A
-      grouping heuristic, not a transport result. The library then also weights the energies within each group by
-      phi (``_within_group_weights``).
-    * "equal_fluence": equal area under the SOURCE spectrum (equal source photon count per group; the rule of
-      citrus <= 0.5, unchanged to the last bit).
-    * "log": geometric spacing, edges energy_min_kev (kVp / energy_min_kev)^(k / G).
+    Args:
+        config (SolverConfig): solver configuration; uses num_groups, group_edges_kev, group_edges_method,
+            energy_min_kev, grouping_object_size_cm and grouping_medium.
+        spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]).
+        backend (XcomXraylibBackend or None, optional): photon data for the "scattered_fluence" rule. Defaults to None
+            (loaded when needed).
+        fine_bin_width_kev (float, optional): bin width in keV of the "scattered_fluence" balance. Defaults to 0.5.
 
-    Why the scattered fluence: "equal area under the spectrum" taken on the SOURCE spectrum is "equal_fluence". It
-    resolves the source photons, but the groups carry the collided photons too, and the multiple-collision scatter
-    consists of downscattered photons. At 125 kVp both spectra lie in the same range and the rules nearly agree; at
-    6 MV the source has few photons below 600 keV, so equal source fluence puts one group across 10-600 keV, where most
-    multiply scattered photons are, and the group-averaged attenuation of that wide group is too coarse. The total
-    fluence spectrum puts edges where the photons of every collision order are.
-    fine_bin_width_kev: bin width of the energy grid of the "scattered_fluence" balance.
+    Returns:
+        np.ndarray: [G+1] edges in keV, descending.
     """
     G = int(config.num_groups)
     if config.group_edges_kev is not None:
@@ -459,16 +482,26 @@ def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarra
 def _within_group_weights(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], backend, E: np.ndarray,
                           fine_groups: np.ndarray, bin_low: np.ndarray, bin_high: np.ndarray,
                           photons_per_bin: np.ndarray, G: int, fine_bin_width_kev: float) -> tuple[np.ndarray, list]:
-    """The weights w(E) of the fine bins within their group (they sum to 1 per group) for the group constants, and the
-    groups that fell back to a flat weight.
+    """Return the weights of the fine bins within their group, and the groups that fell back to a flat weight.
 
-    The source spectrum (the exact photons per bin, photons_per_bin [K]) for explicit edges and the rules
-    "equal_fluence" and "log" (the weighting of citrus <= 0.5); for "scattered_fluence" the estimated total fluence
-    phi(E) of ``scattered_fluence_spectrum`` (its density at the bin midpoint times the bin width), the spectrum of the
-    photons the groups transport: in a group far below the source energies (the lowest groups at MV) the scattered
-    photons sit near the top of the group while the source spectrum may be flat or zero there, and a source weighting
-    would give that group the attenuation of its lowest energies. A group whose weight is zero falls back to a flat
-    weight."""
+    The weight is the source spectrum for explicit edges and the rules "equal_fluence" and "log", and the total fluence
+    estimate of ``scattered_fluence_spectrum`` for "scattered_fluence"; a group whose weight is zero gets a flat weight.
+
+    Args:
+        config (SolverConfig): solver configuration; selects the rule.
+        spectrum (tuple[np.ndarray, np.ndarray]): (energies [S] in keV, photon density per keV [S]).
+        backend (XcomXraylibBackend): photon data for the "scattered_fluence" rule.
+        E (np.ndarray): [K] fine bin midpoints in keV.
+        fine_groups (np.ndarray): [K] group index of each fine bin.
+        bin_low (np.ndarray): [K] lower bin edges in keV.
+        bin_high (np.ndarray): [K] upper bin edges in keV.
+        photons_per_bin (np.ndarray): [K] exact source photons per bin.
+        G (int): number of groups.
+        fine_bin_width_kev (float): bin width in keV of the "scattered_fluence" balance.
+
+    Returns:
+        (np.ndarray, list): weights [K] that sum to 1 within each group, and the indices of the flat-weight groups.
+    """
     if config.group_edges_kev is None and config.group_edges_method == "scattered_fluence":
         bin_edges, photons = scattered_fluence_spectrum(
             spectrum, backend, energy_min_kev=float(config.energy_min_kev),
@@ -492,21 +525,36 @@ def _within_group_weights(config: SolverConfig, spectrum: tuple[np.ndarray, np.n
 
 
 def _klein_nishina_cumulative(epsilon: np.ndarray, k: np.ndarray) -> np.ndarray:
-    """Antiderivative in epsilon = E'/E of the Klein-Nishina cross section per unit epsilon (up to the factor
-    pi r_e^2 / k): d sigma / d epsilon ~ epsilon + 1/epsilon - sin^2(theta), cos(theta) = 1 + 1/k - 1/(k epsilon),
-    k = E / m_e c^2, which expands to epsilon + (1 - 2a/k)/epsilon + (a^2 - 1) + 1/(k^2 epsilon^2), a = 1 + 1/k.
-    epsilon, k broadcastable arrays (epsilon in [1/(1 + 2k), 1])."""
+    """Return the antiderivative in ``epsilon = E'/E`` of the Klein-Nishina cross section per unit epsilon.
+
+    It omits the factor ``pi r_e^2 / k``; the integrand is ``epsilon + 1/epsilon - sin^2(theta)`` with
+    ``cos(theta) = 1 + 1/k - 1/(k epsilon)``.
+
+    Args:
+        epsilon (np.ndarray): energy ratio E'/E in ``[1/(1 + 2k), 1]``, broadcastable with ``k``.
+        k (np.ndarray): photon energy in units of the electron rest energy, ``E / m_e c^2``.
+
+    Returns:
+        np.ndarray: the antiderivative, in the broadcast shape of ``epsilon`` and ``k``.
+    """
     a = 1.0 + 1.0 / k
     return (0.5 * epsilon * epsilon + (1.0 - 2.0 * a / k) * np.log(epsilon) + (a * a - 1.0) * epsilon
             - 1.0 / (k * k * epsilon))
 
 
 def grouping_medium_densities(config: SolverConfig) -> tuple[tuple[str, float], ...]:
-    """The medium of the "scattered_fluence" balance as ((catalogue name, density g/cm^3), ...), sorted by name, the
-    densities rounded to 3 significant digits and the traces below 1e-3 of the largest density dropped (the form that
-    enters the cache key and the balance, so that nearly equal media share a cache entry): ``config.grouping_medium``
-    "auto" not yet replaced by a measurement (`citrus_recon`, `synthesize_cone_beam_data` do that) -> water at 1.0; a
-    catalogue name -> that material at its nominal density; a mapping -> its entries."""
+    """Return the medium of the "scattered_fluence" balance as (catalogue name, density) pairs, as in the cache key.
+
+    The entries are sorted by name, the densities rounded to 3 significant digits and traces below 1e-3 of the largest
+    density dropped, so that nearly equal media share a cache entry. ``config.grouping_medium`` "auto" (not yet replaced
+    by a measurement) gives water at 1.0 g/cm^3, and a catalogue name gives that material at its nominal density.
+
+    Args:
+        config (SolverConfig): solver configuration; uses grouping_medium.
+
+    Returns:
+        tuple[tuple[str, float], ...]: (catalogue name, density in g/cm^3) per material.
+    """
     medium = config.grouping_medium
     if isinstance(medium, str):
         name = "water" if medium == "auto" else medium
@@ -526,29 +574,26 @@ def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend:
                                medium: Sequence[tuple[str, float]] = (("water", 1.0),),
                                fine_bin_width_kev: float = 0.5,
                                max_bins: int = 2000) -> tuple[np.ndarray, np.ndarray]:
-    """Estimate of the total photon fluence spectrum (source plus scattered photons) inside the object: the grouping
-    heuristic of ``make_group_edges`` ("scattered_fluence"), also the within-group weight of that rule. Not a transport
-    result.
+    """Estimate the total photon fluence spectrum (source plus scattered photons) inside the object for grouping.
 
-    One-dimensional (energy only) slowing-down balance in a medium (``medium``: (catalogue name, density g/cm^3) per
-    material; default water at 1 g/cm^3) with a leakage loss 1/L, L = object_size_cm the characteristic chord length of
-    the object:
+    The estimate solves the slowing-down balance in energy alone by one sweep from the highest bin down:
+    ``phi(E) = [S(E) + int_{E' > E} mu_C(E') p(E | E') phi(E') dE'] / (mu_t(E) - mu_R(E) + 1/L)``.
 
-        phi(E) = [S(E) + int_{E' > E} mu_C(E') p(E | E') phi(E') dE'] / (mu_t(E) - mu_R(E) + 1/L)
+    Args:
+        spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]) of the source S.
+        backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
+        energy_min_kev (float, optional): lowest energy in keV; photons below it are absorbed. Defaults to 10.0.
+        object_size_cm (float, optional): characteristic chord length L of the object in cm. Defaults to 20.0.
+        medium (Sequence[tuple[str, float]], optional): (catalogue name, density in g/cm^3) per material of the medium.
+            Defaults to (("water", 1.0),).
+        fine_bin_width_kev (float, optional): minimum bin width in keV. Defaults to 0.5.
+        max_bins (int, optional): maximum number of bins; the bins widen to ``(kVp - energy_min_kev) / max_bins`` if
+            needed. Defaults to 2000.
 
-    with S the source spectrum, mu_C, mu_R, mu_t the Compton, Rayleigh and total attenuation of the medium (elemental
-    XCOM cross sections mixed by the catalogue compositions and the densities),
-    p(E | E') the energy distribution of a Compton photon scattered at E' (Klein-Nishina, normalized; Compton
-    kinematics without binding), Rayleigh ignored (it does not change the energy, so it is neither a loss nor a gain
-    here), photons below energy_min_kev absorbed. L -> 0 gives phi = S L (the source spectrum, "equal_fluence");
-    L -> infinity the spectrum of an infinite medium, where every photon is eventually absorbed.
-
-    Discretization: equal bins of width max(fine_bin_width_kev, (kVp - energy_min_kev) / max_bins) over
-    [energy_min_kev, kVp], source photons per bin integrated exactly from the piecewise-linear spectrum, the
-    Klein-Nishina probability of each bin integrated in closed form (``_klein_nishina_cumulative``) for a photon at the
-    centre of the source bin (scattering within the bin is kept, on the left side), one sweep from the highest bin
-    down. Returns (bin_edges [n + 1] keV ascending, photons [n]: phi integrated over each bin, in units of the source
-    spectrum times cm)."""
+    Returns:
+        (np.ndarray, np.ndarray): bin edges [n+1] in keV, ascending, and phi integrated over each bin [n], in units of
+        the source spectrum times cm.
+    """
     backend = resolve_backend() if backend is None else backend
     density = _Spectrum(*spectrum)
     energy_max, energy_min = density.max_energy(), float(energy_min_kev)
@@ -594,10 +639,15 @@ def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend:
 
 def fine_energy_grid(edges: np.ndarray,
                      fine_bin_width_kev: float = 0.5) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Cut every group into equal bins of width <= fine_bin_width_kev.
+    """Cut every group into equal bins of width at most ``fine_bin_width_kev``; no bin straddles a group edge.
 
-    Returns (E_mid [K], group [K] int, lo [K], hi [K]) with bins ordered by group then
-    ascending energy; bins never straddle a group edge.
+    Args:
+        edges (np.ndarray): [G+1] group edges in keV, descending.
+        fine_bin_width_kev (float, optional): maximum bin width in keV. Defaults to 0.5.
+
+    Returns:
+        (np.ndarray, np.ndarray, np.ndarray, np.ndarray): bin midpoints [K] in keV, group index [K] int64, lower edges
+        [K] and upper edges [K] in keV, ordered by group and then by ascending energy.
     """
     midpoints, groups, lows, highs = [], [], [], []
     for g in range(edges.size - 1):
@@ -612,9 +662,14 @@ def fine_energy_grid(edges: np.ndarray,
 
 
 def group_of_energy(E: np.ndarray, edges: np.ndarray) -> np.ndarray:
-    """Group index of energies E (edges descending); -1 below the lowest edge, 0 at/above top.
+    """Return the group index of each energy; group g holds ``edges[g+1] <= E < edges[g]``.
 
-    A group g holds edges[g+1] <= E < edges[g].
+    Args:
+        E (np.ndarray): energies in keV.
+        edges (np.ndarray): [G+1] group edges in keV, descending.
+
+    Returns:
+        np.ndarray: group index per energy, -1 below the lowest edge and 0 at or above the top edge.
     """
     ascending = edges[::-1]
     j = np.searchsorted(ascending, np.asarray(E, dtype=np.float64), side="right") - 1
@@ -628,7 +683,15 @@ def group_of_energy(E: np.ndarray, edges: np.ndarray) -> np.ndarray:
 # =============================================================================================
 
 def legendre_table(eta: np.ndarray, L: int) -> np.ndarray:
-    """P_l(eta) for l = 0..L. eta [N] -> [L+1, N]."""
+    """Tabulate the Legendre polynomials P_l(eta) for l = 0..L by recurrence.
+
+    Args:
+        eta (np.ndarray): [N] cosines of the scattering angle.
+        L (int): highest Legendre order.
+
+    Returns:
+        np.ndarray: [L+1, N] values P_l(eta).
+    """
     eta = np.asarray(eta, dtype=np.float64)
     P = np.empty((L + 1, eta.size))
     P[0] = 1.0
@@ -640,10 +703,17 @@ def legendre_table(eta: np.ndarray, L: int) -> np.ndarray:
 
 
 def eta_quadrature_in_q(q_breakpoints: np.ndarray, gauss_legendre_nodes: int) -> tuple[np.ndarray, np.ndarray]:
-    """Piecewise Gauss-Legendre in q = sqrt((1-eta)/2) over the given sorted q breakpoints.
+    """Return a piecewise Gauss-Legendre quadrature in eta, built in ``q = sqrt((1 - eta)/2)`` between q breakpoints.
 
-    Returns (eta [N], w [N]) such that sum w f(eta) ~= int f(eta) d eta over the eta range of the
-    breakpoints (w includes the Jacobian d eta = 4 q dq). Nodes of a piece lie strictly inside it.
+    The weights include the Jacobian ``d eta = 4 q dq``, and the nodes of a piece lie strictly inside it.
+
+    Args:
+        q_breakpoints (np.ndarray): [P] sorted breakpoints in q; empty pieces are skipped.
+        gauss_legendre_nodes (int): Gauss-Legendre nodes per piece.
+
+    Returns:
+        (np.ndarray, np.ndarray): nodes eta [N] and weights [N] such that ``sum w f(eta)`` approximates the integral of
+        f over the eta range of the breakpoints.
     """
     x, node_weights = np.polynomial.legendre.leggauss(gauss_legendre_nodes)
     a, b = q_breakpoints[:-1], q_breakpoints[1:]
@@ -661,23 +731,29 @@ def eta_quadrature_in_q(q_breakpoints: np.ndarray, gauss_legendre_nodes: int) ->
 
 @dataclass
 class BuildInfo:
-    """Diagnostics of a library build (not cached; returned by ``compute_library``).
+    """Diagnostics of a library build, returned by ``compute_library`` and not cached.
 
-    Shapes: M materials, G groups, K fine energies.
-      backend, backend_reason       data backend ("xcom-xraylib") and where its data came from
-      composition                   {material: {Z: mass fraction}}
-      compton_below_cutoff [M, G]   group-weighted Compton scatter with E' < edges[-1] (absorbed)
-      sigma_compton_group / sigma_rayleigh_group / sigma_photoelectric_group / sigma_total_group [M, G]
-                                    group-weighted mass cross sections (w(E) weights)
-      fine_energy [K], fine_group [K], fine_weight [K]  the energy quadrature of the group constants
-                                    (spectrum weights summing to 1 within each group; NOT the library's
-                                    fine_weight, which is the spectrum normalized over all groups, zero
-                                    bins dropped)
-      flat_fallback_groups          groups whose spectrum weight was zero -> flat weight used
-      pdf_normalization_max_relative_deviation  max |N_backend / N_quadrature - 1| over elements, energies,
-                                    processes
-      rayleigh_l [M, G, L+1], rayleigh_eta [M, G, N_eta]
-                                    the within-group Rayleigh parts of mu_s_l / mu_s_eta (diagonal)
+    Shapes: M materials, G groups, K fine energies of the build, L Legendre order, N table nodes.
+
+    Attributes:
+        backend (str): name of the photon data backend ("xcom-xraylib").
+        backend_reason (str): where the backend's data came from.
+        composition (dict[str, dict[int, float]]): mass fraction per atomic number Z of each material.
+        compton_below_cutoff (np.ndarray): [M, G] group-weighted Compton scattering to energies below the lowest group
+            edge in cm^2/g; it stays in ``mu_t`` and is absorbed.
+        sigma_compton_group (np.ndarray): [M, G] group-weighted Compton mass cross section in cm^2/g.
+        sigma_rayleigh_group (np.ndarray): [M, G] group-weighted Rayleigh mass cross section in cm^2/g.
+        sigma_photoelectric_group (np.ndarray): [M, G] group-weighted photoelectric mass cross section in cm^2/g.
+        sigma_total_group (np.ndarray): [M, G] group-weighted total mass attenuation in cm^2/g.
+        fine_energy (np.ndarray): [K] fine bin midpoints in keV.
+        fine_group (np.ndarray): [K] group index of each fine bin.
+        fine_weight (np.ndarray): [K] within-group weights that sum to 1 in each group (not the library's
+            ``fine_weight``, which is normalized over all groups).
+        flat_fallback_groups (list[int]): groups whose weight was zero and that got a flat weight. Defaults to [].
+        pdf_normalization_max_relative_deviation (float or None): largest relative deviation between the backend's
+            angular normalization and the quadrature's, or None when the backend has none. Defaults to None.
+        rayleigh_l (np.ndarray or None): [M, G, L+1] within-group Rayleigh part of ``mu_s_l``. Defaults to None.
+        rayleigh_eta (np.ndarray or None): [M, G, N] within-group Rayleigh part of ``mu_s_eta``. Defaults to None.
     """
 
     backend: str
@@ -698,7 +774,14 @@ class BuildInfo:
 
 
 def _spectrum_or_default(spectrum: tuple[np.ndarray, np.ndarray] | None) -> tuple[np.ndarray, np.ndarray]:
-    """(energies keV [K], weights [K]) float64 of `spectrum`, or of ``default_spectrum_125kvp()`` for None."""
+    """Return a spectrum as flat float64 arrays, or the default 125 kVp spectrum for None.
+
+    Args:
+        spectrum (tuple[np.ndarray, np.ndarray] or None): (energies [K] in keV, photon density per keV [K]).
+
+    Returns:
+        (np.ndarray, np.ndarray): energies [K] in keV and photon densities per keV [K], float64.
+    """
     if spectrum is None:
         spectrum = default_spectrum_125kvp()
     e, w = spectrum
@@ -714,21 +797,21 @@ def compute_library(
     gauss_legendre_nodes: int = 32,
     materials: Optional[MaterialTable] = None,
 ) -> tuple[MultigroupLibrary, BuildInfo]:
-    """Build the library without caching; also return diagnostics.
+    """Build the multigroup library without caching and return the build diagnostics with it.
 
     Args:
-      config: uses num_groups, group_edges_kev, group_edges_method, grouping_object_size_cm, energy_min_kev,
-        legendre_order, num_eta_table, angular_table_grid.
-      spectrum: (energies keV [K], photon density per keV [K]); None -> default 125 kVp spectrum.
-      backend: a loaded ``resolve_backend()`` object (None loads one).
-      fine_bin_width_kev: maximum fine energy bin width (<= 0.5 keV for production).
-      gauss_legendre_nodes: Gauss-Legendre nodes per angular piece (>= 32 for production).
-      materials: (name, nominal density g/cm^3, formula) per material, in any order (sorted here by nominal attenuation
-        at the spectrum-mean energy, ``sort_material_table``; ``check_material_order`` raises if two materials cross
-        inside the library's energy range); None: the seven default reference materials (``default_material_table``).
+        config (SolverConfig): solver configuration; uses num_groups, group_edges_kev, group_edges_method,
+            grouping_object_size_cm, grouping_medium, energy_min_kev, legendre_order, num_eta_table, angular_table_grid.
+        spectrum (tuple[np.ndarray, np.ndarray] or None, optional): (energies [K] in keV, photon density per keV [K]).
+            Defaults to None, the default 125 kVp spectrum.
+        backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
+        fine_bin_width_kev (float, optional): maximum fine energy bin width in keV. Defaults to 0.5.
+        gauss_legendre_nodes (int, optional): Gauss-Legendre nodes per angular piece. Defaults to 32.
+        materials (Sequence or None, optional): (name, nominal density in g/cm^3, formula) per material, in any order
+            (sorted by ``sort_material_table``). Defaults to None, the seven default reference materials.
 
     Returns:
-      (MultigroupLibrary with float64 CPU tensors, BuildInfo).
+        (MultigroupLibrary, BuildInfo): the library with float64 CPU tensors and the build diagnostics.
     """
     backend = resolve_backend() if backend is None else backend
     spectrum_energies, spectrum_weights = _spectrum_or_default(spectrum)
@@ -925,10 +1008,26 @@ def _direct_transfer_table(eta: np.ndarray, backend: XcomXraylibBackend, element
                            fine_groups: np.ndarray, bin_low: np.ndarray, bin_high: np.ndarray,
                            within_group_weight: np.ndarray, edges: np.ndarray, compton_scales: np.ndarray,
                            rayleigh_scales: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """The per-steradian transfer at the cos-angles eta [n] (any order): (mu_s_eta [M, G, G, n], rayleigh_eta
-    [M, G, n]) in cm^2/g/sr, Compton with the exact fraction of every fine bin that lands in each outgoing group plus
-    within-group Rayleigh, from the raw backend shapes times the per-element scales [K, NZ, M] of pass 1 of
-    ``compute_library`` (fine energies E [K] of groups fine_groups, bins [bin_low, bin_high], within-group weights)."""
+    """Tabulate the per-steradian transfer at the cosines eta, Compton plus within-group Rayleigh, in cm^2/g/sr.
+
+    Compton scattering of every fine bin enters each outgoing group with the exact fraction of the bin that lands in it.
+
+    Args:
+        eta (np.ndarray): [n] cosines of the scattering angle, any order.
+        backend (XcomXraylibBackend): photon data; supplies the raw angular shapes.
+        elements (Sequence[int]): [NZ] atomic numbers of the elements of the materials.
+        E (np.ndarray): [K] fine bin midpoints in keV.
+        fine_groups (np.ndarray): [K] group index of each fine bin.
+        bin_low (np.ndarray): [K] lower bin edges in keV.
+        bin_high (np.ndarray): [K] upper bin edges in keV.
+        within_group_weight (np.ndarray): [K] weight of each fine bin within its group.
+        edges (np.ndarray): [G+1] group edges in keV, descending.
+        compton_scales (np.ndarray): [K, NZ, M] scale of each element's raw Compton shape per material.
+        rayleigh_scales (np.ndarray): [K, NZ, M] scale of each element's raw Rayleigh shape per material.
+
+    Returns:
+        (np.ndarray, np.ndarray): ``mu_s_eta`` [M, G, G, n] and its within-group Rayleigh part [M, G, n].
+    """
     m_e = ELECTRON_REST_KEV
     G = edges.size - 1
     K, _, M = compton_scales.shape
@@ -961,7 +1060,15 @@ def _direct_transfer_table(eta: np.ndarray, backend: XcomXraylibBackend, element
 
 
 def _smooth(x: np.ndarray, width: int) -> np.ndarray:
-    """Moving average of x [n] over `width` samples (odd; the window shrinks at the ends, so a constant stays)."""
+    """Return the moving average of x over ``width`` samples; the window shrinks at the ends, so constants stay.
+
+    Args:
+        x (np.ndarray): [n] values.
+        width (int): window length in samples (odd).
+
+    Returns:
+        np.ndarray: [n] smoothed values.
+    """
     half = max(0, int(width) // 2)
     if half == 0:
         return x.copy()
@@ -975,27 +1082,31 @@ def angular_map(q_nodes: np.ndarray, compton_shapes: np.ndarray, rayleigh_shapes
                 bin_low: np.ndarray, bin_high: np.ndarray, within_group_weight: np.ndarray, edges: np.ndarray, *,
                 num_knots: int = ANGULAR_MAP_KNOTS, num_reference: int = 20001, floor: float = 0.1,
                 negligible: float = 1.0e-6) -> np.ndarray:
-    """The node placement of an adaptive transfer table: the map u = h(eta) at the knots q_k = k / (num_knots - 1) of
-    q = sin(theta/2) = sqrt((1 - eta)/2), float64 [num_knots], strictly decreasing from 1 (eta = 1) to 0 (eta = -1)
-    (``MultigroupLibrary.eta_map``; the table node j sits at u = j / (N - 1)).
+    """Place the nodes of an adaptive transfer table: the map ``u = h(eta)`` at equally spaced knots of sin(theta/2).
 
-    Inputs: q_nodes [Nr] ascending (the reference angular quadrature of the build, dense near q = 0),
-    compton_shapes / rayleigh_shapes [K, M, Nr] the per-material per-steradian Compton / Rayleigh cross sections of
-    every fine energy at those nodes (cm^2/g/sr, before the kinematic group fraction; the build passes those of
-    ``ANGULAR_MAP_MATERIALS``), the fine-energy bins (groups
-    fine_groups [K], edges bin_low / bin_high [K] keV, within-group weights [K]) and the group edges [G+1] keV.
+    The node density in q is the largest over the transfer curves of ``sqrt(|f''(q)| / max f)``, smoothed and mixed with
+    a floor of the uniform-table density, and h is one minus its normalized cumulative integral (table node j sits at
+    ``u = j / (N - 1)``).
 
-    1. Every transfer curve f_{m, g, g'}(q) (material m, source group g, destination group g' >= g; Compton with the
-       kinematic fraction of every fine bin, plus Rayleigh for g' = g) is evaluated on num_reference points uniform in
-       q, from cubic splines through the shapes at q_nodes (the reference grid resolves the MeV forward peaks, whose
-       width in q is about 5e-4 at 6 MeV).
-    2. Node density: rho(q) = max over the curves (those above `negligible` times the largest curve of the same m, g)
-       of sqrt(|f''(q)| / max f), the density that equalizes the error of linear interpolation relative to each
-       curve's maximum; smoothed over two knot intervals so that neighbouring node spacings change gradually.
-    3. Floor: the normalized density is mixed as (1 - floor) rho / int rho + floor 2q, so every region keeps at least
-       `floor` times the node density of a uniform table in eta (2q is that density in q), and h is strictly monotone.
-    4. h = 1 - (cumulative integral of the density from q = 0) / (total), sampled at the knots.
-    Between knots the map is linear in q, so linear interpolation between table nodes is linear in q there."""
+    Args:
+        q_nodes (np.ndarray): [Nr] ascending q of the reference angular quadrature of the build.
+        compton_shapes (np.ndarray): [K, M, Nr] per-steradian Compton cross section per fine energy and material at
+            ``q_nodes`` in cm^2/g/sr.
+        rayleigh_shapes (np.ndarray): [K, M, Nr] the same for Rayleigh scattering.
+        fine_groups (np.ndarray): [K] group index of each fine bin.
+        bin_low (np.ndarray): [K] lower bin edges in keV.
+        bin_high (np.ndarray): [K] upper bin edges in keV.
+        within_group_weight (np.ndarray): [K] weight of each fine bin within its group.
+        edges (np.ndarray): [G+1] group edges in keV, descending.
+        num_knots (int, optional): number of knots of the map. Defaults to ANGULAR_MAP_KNOTS.
+        num_reference (int, optional): points uniform in q on which the curves are evaluated. Defaults to 20001.
+        floor (float, optional): fraction of the node density taken from a table uniform in eta. Defaults to 0.1.
+        negligible (float, optional): curves below this fraction of the largest curve of the same material and source
+            group are ignored. Defaults to 1.0e-6.
+
+    Returns:
+        np.ndarray: [num_knots] float64 map values, strictly decreasing from 1 (eta = 1) to 0 (eta = -1).
+    """
     from scipy.interpolate import CubicSpline
 
     m_e = ELECTRON_REST_KEV
@@ -1054,10 +1165,24 @@ def angular_map(q_nodes: np.ndarray, compton_shapes: np.ndarray, rayleigh_shapes
 def transfer_at_eta(config: SolverConfig, eta: np.ndarray, spectrum: tuple[np.ndarray, np.ndarray] | None = None,
                     backend: Optional[XcomXraylibBackend] = None, *, fine_bin_width_kev: float = 0.5,
                     gauss_legendre_nodes: int = 32, materials: Optional[MaterialTable] = None) -> np.ndarray:
-    """The exact per-steradian transfer mu_s(eta) [M, G, G, n] (cm^2/g/sr; the quantity ``mu_s_eta`` tabulates,
-    without interpolation) of the library ``compute_library`` builds with the same arguments, at the cos-angles
-    eta [n]: for measuring the interpolation error of a table (tests, validation). Same cost per point as a table
-    node of the build."""
+    """Return the exact per-steradian transfer at the cosines eta of the library that ``compute_library`` builds.
+
+    This is the quantity ``mu_s_eta`` tabulates, without interpolation, for measuring the interpolation error of tables.
+
+    Args:
+        config (SolverConfig): solver configuration, as for ``compute_library``.
+        eta (np.ndarray): [n] cosines of the scattering angle.
+        spectrum (tuple[np.ndarray, np.ndarray] or None, optional): (energies [K] in keV, photon density per keV [K]).
+            Defaults to None, the default 125 kVp spectrum.
+        backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
+        fine_bin_width_kev (float, optional): maximum fine energy bin width in keV. Defaults to 0.5.
+        gauss_legendre_nodes (int, optional): Gauss-Legendre nodes per angular piece. Defaults to 32.
+        materials (Sequence or None, optional): (name, nominal density in g/cm^3, formula) per material. Defaults to
+            None, the seven default reference materials.
+
+    Returns:
+        np.ndarray: [M, G, G, n] transfer in cm^2/g/sr.
+    """
     backend = resolve_backend() if backend is None else backend
     spectrum_energies, spectrum_weights = _spectrum_or_default(spectrum)
     spectrum_density = _Spectrum(spectrum_energies, spectrum_weights)
@@ -1082,9 +1207,9 @@ def transfer_at_eta(config: SolverConfig, eta: np.ndarray, spectrum: tuple[np.nd
         sigma_compton, sigma_rayleigh = backend.sigma("compton", Z, E), backend.sigma("rayleigh", Z, E)
         for k in range(E.size):
             compton_norm = _TWO_PI * float(np.dot(w_reference, backend.pdf_raw("compton", Z, float(E[k]),
-                                                                                eta_reference)))
+                                                                               eta_reference)))
             rayleigh_norm = _TWO_PI * float(np.dot(w_reference, backend.pdf_raw("rayleigh", Z, float(E[k]),
-                                                                                 eta_reference)))
+                                                                                eta_reference)))
             compton_scales[k, element_index] = mass_fractions[:, element_index] * sigma_compton[k] / compton_norm
             rayleigh_scales[k, element_index] = mass_fractions[:, element_index] * sigma_rayleigh[k] / rayleigh_norm
     eta = np.asarray(eta, dtype=np.float64).ravel()
@@ -1094,6 +1219,20 @@ def transfer_at_eta(config: SolverConfig, eta: np.ndarray, spectrum: tuple[np.nd
 
 def _cache_key(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], backend_name: str,
                fine_bin_width_kev: float, gauss_legendre_nodes: int, materials: Optional[MaterialTable] = None) -> str:
+    """Return the cache key of a library: a hash of the build version, configuration, spectrum and build inputs.
+
+    Args:
+        config (SolverConfig): solver configuration.
+        spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]).
+        backend_name (str): name of the photon data backend.
+        fine_bin_width_kev (float): maximum fine energy bin width in keV.
+        gauss_legendre_nodes (int): Gauss-Legendre nodes per angular piece.
+        materials (Sequence or None, optional): the sorted (name, nominal density, formula) table. Defaults to None,
+            the seven default reference materials.
+
+    Returns:
+        str: the first 20 hexadecimal digits of the SHA-256 hash.
+    """
     fields = {
         "version": _BUILD_VERSION,
         "backend": backend_name,
@@ -1126,23 +1265,25 @@ def build_library(
     gauss_legendre_nodes: int = 32,
     materials: Optional[MaterialTable] = None,
 ) -> MultigroupLibrary:
-    """Build (or load from cache) the multigroup library for ``config`` and the material table ``materials`` (None:
-    the seven default reference materials, ``default_material_table``; else (name, nominal density, formula) per
-    material, e.g.
-    ``cross_sections.material_table(names)``, in any order: sorted by nominal attenuation, ``sort_material_table``).
+    """Build the multigroup library for ``config`` and a material table, or load it from the cache.
 
-    Shapes of the result (M materials, 7 by default; G = config.num_groups, L = config.legendre_order):
-      group_edges [G+1] desc, group_energy [G], spectrum_fraction [G], mu_t/mu_pe [M, G],
-      mu_s_l [M, G, G, L+1], eta_grid [num_eta_table], mu_s_eta [M, G, G, num_eta_table],
-      fine_energy [E], fine_mu_t [M, E], fine_weight [E], fine_group [E] (int64; E ~ (kVp - E_min) /
-      fine_bin_width_kev); float64 CPU tensors, per unit density (cm^2/g, cm^2/g/sr); plus materials (names),
-      nominal_density [M] and eta_map [ANGULAR_MAP_KNOTS] (None for config.angular_table_grid "uniform").
+    The cache file ``<cache_dir>/mglib_<hash>.pt`` is keyed by the build version, the configuration, the spectrum, the
+    backend, the numerical parameters and the sorted material table; a cache file that does not load as a complete
+    library is rebuilt and overwritten.
 
-    The cache file is ``<cache_dir>/mglib_<hash>.pt`` keyed by the build version, the relevant config
-    fields, the spectrum arrays, the backend name, the numerical parameters and the SORTED material table (names,
-    nominal densities, formulas: every set of materials has its own entry, any order of the same set the same one).
-    ``cache_dir="default"`` is `default_cache_dir()`; ``cache_dir=None`` disables the cache. A cache file that cannot be
-    loaded as a complete library (e.g. one lacking the fine-energy table) is rebuilt and overwritten.
+    Args:
+        config (SolverConfig): solver configuration, as for ``compute_library``.
+        spectrum (tuple[np.ndarray, np.ndarray] or None, optional): (energies [K] in keV, photon density per keV [K]).
+            Defaults to None, the default 125 kVp spectrum.
+        cache_dir (str or None, optional): cache folder; "default" for ``default_cache_dir()``, None for no cache.
+            Defaults to "default".
+        fine_bin_width_kev (float, optional): maximum fine energy bin width in keV. Defaults to 0.5.
+        gauss_legendre_nodes (int, optional): Gauss-Legendre nodes per angular piece. Defaults to 32.
+        materials (Sequence or None, optional): (name, nominal density in g/cm^3, formula) per material, in any order
+            (sorted by ``sort_material_table``). Defaults to None, the seven default reference materials.
+
+    Returns:
+        MultigroupLibrary: the library with float64 CPU tensors in cm^2/g and cm^2/g/sr, per unit density.
     """
     if cache_dir == "default":
         cache_dir = default_cache_dir()

@@ -1,14 +1,13 @@
 """The material catalogue and the user-selected reference materials (version 0.5.0): every catalogue entry builds in the
 library; `SolverConfig.materials` selects the reference materials, the default set has one cache key and one library
-(the legacy options reproduce a recorded build bit for bit; since version 0.7.0 it encodes the XCOM + xraylib data);
-any set is sorted by
+(the legacy options reproduce a recorded build to float64 rounding; since version 0.7.0 it is the XCOM + xraylib
+data); any set is sorted by
 nominal attenuation and has its own cache entry; the density model, the WLAB phantom, the data generator and the
 solver work on a reduced set (air, water, bone) and on an extended one (the seven plus titanium); unknown names, a
 single reference material and a set without water or bone for the WLAB phantom raise."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -49,11 +48,20 @@ KEY_DEFAULT_V070 = "385b523384ebf80811d7"
 KEY_SMALL_V070 = "47dde6802807fb32dfb3"
 # the library options of versions <= 0.5 (uniform eta table, equal-fluence groups)
 LEGACY_LIBRARY = dict(angular_table_grid="uniform", group_edges_method="equal_fluence")
-# SHA-256 of the tensors of the SMALL build with the legacy options (SMALL_BUILD, default seven materials; field name
-# then the float64 / int64 bytes, in field order), recorded with version 0.7.0 (XCOM + xraylib data; the hash of version
-# 0.5.1, which the legacy options reproduced up to version 0.6.0, encoded XrayPhysics data)
-SMALL_LEGACY_V070_SHA256 = "f888e15ef29e1f1225c57bee0ed444e0f616be5a9b662af55fe69ba615125ada"
+# Shape and float64 statistics of every tensor of the SMALL build with the legacy options (SMALL_BUILD, default seven
+# materials), recorded with version 0.7.0 (XCOM + xraylib data; `tensor_statistics`). Statistics rather than a hash of
+# the bytes: the float64 arithmetic of the builder differs in the last bits between platforms.
+SMALL_LEGACY_V070 = Path(__file__).parent / "data" / "small_legacy_library_v070.json"
 REFERENCE = Path(__file__).parent / "data" / "pre_quadrature_reference.json"
+
+
+def tensor_statistics(value: torch.Tensor) -> dict:
+    """Shape and float64 statistics of a tensor: sum, sum of squares, min, max, first and last 3 values (flattened)."""
+    flat = value.detach().cpu().to(torch.float64).reshape(-1)
+    empty = flat.numel() == 0
+    return {"shape": list(value.shape), "sum": float(flat.sum()), "sum_of_squares": float((flat * flat).sum()),
+            "min": None if empty else float(flat.min()), "max": None if empty else float(flat.max()),
+            "first": flat[:3].tolist(), "last": flat[-3:].tolist() if not empty else []}
 
 
 @pytest.fixture(scope="module")
@@ -211,10 +219,8 @@ def test_every_catalogue_material_builds(name, library_module):
 
 def test_default_set_keeps_the_cache_key_and_library(library_module, tmp_path, monkeypatch):
     """The default reference materials give the cache keys of version 0.7.0 and the same library bit for bit, whether
-    the table is None, the default set by name or the same set in another order (sorted by nominal attenuation before
-    the key and the build); the options of version 0.5 (uniform table, equal-fluence groups) reproduce the library
-    recorded with version 0.7.0 bit for bit (XCOM + xraylib data; up to version 0.6.0 they reproduced the XrayPhysics
-    library of version 0.5.1)."""
+    the table is None, the default set by name or the same set in another order; the legacy options (uniform table,
+    equal-fluence groups) reproduce the statistics of the library recorded with version 0.7.0 to float64 rounding."""
     backend = library_module.resolve_backend()
     spectrum = library_module._spectrum_or_default(None)
     reverse = material_table(tuple(reversed(MATERIALS)))
@@ -225,13 +231,16 @@ def test_default_set_keeps_the_cache_key_and_library(library_module, tmp_path, m
     assert key(SolverConfig(), spectrum, backend.name, 0.5, 32, material_table(MATERIALS)) == KEY_DEFAULT_V070
     assert key(SMALL, spectrum, backend.name, 2.0, 8) == KEY_SMALL_V070
     legacy, _ = library_module.compute_library(replace(SMALL, **LEGACY_LIBRARY), None, backend, **SMALL_BUILD)
-    digest = hashlib.sha256()
-    for field in legacy.__dataclass_fields__:
-        value = getattr(legacy, field)
-        if isinstance(value, torch.Tensor):
-            digest.update(field.encode())
-            digest.update(value.contiguous().numpy().tobytes())
-    assert legacy.eta_map is None and digest.hexdigest() == SMALL_LEGACY_V070_SHA256
+    assert legacy.eta_map is None
+    recorded = json.loads(SMALL_LEGACY_V070.read_text())
+    tensors = {field: getattr(legacy, field) for field in legacy.__dataclass_fields__
+               if isinstance(getattr(legacy, field), torch.Tensor)}
+    assert sorted(tensors) == sorted(recorded)
+    for field, value in tensors.items():
+        stats, expected = tensor_statistics(value), recorded[field]
+        assert stats["shape"] == expected["shape"], field
+        for name in ("sum", "sum_of_squares", "min", "max", "first", "last"):
+            assert stats[name] == pytest.approx(expected[name], rel=1e-9, abs=1e-12), (field, name)
     reference, _ = library_module.compute_library(SMALL, None, backend, **SMALL_BUILD)
     by_name = library_module.build_library(SMALL, None, cache_dir=str(tmp_path), materials=reverse, **SMALL_BUILD)
     assert [p.name for p in tmp_path.glob("mglib_*.pt")] == [f"mglib_{KEY_SMALL_V070}.pt"]

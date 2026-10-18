@@ -1,61 +1,12 @@
-"""Batched linear-discontinuous discrete-ordinates sweep on the supervoxel grid.
+"""Batched linear-discontinuous discrete-ordinates sweep on the transport grid.
 
-One call to `sweep` transports a given linear-discontinuous source for every direction of the (octant-reordered)
-quadrature and every energy group through a cuboid grid with vacuum boundaries, and returns the
-spherical-harmonic moments of the linear-discontinuous angular fluence:
-
-    phi[g, n, k, cell] = sum_m w_m Y_n(Omega_m) psi_m[g, k, cell],     k in {0, x, y, z}
-
-Algorithm
----------
-Directions are grouped by octant (`Quadrature.by_octant`) with D8 directions per octant; reordered
-direction m = octant * D8 + d. For a chunk of Dc directions per octant (8 * Dc directions in total)
-the angular fluence lives in one storage tensor (Q = 4 G, index q = 4 g + k)
-
-    store [8, Dc, num_cells + 1, Q]
-
-whose last cell (index num_cells) is never written and stays zero: it is the "vacuum cell". Upstream
-indices of -1 (vacuum, `wavefront.SweepPlan`) are replaced by num_cells, so a plain gather
-returns zero incoming fluence on boundary faces. The source of the chunk is copied once into the same
-cell-major layout, source [8, Dc, num_cells, Q], so that every gather reads contiguous runs of Q values.
-
-The wavefront plan (`wavefront.build_sweep_plan`) lists, for each diagonal plane p, the
-(octant, cell) entries of all 8 octants. Plane p only depends on planes < p, so the planes are
-processed in order, each as ONE batched step over [Dc directions, G groups, E entries]:
-
-    1. gather the upstream neighbors' moments       store[o_e, :, up_e[a], :]   -> [E, 3, Dc, G, 4]
-    2. gather the entries' source moments and mu_t  source[o_e, :, n_e, :]      -> [E, Dc, G, 4], [E, G]
-    3. gather c = |Omega_a|/Delta_a and s = sign(Omega_a) for (o_e, d)         -> [Dc, 1, 3, E]
-    4. R_0, R_a = cell_right_hand_sides(...);  psi_0, psi_a = cell_solve(...)
-                                                    (closed form, linear_discontinuous_cell.py)
-    5. scatter (psi_0, psi_a) into store[o_e, :, n_e, :]
-
-The number of sequential steps per chunk is num_planes = rows + cols + slices - 2. After a chunk the
-moments are accumulated with one GEMM straight from the storage (no copy):
-
-    acc[n, (cell, q)] += sum_(o, d) (w Y)[o D8 + d, n] store[o, d, cell, q]
-
-so the angular fluence of all directions is never held at once (unless return_psi=True).
-
-Signs: s_a = +1 for a zero direction component, consistent with `angular_quadrature.octant_of` and the sweep
-plan's octant signs. Axis order a = 0 -> x (cols), 1 -> y (rows), 2 -> z (slices).
-
-No negative-flux fix-up is applied: the linear-discontinuous scheme is particle conserving cell by cell, and the rare
-negative cell means of the collided fluence are kept (they integrate correctly in the moments).
-
-Backends
---------
-The plane loop (steps 1-5) runs either as the PyTorch plane step above (~15 kernels per plane) or as ONE
-fused Triton kernel per plane (`kernels/sweep_kernels.py`; same storage layout, so the source fill and the moment
-GEMM are shared). Selection: `make_sweep_context(..., backend=...)` stores the default on the context;
-`sweep(..., backend=...)` overrides it per call:
-
-    "auto"   (default) the fused kernel for float32 CUDA sweeps when `sweep_kernels.kernels_usable(device)`
-             passes (Triton importable, probe kernel runs, per-device self-check against the PyTorch plane
-             step; `CITRUS_DISABLE_TRITON=1` disables it), else the PyTorch plane step. float64 and CPU
-             sweeps always use the PyTorch plane step.
-    "torch"  always the PyTorch plane step.
-    "triton" the fused kernel; raises if the sweep is not float32 on CUDA or the kernel is unusable.
+:func:`~citrus.scatter_solver.transport_sweep.sweep` transports a linear-discontinuous source for every direction of
+the octant-reordered quadrature and every energy group through a cuboid grid with vacuum boundaries, one diagonal
+wavefront plane at a time, and returns the spherical-harmonic moments
+``phi[g, n, k, cell] = sum_m w_m Y_n(Omega_m) psi_m[g, k, cell]`` of the angular fluence. Each plane step runs either
+in PyTorch or as one fused Triton kernel (:mod:`citrus.scatter_solver.kernels.sweep_kernels`). The algorithm and the
+storage layout are described in docs/source/method.rst, "Transport sweep", and docs/source/design_notes.rst,
+"Transport sweep and source iteration".
 """
 
 from __future__ import annotations
@@ -94,12 +45,14 @@ _BACKENDS = ("auto", "torch", "triton")
 
 @dataclass(frozen=True, eq=False)
 class PlaneIndex:
-    """Gather/scatter indices of one wavefront plane (int64, on the sweep device). E = entries on the plane.
+    """Gather and scatter indices of one wavefront plane, int64 on the sweep device.
 
-    octant        : [E]     octant code of each entry
-    cell          : [E]     flat cell index (row-major over [rows, cols, slices])
-    octant_column : [E, 1]  octant code, shaped to broadcast against upstream_cell
-    upstream_cell : [E, 3]  flat index of the upstream neighbor along x, y, z; vacuum -> num_cells (the zero cell)
+    Attributes:
+        octant (Tensor): [E] octant code of each entry on the plane.
+        cell (Tensor): [E] flat cell index, row-major over [rows, cols, slices].
+        octant_column (Tensor): [E, 1] octant codes shaped to broadcast against ``upstream_cell``.
+        upstream_cell (Tensor): [E, 3] flat index of the upstream neighbor along x, y, z; num_cells (the zero vacuum
+            cell) on a vacuum face.
     """
 
     octant: Tensor
@@ -109,6 +62,7 @@ class PlaneIndex:
 
     @property
     def num_entries(self) -> int:
+        """Number of entries E on the plane."""
         return int(self.octant.shape[0])
 
 
@@ -116,20 +70,23 @@ class PlaneIndex:
 class SweepContext:
     """Everything the sweep needs that depends only on the grid and the quadrature.
 
-    shape      : (rows, cols, slices)
-    deltas     : (dx, dy, dz) cm
-    L          : spherical-harmonic degree of the returned moments; num_moments = (L+1)^2
-    plan       : SweepPlan on the sweep device
-    quadrature : the quadrature REORDERED by octant: direction m = octant * D8 + d (D8 directions per octant)
-    permutation: [M] int64, quadrature = original.reordered(permutation) (original index of each reordered
-                 direction)
-    basis      : SphericalHarmonicBasis of degree L on the reordered quadrature (Y, Y_weighted: [M, (L+1)^2])
-    directions_per_octant : D8
-    c          : [8, D8, 3] |Omega_a| / Delta_a of direction (octant, d)
-    s          : [8, D8, 3] sign(Omega_a), +1 for a zero component
-    planes     : tuple of PlaneIndex, one per wavefront plane, in sweep order
-    backend    : default plane-step backend of `sweep`: "auto", "torch" or "triton"
-    flat_index : plane-sorted int32 entry tables for the fused Triton kernel (CUDA contexts only, else None)
+    The quadrature is reordered by octant: reordered direction ``m = octant * D8 + d``, with D8 directions per octant.
+
+    Attributes:
+        shape (tuple[int, int, int]): (rows, cols, slices) of the grid.
+        deltas (tuple[float, float, float]): (dx, dy, dz) cell sizes in cm.
+        L (int): spherical-harmonic degree of the returned moments.
+        plan (SweepPlan): wavefront plan on the sweep device.
+        quadrature (Quadrature): the quadrature reordered by octant.
+        permutation (Tensor): [M] int64 original index of each reordered direction.
+        basis (SphericalHarmonicBasis): tables of degree L on the reordered quadrature.
+        directions_per_octant (int): number of directions per octant, D8.
+        c (Tensor): [8, D8, 3] ``|Omega_a| / Delta_a`` of direction (octant, d) in cm^-1.
+        s (Tensor): [8, D8, 3] ``sign(Omega_a)``, +1 for a zero component.
+        planes (tuple[PlaneIndex, ...]): one index set per wavefront plane, in sweep order.
+        backend (str): default plane-step backend of the sweeps, "auto", "torch" or "triton". Defaults to "auto".
+        flat_index (FlatPlaneIndex, optional): plane-sorted int32 entry tables of the fused Triton kernel, CUDA contexts
+            only. Defaults to None.
     """
 
     shape: tuple[int, int, int]
@@ -148,33 +105,45 @@ class SweepContext:
 
     @property
     def num_cells(self) -> int:
+        """Number of grid cells N."""
         return self.shape[0] * self.shape[1] * self.shape[2]
 
     @property
     def num_planes(self) -> int:
+        """Number of wavefront planes."""
         return len(self.planes)
 
     @property
     def num_directions(self) -> int:
+        """Number of directions M, 8 times D8."""
         return 8 * self.directions_per_octant
 
     @property
     def num_moments(self) -> int:
+        """Number of spherical-harmonic moments, ``(L+1)^2``."""
         return (self.L + 1) ** 2
 
     @property
     def device(self) -> torch.device:
+        """Device of the direction tables."""
         return self.c.device
 
     @property
     def dtype(self) -> torch.dtype:
+        """Floating dtype of the direction tables."""
         return self.c.dtype
 
     def direction_indices(self, start: int, stop: int, octants: Optional[Tensor] = None) -> Tensor:
-        """Reordered direction indices of the per-octant chunk d in [start, stop), octant-major.
+        """Reordered direction indices of the per-octant chunk ``start <= d < stop``, octant-major.
 
-        octants: optional int64 [K] subset of octant codes (default all 8, in order).
-        Returns int64 [K * (stop - start)] with entry i * (stop - start) + j = octants[i] * D8 + start + j.
+        Args:
+            start (int): first per-octant direction index of the chunk.
+            stop (int): end (exclusive) of the chunk.
+            octants (Tensor, optional): [K] int64 subset of octant codes. Defaults to None (all 8, in order).
+
+        Returns:
+            Tensor: ``[K * (stop - start)]`` int64 indices; entry ``i * (stop - start) + j`` is
+            ``octants[i] * D8 + start + j``.
         """
         d = torch.arange(start, stop, device=self.device, dtype=torch.int64)
         o = torch.arange(8, device=self.device, dtype=torch.int64) if octants is None else octants.to(self.device)
@@ -189,13 +158,23 @@ def make_sweep_context(
     dtype: torch.dtype = torch.float32,
     backend: Backend = "auto",
 ) -> SweepContext:
-    """Build the sweep context for `grid` and `quadrature` (any order; it is reordered by octant here).
+    """Build the sweep context of a grid and a quadrature, reordering the quadrature by octant.
 
-    Requires quadrature.directions_per_octant is not None (equal direction counts per octant), e.g. a
-    product set with even num_polar and num_azimuthal % 4 == 0.
-    All tensors are placed on `device` (default: the quadrature's device) with `dtype`.
-    backend: default plane-step backend of the sweeps of this context ("auto", "torch", "triton"; see the
-    module docstring). "triton" raises here if the device is not CUDA or Triton is unusable.
+    The quadrature must hold the same number of directions in every octant, e.g. a product set with even ``num_polar``
+    and ``num_azimuthal`` divisible by 4.
+
+    Args:
+        grid (Grid): transport grid.
+        quadrature (Quadrature): direction set, in any order.
+        L (int): spherical-harmonic degree of the returned moments, at least 0.
+        device (torch.device | str, optional): device of the tables. Defaults to None (the device of the quadrature).
+        dtype (torch.dtype, optional): floating dtype of the tables. Defaults to torch.float32.
+        backend (Backend, optional): default plane-step backend, "auto", "torch" or "triton" (see
+            :func:`~citrus.scatter_solver.transport_sweep.sweep`); "triton" requires CUDA and a usable Triton.
+            Defaults to "auto".
+
+    Returns:
+        SweepContext: the context on ``device``.
     """
     if backend not in _BACKENDS:
         raise ValueError(f"backend must be one of {_BACKENDS}, got {backend!r}")
@@ -255,7 +234,17 @@ def make_sweep_context(
 
 def _use_triton(sweep_context: SweepContext, backend: Optional[str], device: torch.device,
                 dtype: torch.dtype) -> bool:
-    """Resolve the plane-step backend (None -> sweep_context.backend) for a sweep of `dtype` tensors on `device`."""
+    """Resolve the plane-step backend of a sweep and tell whether the fused Triton kernel runs.
+
+    Args:
+        sweep_context (SweepContext): sweep context.
+        backend (str, optional): "auto", "torch" or "triton", or None for ``sweep_context.backend``.
+        device (torch.device): device of the sweep tensors.
+        dtype (torch.dtype): dtype of the sweep tensors.
+
+    Returns:
+        bool: True for the fused kernel, False for the PyTorch plane step.
+    """
     chosen = sweep_context.backend if backend is None else backend
     if chosen not in _BACKENDS:
         raise ValueError(f"backend must be one of {_BACKENDS}, got {chosen!r}")
@@ -284,12 +273,18 @@ def _plane_step(
     c: Tensor,
     s: Tensor,
 ) -> None:
-    """Solve all entries of one plane for all chunk directions and groups; writes into `store` in place.
+    """Solve all entries of one wavefront plane for all chunk directions and groups, writing into ``store`` in place.
 
-    store    : [8, Dc, N + 1, 4G]   angular-fluence linear-discontinuous moments, last cell = zero vacuum cell
-    source   : [8, Dc, N, 4G]       source linear-discontinuous moments of the chunk
-    mu_cells : [N, G]               total attenuation per cell
-    c, s     : [8, Dc, 3]           direction coefficients of the chunk
+    The upstream moments and the source are gathered, the cell equations are solved in closed form
+    (:func:`~citrus.scatter_solver.linear_discontinuous_cell.cell_solve`) and the result is scattered into ``store``.
+
+    Args:
+        plane (PlaneIndex): indices of the plane.
+        store (Tensor): [8, Dc, N + 1, 4G] angular-fluence moments of the chunk; the last cell is the zero vacuum cell.
+        source (Tensor): [8, Dc, N, 4G] source moments of the chunk.
+        mu_cells (Tensor): [N, G] total attenuation coefficient mu_t per cell in cm^-1.
+        c (Tensor): [8, Dc, 3] ``|Omega_a| / Delta_a`` of the chunk directions in cm^-1.
+        s (Tensor): [8, Dc, 3] ``sign(Omega_a)`` of the chunk directions.
     """
     E = plane.octant.shape[0]
     Dc = store.shape[1]
@@ -316,10 +311,20 @@ def _sweep_chunk(
     store: Optional[Tensor] = None,
     use_triton: bool = False,
 ) -> Tensor:
-    """Sweep one direction chunk through all planes. source [8, Dc, N, 4G]. Returns store [8, Dc, N + 1, 4G].
+    """Sweep one direction chunk through all wavefront planes.
 
-    use_triton: one fused `sweep_kernels` kernel per plane instead of `_plane_step` (float32 CUDA tensors,
-    sweep_context.flat_index set; source, mu_cells, c and a given store must be contiguous).
+    Args:
+        sweep_context (SweepContext): sweep context.
+        source (Tensor): [8, Dc, N, 4G] source moments of the chunk.
+        mu_cells (Tensor): [N, G] total attenuation coefficient mu_t per cell in cm^-1.
+        c (Tensor): [8, Dc, 3] ``|Omega_a| / Delta_a`` of the chunk directions in cm^-1.
+        s (Tensor): [8, Dc, 3] ``sign(Omega_a)`` of the chunk directions.
+        store (Tensor, optional): [8, Dc, N + 1, 4G] buffer to reuse, zeroed here. Defaults to None (allocated).
+        use_triton (bool, optional): one fused Triton kernel per plane instead of the PyTorch plane step (float32 CUDA,
+            contiguous inputs). Defaults to False.
+
+    Returns:
+        Tensor: [8, Dc, N + 1, 4G] angular-fluence moments of the chunk.
     """
     N = sweep_context.num_cells
     Dc = c.shape[1]
@@ -339,6 +344,15 @@ def _sweep_chunk(
 
 
 def _resolve_chunk(sweep_context: SweepContext, direction_chunk: Optional[int]) -> int:
+    """Number of directions per octant swept together.
+
+    Args:
+        sweep_context (SweepContext): sweep context.
+        direction_chunk (int, optional): requested chunk, at least 1, or None for all D8.
+
+    Returns:
+        int: the chunk, at most D8.
+    """
     D8 = sweep_context.directions_per_octant
     if direction_chunk is None:
         return D8
@@ -349,7 +363,14 @@ def _resolve_chunk(sweep_context: SweepContext, direction_chunk: Optional[int]) 
 
 
 def source_function_accepts_out(source_function: SourceFunction) -> bool:
-    """True if source_function takes an `out` keyword (the sweep then lends it scratch memory for its result)."""
+    """Tell whether a source function takes an ``out`` keyword, so the sweep can lend it memory for its result.
+
+    Args:
+        source_function (SourceFunction): the source function.
+
+    Returns:
+        bool: True if it accepts ``out`` as a positional-or-keyword or keyword-only parameter.
+    """
     try:
         params = inspect.signature(source_function).parameters
     except (TypeError, ValueError):
@@ -360,13 +381,20 @@ def source_function_accepts_out(source_function: SourceFunction) -> bool:
 
 def _fill_source(sweep_context: SweepContext, source_function: SourceFunction, d0: int, d1: int, G: int,
                  out: Tensor, scratch: Optional[Tensor] = None) -> None:
-    """Evaluate the source of the chunk d in [d0, d1) of every octant and copy it cell-major into out [8, dc, N, 4G].
+    """Evaluate the source of the chunk ``d0 <= d < d1`` of every octant and copy it cell-major into ``out``.
 
-    ONE call source_function(sweep_context.direction_indices(d0, d1)) with all 8 dc directions (octant-major, the
-    layout of `out`; dc = d1 - d0), so a GEMM-type source (scatter_source_function) reads its moments once per chunk.
-    If source_function accepts `out=`, it is given a [8 dc, G, 4, R, C, S] view of `scratch` (contiguous, >= 8 dc 4G N
-    elements, contents destroyed; the sweep passes the not-yet-used storage tensor of the chunk), so no temporary is
-    allocated; otherwise its result is one transient source-sized tensor.
+    The source function is called once with all ``8 dc`` directions, octant-major; if it accepts ``out``, it writes into
+    a view of ``scratch``, so that no temporary is allocated.
+
+    Args:
+        sweep_context (SweepContext): sweep context.
+        source_function (SourceFunction): source function of :func:`~citrus.scatter_solver.transport_sweep.sweep`.
+        d0 (int): first per-octant direction index of the chunk.
+        d1 (int): end (exclusive) of the chunk; ``dc = d1 - d0``.
+        G (int): number of energy groups.
+        out (Tensor): [8, dc, N, 4G] cell-major source moments, written in place.
+        scratch (Tensor, optional): contiguous buffer of at least ``8 dc 4G N`` elements of the dtype and device of
+            ``out``, contents destroyed. Defaults to None.
     """
     chunk = d1 - d0
     N = sweep_context.num_cells
@@ -403,24 +431,20 @@ def sweep(
 ) -> Union[Tensor, tuple[Tensor, Tensor]]:
     """Linear-discontinuous discrete-ordinates sweep of all directions and groups with vacuum boundaries.
 
-    mu_t            : [G, rows, cols, slices] total attenuation (1/cm), on sweep_context.device; its dtype sets the
-                      computation dtype (sweep_context tables are cast to it).
-    source_function : direction_index [Dsel] int64 (reordered direction indices, see
-                      SweepContext.direction_indices) -> linear-discontinuous source moments [Dsel, G, 4, rows, cols,
-                      slices] (per steradian, moments [0, x, y, z]). Called ONCE per direction chunk with the Dsel = 8
-                      Dc directions of all octants, octant-major: indices o * D8 + d for o = 0..7, d0 <= d < d0 + Dc
-                      (sweep_context.direction_indices(d0, d0 + Dc)). It may take a keyword `out` (a contiguous
-                      [Dsel, G, 4, rows, cols, slices] tensor of the sweep dtype, contents undefined) to write
-                      its result into and return; the sweep then lends it the chunk's storage buffer as
-                      scratch and no source-sized temporary is allocated.
-    direction_chunk : directions per octant swept together (Dc); default all D8. Smaller chunks reduce
-                      memory (store and source scale with 8 * Dc) at the cost of more plane steps.
-    return_psi      : also return the angular fluence psi [M, G, 4, rows, cols, slices] in reordered
-                      direction order (small grids / tests only).
-    backend         : plane-step backend "auto" / "torch" / "triton" (default None: sweep_context.backend), see the
-                      module docstring. The backends agree to float32 rounding.
+    Args:
+        sweep_context (SweepContext): context of the grid and the quadrature.
+        mu_t (Tensor): [G, rows, cols, slices] total attenuation coefficient mu_t in cm^-1 on the context device; its
+            dtype sets the computation dtype.
+        source_function (SourceFunction): maps [Dsel] int64 reordered direction indices to [Dsel, G, 4, rows, cols,
+            slices] source moments per sr, called once per chunk; it may write into an ``out`` keyword buffer.
+        direction_chunk (int, optional): directions per octant swept together (Dc). Defaults to None (all D8).
+        return_psi (bool, optional): also return the angular fluence (small grids and tests). Defaults to False.
+        backend (Backend, optional): plane-step backend "auto", "torch" or "triton"; "auto" uses the fused Triton kernel
+            for float32 CUDA sweeps when it is usable. Defaults to None (``sweep_context.backend``).
 
-    Returns phi [G, (L+1)^2, 4, rows, cols, slices] (and psi if return_psi).
+    Returns:
+        Tensor: [G, (L+1)^2, 4, rows, cols, slices] spherical-harmonic moments phi of the angular fluence; with
+        ``return_psi``, the tuple (phi, psi) with psi [M, G, 4, rows, cols, slices] in reordered direction order.
     """
     if mu_t.dim() != 4 or tuple(mu_t.shape[1:]) != tuple(sweep_context.shape):
         raise ValueError(f"mu_t must be [G, {sweep_context.shape}], got {tuple(mu_t.shape)}")

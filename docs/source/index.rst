@@ -26,7 +26,7 @@ A reconstruction in a few lines
 
 ``counts`` are the measured projections (primary plus scatter), ``grid`` and ``geometry`` describe the volume and the
 cone-beam scanner in MBIRTORCH's conventions, and the configuration sets how often the scatter is refreshed.
-:doc:`usage` walks through the demo that produces the figures below.
+:doc:`usage` describes the two demos and the study script that produces the figures below.
 
 What CITRUS gives you
 ---------------------

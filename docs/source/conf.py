@@ -39,9 +39,10 @@ for optional in ("sphinx_copybutton", "sphinxext.opengraph", "sphinx_design"):
 autodoc_mock_imports = ["torch", "triton", "mbirtorch"]
 autodoc_member_order = "bysource"
 autodoc_typehints = "description"
+autodoc_typehints_description_target = "documented"
 autodoc_default_options = {"members": True, "show-inheritance": True}
 napoleon_google_docstring = True
-napoleon_numpy_docstring = True
+napoleon_numpy_docstring = False
 
 templates_path = []
 exclude_patterns = ["_build", "build"]
@@ -80,13 +81,3 @@ html_short_title = "CITRUS"
 ogp_site_url = "https://purduecitrus.readthedocs.io/"
 ogp_image = "https://purduecitrus.readthedocs.io/en/latest/_static/citrus_pipeline.png"
 
-
-def _literal_docstrings(app, what, name, obj, options, lines):
-    """The docstrings are plain text with ASCII math (|x|, a_b, ...): render them verbatim."""
-    if lines:
-        text = list(lines)
-        lines[:] = ["::", ""] + ["    " + line for line in text] + [""]
-
-
-def setup(app):
-    app.connect("autodoc-process-docstring", _literal_docstrings)

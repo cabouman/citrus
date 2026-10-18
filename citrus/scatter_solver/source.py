@@ -1,9 +1,7 @@
-"""Point-source model: spectrum and collimation.
+"""Point-source model of the solver: the spectrum and the collimation of the focal spot.
 
-The focal spot emits 1 photon per steradian in total; group g carries f_g = spectrum_fraction[g]
-photons per steradian (sum_g f_g = 1), modulated by an angular weight b(Omega) for collimation:
-
-    q_g(r0, Omega) = f_g b(Omega) delta(r - r0)          (photons per steradian per source photon/sr)
+The focal spot emits one photon per steradian in total, split over the energy groups by the library's spectrum
+fractions and collimated to the panel.
 """
 
 from __future__ import annotations
@@ -19,20 +17,33 @@ from .geometry import ConeGeometry
 
 @dataclass(frozen=True)
 class SourceModel:
-    """Isotropic point source at geometry.source_position(angle), collimated to the panel.
+    """Isotropic point source at ``geometry.source_position(angle)``, collimated to the panel, without a bowtie filter.
 
-    Collimation: b(Omega) = 1 if the ray from the focal spot along Omega hits the active panel area (edge to edge,
-    including the outer half pixels), else 0: the source is collimated to the detector. No bowtie filter.
+    The angular weight ``b(Omega)`` is 1 for directions whose ray from the focal spot hits the active panel area (edge
+    to edge, outer half pixels included) and 0 otherwise.
     """
 
     def per_group_strength(self, library: MultigroupLibrary) -> Tensor:
-        """Photons per steradian per group, f_g = library.spectrum_fraction: [G]."""
+        """Photons per steradian of each group, ``f_g = library.spectrum_fraction`` (summing to 1).
+
+        Args:
+            library (MultigroupLibrary): the library.
+
+        Returns:
+            Tensor: [G] photons per steradian per group, per source photon/sr.
+        """
         return library.spectrum_fraction
 
     def angular_weight(self, directions: Tensor, geometry: ConeGeometry, angle: float) -> Tensor:
-        """Angular weight b(Omega) of the source for directions [..., 3] (recon frame). Returns [...].
+        """Angular weight ``b(Omega)`` of the source: 1 where the ray from the focal spot hits the panel, else 0.
 
-        Directions need not be normalized. Same device and dtype as `directions`.
+        Args:
+            directions (Tensor): [..., 3] directions in the recon frame, not necessarily normalized.
+            geometry (ConeGeometry): scan geometry.
+            angle (float): view angle in rad.
+
+        Returns:
+            Tensor: [...] weights, on the device and in the dtype of ``directions``.
         """
         source_position = torch.tensor(geometry.source_position(angle), device=directions.device,
                                        dtype=directions.dtype)

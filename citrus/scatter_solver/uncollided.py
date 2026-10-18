@@ -1,29 +1,11 @@
-"""Uncollided fluence and first-collision source of the LBTE solver.
+"""Uncollided fluence and first-collision source of the LBTE solver, for one view.
 
-For a point source at r0 emitting q_g = f_g b(Omega) photons per steradian in group g, the uncollided fluence and
-the first-collision source are
-
-    phi_UC,g(r)       = f_g b(Omega_UC(r)) / |r - r0|^2  exp(-tau_g(r0 -> r)),     Omega_UC(r) = (r - r0) / |r - r0|
-    S_FC,g(r, Omega)  = sum_{g' <= g} mu_s^{g' -> g}(r; Omega_UC(r) . Omega) phi_UC,g'(r)
-
-(per-steradian transfer mu_s(eta) tabulated in eta = cos(scattering angle)). All functions work for one view angle
-in the recon frame and are device- and dtype-preserving (the dtype of `rho` / `phi_uncollided` decides the computation
-dtype). The evaluation points are the voxel centers of the `grid` argument: in the solver the quadrature grid Q (q^3
-points per transport cell, docs/source/conventions.rst, "Grids"), with the densities resampled onto Q.
-
-The uncollided fluence is exact in energy within each group: upstream ray traces of the density maps (one per basis
-material present in the volume, `present_materials`) and the library's fine-energy attenuation table
-(`cross_sections.group_transmission`), not the group-averaged mu_t. The trace runs through any grid to the points of
-any other (`uncollided_fluence(..., points=)`): the solver traces through the quadrature grid Q by default
-(SolverConfig.uncollided_trace_grid). It is the composition of `uncollided_path_lengths` (the per-material upstream
-line integrals, which can be traced one material map at a time: the solver does so for fields built from the
-attenuation, `ScatterSolver.material_fields_from_attenuation`) and `uncollided_from_path_lengths`.
-
-Materials: rho is [M, R, C, S] for any number of basis materials M (7 for the package's table). Where every point has
-at most two nonzero materials, the first-collision source uses the compact pair representation
-(`cross_sections.MaterialPairs`: the two table rows gathered by material index; the cost of a two-material basis);
-otherwise (resampled densities can mix more materials per point) and for M <= 2 it evaluates all M materials densely
-(`pairs` argument: a MaterialPairs, `DENSE`, or None to decide from rho, `resolve_pairs`).
+The uncollided scalar fluence is exact in energy within each group: it is computed from upstream ray traces of the
+density maps and the fine-energy attenuation table of the library. The first-collision source is evaluated from the
+tabulated per-steradian transfer at the angle between the primary direction and each sweep direction, and the module
+also restricts fields on the quadrature grid to linear-discontinuous moments and corrects the point-sampled
+first-collision source so that the sweep quadrature reproduces its exact l = 0 and l = 1 moments. The equations are in
+docs/source/method.rst, "Uncollided fluence and first-collision source" and "Source iteration".
 """
 
 from __future__ import annotations
@@ -43,9 +25,17 @@ from .source import SourceModel
 
 
 def present_materials(rho: Tensor) -> Optional[list[int]]:
-    """Library indices of the materials with any nonzero density in rho [M, ...] when M > 2 and some material is
-    absent (one host synchronization), else None (= all materials). An absent material has zero line integrals, so
-    tracing only the present ones gives the same transmission (`cross_sections.group_transmission(materials=...)`)."""
+    """Library indices of the materials with any nonzero density, or None for all materials.
+
+    Tracing only the present materials gives the same transmission, since an absent material has zero line integrals;
+    the test needs one host synchronization.
+
+    Args:
+        rho (Tensor): [M, ...] material densities in g/cm^3.
+
+    Returns:
+        list[int] | None: indices of the present materials ([0] if none), or None when M <= 2 or all are present.
+    """
     M = int(rho.shape[0])
     if M <= 2:
         return None
@@ -61,10 +51,16 @@ PairsArgument = Union[MaterialPairs, str, None]
 
 
 def resolve_pairs(rho: Tensor, pairs: PairsArgument) -> Union[MaterialPairs, str]:
-    """The material representation of the first-collision source: `pairs` itself when it is a MaterialPairs or `DENSE`;
-    for None, `cross_sections.material_pairs_if_compact(rho)` (the pair representation when M > 2 and every point has at
-    most two nonzero materials; one host synchronization) or DENSE. Resolve once and pass the result when calling
-    repeatedly with the same densities."""
+    """Material representation of the first-collision source: a ``MaterialPairs`` or ``DENSE``.
+
+    Args:
+        rho (Tensor): [M, rows, cols, slices] material densities in g/cm^3.
+        pairs (MaterialPairs | str | None): returned as is when a ``MaterialPairs`` or ``DENSE``; None chooses the pair
+            representation when M > 2 and every point has at most two nonzero materials (one host synchronization).
+
+    Returns:
+        MaterialPairs | str: the pair representation of rho, or ``DENSE``.
+    """
     if isinstance(pairs, MaterialPairs):
         return pairs
     if pairs is None:
@@ -77,9 +73,17 @@ def resolve_pairs(rho: Tensor, pairs: PairsArgument) -> Union[MaterialPairs, str
 
 def primary_directions_to_voxels(grid: Grid, geometry: ConeGeometry, angle: float, device=None,
                                  dtype=torch.float32) -> Tensor:
-    """Unit vectors Omega_UC(r) = (r - r0)/|r - r0| from the focal spot to each voxel center.
+    """Unit vectors ``Omega_UC(r) = (r - r0) / |r - r0|`` from the focal spot to each voxel center.
 
-    Returns [rows, cols, slices, 3] (recon frame).
+    Args:
+        grid (Grid): grid of the voxel centers.
+        geometry (ConeGeometry): scanner geometry.
+        angle (float): view angle in radians.
+        device (torch.device | str, optional): device of the result. Defaults to None (CPU).
+        dtype (torch.dtype, optional): dtype of the result. Defaults to torch.float32.
+
+    Returns:
+        Tensor: [rows, cols, slices, 3] unit directions in the reconstruction frame.
     """
     r = grid.center_coordinates(device, dtype)
     r0 = torch.tensor(geometry.source_position(angle), device=device, dtype=dtype)
@@ -89,24 +93,23 @@ def primary_directions_to_voxels(grid: Grid, geometry: ConeGeometry, angle: floa
 
 def uncollided_fluence(library: MultigroupLibrary, rho: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
                        source: SourceModel, projectors: Projectors, points: Optional[Grid] = None) -> Tensor:
-    """Uncollided scalar fluence at the voxel centers of `points` (default: of `grid`), exact in energy within each
-    group, traced through the densities rho on `grid`.
+    """Uncollided scalar fluence at the voxel centers of ``points``, exact in energy within each group.
 
-        phi_UC,g(r) = b(Omega_UC(r)) / |r - r0|^2 * sum_{E in g} w_E exp(-sum_m P_m(r) m_m(E))
+    ``phi_UC,g(r) = b(Omega_UC(r)) / |r - r0|^2 sum_{E in g} w_E exp(-sum_m P_m(r) m_m(E))``, with the upstream density
+    line integrals P_m traced through ``grid`` for the materials present in the volume.
 
-    with P_m(r) = int_{r0}^{r} rho_m dl the upstream line integrals of the density maps on `grid` (g/cm^2, zero outside
-    its box; one ray trace per material PRESENT in the volume, `present_materials`: an absent material adds nothing):
-    `projectors.upstream_cumulative(rho[present], grid)` when the points are the centers of `grid` itself, else
-    `projectors.upstream_to_points(rho[present], grid, ..., points centers)` (one ray per point: the number of rays is
-    the number of points, the path cost that of `grid`; a point outside the box gets the integral of the part of its
-    ray inside the box). The library's fine-energy table: w_E = library.fine_weight
-    (source photons/sr per fine bin; their sum over group g is f_g = source.per_group_strength), m_m(E) =
-    library.fine_mu_t (`cross_sections.group_transmission`). Since mu_t is linear in the densities this is the exact
-    group-integrated polychromatic Beer's law (up to the fine quadrature); the group-averaged attenuation
-    f_g exp(-int mu_t,g dl) ignores beam hardening within a group.
+    Args:
+        library (MultigroupLibrary): cross-section library with the fine-energy weights and mass attenuation.
+        rho (Tensor): [M, rows, cols, slices] material densities rho in g/cm^3 on ``grid``.
+        grid (Grid): grid of the densities, traced through.
+        geometry (ConeGeometry): scanner geometry.
+        angle (float): view angle in radians.
+        source (SourceModel): source model giving the angular weight b.
+        projectors (Projectors): ray tracers of the upstream line integrals.
+        points (Grid, optional): grid whose voxel centers receive the fluence. Defaults to None (``grid``).
 
-    rho: [M, rows, cols, slices] g/cm^3 on grid. Returns phi_uncollided [G, *points.shape] in photons/cm^2 per source
-    photon/sr (point values at the voxel centers of `points`).
+    Returns:
+        Tensor: [G, rows, cols, slices] fluence on ``points`` in photons/cm^2 per source photon/sr.
     """
     if int(rho.shape[0]) != library.num_materials:
         raise ValueError(f"rho has {int(rho.shape[0])} materials, the library {library.num_materials}")
@@ -120,11 +123,23 @@ def uncollided_fluence(library: MultigroupLibrary, rho: Tensor, grid: Grid, geom
 
 def uncollided_path_lengths(projectors: Projectors, rho: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
                             points: Optional[Grid] = None) -> Tensor:
-    """Upstream density line integrals P_m(r) = int_{r0}^{r} rho_m dl (g/cm^2) of the maps rho [M', R, C, S] on `grid`
-    (any subset of the materials, e.g. one map at a time) to the voxel centers of `points` (default: of `grid`):
-    `projectors.upstream_cumulative` when the points are the centers of `grid`, else `projectors.upstream_to_points`.
-    Returns [M', *points.shape]. Linear and channel by channel: tracing the materials one at a time and concatenating
-    gives the same path lengths."""
+    """Upstream density line integrals ``P_m(r) = int_{r0}^{r} rho_m dl`` to the voxel centers of ``points``.
+
+    The integrals are linear and channel by channel, so any subset of the materials can be traced, e.g. one map at a
+    time; the density is zero outside the box of ``grid``.
+
+    Args:
+        projectors (Projectors): ray tracers (``upstream_cumulative`` when the points are the centers of ``grid``, else
+            ``upstream_to_points``).
+        rho (Tensor): [M', rows, cols, slices] density maps in g/cm^3 on ``grid``.
+        grid (Grid): grid of the densities.
+        geometry (ConeGeometry): scanner geometry.
+        angle (float): view angle in radians.
+        points (Grid, optional): grid of the end points. Defaults to None (``grid``).
+
+    Returns:
+        Tensor: [M', rows, cols, slices] line integrals on ``points`` in g/cm^2.
+    """
     point_grid = grid if points is None else points
     if point_grid == grid:
         return projectors.upstream_cumulative(rho, grid, geometry, angle)  # [M', R, C, S] g/cm^2
@@ -134,9 +149,23 @@ def uncollided_path_lengths(projectors: Projectors, rho: Tensor, grid: Grid, geo
 
 def uncollided_from_path_lengths(library: MultigroupLibrary, path_lengths: Tensor, materials: Optional[Sequence[int]],
                                  points: Grid, geometry: ConeGeometry, angle: float, source: SourceModel) -> Tensor:
-    """phi_UC,g(r) = b(Omega_UC(r)) / |r - r0|^2 sum_{E in g} w_E exp(-sum_m P_m(r) m_m(E)) at the voxel centers of
-    `points` from the upstream line integrals path [M', *points.shape] (g/cm^2; `uncollided_path_lengths`) of the
-    materials `materials` (library indices of the rows; None = all, in library order). Returns [G, *points.shape]."""
+    """Uncollided scalar fluence at the voxel centers of ``points`` from the upstream density line integrals.
+
+    Computes ``phi_UC,g(r) = b(Omega_UC(r)) / |r - r0|^2 sum_{E in g} w_E exp(-sum_m P_m(r) m_m(E))``.
+
+    Args:
+        library (MultigroupLibrary): cross-section library with the fine-energy weights and mass attenuation.
+        path_lengths (Tensor): [M', rows, cols, slices] upstream line integrals on ``points`` in g/cm^2.
+        materials (Sequence[int] | None): library indices of the rows of ``path_lengths``, None for all materials in
+            library order.
+        points (Grid): grid of the voxel centers.
+        geometry (ConeGeometry): scanner geometry.
+        angle (float): view angle in radians.
+        source (SourceModel): source model giving the angular weight b.
+
+    Returns:
+        Tensor: [G, rows, cols, slices] fluence on ``points`` in photons/cm^2 per source photon/sr.
+    """
     device, dtype = path_lengths.device, path_lengths.dtype
     transmission = group_transmission(library, path_lengths, materials=materials)  # [G, R, C, S]
     r = points.center_coordinates(device, dtype)
@@ -150,27 +179,26 @@ def uncollided_from_path_lengths(library: MultigroupLibrary, path_lengths: Tenso
 def first_collision_source_at_directions(library: MultigroupLibrary, rho: Tensor, phi_uncollided: Tensor, grid: Grid,
                                          geometry: ConeGeometry, angle: float, omegas: Tensor, chunk: int = 4,
                                          backend: str = "auto", pairs: PairsArgument = None) -> Tensor:
-    """First-collision source at every voxel center of `grid` (in the solver the quadrature grid Q) for each
-    direction.
+    """First-collision source at every voxel center of ``grid`` for each direction.
 
-        S_FC,g(r, omega_k) = sum_{g' <= g} mu_s^{g'->g}(r; Omega_UC(r) . omega_k) phi_UC,g'(r)
+    ``S_FC,g(r, omega_k) = sum_{g' <= g} mu_s^{g'->g}(r; Omega_UC(r) . omega_k) phi_UC,g'(r)``, downscatter only.
 
-    Groups are ordered from high to low energy, so g' <= g is downscatter (no upscatter).
-    rho: [M, rows, cols, slices]; phi_uncollided: [G, rows, cols, slices]; omegas: [K, 3] unit vectors.
-    Returns [K, G, rows, cols, slices] in photons/(cm^3 sr) per source photon/sr.
+    Args:
+        library (MultigroupLibrary): cross-section library with the angular transfer table.
+        rho (Tensor): [M, rows, cols, slices] material densities rho in g/cm^3.
+        phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence in photons/cm^2 per source photon/sr.
+        grid (Grid): grid of the points (in the solver the quadrature grid).
+        geometry (ConeGeometry): scanner geometry.
+        angle (float): view angle in radians.
+        omegas (Tensor): [K, 3] unit directions.
+        chunk (int, optional): directions per batch of the PyTorch path. Defaults to 4.
+        backend (str, optional): "auto" (the fused Triton kernel for float32 CUDA inputs when it is usable, else
+            PyTorch), "torch" or "triton". Defaults to "auto".
+        pairs (MaterialPairs | str | None, optional): material representation, see ``resolve_pairs``; pass the resolved
+            value when calling repeatedly. Defaults to None.
 
-    backend: "auto" (default) runs float32 CUDA inputs through the fused Triton kernel of
-    `kernels/uncollided_kernels.py` when it is usable on the device (shared Triton probe, CITRUS_DISABLE_TRITON=1 kill
-    switch, per-device self-check against the PyTorch path), else the PyTorch path; "torch" forces the PyTorch path;
-    "triton" requires the kernel for float32 CUDA inputs (raises if it is unusable). float64 and CPU inputs always use
-    the PyTorch path (the reference). The two paths agree to float32 rounding.
-    chunk: directions per batch of the PyTorch path (peak memory ~ 3 M G^2 chunk |F| scalars); the kernel
-    evaluates all K directions in one launch without temporaries, so it ignores `chunk`.
-    pairs: the material representation (`resolve_pairs`): a `cross_sections.MaterialPairs` of rho (at most two
-    nonzero materials per point; both paths gather the two table rows of each point by material index: cost and
-    memory of a two-material basis), `DENSE` (all M materials per point: the PyTorch path forms the M-material mix, the
-    kernel's dense mode costs about M / 2 times its pair mode), or None (decided from rho here, one host
-    synchronization: pass the resolved value when calling repeatedly with the same densities).
+    Returns:
+        Tensor: [K, G, rows, cols, slices] source in photons/(cm^3 sr) per source photon/sr.
     """
     pairs = resolve_pairs(rho, pairs)
     compact_pairs = pairs if isinstance(pairs, MaterialPairs) else None
@@ -186,8 +214,23 @@ def first_collision_source_at_directions(library: MultigroupLibrary, rho: Tensor
 
 def _first_collision_source_torch(library: MultigroupLibrary, rho: Tensor, phi_uncollided: Tensor, grid: Grid,
                                   geometry: ConeGeometry, angle: float, omegas: Tensor, chunk: int = 4) -> Tensor:
-    """PyTorch path of `first_collision_source_at_directions` (any device / dtype; same shapes): materializes the
-    interpolated transfer table [G_in, G_out, chunk, rows, cols, slices] per `chunk` directions."""
+    """PyTorch path of ``first_collision_source_at_directions`` with all M materials per point.
+
+    The interpolated transfer table ``[G_in, G_out, chunk, rows, cols, slices]`` is formed per chunk of directions.
+
+    Args:
+        library (MultigroupLibrary): cross-section library with the angular transfer table.
+        rho (Tensor): [M, rows, cols, slices] material densities rho in g/cm^3.
+        phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence in photons/cm^2 per source photon/sr.
+        grid (Grid): grid of the points (in the solver the quadrature grid).
+        geometry (ConeGeometry): scanner geometry.
+        angle (float): view angle in radians.
+        omegas (Tensor): [K, 3] unit directions.
+        chunk (int, optional): directions per batch. Defaults to 4.
+
+    Returns:
+        Tensor: [K, G, rows, cols, slices] source in photons/(cm^3 sr) per source photon/sr.
+    """
     device, dtype = phi_uncollided.device, phi_uncollided.dtype
     rho = rho.to(device=device, dtype=dtype)
     omegas = omegas.to(device=device, dtype=dtype).reshape(-1, 3)
@@ -210,9 +253,23 @@ def _first_collision_source_torch(library: MultigroupLibrary, rho: Tensor, phi_u
 def _first_collision_source_torch_pairs(library: MultigroupLibrary, pairs: MaterialPairs, phi_uncollided: Tensor,
                                         grid: Grid, geometry: ConeGeometry, angle: float, omegas: Tensor,
                                         chunk: int = 4) -> Tensor:
-    """PyTorch path of `first_collision_source_at_directions` for the pair representation (any device / dtype): per
-    `chunk` directions the two table rows of every voxel are gathered by material index
-    (`cross_sections.transfer_eta_at_pairs`)."""
+    """PyTorch path of ``first_collision_source_at_directions`` for the pair representation.
+
+    Per chunk of directions, the two table rows of every point are gathered by material index.
+
+    Args:
+        library (MultigroupLibrary): cross-section library with the angular transfer table.
+        pairs (MaterialPairs): pair representation of the material densities.
+        phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence in photons/cm^2 per source photon/sr.
+        grid (Grid): grid of the points (in the solver the quadrature grid).
+        geometry (ConeGeometry): scanner geometry.
+        angle (float): view angle in radians.
+        omegas (Tensor): [K, 3] unit directions.
+        chunk (int, optional): directions per batch. Defaults to 4.
+
+    Returns:
+        Tensor: [K, G, rows, cols, slices] source in photons/(cm^3 sr) per source photon/sr.
+    """
     device, dtype = phi_uncollided.device, phi_uncollided.dtype
     pairs = pairs.to(device=device, dtype=dtype)
     omegas = omegas.to(device=device, dtype=dtype).reshape(-1, 3)
@@ -231,21 +288,20 @@ def _first_collision_source_torch_pairs(library: MultigroupLibrary, pairs: Mater
 
 
 def restrict_to_linear_discontinuous_moments(field: Tensor, grid: Grid, factor: int) -> Tensor:
-    """Restrict a field on a refined grid (the quadrature grid Q = C.refine(factor)) to linear-discontinuous moments on
-    the grid it refines (the transport grid C).
+    """Restrict a field on a refined grid to linear-discontinuous moments on the grid it refines.
 
-    field: [..., rows, cols, slices] on `grid` (typically [K, G, rows, cols, slices]).
-    Returns [..., 4, rows/f, cols/f, slices/f] (f = factor) with moments ordered [0, x, y, z] (x <-> cols,
-    y <-> rows, z <-> slices), using the f^3 sub-cell centers as equal-weight quadrature points
-    with local coordinates u_j = (2j + 1)/f - 1 (grid.local_coordinates_of_fine_in_coarse):
+    The ``f^3`` sub-cell centers are equal-weight quadrature points at local coordinates ``u_j = (2j + 1)/f - 1``;
+    moment 0 is ``mean_j S_j`` and moment a is ``mean_j(S_j u_a,j) / mean_j(u_a,j^2)``, exact for a field linear in the
+    cell.
 
-      moment 0 = mean_j S_j
-      moment a = mean_j(S_j u_a,j) / mean_j(u_a,j^2)
+    Args:
+        field (Tensor): [..., rows, cols, slices] values on ``grid``, typically [K, G, rows, cols, slices].
+        grid (Grid): the refined grid (in the solver the quadrature grid).
+        factor (int): refinement factor f; the grid dimensions must be divisible by it.
 
-    The midpoint quadrature gives mean_j(u_j^2) = (1 - 1/f^2)/3, not 1/3, so the continuous Galerkin
-    formula (3 mean(S u)) would return s (1 - 1/f^2) for a field c + s u sampled at the sub-cell centers.
-    Dividing by the discrete second moment instead reproduces a field that is linear within each
-    cell exactly (slope s, mean c). For f = 1 the slopes are 0.
+    Returns:
+        Tensor: [..., 4, rows/f, cols/f, slices/f] moments ordered [0, x, y, z] (x along cols, y along rows, z along
+        slices); the slopes are 0 for f = 1.
     """
     f = int(factor)
     coarse = grid.coarsen(f)  # validates divisibility
@@ -279,12 +335,18 @@ def restrict_to_linear_discontinuous_moments(field: Tensor, grid: Grid, factor: 
 
 def first_collision_exact_moments(library: MultigroupLibrary, rho: Tensor, phi_uncollided: Tensor,
                                   l_max: int = 1) -> Tensor:
-    """Exact angular moments of the first-collision source about Omega_UC from the library Legendre moments.
+    """Exact Legendre moments of the first-collision source about the primary direction ``Omega_UC``.
 
-        M_l[g](r) = int P_l(Omega . Omega_UC(r)) S_FC,g(r, Omega) dOmega = sum_{g' <= g} mu_s_l^{g'->g}(r) phi_UC,g'(r)
+    ``M_l[g] = int P_l(Omega . Omega_UC) S_FC,g dOmega = sum_{g' <= g} mu_s_l^{g'->g} phi_UC,g'`` for l = 0..l_max.
 
-    (convention mu_s(eta) = sum_l (2l+1)/(4 pi) mu_s_l P_l(eta)), l = 0..l_max. rho: [M, R, C, S];
-    phi_uncollided: [G, R, C, S]. Returns [l_max+1, G, R, C, S] in the dtype/device of phi_uncollided.
+    Args:
+        library (MultigroupLibrary): library with Legendre transfer moments of order at least ``l_max``.
+        rho (Tensor): [M, R, C, S] material densities in g/cm^3.
+        phi_uncollided (Tensor): [G, R, C, S] uncollided fluence in photons/cm^2 per source photon/sr.
+        l_max (int, optional): highest Legendre order. Defaults to 1.
+
+    Returns:
+        Tensor: [l_max+1, G, R, C, S] moments in photons/cm^3 per source photon/sr, dtype and device of phi_uncollided.
     """
     if library.legendre_order < l_max:
         raise ValueError(f"library Legendre order {library.legendre_order} < {l_max}")
@@ -298,14 +360,15 @@ def first_collision_exact_moments(library: MultigroupLibrary, rho: Tensor, phi_u
 
 @dataclass(frozen=True, eq=False)
 class FirstCollisionSamplingCorrection:
-    """Per-point, per-group correction of the pointwise-sampled first-collision source (on the grid of its points, in
-    the solver the quadrature grid Q):
+    """Per-point, per-group correction ``S_m <- scale * S_m * (1 + beta * Omega_m . Omega_UC)`` of the sampled source.
 
-        S_m <- scale * S_m * (1 + beta * Omega_m . Omega_UC)
+    The factors make the quadrature-weighted l = 0 and l = 1 moments of the corrected first-collision source equal to
+    the exact moments (l = 1 unless beta was clamped to [-1, 1] to keep the source non-negative).
 
-    scale, beta: [G, R, C, S]; omega_uncollided: [R, C, S, 3]. The factors make the quadrature-weighted l = 0 and l = 1
-    (unless beta had to be clamped to [-1, 1] to keep the source non-negative) moments of the corrected source equal to
-    `first_collision_exact_moments` (see `first_collision_sampling_correction`).
+    Attributes:
+        scale (Tensor): [G, R, C, S] scale factor of each point and group.
+        beta (Tensor): [G, R, C, S] linear coefficient in [-1, 1].
+        omega_uncollided (Tensor): [R, C, S, 3] primary direction ``Omega_UC`` at each point.
     """
 
     scale: Tensor
@@ -313,8 +376,15 @@ class FirstCollisionSamplingCorrection:
     omega_uncollided: Tensor
 
     def apply(self, source: Tensor, omegas: Tensor) -> Tensor:
-        """source: [K, G, R, C, S] = first_collision_source_at_directions(..., omegas [K, 3]). Returns the
-        corrected source."""
+        """Apply the correction to the sampled first-collision source.
+
+        Args:
+            source (Tensor): [K, G, R, C, S] source from ``first_collision_source_at_directions`` at ``omegas``.
+            omegas (Tensor): [K, 3] unit directions of the samples.
+
+        Returns:
+            Tensor: [K, G, R, C, S] corrected source.
+        """
         directions = omegas.to(device=source.device, dtype=source.dtype).reshape(-1, 3)
         eta = torch.einsum("rcsx,kx->krcs", self.omega_uncollided, directions)  # [K, R, C, S]
         return source * self.scale * (1.0 + self.beta[None] * eta[:, None])
@@ -324,20 +394,26 @@ def first_collision_sampling_correction(library: MultigroupLibrary, rho: Tensor,
                                         geometry: ConeGeometry, angle: float, omegas: Tensor, weights: Tensor,
                                         chunk: int = 4, batch: int = 8,
                                         pairs: PairsArgument = None) -> FirstCollisionSamplingCorrection:
-    """Correction factors that make the quadrature (omegas [K, 3], weights [K]) integrate the sampled first-collision
-    source exactly in angle, l = 0 and l = 1 about Omega_UC (one extra pass of `first_collision_source_at_directions`
-    over all K directions, `batch` at a time).
+    """Correction that makes a direction quadrature integrate the sampled first-collision source exactly for l = 0, 1.
 
-    With the quadrature sums (per voxel and group, mu_m = Omega_m . Omega_UC(r), S_m the point-sampled source)
-        I0 = sum_m w_m S_m,  I1 = sum_m w_m mu_m S_m,  I2 = sum_m w_m mu_m^2 S_m
-    and the exact moments E0, E1 (`first_collision_exact_moments`): with c = E1 / E0, beta = (c I0 - I1) / (I2 - c I1)
-    clamped to [-1, 1] (beta = 0 where E0 == 0 or the denominator vanishes), scale = E0 / (I0 + beta I1) (1 where that
-    denominator is not positive). The l = 0 moment is always matched; l = 1 is matched unless beta was clamped
-    (the clamp keeps 1 + beta mu >= 0, i.e. a non-negative source).
-    Precision (`first_collision_quadrature_sums`): the sums are formed by matmuls in the input dtype (float32 on GPU)
-    over blocks of at most `_FIRST_COLLISION_SUM_MAX_DIRECTIONS` directions and accumulated across blocks in float64;
-    the factors are computed in float64. Returns a FirstCollisionSamplingCorrection in the dtype of phi_uncollided.
-    pairs: as in `first_collision_source_at_directions`.
+    The factors follow from the quadrature sums (``first_collision_quadrature_sums``) and the exact moments
+    (``first_collision_exact_moments``) by ``first_collision_correction_factors``.
+
+    Args:
+        library (MultigroupLibrary): cross-section library with the angular transfer table.
+        rho (Tensor): [M, rows, cols, slices] material densities rho in g/cm^3.
+        phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence in photons/cm^2 per source photon/sr.
+        grid (Grid): grid of the points (in the solver the quadrature grid).
+        geometry (ConeGeometry): scanner geometry.
+        angle (float): view angle in radians.
+        omegas (Tensor): [K, 3] unit directions of the quadrature.
+        weights (Tensor): [K] quadrature weights in sr.
+        chunk (int, optional): directions per batch of the PyTorch path of the source. Defaults to 4.
+        batch (int, optional): directions per source evaluation. Defaults to 8.
+        pairs (MaterialPairs | str | None, optional): as in ``first_collision_source_at_directions``. Defaults to None.
+
+    Returns:
+        FirstCollisionSamplingCorrection: the factors, in the dtype of ``phi_uncollided``.
     """
     device, dtype = phi_uncollided.device, phi_uncollided.dtype
     omegas = omegas.to(device=device, dtype=dtype).reshape(-1, 3)
@@ -359,9 +435,19 @@ _FIRST_COLLISION_SUM_MAX_DIRECTIONS = 256
 
 
 def _moment_weight_rows(omegas: Tensor, weights: Tensor) -> Tensor:
-    """[10, K] rows (w, w o_x, w o_y, w o_z, w o_x^2, w o_y^2, w o_z^2, 2 w o_x o_y, 2 w o_x o_z, 2 w o_y o_z) such
-    that, for P = rows @ S ([10, K] @ [K, n]) and u = Omega_UC, I0 = P_0, I1 = sum_a u_a P_{1+a} and
-    I2 = sum_m w_m (omega_m . u)^2 S_m = u_x^2 P_4 + u_y^2 P_5 + u_z^2 P_6 + u_x u_y P_7 + u_x u_z P_8 + u_y u_z P_9."""
+    """Weight rows that turn one matrix product with the sampled source into the partial quadrature sums.
+
+    The rows are ``(w, w o_x, w o_y, w o_z, w o_x^2, w o_y^2, w o_z^2, 2 w o_x o_y, 2 w o_x o_z, 2 w o_y o_z)``, so that
+    for ``P = rows @ S`` and ``u = Omega_UC``: ``I0 = P_0``, ``I1 = sum_a u_a P_(1+a)`` and I2 is the quadratic form of
+    u in ``P_4..P_9``.
+
+    Args:
+        omegas (Tensor): [K, 3] unit directions.
+        weights (Tensor): [K] quadrature weights in sr.
+
+    Returns:
+        Tensor: [10, K] weight rows.
+    """
     x, y, z = omegas.unbind(-1)
     w2 = 2.0 * weights
     return torch.stack([weights, weights * x, weights * y, weights * z, weights * x * x, weights * y * y,
@@ -372,21 +458,29 @@ def first_collision_quadrature_sums(library: MultigroupLibrary, rho: Tensor, phi
                                     geometry: ConeGeometry, angle: float, omegas: Tensor, weights: Tensor,
                                     omega_uncollided: Tensor | None = None, chunk: int = 4, batch: int = 8,
                                     pairs: PairsArgument = None) -> Tensor:
-    """Quadrature sums of the point-sampled first-collision source per voxel and group (see
-    `first_collision_sampling_correction`):
+    """Quadrature sums of the point-sampled first-collision source per point and group.
 
-        I0 = sum_m w_m S_m,  I1 = sum_m w_m mu_m S_m,  I2 = sum_m w_m mu_m^2 S_m,   mu_m = omega_m . Omega_UC(r)
+    ``I0 = sum_m w_m S_m``, ``I1 = sum_m w_m mu_m S_m`` and ``I2 = sum_m w_m mu_m^2 S_m`` with
+    ``mu_m = omega_m . Omega_UC(r)``; float32 partial sums run over at most ``_FIRST_COLLISION_SUM_MAX_DIRECTIONS``
+    directions and are accumulated in float64.
 
-    Returns [3, G, R, C, S] float64. One pass of `first_collision_source_at_directions` over the K directions, `batch`
-    at a time (this sets the size of the [batch, G, R, C, S] source temporary). Since mu_m is linear in Omega_UC, a
-    batch's contribution to all three sums is ONE matmul (`addmm`) of the [10, k] weight rows of `_moment_weight_rows`
-    (quadrature weights times the monomials of omega_m up to degree 2) with the [k, G V] source, accumulated into a
-    [10, G V] partial in the input dtype. Every `_FIRST_COLLISION_SUM_MAX_DIRECTIONS` directions (and at the end) the
-    partial is contracted with the per-voxel monomials of Omega_UC (1 + 3 + 6 rows -> I0, I1, I2) and added to the
-    float64 accumulators, so a float32 sum runs over at most `_FIRST_COLLISION_SUM_MAX_DIRECTIONS` directions and the
-    sum across those blocks keeps float64. float64 inputs are summed in float64 throughout. (The float32 matmul assumes
-    TF32 is off, `torch.backends.cuda.matmul.allow_tf32 = False`, the PyTorch default.) pairs: as in
-    `first_collision_source_at_directions`.
+    Args:
+        library (MultigroupLibrary): cross-section library with the angular transfer table.
+        rho (Tensor): [M, rows, cols, slices] material densities rho in g/cm^3.
+        phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence in photons/cm^2 per source photon/sr.
+        grid (Grid): grid of the points (in the solver the quadrature grid).
+        geometry (ConeGeometry): scanner geometry.
+        angle (float): view angle in radians.
+        omegas (Tensor): [K, 3] unit directions of the quadrature.
+        weights (Tensor): [K] quadrature weights in sr.
+        omega_uncollided (Tensor, optional): [R, C, S, 3] primary directions. Defaults to None (computed).
+        chunk (int, optional): directions per batch of the PyTorch path of the source. Defaults to 4.
+        batch (int, optional): directions per source evaluation, which sets the [batch, G, R, C, S] temporary.
+            Defaults to 8.
+        pairs (MaterialPairs | str | None, optional): as in ``first_collision_source_at_directions``. Defaults to None.
+
+    Returns:
+        Tensor: [3, G, R, C, S] float64 sums I0, I1, I2.
     """
     pairs = resolve_pairs(rho, pairs)
     device, dtype = phi_uncollided.device, phi_uncollided.dtype
@@ -429,9 +523,18 @@ def first_collision_quadrature_sums(library: MultigroupLibrary, rho: Tensor, phi
 
 
 def first_collision_correction_factors(I: Tensor, E: Tensor) -> tuple[Tensor, Tensor]:
-    """(scale, beta) of `first_collision_sampling_correction` from the quadrature sums I = [I0, I1, I2]
-    (`first_collision_quadrature_sums`) and the exact moments E = [E0, E1] (`first_collision_exact_moments`, l_max = 1),
-    computed in float64; returned in float64."""
+    """Scale and beta of the sampling correction from the quadrature sums and the exact moments, in float64.
+
+    With ``c = E1 / E0``, ``beta = (c I0 - I1) / (I2 - c I1)`` clamped to [-1, 1] (0 where E0 is not positive or the
+    denominator vanishes) and ``scale = E0 / (I0 + beta I1)`` (1 where that denominator is not positive).
+
+    Args:
+        I (Tensor): [3, G, R, C, S] quadrature sums I0, I1, I2 from ``first_collision_quadrature_sums``.
+        E (Tensor): [2, G, R, C, S] exact moments E0, E1 from ``first_collision_exact_moments`` with ``l_max = 1``.
+
+    Returns:
+        (scale, beta): two [G, R, C, S] float64 tensors.
+    """
     I = I.double()
     E = E.to(device=I.device, dtype=torch.float64)
     I0, I1, I2 = I[0], I[1], I[2]

@@ -1,85 +1,10 @@
-"""Point-wise photon interaction data of the library builder: NIST XCOM cross sections and xraylib angular shapes.
+"""Point-wise photon interaction data for the cross-section library builder.
 
-The library builder (`cross_section_library`) needs, per element Z and photon energy E:
-
-* the integrated cross sections of coherent (Rayleigh) and incoherent (Compton) scattering, photoelectric absorption
-  and pair production (nuclear and electron field), as mass cross sections in cm^2/g;
-* the angular shapes of Compton and Rayleigh scattering (per steradian, unnormalized: the builder normalizes them to
-  the XCOM cross section of the same process);
-* the atomic weight (to turn a chemical formula into mass fractions): XCOM's (NIST's) atomic weights, ATWTS.DAT.
-
-Sources
--------
-**Integrated cross sections: NIST XCOM** (M.J. Berger, J.H. Hubbell, S.M. Seltzer, J. Chang, J.S. Coursey,
-R. Sukumar, D.S. Zucker and K. Olsen, XCOM: Photon Cross Sections Database, NIST Standard Reference Database 8 (XGAM),
-National Institute of Standards and Technology, https://physics.nist.gov/xcom). The offline distribution of XCOM 3.1
-(``XCOM_URL``, the archive XCOM.tar.gz of 172805 bytes) holds one table per element Z = 1..100, MDATX3.001 ..
-MDATX3.100, from 1 keV to 100 GeV, in barns/atom: coherent scattering (relativistic form factors), incoherent
-scattering (Klein-Nishina times the incoherent scattering function), photoelectric absorption (Scofield) and pair
-production in the nuclear and in the electron field. XCOM's interpolation is reproduced here as its Fortran program
-XCOM.f does it (``XcomElement.cross_section``):
-
-* the energy grid lists every absorption edge twice, once just below the edge (the energy minus 0.1 eV) and once at
-  the edge; coherent and incoherent scattering are interpolated by a natural cubic spline in (ln E, ln sigma) over the
-  grid with the points just below the edges removed (XCOM.f subroutines SCOF and BSPOL);
-* photoelectric absorption above the highest edge listed (the K edge) is the same spline over the points from the K
-  edge up; below the K edge every interval between two edges has its own short table (energies in MeV and cross
-  sections, the last records of the file), interpolated linearly in (ln E, ln sigma) (XCOM.f subroutine BLIN). At an
-  edge energy the value above the edge is taken, so the photoelectric cross section jumps at every edge, as in
-  XCOM's tables;
-* pair production is zero up to its threshold (1.022007 MeV in the nuclear field, 2.044014 MeV in the electron field,
-  the values of XCOM.f); above it the spline interpolates ln(sigma / ((E - E_threshold) / E)^3) over the grid points
-  from the threshold up, the value at the threshold extrapolated from the three points above it by XCOM.f's formula;
-* the mass cross section is sigma (barns/atom) x 0.60221367 / A, with XCOM.f's Avogadro factor and the atomic
-  weights A of XCOM's table ATWTS.DAT.
-
-The total is the sum of the five processes (coherent included), XCOM's "total attenuation with coherent scattering".
-Elements without listed edges (Z <= 10: their K edge lies below 1 keV) use one spline for the photoelectric cross
-section over the whole grid.
-
-**Angular shapes: xraylib** (T. Schoonjans, A. Brunetti, B. Golosio, M. Sanchez del Rio,
-V.A. Sole, C. Ferrero and L. Vincze, "The xraylib library for X-ray-matter interactions. Recent developments",
-Spectrochimica Acta Part B 66, 776-784 (2011); BSD license): the Compton shape is the Klein-Nishina cross section
-times the incoherent scattering function S(x, Z) (xraylib ``DCS_KN`` x ``SF_Compt``: xraylib's ``DCS_Compt``), the
-Rayleigh shape the Thomson cross section times the squared atomic form factor F(x, Z) (``DCS_Thoms`` x ``FF_Rayl``^2:
-xraylib's ``DCS_Rayl``), with the momentum transfer x = sin(theta/2) E / 12.3984193 keV angstrom (xraylib's
-``MomentTransf``). xraylib's tables of S and F start at x = 1e-3 and 1e-7 per angstrom, and xraylib refuses smaller x
-(the most forward angles at MeV energies: x = 1e-3 is theta = 4e-6 rad at 6 MeV); there S is continued as
-S(x_min) (x / x_min)^2 (S grows as x^2 from 0) and F is held at F(x_min) (F -> Z). The shapes cover Z = 1..98
-(``SCATTERING_ELEMENTS``); xraylib has no scattering functions for Z = 99, 100.
-
-**Atomic weights: XCOM** (ATWTS.DAT, the standard atomic weights NIST uses, e.g. H 1.00794, O 15.9994), both for the
-barns -> cm^2/g conversion and for the mass fractions of formulas (``XcomXraylibBackend.atomic_mass``). xraylib's
-``AtomicWeight`` is not used: it is rounded (H 1.01, C 12.01, N 14.01, O 16.0, which moves water's hydrogen fraction
-from 0.111898 to 0.112098) and wrong for thulium (167.27 instead of 168.934); xraylib's element densities, symbols and
-NIST compound data are used (`cross_sections`).
-
-Download and cache
-------------------
-The XCOM data are NOT shipped with the package. ``load_xcom_tables`` looks for them in this order:
-
-1. ``$CITRUS_XCOM_ARCHIVE`` (``XCOM_ARCHIVE_ENVIRONMENT_VARIABLE``): the path of a downloaded XCOM.tar.gz or of the
-   folder it unpacks to (the folder holding MDATX3.001 .., or its parent), for machines without internet access;
-2. the parsed cache ``<cache>/xcom/xcom_elements.npz`` (``xcom_cache_dir()``, cache = ``default_cache_dir()``);
-3. the archive ``<cache>/xcom/XCOM.tar.gz``;
-4. a download of ``XCOM_URL`` into ``<cache>/xcom/XCOM.tar.gz`` (urllib; size and SHA-256 checked against
-   ``XCOM_ARCHIVE_SIZE`` and ``XCOM_ARCHIVE_SHA256``).
-
-The tables are read from the archive in memory (only the files MDATX3.001 .. MDATX3.100 and ATWTS.DAT; nothing is
-written outside the cache folder) and parsed once into the compact cache ``xcom_elements.npz`` (every element's grid,
-the five cross sections, its edges and the tables below the K edge, plus the SHA-256 of the source). When neither the
-environment variable, the cache nor the network is available, ``load_xcom_tables`` raises a RuntimeError naming the
-URL and the variable.
-
-Terms of use. XCOM is a NIST Standard Reference Database. NIST distributes it free of charge and makes no warranties
-about the data (XCOM Readme, "Disclaimer"); the XCOM program carries the note "Copyright 1999, Martin J. Berger.
-Permission is given to use the program for non-commercial purposes". CITRUS does not redistribute the data: every
-installation downloads them from NIST, and their use is subject to NIST's terms for Standard Reference Data
-(NIST's copyright, fair use and licensing statements for SRD, https://www.nist.gov/srd).
-Publications using results of CITRUS should cite XCOM and xraylib as above.
-
-Units: energies in keV at the interface (eV inside the XCOM tables, as in the files), mass cross sections in cm^2/g,
-angular shapes in cm^2/g/sr, scattering angles through eta = cos(theta).
+The module reads the NIST XCOM 3.1 element tables (coherent and incoherent scattering, photoelectric absorption, pair
+production), downloaded on first use and cached, and interpolates them as XCOM's own program does; it evaluates the
+Compton and Rayleigh angular shapes of xraylib. :class:`XcomXraylibBackend` serves both to ``cross_section_library``.
+Energies are in keV at the interface (eV inside the XCOM tables), mass cross sections in cm^2/g, angular shapes in
+cm^2/g/sr, and scattering angles enter through ``eta = cos(theta)``.
 """
 
 from __future__ import annotations
@@ -141,13 +66,20 @@ _FORM_FACTOR_X_MIN = 1.0e-7
 
 
 def default_cache_dir() -> str:
-    """Directory of the CITRUS caches (multigroup libraries, the XCOM data): ``$CITRUS_CACHE_DIR`` if set, else
-    ``~/.cache/citrus``."""
+    """Return the directory of the CITRUS caches: ``$CITRUS_CACHE_DIR`` if set, else ``~/.cache/citrus``.
+
+    Returns:
+        str: path of the directory of the multigroup libraries and the XCOM data.
+    """
     return os.environ.get("CITRUS_CACHE_DIR") or os.path.join(os.path.expanduser("~"), ".cache", "citrus")
 
 
 def xcom_cache_dir() -> str:
-    """Directory of the downloaded XCOM archive and of its parsed cache: ``default_cache_dir()/xcom``."""
+    """Return the directory of the downloaded XCOM archive and its parsed cache, ``default_cache_dir()/xcom``.
+
+    Returns:
+        str: path of the XCOM cache directory.
+    """
     return os.path.join(default_cache_dir(), "xcom")
 
 
@@ -156,16 +88,31 @@ def xcom_cache_dir() -> str:
 # =============================================================================================
 
 def _natural_spline(x: np.ndarray, y: np.ndarray):
-    """Natural cubic spline through (x [n], y [n]) with x strictly increasing: XCOM.f's SCOF (second derivative zero
-    at both ends; evaluated outside the knots with the end polynomials, as XCOM.f's BSPOL)."""
+    """Build the natural cubic spline through (x, y), extrapolated with its end polynomials (XCOM.f's SCOF and BSPOL).
+
+    Args:
+        x (np.ndarray): [n] knots, strictly increasing.
+        y (np.ndarray): [n] values at the knots.
+
+    Returns:
+        CubicSpline: scipy spline with zero second derivative at both ends.
+    """
     from scipy.interpolate import CubicSpline
 
     return CubicSpline(x, y, bc_type="natural", extrapolate=True)
 
 
 def _linear_with_end_segments(s: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """Linear interpolation of y [n] over strictly increasing x [n] at s [k], extrapolated with the end segments
-    (XCOM.f's BLIN)."""
+    """Interpolate linearly at ``s``, extrapolating with the end segments (XCOM.f's BLIN).
+
+    Args:
+        s (np.ndarray): [k] evaluation points.
+        x (np.ndarray): [n] knots, strictly increasing, n >= 2.
+        y (np.ndarray): [n] values at the knots.
+
+    Returns:
+        np.ndarray: [k] interpolated values.
+    """
     index = np.clip(np.searchsorted(x, s, side="right") - 1, 0, x.size - 2)
     x0, x1, y0, y1 = x[index], x[index + 1], y[index], y[index + 1]
     return y0 + (s - x0) * (y1 - y0) / (x1 - x0)
@@ -173,23 +120,29 @@ def _linear_with_end_segments(s: np.ndarray, x: np.ndarray, y: np.ndarray) -> np
 
 @dataclass(eq=False)
 class XcomElement:
-    """The XCOM 3.1 table of one element (file MDATX3.<Z>) and its interpolation (module docstring, XCOM.f).
+    """The XCOM 3.1 table of one element (file ``MDATX3.<Z>``) and its interpolation as XCOM.f does it.
 
-    Fields (n grid energies, n_e absorption edges above 1 keV):
-      atomic_number          Z
-      atomic_weight          A (g/mol) of XCOM's ATWTS.DAT, the factor of the barns -> cm^2/g conversion
-      energy_ev [n]          the grid, ascending, every edge twice (0.1 eV below it, or at the same energy above
-                             100 keV, and at it)
-      coherent, incoherent, photoelectric, pair_nuclear, pair_electron [n]
-                             cross sections in barns/atom on the grid (the photoelectric value at the lower of the
-                             two edge energies is the one below the edge)
-      edge_energy_ev [n_e]   the edge energies, ascending (the K edge last)
-      edge_index [n_e]       index into energy_ev of each edge energy (the point above the edge; index - 1 is the
-                             point below it)
-      edge_labels            the edge names, ascending ("M5", ..., "K")
-      subshell_energy_ev     n_e arrays: the photoelectric tables of the intervals below the K edge, interval i from
-                             edge i - 1 (1 keV for i = 0) to edge i, energies in eV
-      subshell_photoelectric n_e arrays: the photoelectric cross sections (barns/atom) at those energies
+    The interpolation is described in docs/source/design_notes.rst, "Photon data". Arrays [n] are on the energy grid,
+    arrays [n_e] run over the absorption edges above 1 keV.
+
+    Attributes:
+        atomic_number (int): atomic number Z.
+        atomic_weight (float): atomic weight A in g/mol (XCOM's ATWTS.DAT), the factor of the barns to cm^2/g
+            conversion.
+        energy_ev (np.ndarray): [n] grid energies in eV, ascending, every edge listed twice (just below it and at it).
+        coherent (np.ndarray): [n] coherent scattering cross section in barns/atom.
+        incoherent (np.ndarray): [n] incoherent scattering cross section in barns/atom.
+        photoelectric (np.ndarray): [n] photoelectric cross section in barns/atom (at the lower of the two energies of
+            an edge, the value below the edge).
+        pair_nuclear (np.ndarray): [n] pair production cross section in the nuclear field in barns/atom.
+        pair_electron (np.ndarray): [n] pair production cross section in the electron field in barns/atom.
+        edge_energy_ev (np.ndarray): [n_e] edge energies in eV, ascending (the K edge last).
+        edge_index (np.ndarray): [n_e] index into ``energy_ev`` of each edge, the point above it (index - 1 is below).
+        edge_labels (tuple[str, ...]): edge names, ascending ("M5", ..., "K").
+        subshell_energy_ev (tuple[np.ndarray, ...]): n_e photoelectric tables below the K edge, energies in eV;
+            interval i runs from edge i - 1 (1 keV for i = 0) to edge i.
+        subshell_photoelectric (tuple[np.ndarray, ...]): n_e photoelectric cross sections in barns/atom at those
+            energies.
     """
 
     atomic_number: int
@@ -207,6 +160,7 @@ class XcomElement:
     subshell_photoelectric: tuple[np.ndarray, ...]
 
     def __post_init__(self) -> None:
+        """Check the shapes, the energy grid and the edges, and start the empty spline cache."""
         self._splines: dict[str, object] = {}
         n = self.energy_ev.size
         for name in ("coherent", "incoherent", "photoelectric", "pair_nuclear", "pair_electron"):
@@ -229,18 +183,29 @@ class XcomElement:
 
     @property
     def mass_factor(self) -> float:
-        """barns/atom -> cm^2/g: 0.60221367 / A (XCOM.f)."""
+        """Conversion factor from barns/atom to cm^2/g, ``0.60221367 / A`` (XCOM.f)."""
         return _AVOGADRO_PER_BARN / float(self.atomic_weight)
 
     def _retained(self) -> np.ndarray:
-        """Boolean mask [n] of the grid without the points just below the edges (XCOM.f, loop 360)."""
+        """Mask out the grid points just below the edges (XCOM.f, loop 360).
+
+        Returns:
+            np.ndarray: [n] bool, True for the grid points the splines use.
+        """
         keep = np.ones(self.energy_ev.size, dtype=bool)
         keep[np.asarray(self.edge_index, dtype=np.int64) - 1] = False
         return keep
 
     def _spline(self, name: str):
-        """The spline of one process in ln E (built once): name in coherent, incoherent, photoelectric (above the K
-        edge, or everywhere without edges), pair_nuclear, pair_electron."""
+        """Return the spline of one process over ln E, built on first use.
+
+        Args:
+            name (str): "coherent", "incoherent", "photoelectric" (above the K edge, or the whole grid without edges),
+                "pair_nuclear" or "pair_electron".
+
+        Returns:
+            CubicSpline: spline of ``ln sigma`` (for pair production ``ln(sigma / ((E - E_threshold) / E)**3)``).
+        """
         if name in self._splines:
             return self._splines[name]
         keep = self._retained()
@@ -268,9 +233,15 @@ class XcomElement:
         return spline
 
     def cross_section(self, process: str, energy_ev: np.ndarray) -> np.ndarray:
-        """Cross section of one process in barns/atom at energy_ev [k] (eV, within 1 keV .. 100 GeV): process in
-        coherent, incoherent, photoelectric, pair_nuclear, pair_electron. XCOM.f's interpolation (module
-        docstring). Returns float64 [k]."""
+        """Interpolate the cross section of one process as XCOM.f does (docs/source/design_notes.rst, "Photon data").
+
+        Args:
+            process (str): "coherent", "incoherent", "photoelectric", "pair_nuclear" or "pair_electron".
+            energy_ev (np.ndarray): [k] photon energies in eV, from 1 keV to 100 GeV.
+
+        Returns:
+            np.ndarray: [k] float64 cross sections in barns/atom.
+        """
         energy = np.asarray(energy_ev, dtype=np.float64).ravel()
         if energy.size and (energy.min() < _ENERGY_MIN_EV * (1 - 1e-12) or energy.max() > _ENERGY_MAX_EV * (1 + 1e-12)):
             raise ValueError(f"XCOM energies span 1 keV .. 100 GeV, got {energy.min() / 1e3:g} .. "
@@ -305,21 +276,30 @@ class XcomElement:
 
 
 def _tokens(text: str) -> list[str]:
-    """Whitespace-separated records of a file; a DOS end-of-file mark (Ctrl-Z, some MDATX3 files end with one) ends
-    it."""
+    """Split a file into whitespace-separated records, stopping at a DOS end-of-file mark (Ctrl-Z).
+
+    Args:
+        text (str): contents of the file.
+
+    Returns:
+        list[str]: the records.
+    """
     return text.split("", 1)[0].split()
 
 
 def parse_xcom_element(text: str, atomic_weight: Optional[float] = None) -> XcomElement:
-    """Parse one XCOM element file (MDATX3.<Z>, the format read by XCOM.f) into an `XcomElement`.
+    """Parse one XCOM element file (``MDATX3.<Z>``, the format XCOM.f reads) into an :class:`XcomElement`.
 
-    Layout (whitespace-separated records): Z and atomic weight; number of edges n_e and grid size n; when n_e > 0 the
-    grid indices (1-based) of the edges, their labels and their energies (eV), each list from the K edge down; the n
-    grid energies (eV, ascending); the n values of coherent, incoherent, photoelectric, pair (nuclear field) and pair
-    (electron field) cross sections (barns/atom); when n_e > 0 the number of photoelectric tables below the K edge,
-    their lengths and then all their energies (MeV) and all their cross sections (barns/atom), from the lowest
-    interval up.
-    atomic_weight: A for the cm^2/g conversion (XCOM's ATWTS.DAT); None takes the value of the file's first line."""
+    The file layout is described in docs/source/design_notes.rst, "Photon data".
+
+    Args:
+        text (str): contents of the file.
+        atomic_weight (float, optional): atomic weight A in g/mol for the cm^2/g conversion (XCOM's ATWTS.DAT); None
+            takes the value of the file's first line. Defaults to None.
+
+    Returns:
+        XcomElement: the parsed table.
+    """
     tokens = _tokens(text)
     position = 0
 
@@ -359,8 +339,14 @@ def parse_xcom_element(text: str, atomic_weight: Optional[float] = None) -> Xcom
 
 
 def parse_xcom_atomic_weights(text: str) -> np.ndarray:
-    """The atomic weights [100] (g/mol, Z = 1..100) of XCOM's ATWTS.DAT (a Fortran DATA statement: the values after
-    the continuation column 6 of every line)."""
+    """Parse XCOM's ATWTS.DAT, a Fortran DATA statement whose values follow column 6 of every line.
+
+    Args:
+        text (str): contents of ATWTS.DAT.
+
+    Returns:
+        np.ndarray: [100] float64 atomic weights in g/mol of Z = 1..100.
+    """
     values = [float(v) for line in text.splitlines()[1:] for v in re.findall(r"[0-9]+\.[0-9]*", line[6:])]
     if len(values) != len(XCOM_ELEMENTS):
         raise ValueError(f"ATWTS.DAT holds {len(values)} atomic weights, expected {len(XCOM_ELEMENTS)}")
@@ -375,8 +361,14 @@ _WANTED_FILE = re.compile(r"^(MDATX3\.(\d{3})|ATWTS\.DAT)$")
 
 
 def _read_archive(path: str) -> dict[str, bytes]:
-    """The wanted files (MDATX3.001 .. MDATX3.100, ATWTS.DAT) of an XCOM archive, read in memory by base name
-    (nothing is extracted to disk)."""
+    """Read the XCOM table files (MDATX3.001 to MDATX3.100 and ATWTS.DAT) of an archive in memory, without extracting.
+
+    Args:
+        path (str): path of XCOM.tar.gz.
+
+    Returns:
+        dict[str, bytes]: contents of the files by base name.
+    """
     files: dict[str, bytes] = {}
     with tarfile.open(path, mode="r:gz") as archive:
         for member in archive.getmembers():
@@ -389,7 +381,14 @@ def _read_archive(path: str) -> dict[str, bytes]:
 
 
 def _read_folder(path: str) -> dict[str, bytes]:
-    """The wanted files of an unpacked XCOM archive: the folder itself or its subfolder XCOM."""
+    """Read the XCOM table files of an unpacked archive, from the folder itself or its subfolder XCOM.
+
+    Args:
+        path (str): the folder.
+
+    Returns:
+        dict[str, bytes]: contents of the files by base name.
+    """
     for folder in (path, os.path.join(path, "XCOM")):
         if os.path.isfile(os.path.join(folder, "MDATX3.001")):
             files = {}
@@ -403,6 +402,14 @@ def _read_folder(path: str) -> dict[str, bytes]:
 
 
 def _sha256_file(path: str) -> str:
+    """Compute the SHA-256 of a file.
+
+    Args:
+        path (str): path of the file.
+
+    Returns:
+        str: hexadecimal digest.
+    """
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for block in iter(lambda: handle.read(1 << 20), b""):
@@ -411,6 +418,14 @@ def _sha256_file(path: str) -> str:
 
 
 def _sha256_files(files: Mapping[str, bytes]) -> str:
+    """Compute one SHA-256 over a set of files, from their sorted names and the digests of their contents.
+
+    Args:
+        files (Mapping[str, bytes]): contents of the files by name.
+
+    Returns:
+        str: hexadecimal digest.
+    """
     digest = hashlib.sha256()
     for name in sorted(files):
         digest.update(name.encode() + b"\0" + hashlib.sha256(files[name]).digest())
@@ -418,6 +433,14 @@ def _sha256_files(files: Mapping[str, bytes]) -> str:
 
 
 def _missing_data_message(reason: str) -> str:
+    """Build the error message for missing XCOM data, naming the URL, the cache folder and the environment variable.
+
+    Args:
+        reason (str): why the data are not available.
+
+    Returns:
+        str: the message.
+    """
     return (f"the NIST XCOM photon cross sections are not available ({reason}). CITRUS downloads them on first use "
             f"from {XCOM_URL} into {xcom_cache_dir()}. On a machine without internet access download that file "
             f"elsewhere and set the environment variable {XCOM_ARCHIVE_ENVIRONMENT_VARIABLE} to its path (or to the "
@@ -425,7 +448,11 @@ def _missing_data_message(reason: str) -> str:
 
 
 def _download_archive(destination: str) -> None:
-    """Download ``XCOM_URL`` to `destination` (atomically), checking its size and SHA-256."""
+    """Download ``XCOM_URL`` to ``destination`` atomically, after checking its size and SHA-256.
+
+    Args:
+        destination (str): path of the archive to write.
+    """
     os.makedirs(os.path.dirname(destination), exist_ok=True)
     temporary = destination + f".{os.getpid()}.part"
     from .. import __version__
@@ -449,9 +476,18 @@ def _download_archive(destination: str) -> None:
 
 
 def read_xcom_source(path: str) -> tuple[dict[int, XcomElement], str]:
-    """Parse an XCOM archive (XCOM.tar.gz) or unpacked folder: ({Z: XcomElement} for Z = 1..100, SHA-256 of the
-    source: of the archive file, or of the table files of a folder). Raises RuntimeError for a missing or incomplete
-    source."""
+    """Parse an XCOM archive (XCOM.tar.gz) or the folder it unpacks to.
+
+    Args:
+        path (str): path of the archive or the folder.
+
+    Returns:
+        (dict[int, XcomElement], str): the tables of Z = 1..100 by Z, and the SHA-256 of the source (of the archive
+        file, or of the table files of a folder).
+
+    Raises:
+        RuntimeError: if the source is missing, incomplete or cannot be parsed.
+    """
     if os.path.isdir(path):
         files = _read_folder(path)
         digest = _sha256_files(files)
@@ -481,6 +517,13 @@ def read_xcom_source(path: str) -> tuple[dict[int, XcomElement], str]:
 
 
 def _save_cache(path: str, elements: Mapping[int, XcomElement], source_sha256: str) -> None:
+    """Write the parsed tables and the SHA-256 of their source to the compact cache file, atomically.
+
+    Args:
+        path (str): path of the cache file (npz).
+        elements (Mapping[int, XcomElement]): the tables by Z.
+        source_sha256 (str): SHA-256 of the XCOM source.
+    """
     arrays: dict[str, np.ndarray] = {"cache_version": np.array(_XCOM_CACHE_VERSION),
                                      "source_sha256": np.array(source_sha256)}
     for Z, element in elements.items():
@@ -503,6 +546,14 @@ def _save_cache(path: str, elements: Mapping[int, XcomElement], source_sha256: s
 
 
 def _load_cache(path: str) -> tuple[dict[int, XcomElement], str]:
+    """Read the tables written by ``_save_cache``.
+
+    Args:
+        path (str): path of the cache file (npz).
+
+    Returns:
+        (dict[int, XcomElement], str): the tables by Z and the SHA-256 of their source.
+    """
     with np.load(path, allow_pickle=False) as data:
         if int(data["cache_version"]) != _XCOM_CACHE_VERSION:
             raise ValueError(f"XCOM cache version {int(data['cache_version'])} != {_XCOM_CACHE_VERSION}")
@@ -529,12 +580,22 @@ _TABLES_MEMO: dict[str, tuple[dict[int, XcomElement], str, str]] = {}
 
 def load_xcom_tables(cache_dir: Optional[str] = None, *,
                      download: bool = True) -> tuple[dict[int, XcomElement], str, str]:
-    """The XCOM tables of Z = 1..100, located, downloaded and cached as the module docstring describes.
+    """Locate, download if needed, parse and cache the XCOM tables of Z = 1..100.
 
-    cache_dir: the XCOM cache folder (None: ``xcom_cache_dir()``). download: False never touches the network.
-    Returns ({Z: XcomElement}, description of the source, SHA-256 of the source). The result is kept in memory for the
-    rest of the process. Raises RuntimeError (naming ``XCOM_URL`` and ``$CITRUS_XCOM_ARCHIVE``) when the data cannot
-    be found or fetched."""
+    The search order and the cache are described in docs/source/installation.rst, "Photon data"; the result is kept in
+    memory for the rest of the process.
+
+    Args:
+        cache_dir (str, optional): the XCOM cache folder; None uses ``xcom_cache_dir()``. Defaults to None.
+        download (bool, optional): False never touches the network. Defaults to True.
+
+    Returns:
+        (dict[int, XcomElement], str, str): the tables by Z, a description of the source and its SHA-256.
+
+    Raises:
+        RuntimeError: if the data can be neither found nor downloaded (the message names ``XCOM_URL`` and
+            ``$CITRUS_XCOM_ARCHIVE``).
+    """
     folder = xcom_cache_dir() if cache_dir is None else cache_dir
     override = os.environ.get(XCOM_ARCHIVE_ENVIRONMENT_VARIABLE) or None
     memo_key = f"{folder}|{override}"
@@ -588,25 +649,25 @@ def load_xcom_tables(cache_dir: Optional[str] = None, *,
 # =============================================================================================
 
 class XcomXraylibBackend:
-    """Point-wise photon data for the library builder: XCOM integrated cross sections and xraylib angular shapes
-    (module docstring). Energies in keV, mass cross sections in cm^2/g.
+    """Point-wise photon data for the library builder: XCOM integrated cross sections and xraylib angular shapes.
 
-    ``sigma(kind, Z, E)``: kind in ``CROSS_SECTION_KINDS`` ("total", "photoelectric", "compton", "rayleigh", "pair";
-    "pair" = nuclear + electron field, "total" = the sum of all five XCOM processes), E [K] -> [K].
-    ``pdf_raw(kind, Z, E, eta)``: kind "compton" or "rayleigh", E scalar, eta [N] -> [N] cm^2/g/sr (xraylib's
-    DCS_Compt / DCS_Rayl, continued below the smallest tabulated momentum transfer); the builder normalizes the shape
-    to the XCOM cross section of the process.
-    ``library_pdf_normalization(kind, Z, E)``: the sphere integral 2 pi int pdf_raw d eta on a fine quadrature
-    (a check of the builder's own quadrature, ``BuildInfo.pdf_normalization_max_relative_deviation``).
-    ``atomic_mass(Z)``: XCOM's atomic weight (g/mol, ATWTS.DAT), used to turn formulas into mass fractions.
-    ``.name`` ("xcom-xraylib", part of the library cache key), ``.reason`` (where the data came from),
-    ``.xcom_sha256`` (SHA-256 of the XCOM source).
+    Energies are in keV and mass cross sections in cm^2/g; the data and their interpolation are described in
+    docs/source/design_notes.rst, "Photon data".
 
-    tables: {Z: XcomElement} to use instead of ``load_xcom_tables()`` (tests)."""
+    Args:
+        tables (Mapping[int, XcomElement], optional): tables by Z to use instead of ``load_xcom_tables()`` (tests).
+            Defaults to None.
+
+    Attributes:
+        name (str): "xcom-xraylib", part of the library cache key.
+        reason (str): where the data came from (the XCOM source and the xraylib version).
+        xcom_sha256 (str): SHA-256 of the XCOM source; empty for tables given by the caller.
+    """
 
     name = "xcom-xraylib"
 
     def __init__(self, tables: Optional[Mapping[int, XcomElement]] = None) -> None:
+        """Import xraylib and load the XCOM tables unless they are given."""
         import xraylib  # noqa: F401  (hard dependency; imported here so that a missing install reads clearly)
         import xraylib_np
 
@@ -624,20 +685,41 @@ class XcomXraylibBackend:
         self._fine_quadrature: Optional[tuple[np.ndarray, np.ndarray]] = None
 
     def element(self, Z: int) -> XcomElement:
-        """The XCOM table of element Z (1..100)."""
+        """Return the XCOM table of one element.
+
+        Args:
+            Z (int): atomic number, 1 to 100.
+
+        Returns:
+            XcomElement: the table.
+        """
         if Z not in self._tables:
             raise ValueError(f"no XCOM data for Z = {Z}")
         return self._tables[Z]
 
     def atomic_mass(self, Z: int) -> float:
-        """XCOM's (NIST's) atomic weight of element Z in g/mol (Z = 1..100, ATWTS.DAT): the weight of the barns ->
-        cm^2/g conversion, used for the mass fractions of formulas too (xraylib's ``AtomicWeight`` is rounded, e.g.
-        H 1.01 and O 16.0, and gives 167.27 for thulium instead of 168.934)."""
+        """Return XCOM's (NIST's) atomic weight of an element, used for the cm^2/g conversion and for mass fractions.
+
+        Args:
+            Z (int): atomic number, 1 to 100.
+
+        Returns:
+            float: atomic weight in g/mol (ATWTS.DAT).
+        """
         return float(self.element(int(Z)).atomic_weight)
 
     def sigma(self, kind: str, Z: int, E: np.ndarray) -> np.ndarray:
-        """Mass cross section (cm^2/g) of process `kind` (``CROSS_SECTION_KINDS``) of element Z at energies E [K] keV
-        (1 keV .. 100 GeV). Returns float64 [K]."""
+        """Return the mass cross section of one process of an element.
+
+        Args:
+            kind (str): one of ``CROSS_SECTION_KINDS``; "pair" is nuclear plus electron field, "total" the sum of all
+                five XCOM processes.
+            Z (int): atomic number, 1 to 100.
+            E (np.ndarray): [K] photon energies in keV, from 1 keV to 100 GeV.
+
+        Returns:
+            np.ndarray: [K] float64 mass cross sections in cm^2/g.
+        """
         element = self.element(int(Z))
         energy_ev = np.asarray(E, dtype=np.float64).ravel() * 1.0e3
         processes = {"photoelectric": ("photoelectric",), "compton": ("incoherent",), "rayleigh": ("coherent",),
@@ -649,10 +731,20 @@ class XcomXraylibBackend:
         return np.asarray(barns, dtype=np.float64) * element.mass_factor
 
     def pdf_raw(self, kind: str, Z: int, E: float, eta: np.ndarray) -> np.ndarray:
-        """Per-steradian angular shape (cm^2/g/sr) of Compton or Rayleigh scattering of element Z (1..98) at energy E
-        (keV) for the cosines eta [N]: xraylib's DCS_KN x SF_Compt (= DCS_Compt) or DCS_Thoms x FF_Rayl^2
-        (= DCS_Rayl), times N_A / A; below xraylib's smallest momentum transfer S is continued as x^2 and F held
-        constant (module docstring). Returns float64 [N]."""
+        """Return the unnormalized per-steradian angular shape of Compton or Rayleigh scattering of an element.
+
+        The shapes are xraylib's ``DCS_Compt`` and ``DCS_Rayl`` times ``N_A / A``, continued below xraylib's smallest
+        momentum transfer (docs/source/design_notes.rst, "Photon data").
+
+        Args:
+            kind (str): "compton" or "rayleigh".
+            Z (int): atomic number, 1 to 98.
+            E (float): photon energy in keV.
+            eta (np.ndarray): [N] cosines of the scattering angle, ``eta = cos(theta)``.
+
+        Returns:
+            np.ndarray: [N] float64 angular shape in cm^2/g/sr.
+        """
         Z = int(Z)
         if Z not in SCATTERING_ELEMENTS:
             raise ValueError(f"element Z = {Z} is outside Z = 1..98 (xraylib's scattering data)")
@@ -676,16 +768,27 @@ class XcomXraylibBackend:
         raise ValueError(f"unknown angular shape {kind!r}; expected 'compton' or 'rayleigh'")
 
     def _xraylib_weight(self, Z: int) -> float:
-        """xraylib's atomic weight of Z (g/mol): the per-gram scale of its DCS_Compt / DCS_Rayl, kept so that
-        ``pdf_raw`` equals those functions (the builder normalizes the shapes, so the scale does not matter)."""
+        """Return xraylib's atomic weight of an element, the per-gram scale of its ``DCS_Compt`` and ``DCS_Rayl``.
+
+        Args:
+            Z (int): atomic number.
+
+        Returns:
+            float: atomic weight in g/mol.
+        """
         if Z not in self._atomic_weight:
             self._atomic_weight[Z] = float(self._xraylib.AtomicWeight(Z))
         return self._atomic_weight[Z]
 
     def _fine_eta_quadrature(self) -> tuple[np.ndarray, np.ndarray]:
-        """(eta [N], weights [N]) with sum w f(eta) ~ int_{-1}^{1} f d eta: 16-point Gauss-Legendre on 61 pieces in
-        q = sin(theta/2), [0, 1e-7] and then geometric from 1e-7 to 1 (resolves the forward peaks at any energy up to
-        100 MeV), d eta = 4 q dq."""
+        """Build, once, a fine quadrature in eta that resolves the forward peaks at energies up to 100 MeV.
+
+        The rule is 16-point Gauss-Legendre on 61 pieces in ``q = sin(theta/2)`` (``[0, 1e-7]``, then geometric from
+        1e-7 to 1), with ``d eta = 4 q dq``.
+
+        Returns:
+            (np.ndarray, np.ndarray): nodes eta [N] and weights [N], ``sum w f(eta) ~ int_{-1}^{1} f d eta``.
+        """
         if self._fine_quadrature is None:
             breaks = np.concatenate([[0.0], np.geomspace(1.0e-7, 1.0, 61)])
             x, w = np.polynomial.legendre.leggauss(16)
@@ -696,17 +799,32 @@ class XcomXraylibBackend:
         return self._fine_quadrature
 
     def library_pdf_normalization(self, kind: str, Z: int, E: float) -> float:
-        """2 pi int_{-1}^{1} pdf_raw(kind, Z, E, eta) d eta in cm^2/g, on the fine quadrature
-        ``_fine_eta_quadrature`` (independent of the builder's reference quadrature, which it checks)."""
+        """Integrate ``pdf_raw`` over the sphere on the fine quadrature ``_fine_eta_quadrature``.
+
+        The result checks the builder's own quadrature (``BuildInfo.pdf_normalization_max_relative_deviation``).
+
+        Args:
+            kind (str): "compton" or "rayleigh".
+            Z (int): atomic number, 1 to 98.
+            E (float): photon energy in keV.
+
+        Returns:
+            float: ``2 pi int_{-1}^{1} pdf_raw d eta`` in cm^2/g.
+        """
         eta, weights = self._fine_eta_quadrature()
         return 2.0 * math.pi * float(np.dot(weights, self.pdf_raw(kind, Z, E, eta)))
 
 
 def resolve_backend() -> XcomXraylibBackend:
-    """Load the photon data backend (XCOM + xraylib; ``.name``, ``.reason``: where the data came from).
+    """Load the photon data backend (XCOM and xraylib).
 
-    Raises RuntimeError when the XCOM data can be neither found nor downloaded (the message names ``XCOM_URL`` and
-    ``$CITRUS_XCOM_ARCHIVE``) or xraylib does not import."""
+    Returns:
+        XcomXraylibBackend: the backend; its ``reason`` says where the data came from.
+
+    Raises:
+        RuntimeError: if the XCOM data can be neither found nor downloaded (the message names ``XCOM_URL`` and
+            ``$CITRUS_XCOM_ARCHIVE``) or xraylib does not import.
+    """
     try:
         return XcomXraylibBackend()
     except ImportError as exc:

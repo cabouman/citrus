@@ -1,25 +1,14 @@
-"""Benchmark the linear-discontinuous sweep and one source iteration on WLAB-like coarse grids (CUDA, float32).
+"""Benchmark of the linear-discontinuous transport sweep and one source iteration on coarse grids (CUDA, float32).
 
-Usage:  python benchmarks/bench_transport_sweep.py [--grids 20x30x40,40x60x80] [--chunks 16,8] [--repeats 5]
-                                                  [--variants torch,triton] [--memory-cap-mib 5000]
-                                                  [--no-source-iteration]
+For every grid, direction chunk (directions per octant swept together) and plane-step backend (``torch`` or
+``triton``), measures the time of one sweep, its split into source evaluation, plane loop, moment product and the
+rest, the time of one source iteration and the peak memory. Configurations whose estimated footprint exceeds the
+PyTorch allocator cap are skipped.
 
-For each grid (rows x cols x slices, 12.5 mm cells), each direction chunk (directions per octant swept
-together; D8 = 16) and each variant (plane-step backend "torch" / "triton") it reports, for G = 6, L = 7,
-product_quadrature(8, 16) = 128 directions:
+Usage::
 
-  ms/sweep   best-of-`repeats` wall time of one full `sweep` call (ONE source_function call per chunk for all 8 octants,
-             writing into the lent storage buffer)
-  ms/source-iteration-it   one source-iteration iteration: scatter_moments + scatter_source_function + sweep
-  breakdown  of one sweep, CUDA-event timed per phase and summed over the chunks (same code path as
-             `sweep`, instrumented): source evaluation (source_function + cell-major copy, `_fill_source`), the plane
-             loop (`_sweep_chunk`), the moment GEMM (`addmm_`), and the rest (allocation, the final permute of phi)
-  peak MB    torch.cuda.max_memory_allocated during the timed sweeps / source-iteration iterations, including the
-             problem data (mu_t, transfer moments, the source moments T held by the source function)
-
-PyTorch memory is capped with torch.cuda.set_per_process_memory_fraction (--memory-cap-mib, default 5000 MiB):
-on Windows, VRAM oversubscription silently spills into system memory and runs orders of magnitude slower.
-Configurations whose estimated footprint exceeds the cap are skipped; an allocator OOM is reported as such.
+    python benchmarks/bench_transport_sweep.py [--grids 20x30x40,40x60x80] [--chunks 16,8] [--repeats 5]
+        [--variants torch,triton] [--memory-cap-mib 5000] [--no-source-iteration]
 """
 
 from __future__ import annotations
@@ -48,6 +37,15 @@ ALL_VARIANTS = ("torch", "triton")
 
 
 def _time(fn: Callable[[], object], repeats: int) -> float:
+    """Best wall time of a function over repeated synchronized calls.
+
+    Args:
+        fn (Callable): the function to time, without arguments.
+        repeats (int): number of calls.
+
+    Returns:
+        float: the shortest time in ms.
+    """
     torch.cuda.synchronize()
     best = float("inf")
     for _ in range(repeats):
@@ -59,20 +57,53 @@ def _time(fn: Callable[[], object], repeats: int) -> float:
 
 
 def field_bytes(shape: tuple[int, int, int], G: int = 6, L: int = 7, itemsize: int = 4) -> int:
-    """One spherical-harmonic/linear-discontinuous moment field [G, (L+1)^2, 4, N]."""
+    """Bytes of one spherical-harmonic, linear-discontinuous moment field [G, (L+1)^2, 4, N].
+
+    Args:
+        shape (tuple[int, int, int]): grid shape (rows, cols, slices).
+        G (int): number of energy groups. Defaults to 6.
+        L (int): spherical-harmonic order. Defaults to 7.
+        itemsize (int): bytes per value. Defaults to 4.
+
+    Returns:
+        int: the size in bytes.
+    """
     return itemsize * G * (L + 1) ** 2 * 4 * shape[0] * shape[1] * shape[2]
 
 
 def sweep_buffer_bytes(shape: tuple[int, int, int], chunk: int, G: int = 6, itemsize: int = 4) -> int:
-    """store + source of one chunk: 2 x [8, Dc, N, 4G]."""
+    """Bytes of the store and source buffers of one direction chunk, 2 x [8, Dc, N, 4G].
+
+    Args:
+        shape (tuple[int, int, int]): grid shape (rows, cols, slices).
+        chunk (int): directions per octant in the chunk (Dc).
+        G (int): number of energy groups. Defaults to 6.
+        itemsize (int): bytes per value. Defaults to 4.
+
+    Returns:
+        int: the size in bytes.
+    """
     return itemsize * 2 * 8 * chunk * shape[0] * shape[1] * shape[2] * 4 * G
 
 
 def estimate_bytes(shape: tuple[int, int, int], chunk: int, G: int = 6, L: int = 7, itemsize: int = 4,
                    source_iteration: bool = True) -> int:
-    """Rough peak of the benchmark. Sweep: problem data (transfer moments, T of the source function) + the
-    accumulator + the sweep buffers. Source iteration: phi_n, T, the accumulator (3 fields) plus the larger of the
-    sweep buffers and the final permuted phi, plus the transfer moments."""
+    """Rough peak memory of the benchmark: moment fields, sweep buffers and transfer moments.
+
+    A sweep holds two moment fields and the sweep buffers; a source iteration three fields and the larger of the
+    sweep buffers and one more field.
+
+    Args:
+        shape (tuple[int, int, int]): grid shape (rows, cols, slices).
+        chunk (int): directions per octant swept together.
+        G (int): number of energy groups. Defaults to 6.
+        L (int): spherical-harmonic order. Defaults to 7.
+        itemsize (int): bytes per value. Defaults to 4.
+        source_iteration (bool): estimate a source iteration instead of a sweep. Defaults to True.
+
+    Returns:
+        int: the estimate in bytes.
+    """
     N = shape[0] * shape[1] * shape[2]
     F = field_bytes(shape, G, L, itemsize)
     B = sweep_buffer_bytes(shape, chunk, G, itemsize)
@@ -83,7 +114,18 @@ def estimate_bytes(shape: tuple[int, int, int], chunk: int, G: int = 6, L: int =
 
 
 def breakdown(context: SweepContext, mu_t: torch.Tensor, source_function, chunk: int, use_triton: bool) -> dict:
-    """One sweep, phase by phase, mirroring `sweep` (CUDA-event timed). Returns ms per phase."""
+    """Time of one sweep per phase, mirroring ``sweep`` with CUDA events.
+
+    Args:
+        context (SweepContext): sweep context of the grid and quadrature.
+        mu_t (Tensor): [G, R, C, S] total attenuation in cm^-1.
+        source_function (Callable): source function of the sweep.
+        chunk (int): directions per octant swept together.
+        use_triton (bool): use the Triton plane kernel.
+
+    Returns:
+        dict: time in ms of ``source``, ``planes``, ``gemm``, ``other`` and ``total``.
+    """
     lend = source_function_accepts_out(source_function)
     G = int(mu_t.shape[0])
     Q, N, D8, num_moments = 4 * G, context.num_cells, context.directions_per_octant, context.num_moments
@@ -134,6 +176,22 @@ def breakdown(context: SweepContext, mu_t: torch.Tensor, source_function, chunk:
 
 def bench(shape: tuple[int, int, int], chunk: int, repeats: int, variants: list[str], do_source_iteration: bool,
           cap_bytes: int) -> list[dict]:
+    """Time and peak memory of the sweep and of one source iteration on random densities in 1.25 cm cells.
+
+    Uses G = 6 groups, order L = 7 and the 8 x 16 product quadrature (128 directions).
+
+    Args:
+        shape (tuple[int, int, int]): grid shape (rows, cols, slices).
+        chunk (int): directions per octant swept together.
+        repeats (int): timed calls per measurement.
+        variants (list[str]): plane-step backends, ``"torch"`` and/or ``"triton"``.
+        do_source_iteration (bool): also time one source iteration.
+        cap_bytes (int): allocator cap in bytes; the source iteration is skipped when its estimate exceeds it.
+
+    Returns:
+        list[dict]: one row per backend (``ms_sweep``, ``peak_sweep_MB``, ``bd_*``, ``ms_si``, ``peak_si_MB``, or
+            ``oom_sweep`` / ``oom_si`` flags).
+    """
     device = torch.device("cuda")
     dtype = torch.float32
     G, L = 6, 7
@@ -194,6 +252,16 @@ def bench(shape: tuple[int, int, int], chunk: int, repeats: int, variants: list[
 
 
 def _f(r: dict, k: str, fmt: str = "{:.1f}") -> str:
+    """Format one field of a row, or give ``OOM`` / ``-`` when it is missing.
+
+    Args:
+        r (dict): a row of ``bench``.
+        k (str): field name.
+        fmt (str): format string. Defaults to ``"{:.1f}"``.
+
+    Returns:
+        str: the table cell.
+    """
     if k in r:
         return fmt.format(r[k])
     if k.endswith("_source_iteration") or k == "peak_si_MB":
@@ -202,6 +270,7 @@ def _f(r: dict, k: str, fmt: str = "{:.1f}") -> str:
 
 
 def main() -> None:
+    """Parse the command line, cap the PyTorch allocator and print one table row per grid, chunk and backend."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--grids", default="20x30x40,40x60x80")
     parser.add_argument("--chunks", default="16,8")

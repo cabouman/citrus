@@ -1,19 +1,13 @@
-"""Per-stage profile of one CITRUS step per view (citrus.citrus.citrus_step).
+"""Per-stage time profile of the CITRUS step (``citrus_step``) on the WLAB phantom.
 
-    python benchmarks/profile_citrus_step.py [--panel full|small] [--views 12] [--cone 16x32]
-        [--delta-voxel 0.5] [--transport-cell-cm 1.0] [--quadrature-spacing cm]
-        [--uncollided-trace quadrature|coarse|fine] [--memory-cap-mib 4400]
+Runs every view once to build its accumulator, then times the plain ``citrus_step`` per view and the same step taken
+apart, synchronized around every stage and, in a second pass, also around the inner stages of the scatter image and
+the sweep's first-collision source. Prints the time per view of every stage in ms.
 
-Synthesizes nothing: uses the WLAB phantom on the `--delta-voxel` grid (default 0.5 cm; any pitch that tiles the prism,
-e.g. 0.25, 0.125, 0.4 cm) with `--transport-cell-cm` cm transport cells (SolverConfig.transport_cell_cm, default 1), the
-first-collision quadrature point spacing `--quadrature-spacing` (cm; q = round(cell / spacing), at most round(cell /
-voxel)) and the uncollided trace grid `--uncollided-trace` (SolverConfig quadrature_point_spacing_cm,
-uncollided_trace_grid; defaults: the SolverConfig defaults), the full-field (150 x 184) or the small (100 x 75) panel,
-and `--views` of 180 equally spaced angles (every 180/views-th). Pass 1 builds every view's accumulator (one citrus_step
-each); pass 2 is timed: first the plain `citrus_step` (synchronized around the call), then the same step taken apart
-with torch.cuda.synchronize around every stage, with the scatter-image inner stages (first-collision source at the cone
-directions, downstream attenuation, sub-point emission, oblique projection, accumulation) and the sweep's
-first-collision-source evaluations timed by wrapping those functions. Prints a per-view table (ms).
+Usage::
+
+    python benchmarks/profile_citrus_step.py [--panel full|small] [--views 12] [--cone 16x32] [--delta-voxel 0.5]
+        [--transport-cell-cm 1.0] [--quadrature-spacing cm] [--uncollided-trace quadrature|coarse|fine]
 """
 
 from __future__ import annotations
@@ -48,24 +42,50 @@ CUR = [""]
 
 
 def sync() -> None:
+    """Wait for every CUDA kernel on the device to finish."""
     torch.cuda.synchronize(DEVICE)
 
 
 class stage:
+    """Context manager that adds the synchronized wall time of its body to the stage total ``T[name]``.
+
+    Attributes:
+        name (str): stage name, the key in ``T``.
+        t0 (float): start time in s, set on entry.
+    """
+
     def __init__(self, name: str) -> None:
+        """Name the stage.
+
+        Args:
+            name (str): stage name.
+        """
         self.name = name
 
     def __enter__(self):
+        """Make this the current stage, synchronize and start the clock."""
         CUR[0] = self.name
         sync()
         self.t0 = time.perf_counter()
 
     def __exit__(self, *exc):
+        """Synchronize and add the elapsed time to the stage total.
+
+        Args:
+            *exc: exception type, value and traceback (ignored).
+        """
         sync()
         T[self.name] += time.perf_counter() - self.t0
 
 
 def wrap(obj, attr: str, name: str) -> None:
+    """Replace a function by a wrapper that, while instrumenting, adds its synchronized time to the current stage.
+
+    Args:
+        obj (object): module, class or object that holds the function.
+        attr (str): attribute name of the function.
+        name (str): inner stage name.
+    """
     fn = getattr(obj, attr)
 
     def wrapped(*a, **k):
@@ -82,6 +102,7 @@ def wrap(obj, attr: str, name: str) -> None:
 
 
 def main() -> None:
+    """Parse the command line, build the accumulators, then time and print the step per stage."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--panel", default="full", choices=["full", "small"])
     parser.add_argument("--views", type=int, default=12)

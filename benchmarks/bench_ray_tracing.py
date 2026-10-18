@@ -1,40 +1,14 @@
-"""Benchmark of the fused Triton Siddon ray tracer against the PyTorch Siddon reference.
+"""Benchmark of the fused Triton Siddon ray tracer against the PyTorch Siddon reference on the WLAB phantom.
 
-Usage:
+Measures the agreement of every ray-tracing operation with the PyTorch float32 and float64 paths (part ``equality``),
+the time and peak memory per chunk of directions (``chunks``), and the time, peak memory and detector signal of the
+first-order scatter image, with the quadrature points on the fine grid (``images``) or on a single grid (``fine``).
+The records, the images and a Markdown table are written to ``--out``.
+
+Usage::
+
     python benchmarks/bench_ray_tracing.py [--coarse 2.0 1.0 0.5] [--cones 16x32 32x64]
-                                            [--out _cache/runs/bench_ray_tracing] [--parts equality,chunks,images,fine]
-                                            [--torch-chunks 8] [--skip KEY,...] [--rerun]
-
-Setting: WLAB phantom (utilities.wlab_setup), angle 0, real XCOM / xraylib library (G = 6, the cached build at
-Legendre order 10), CsI 0.6 mm response, no grid, float32, CUDA, caching-allocator cap 5000 MiB. The
-solver traces the attenuation tau_down on the transport (coarse) grid and projects the emission at the quadrature
-points (scatter_image.combined_scatter_image). Here the quadrature points are the 0.5 cm grid and the coarse grid
-2 / 1 / 0.5 cm (q = 4 / 2 / 1 points per cell and axis). Direction sets: `scatter_image.panel_direction_set` in the
-51 deg covering cone, 16x32 = 512 and
-32x64 = 2048 directions; the scatter image's chunks of 8 panel-facing directions.
-
-Backends:
-    torch     SiddonProjectors(backend="torch")     (exact; PyTorch traversal: the reference)
-    triton    SiddonProjectors(backend="auto")      (exact; the fused kernels of kernels/ray_tracing_kernels.py;
-    default)
-
-Parts (--parts):
-    equality  max |Triton - PyTorch| / max |PyTorch| for every operation on the WLAB grids (one chunk of 8 directions
-              of the 512 set; downstream on each coarse grid, oblique on the fine grid with a per-direction field,
-              upstream and primary on the fine grid), and vs the float64 PyTorch path for one chunk.
-    chunks    ms per chunk of 8 of downstream_cumulative(mu_coarse) on the coarse grid and of
-              oblique_project([8, G, fine]) on the fine grid, over every panel-facing chunk of the set, pipelined as in
-              the scatter image (one synchronize at the end), median of 3 passes after a warm pass. The PyTorch Siddon
-              is timed on the first --torch-chunks chunks (one pass; its cost per chunk does not depend on the chunk).
-              Also the peak memory of one chunk pair.
-    images    the first-order image (`combined_scatter_image(chunk=8, first_collision_chunk=4)` with a zero
-              multiple-collision source) with a fresh projector per image, seconds (wall, synchronized, after an untimed
-              warm-up of every backend on a 4x8 set), peak MiB, and rel RMS of the detector signal vs the PyTorch Siddon
-              image of the same set and factor. phi_uncollided comes from the PyTorch Siddon upstream operator once
-              (identical inputs).
-    fine      the first-order image on a single grid (q = 1, the quadrature grid equal to the transport grid) at
-              2 / 1 cm (0.5 cm is the images part at factor 1, the identical computation).
-Outputs: <out>/records.jsonl, <out>/img/<key>.npz, <out>/bench_ray_tracing.md (printed).
+        [--out _cache/runs/bench_ray_tracing] [--parts equality,chunks,images,fine] [--torch-chunks 8]
 """
 
 from __future__ import annotations
@@ -74,14 +48,29 @@ LABEL = {"torch": "Siddon (PyTorch)", "triton": "Siddon (Triton)"}
 
 
 def sync() -> None:
+    """Wait for every CUDA kernel on the current device to finish."""
     torch.cuda.synchronize()
 
 
 def library():
+    """Cross-section library of the benchmark (6 groups, Legendre order 10), built once and cached on disk.
+
+    Returns:
+        MultigroupLibrary: the library.
+    """
     return build_solver_library(SolverConfig(num_groups=6, legendre_order=10))  # cached on disk (_cache/)
 
 
 def rel_rms(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+    """Relative RMS difference ``norm(a - b) / norm(b)`` of two images.
+
+    Args:
+        a (ndarray or None): [Rd, Cd] image to compare.
+        b (ndarray or None): [Rd, Cd] reference image.
+
+    Returns:
+        float or None: the relative difference, None when ``a`` or ``b`` is None.
+    """
     if a is None or b is None:
         return None
     return float(np.linalg.norm(a - b) / np.linalg.norm(b))
@@ -90,8 +79,25 @@ def rel_rms(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]
 def first_order_image(library, rho, phi_uncollided, grid, factor: int, geometry, quadrature, mu_coarse, projectors,
                       detector,
                       grid_response) -> dict:
-    """First-order image of the solver's scatter pass: combined_scatter_image with a zero multiple-collision source
-    (mu_coarse None -> the true coarse attenuation)."""
+    """First-order scatter image: ``combined_scatter_image`` with a zero multiple-collision source.
+
+    Args:
+        library (MultigroupLibrary): cross-section library.
+        rho (Tensor): [M, Rq, Cq, Sq] densities in g/cm^3 on the quadrature grid.
+        phi_uncollided (Tensor): [G, Rq, Cq, Sq] uncollided fluence on the quadrature grid.
+        grid (Grid): the quadrature grid.
+        factor (int): quadrature points per transport cell and axis.
+        geometry (ConeGeometry): scanner geometry.
+        quadrature (Quadrature): direction set of the scatter image.
+        mu_coarse (Tensor or None): [G, R, C, S] total attenuation on the transport grid in cm^-1, or None for the
+            cell average of the attenuation of ``rho``.
+        projectors (SiddonProjectors): ray tracer.
+        detector (DetectorResponse): detector response.
+        grid_response (GridResponse): anti-scatter grid response.
+
+    Returns:
+        dict: the image dict of ``combined_scatter_image`` (``signal`` [Rd, Cd], ...).
+    """
     T0 = torch.zeros(library.num_groups, 1, *grid.coarsen(factor).shape, device=phi_uncollided.device,
                      dtype=phi_uncollided.dtype)
     return combined_scatter_image(library, rho, phi_uncollided, grid, factor, T0, 0, geometry, 0.0, quadrature,
@@ -100,7 +106,11 @@ def first_order_image(library, rho, phi_uncollided, grid, factor: int, geometry,
 
 
 def foreign_gpu_load() -> str:
-    """GPU utilization and memory reported by nvidia-smi (includes this process)."""
+    """GPU utilization and used memory reported by nvidia-smi (this process included).
+
+    Returns:
+        str: the nvidia-smi CSV line, or ``"?"`` when nvidia-smi fails.
+    """
     import subprocess
 
     try:
@@ -112,7 +122,25 @@ def foreign_gpu_load() -> str:
 
 
 class Bench:
+    """Runner of the benchmark parts; every record is appended to ``records.jsonl`` and skipped when already there.
+
+    Attributes:
+        args (argparse.Namespace): the parsed command line.
+        device (torch.device): the CUDA device.
+        jsonl (str): path of the records file.
+        records (dict): the records by key, loaded from ``jsonl`` unless ``--rerun``.
+        library (MultigroupLibrary): cross-section library.
+        detector (DetectorResponse): CsI 0.6 mm detector response.
+        grid_response (GridResponse): anti-scatter grid response (no grid).
+        setups (dict): the inputs of ``setup`` by voxel size.
+    """
+
     def __init__(self, args):
+        """Load the stored records and the cross-section library.
+
+        Args:
+            args (argparse.Namespace): the parsed command line.
+        """
         self.args = args
         self.device = torch.device("cuda")
         os.makedirs(os.path.join(args.out, "img"), exist_ok=True)
@@ -130,8 +158,15 @@ class Bench:
 
     # ---- inputs -----------------------------------------------------------------------------------
     def setup(self, d: float):
-        """(grid, geometry, rho, mu, phi_uncollided) on the d cm grid; phi_uncollided from the PyTorch Siddon upstream
-    operator."""
+        """Inputs on the WLAB grid of voxel size ``d``, computed once.
+
+        Args:
+            d (float): voxel size in cm.
+
+        Returns:
+            tuple: (grid, geometry, rho [M, R, C, S] in g/cm^3, mu [G, R, C, S] in cm^-1, phi_uncollided [G, R, C, S]);
+                phi_uncollided comes from the PyTorch Siddon upstream operator.
+        """
         if d not in self.setups:
             grid, geometry, rho = wlab_setup(d, device=self.device, dtype=torch.float32)
             mu = mu_t_volume(self.library, rho)
@@ -141,10 +176,27 @@ class Bench:
         return self.setups[d]
 
     def quadrature(self, cone: tuple[int, int]):
+        """Direction set of the scatter image in the cone that covers the fine grid, at angle 0.
+
+        Args:
+            cone (tuple[int, int]): numbers of polar and azimuthal directions, e.g. (16, 32).
+
+        Returns:
+            Quadrature: the direction set.
+        """
         grid, geometry = self.setup(FINE)[:2]
         return panel_direction_set(geometry, 0.0, cone, max_polar_angle=grid, device=self.device, dtype=torch.float32)
 
     def chunks(self, cone: tuple[int, int], chunk: int = 8) -> list[torch.Tensor]:
+        """Panel-facing directions of the ``cone`` set, split into chunks.
+
+        Args:
+            cone (tuple[int, int]): numbers of polar and azimuthal directions.
+            chunk (int): directions per chunk. Defaults to 8.
+
+        Returns:
+            list[Tensor]: [chunk, 3] float32 unit directions per chunk (the last one may be shorter).
+        """
         geometry = self.setup(FINE)[1]
         directions = self.quadrature(cone).omega.to(self.device, torch.float32)
         _, _, n = geometry.panel_axes(0.0)
@@ -153,6 +205,12 @@ class Bench:
 
     # ---- records ----------------------------------------------------------------------------------
     def store(self, record: dict, images: Optional[dict] = None) -> None:
+        """Append a record to ``records.jsonl`` and save its images.
+
+        Args:
+            record (dict): the record, with its ``key``.
+            images (dict, optional): arrays saved to ``img/<key>.npz``. Defaults to None (no file).
+        """
         if images is not None:
             np.savez_compressed(os.path.join(self.args.out, "img", record["key"] + ".npz"), **images)
         self.records[record["key"]] = record
@@ -160,6 +218,14 @@ class Bench:
             file.write(json.dumps(record) + "\n")
 
     def image(self, key: str) -> Optional[np.ndarray]:
+        """Detector signal of a stored image.
+
+        Args:
+            key (str): record key.
+
+        Returns:
+            ndarray or None: [Rd, Cd] signal, None when the image file does not exist.
+        """
         p = os.path.join(self.args.out, "img", key + ".npz")
         if not os.path.isfile(p):
             return None
@@ -167,6 +233,14 @@ class Bench:
             return z["signal"]
 
     def timed(self, function: Callable[[], object]) -> tuple[object, float, float]:
+        """Run a function once, synchronized, after emptying the allocator cache and resetting the peak memory.
+
+        Args:
+            function (Callable): the function to run, without arguments.
+
+        Returns:
+            (result, seconds, peak_mib): the function's result, the wall time in s and the peak allocation in MiB.
+        """
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
@@ -177,10 +251,29 @@ class Bench:
         return r, time.perf_counter() - t0, torch.cuda.max_memory_allocated(self.device) / 2 ** 20
 
     def skip(self, key: str) -> bool:
+        """Whether a record is already stored or listed in ``--skip``.
+
+        Args:
+            key (str): record key.
+
+        Returns:
+            bool: True to skip the record.
+        """
         return key in self.records or key in self.args.skip
 
     # ---- part 1: equality ---------------------------------------------------------------------------
     def run_equality(self, coarse: list[float]) -> list[dict]:
+        """Maximum relative deviation of the Triton operations from the PyTorch float32 and float64 paths.
+
+        Covers ``downstream_cumulative`` on each coarse grid and ``oblique_project``, ``upstream_cumulative`` and
+        ``primary_project`` on the fine grid, for one chunk of 8 directions of the 16x32 set.
+
+        Args:
+            coarse (list[float]): coarse voxel sizes in cm.
+
+        Returns:
+            list[dict]: one row per operation and backend (``op``, ``impl``, ``vs_torch32``, ``vs_torch64``).
+        """
         key = "equality"
         if self.skip(key):
             return self.records[key]["rows"]
@@ -233,6 +326,19 @@ class Bench:
 
     # ---- part 2: per-chunk cost ---------------------------------------------------------------------
     def run_chunks(self, d: float, cone: tuple[int, int], impl: str) -> dict:
+        """Time per chunk of ``downstream_cumulative`` (coarse grid) and ``oblique_project`` (fine grid), peak memory.
+
+        Each time is the median of 3 passes over every panel-facing chunk after a warm pass; the PyTorch backend runs
+        one pass over the first ``--torch-chunks`` chunks.
+
+        Args:
+            d (float): coarse voxel size in cm.
+            cone (tuple[int, int]): numbers of polar and azimuthal directions.
+            impl (str): backend, ``"torch"`` or ``"triton"``.
+
+        Returns:
+            dict: the record (``down_ms``, ``obl_ms``, ``pair_ms``, ``pair_peak_extra_mib``); stored one if skipped.
+        """
         key = f"chunks_c{d:g}_q{cone[0]}x{cone[1]}_{impl}"
         if self.skip(key):
             return self.records.get(key, {})
@@ -294,6 +400,16 @@ class Bench:
 
     # ---- part 3: first-order image (supervoxel, sub-points on the fine grid) -------------------------
     def first_order(self, d: float, quadrature, impl: str) -> dict:
+        """First-order scatter image on the transport grid of voxel size ``d``, quadrature points on the fine grid.
+
+        Args:
+            d (float): transport voxel size in cm, a multiple of the fine 0.5 cm.
+            quadrature (Quadrature): direction set.
+            impl (str): backend, ``"torch"`` or ``"triton"``.
+
+        Returns:
+            dict: the image dict of ``combined_scatter_image`` (``signal`` [Rd, Cd], ...).
+        """
         grid_fine, geometry, rho_fine, _, phi_fine = self.setup(FINE)
         f = int(round(d / FINE))
         return first_order_image(self.library, rho_fine, phi_fine, grid_fine, f, geometry, quadrature, None,
@@ -302,6 +418,16 @@ class Bench:
                                  self.grid_response)
 
     def run_image(self, d: float, cone: tuple[int, int], impl: str) -> dict:
+        """Time, peak memory and detector signal of the first-order image with the quadrature points on the fine grid.
+
+        Args:
+            d (float): transport voxel size in cm.
+            cone (tuple[int, int]): numbers of polar and azimuthal directions.
+            impl (str): backend, ``"torch"`` or ``"triton"``.
+
+        Returns:
+            dict: the record (``seconds``, ``peak_mib``, ``dirs``); the stored one when skipped.
+        """
         key = f"img_c{d:g}_q{cone[0]}x{cone[1]}_{impl}"
         if self.skip(key):
             return self.records.get(key, {})
@@ -316,6 +442,16 @@ class Bench:
 
     # ---- part 4: single-grid first-order image --------------------------------------------------------
     def run_fine_image(self, d: float, cone: tuple[int, int], impl: str) -> dict:
+        """Time, peak memory and detector signal of the first-order image on a single grid (one point per cell).
+
+        Args:
+            d (float): voxel size in cm.
+            cone (tuple[int, int]): numbers of polar and azimuthal directions.
+            impl (str): backend, ``"torch"`` or ``"triton"``.
+
+        Returns:
+            dict: the record (``seconds``, ``peak_mib``, ``dirs``); the stored one when skipped.
+        """
         key = f"fine_d{d:g}_q{cone[0]}x{cone[1]}_{impl}"
         if self.skip(key):
             return self.records.get(key, {})
@@ -331,7 +467,11 @@ class Bench:
         return record
 
     def warmup(self, coarse: list[float]) -> None:
-        """Untimed small runs of every backend (CUDA context, allocator, every Triton kernel variant)."""
+        """Untimed small runs of every backend (CUDA context, allocator, every Triton kernel variant).
+
+        Args:
+            coarse (list[float]): coarse voxel sizes in cm.
+        """
         t0 = time.perf_counter()
         ray_tracing_kernels.warmup(self.device, int(self.library.num_groups))
         q = self.quadrature((4, 8))
@@ -348,10 +488,30 @@ class Bench:
 # =====================================================================================================
 
 def _f(x, fmt: str) -> str:
+    """Format a value, or give an empty string for None.
+
+    Args:
+        x (float or None): the value.
+        fmt (str): format specification, e.g. ``".3f"``.
+
+    Returns:
+        str: the formatted value.
+    """
     return "" if x is None else format(x, fmt)
 
 
 def tables(b: Bench, coarse: list[float], cones: list[tuple[int, int]], parts: set[str]) -> str:
+    """Markdown tables of the stored records of the selected parts.
+
+    Args:
+        b (Bench): the benchmark runner with its records.
+        coarse (list[float]): coarse voxel sizes in cm.
+        cones (list[tuple[int, int]]): numbers of polar and azimuthal directions of each direction set.
+        parts (set[str]): parts to tabulate.
+
+    Returns:
+        str: the Markdown text.
+    """
     md: list[str] = []
     R = b.records
     if "equality" in parts and "equality" in R:
@@ -415,6 +575,7 @@ def tables(b: Bench, coarse: list[float], cones: list[tuple[int, int]], parts: s
 
 
 def main() -> None:
+    """Parse the command line, run the selected parts, then write and print the tables."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--coarse", type=float, nargs="+", default=[2.0, 1.0, 0.5])
     parser.add_argument("--cones", nargs="+", default=["16x32", "32x64"])

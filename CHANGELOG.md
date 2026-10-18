@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.7.1 - 2026-10-17
+
+Style release: the docstrings, the demos and the docs pages. No change of behaviour.
+
+- **Docstrings in the Google format of MBIRTORCH** in every module of the package, the benchmarks and the docs
+  figure script: one to three sentences on what the function does, then `Args:` (one line per parameter with its
+  shape, unit and default) and `Returns:`; classes and dataclasses list their fields under `Attributes:`. The module
+  docstrings say in a few sentences what the module contains; the derivations, conventions and design notes they
+  carried are in `docs/source/method.rst`, `conventions.rst` and `design_notes.rst` (the missing ones were added
+  there), the version history and the measurements are dropped.
+- **Docs:** the `_literal_docstrings` hook of `docs/source/conf.py` is gone, so napoleon renders the Google docstrings
+  (parameters and returns as field lists); `napoleon_numpy_docstring` is off and the type hints are added to the
+  documented parameters only (`autodoc_typehints_description_target = "documented"`). Two stray tab characters
+  (`\cos\theta` in conventions.rst, `C:\path\to` in installation.rst) are fixed.
+- **Two quick-start demos** in the style of MBIRTORCH's (a linear script, a comment before every step, under 100
+  lines, no flags, every setting a variable in a parameter block at the top: spectrum file, reference materials,
+  panel, voxel pitch, views and angular range, flat field, loop and solver settings):
+  `demo/demo_1_scatter_solver.py` (the scatter solver on one view of the WLAB phantom: primary, scatter and scatter
+  fraction) and `demo/demo_2_citrus.py` (synthetic data of 180 views over a short scan at 0.5 cm from
+  `synthesize_cone_beam_data`, cached in `demo/input/` under a name built from the settings; the solver built from
+  `SolverConfig` and the spectrum; `citrus_recon` and `mbir_recon`, the relative RMSE of both, central slices and
+  profiles).
+  They replace `demo/demo_scatter_solver.py` and `demo/demo_citrus.py`.
+- **`benchmarks/citrus_study.py`**: the former `demo/demo_citrus.py` with all its flags, defaults, output names and
+  summary JSON unchanged (data sets in `demo/input/`, outputs in `demo/output/`). `docs/source/usage.rst` describes
+  the demos and the study script ("CITRUS studies"); README and `dev_scripts/wsl_install_test.sh` run the new demos.
+- **Tests:** `test_default_set_keeps_the_cache_key_and_library` (tests/test_material_catalogue.py) compared a SHA-256
+  of the bytes of the small legacy library with a value recorded on Windows, which fails on Linux where the float64
+  arithmetic of the builder differs in the last bits. It now compares the shape and float64 statistics of every
+  tensor (sum, sum of squares, min, max, the first and last three values) with
+  `tests/data/small_legacy_library_v070.json`, at a relative tolerance of 1e-9 (absolute 1e-12).
+
 ## v0.7.0 - 2026-10-17
 
 Photon data from NIST XCOM and xraylib instead of XrayPhysics, so that CITRUS installs from wheels without compiling

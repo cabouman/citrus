@@ -1,98 +1,10 @@
-"""CITRUS: scatter-corrected MBIR with the LBTE source iteration solver in the loop (docs/source/method.rst).
+"""The CITRUS reconstruction loop: scatter-corrected MBIR with the LBTE scatter solver in the loop.
 
-The algorithm
--------------
-Measured counts Y [V, Rd, Cd] (flat field I0) contain primary and scatter, Y ~ Poisson(P + S). CITRUS alternates, per
-outer iteration k, ONE scatter step per view and ONE warm-started MBIR iteration:
-
-    X_0      = FDK(-log(Y / I0))                                    (the uncorrected data; Parker-weighted for a
-                                                                     short scan)
-    for k = 0 .. N-1:
-        rho_k            = densities(X_k)                            interpolating model between the library's reference
-                                                                     materials at E_eff, resampled onto the transport
-                                                                     and quadrature grids material by material (never
-                                                                     [M, R, C, S])
-        for every view v:
-            phi_UC       = G_1(rho_k)                                uncollided fluence on the quadrature grid Q
-                                                                     (`uncollided_operator`)
-            Phi_v        = phi^(1)(phi_UC) + K Phi_v                 ONE sweep of the first-collision source plus the
-                                                                     scattering source of the aged accumulator
-                                                                     (`accumulator_update_operator`)
-            s_v          = project_scatter(phi_UC, Phi_v)            scatter signal of the view
-        p                = primary(rho_k)                            primary signals of every view: MBIRTORCH
-                                                                     projections of the material maps (the
-                                                                     reconstruction's own operator A)
-        SPR_k            = s / p
-        Y_c              = Y / (1 + SPR_k)                           scatter-corrected counts
-        X_{k+1}          = one VCD iteration of MBIR on y_c = -log(Y_c / I0), warm-started at X_k,
-                           at partition-schedule position k, weights W = Y / I0, frozen regularization
-
-(Symbols of docs/source/method.rst: X the reconstruction (1/cm), Y the measured counts, I0 the flat field, P / S the
-primary / scatter counts, rho the densities, phi the fluence, G_1 the uncollided operator, phi^(1) the once-collided
-fluence moments, K = sweep o scatter the collided transport of one collision order, V views, Rd x Cd detector pixels.)
-
-The per-view accumulator Phi_v = sum_{n >= 1} (collided moments of order n) is carried across outer iterations: with
-the densities held fixed, N steps reproduce N source iterations exactly (`citrus_step`), so the scatter estimate
-converges together with the reconstruction ("age-ordered" source iteration: the n-th collision order of the current
-estimate was computed n - 1 outer iterations ago). The collided transport is the expensive part of a converged
-scatter solve; CITRUS spends one sweep per view per outer iteration instead of a full source iteration.
-
-Densities and primary: the loop never forms the density volume [M, R, C, S] of the M reference materials on the
-reconstruction grid (M reconstruction-sized volumes).
-`ScatterSolver.material_fields_from_attenuation(X_k, grid, density)` evaluates one material's map at a time
-(`DensityModel.material`, bit for bit the row of the full model) and resamples it onto the transport and quadrature
-grids. The primary signal of every view is the MBIRTORCH per-material primary: the path lengths P_m = A rho_m
-(g/cm^2) of the materials present with MBIRTORCH's projector over all views at once (one material map at a time, in
-chunks of views so that the path lengths [M', V_chunk, Rd, Cd] stay within one sinogram, `primary_signals`), then the
-solver's polychromatic transmission and detector / grid response per view (`ScatterSolver.primary_from_path_lengths`).
-These are pixel-averaged line integrals (separable footprint), the reconstruction's own operator A. The standalone
-solver uses the Siddon primary instead, one ray to each pixel center (`ScatterSolver.primary`, `solve_view`).
-
-Scatter model -> correction: the solver gives per view the scatter and primary signals (s, p) of the current
-densities, so the correction is the multiplicative Y_c = Y p / (p + s) = Y / (1 + SPR(X)); it is independent of I0 and
-of any mismatch between the solver's polychromatic primary and MBIR's monoenergetic model, and it rescales the noise
-of Y (W = Y / I0 is the exact weight of y_c).
-
-Sparse-view scatter (CitrusConfig.scatter_view_stride n > 1): the scatter step runs only on the views 0, n, 2n, ...
-(uniform over the angular range, starting at view 0); only those views keep an accumulator. The scatter SIGNAL of every
-other view is interpolated in angle, per detector pixel, from the computed views' scatter signals (Catmull-Rom over
-the 4 nearest computed views by default, circular in angle for a full rotation, along the arc with the end views held
-for a short scan; orders 0-2 and None also exist;
-`interpolate_scatter`), its primary signal comes from the primary projection of every view (`primary_signals`; cheap:
-no transport), and the correction ratio s / p is formed on every view. The scatter
-signal is interpolated, not the ratio: the scatter is smooth on the panel and in angle, the ratio carries the object's
-shadow edges, which move across the panel with the angle.
-
-Scatter step every n outer iterations (CitrusConfig.scatter_every n > 1): the scatter stage runs at the outer
-iterations 0, n, 2n, ... only; in between, the previous scatter-to-primary ratio is reused and only the MBIR iteration
-runs, so n MBIR iterations run per scatter step and the accumulators keep their age across the skipped iterations. An
-MBIR iteration is cheap next to a scatter stage, so for a given number of scatter steps more MBIR iterations cost
-little; at a fixed number of outer iterations, skipping scatter stages lets MBIR converge towards a stale correction
-between refreshes. The default is 1.
-
-Per-view state: one accumulator [G, (L+1)^2, 4, Rc, Cc, Sc] per view (G energy groups, (L+1)^2 spherical-harmonic
-moments, 4 linear-discontinuous moments, Rc x Cc x Sc transport cells), stored compactly (`StateStore`): only the
-linear-discontinuous cell mean (the aged accumulator re-enters the next sweep with zero slopes) in float16 with a
-per-(group, moment) scale, 1/8 of float32. The aged accumulator re-enters only through the scattering source of the
-next sweep, so the compact storage changes the reconstruction far less than its own error.
-
-MBIR resume (CitrusConfig.resume_error_sinogram): MBIRTORCH's `recon` recomputes the error sinogram y_c - A X with
-one forward projection per call. With the switch on, the loop keeps it between outer iterations (as -A X, one
-sinogram) and resumes MBIRTORCH's engine from it (`recon.mbir_bridge.mbir_iterations(..., error_sinogram=)`); a new
-corrected sinogram only shifts it, e = y_c,new - A X. The reconstruction equals the restarted one to float rounding.
-
-Public API
-----------
-    citrus_recon(...)     the CITRUS reconstruction (returns the reconstruction and a dict of diagnostics)
-    mbir_recon(...)       the same MBIR loop without the solver: no correction, or a fixed SPR correction
-    citrus_step(...)      one scatter step of one view over an explicit CitrusState (densities given)
-    citrus_view_step(...) the same from prebuilt MaterialFields, optionally without the primary (the loop's form)
-    primary_signals(...)  primary signals of all views from MBIRTORCH projections of the material maps
-    scatter_view_indices, angular_neighbors, full_rotation, interpolation_weights, interpolate_scatter
-                          sparse-view scatter
-    uncollided_operator, first_collision_operator, multiple_collision_operator, accumulator_update_operator,
-    project_scatter       the per-view operators of the step
-    DensityModel, StateStore, CitrusConfig, estimate_regularization, apply_regularization
+Every outer iteration advances the collided fluence of every view by one transport sweep, divides the measured counts
+by one plus the scatter-to-primary ratio of the current densities and runs one warm-started MBIR iteration on the
+corrected data. The module holds the loop (``citrus_recon``, ``mbir_recon``), the per-view scatter step and its
+operators, the density model, the compact per-view state storage and the angular interpolation of sparse-view scatter.
+The method is described in docs/source/method.rst, "The CITRUS loop" and "Options and secondary components".
 """
 
 from __future__ import annotations
@@ -148,16 +60,15 @@ REGULARIZATION_NAMES = ("sigma_y", "sigma_x", "sigma_prox")
 
 @dataclass
 class CitrusState:
-    """Caller-owned state of the CITRUS scatter recursion for ONE view.
+    """Caller-owned state of the CITRUS scatter recursion for one view (keep one state per view).
 
-    angle            : view angle (rad) the state belongs to; None until the first step (then fixed).
-    collided_moments : [G, (L+1)^2, 4, Rc, Cc, Sc] the accumulator Phi of collided-fluence moments (sum over the
-                       collision orders n >= 1), or None (= zero) initially.
-    cone_quadrature  : cached collapsed-cone direction set of the view (depends on grid and angle only).
-    num_steps        : number of `citrus_step` calls applied.
-    history          : relative change ||Phi_new - Phi_old|| / ||Phi_new|| of the scalar-flux cell means per step
-                       (the CITRUS analogue of SourceIterationResult.history).
-    For several views keep one state per view.
+    Attributes:
+        angle (float or None): view angle in rad the state belongs to; fixed by the first step. Defaults to None.
+        collided_moments (Tensor or None): [G, (L+1)^2, 4, Rc, Cc, Sc] accumulator Phi of the
+            collided-fluence moments (sum over the collision orders n >= 1); None means zero. Defaults to None.
+        cone_quadrature (Quadrature or None): cached collapsed-cone direction set of the view. Defaults to None.
+        num_steps (int): number of steps applied. Defaults to 0.
+        history (list[float]): relative change of the scalar-flux cell means of Phi at every step. Defaults to [].
     """
 
     angle: Optional[float] = None
@@ -169,28 +80,70 @@ class CitrusState:
 
 def _material_fields_or_build(solver: ScatterSolver, rho: Tensor, grid: Grid,
                               fields: Optional[MaterialFields]) -> MaterialFields:
+    """The given material fields, or the solver's material fields of ``rho`` when ``fields`` is None.
+
+    Args:
+        solver (ScatterSolver): the scatter solver.
+        rho (Tensor): [M, R, C, S] densities in g/cm^3 of the M library materials on ``grid``.
+        grid (Grid): the fine (reconstruction) grid.
+        fields (MaterialFields or None): prebuilt material fields.
+
+    Returns:
+        MaterialFields: ``fields``, or ``solver.material_fields(rho, grid)`` when it is None.
+    """
     return solver.material_fields(rho, grid) if fields is None else fields
 
 
 def uncollided_operator(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float,
                         fields: Optional[MaterialFields] = None) -> Tensor:
-    """G_1 of docs/source/method.rst: the uncollided fluence phi_uncollided [G, Rq, Cq, Sq] at the quadrature points
-    (the voxel centers of the solver's quadrature grid Q = transport grid refined q = cell /
-    quadrature_point_spacing_cm times, `ScatterSolver.uncollided_fluence`). rho [M, R, C, S] on the fine grid (M
-    library materials), unused when fields are given."""
+    """Uncollided fluence G_1 of the densities at the points of the solver's quadrature grid.
+
+    Args:
+        solver (ScatterSolver): the scatter solver.
+        rho (Tensor): [M, R, C, S] densities in g/cm^3 of the M library materials on ``grid``; unused when
+            ``fields`` is given.
+        grid (Grid): the fine (reconstruction) grid.
+        angle (float): view angle in rad.
+        fields (MaterialFields, optional): prebuilt material fields of ``rho``. Defaults to None (built here).
+
+    Returns:
+        Tensor: [G, Rq, Cq, Sq] uncollided fluence phi_uncollided per energy group at the quadrature points.
+    """
     return solver.uncollided_fluence(_material_fields_or_build(solver, rho, grid, fields), angle)
 
 
 def first_collision_operator(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float, phi_uncollided: Tensor,
                              fields: Optional[MaterialFields] = None) -> Tensor:
-    """Once-collided fluence moments phi^(1) [G, (L+1)^2, 4, Rc, Cc, Sc] from phi_uncollided [G, Rq, Cq, Sq]
-    (`uncollided_operator`): restrict the first-collision source at the quadrature points to linear-discontinuous
-    moments on the transport grid and do ONE sweep (= source iteration n = 1)."""
+    """Once-collided fluence moments phi^(1): one transport sweep of the first-collision source.
+
+    Args:
+        solver (ScatterSolver): the scatter solver.
+        rho (Tensor): [M, R, C, S] densities in g/cm^3 of the M library materials on ``grid``; unused when
+            ``fields`` is given.
+        grid (Grid): the fine (reconstruction) grid.
+        angle (float): view angle in rad.
+        phi_uncollided (Tensor): [G, Rq, Cq, Sq] uncollided fluence at the quadrature points
+            (``uncollided_operator``).
+        fields (MaterialFields, optional): prebuilt material fields of ``rho``. Defaults to None (built here).
+
+    Returns:
+        Tensor: [G, (L+1)^2, 4, Rc, Cc, Sc] once-collided fluence moments on the transport grid.
+    """
     fields = _material_fields_or_build(solver, rho, grid, fields)
     return solver.transport_sweep(fields, solver.first_collision_moment_source(fields, angle, phi_uncollided))
 
 
 def _check_accumulator(solver: ScatterSolver, fields: MaterialFields, collided_moments: Tensor) -> None:
+    """Check the shape of an accumulator against the solver and the transport grid of ``fields``.
+
+    Args:
+        solver (ScatterSolver): the scatter solver.
+        fields (MaterialFields): material fields whose transport grid the accumulator lives on.
+        collided_moments (Tensor): [G, (L+1)^2, 4, Rc, Cc, Sc] accumulator to check.
+
+    Raises:
+        ValueError: if the shape differs.
+    """
     sweep_context = solver.sweep_context(fields.grid_coarse)
     expected = (solver.num_groups, sweep_context.num_moments, 4, *fields.grid_coarse.shape)
     if tuple(collided_moments.shape) != expected:
@@ -199,9 +152,23 @@ def _check_accumulator(solver: ScatterSolver, fields: MaterialFields, collided_m
 
 def multiple_collision_operator(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float,
                                 collided_moments: Optional[Tensor], fields: Optional[MaterialFields] = None) -> Tensor:
-    """K Phi: ONE sweep from the scattering source of the collided moments Phi = collided_moments [G, (L+1)^2, 4, Rc,
-    Cc, Sc]. collided_moments None gives zeros. `angle` is unused (the collided transport does not depend on the view
-    once its source is given) and kept for a uniform signature. Returns [G, (L+1)^2, 4, Rc, Cc, Sc]."""
+    """One transport sweep ``K Phi`` of the scattering source of the collided moments Phi.
+
+    Args:
+        solver (ScatterSolver): the scatter solver.
+        rho (Tensor): [M, R, C, S] densities in g/cm^3 of the M library materials on ``grid``; unused when
+            ``fields`` is given.
+        grid (Grid): the fine (reconstruction) grid.
+        angle (float): view angle in rad; unused (the collided transport does not depend on the view).
+        collided_moments (Tensor or None): [G, (L+1)^2, 4, Rc, Cc, Sc] collided moments Phi; None gives zeros.
+        fields (MaterialFields, optional): prebuilt material fields of ``rho``. Defaults to None (built here).
+
+    Returns:
+        Tensor: [G, (L+1)^2, 4, Rc, Cc, Sc] collided moments of the next collision order.
+
+    Raises:
+        ValueError: if ``collided_moments`` has the wrong shape.
+    """
     fields = _material_fields_or_build(solver, rho, grid, fields)
     sweep_context = solver.sweep_context(fields.grid_coarse)
     if collided_moments is None:
@@ -215,12 +182,26 @@ def multiple_collision_operator(solver: ScatterSolver, rho: Tensor, grid: Grid, 
 
 def accumulator_update_operator(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float, phi_uncollided: Tensor,
                                 collided_moments: Optional[Tensor], fields: Optional[MaterialFields] = None) -> Tensor:
-    """first_collision_operator(phi_uncollided) + multiple_collision_operator(collided_moments) in ONE sweep: the sweep
-    is linear in its source, so the first-collision source and the scattering source of the previous accumulator are
-    summed per direction chunk and transported together (half the transport cost of the two separate operators).
-    phi_uncollided: [G, Rq, Cq, Sq] (`uncollided_operator`). Returns the new accumulator
-    Phi' = phi^(1) + K Phi [G, (L+1)^2, 4, Rc, Cc, Sc] (Phi = collided_moments, K = sweep o scatter); collided_moments
-    None gives phi^(1) alone."""
+    """New accumulator ``phi^(1) + K Phi``: first-collision and scattering sources transported in one sweep.
+
+    Args:
+        solver (ScatterSolver): the scatter solver.
+        rho (Tensor): [M, R, C, S] densities in g/cm^3 of the M library materials on ``grid``; unused when
+            ``fields`` is given.
+        grid (Grid): the fine (reconstruction) grid.
+        angle (float): view angle in rad.
+        phi_uncollided (Tensor): [G, Rq, Cq, Sq] uncollided fluence at the quadrature points
+            (``uncollided_operator``).
+        collided_moments (Tensor or None): [G, (L+1)^2, 4, Rc, Cc, Sc] previous accumulator Phi;
+            None gives phi^(1) alone.
+        fields (MaterialFields, optional): prebuilt material fields of ``rho``. Defaults to None (built here).
+
+    Returns:
+        Tensor: [G, (L+1)^2, 4, Rc, Cc, Sc] new accumulator.
+
+    Raises:
+        ValueError: if ``collided_moments`` has the wrong shape.
+    """
     fields = _material_fields_or_build(solver, rho, grid, fields)
     sweep_context = solver.sweep_context(fields.grid_coarse)
     first_collision_source = solver.first_collision_moment_source(fields, angle, phi_uncollided, sweep_context)
@@ -241,12 +222,25 @@ def accumulator_update_operator(solver: ScatterSolver, rho: Tensor, grid: Grid, 
 def project_scatter(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float, phi_uncollided: Tensor,
                     collided_moments: Tensor, fields: Optional[MaterialFields] = None,
                     quadrature: Optional[Quadrature] = None) -> dict[str, Tensor]:
-    """Total scatter image (first order + multiple collision) in ONE collapsed-cone pass, exactly
-    `ScatterSolver.scatter_image`: the first-collision source of phi_uncollided [G, Rq, Cq, Sq] (the quadrature
-    points) and the multiple-collision source of the collided moments collided_moments [G, (L+1)^2, 4, Rc, Cc, Sc]
-    (cell mean) share tau_down and one projection per direction chunk. quadrature: the collapsed-cone direction set
-    (default: the solver's `cone_quadrature`). Returns the image dict: fluence, planar_fluence, signal_per_group
-    [G, Rd, Cd], signal [Rd, Cd]."""
+    """Total scatter image (first order and multiple collision) of one view in one collapsed-cone pass.
+
+    Args:
+        solver (ScatterSolver): the scatter solver.
+        rho (Tensor): [M, R, C, S] densities in g/cm^3 of the M library materials on ``grid``; unused when
+            ``fields`` is given.
+        grid (Grid): the fine (reconstruction) grid.
+        angle (float): view angle in rad.
+        phi_uncollided (Tensor): [G, Rq, Cq, Sq] uncollided fluence at the quadrature points
+            (``uncollided_operator``).
+        collided_moments (Tensor): [G, (L+1)^2, 4, Rc, Cc, Sc] collided moments Phi (their cell means are used).
+        fields (MaterialFields, optional): prebuilt material fields of ``rho``. Defaults to None (built here).
+        quadrature (Quadrature, optional): collapsed-cone direction set. Defaults to None (the solver's
+            ``cone_quadrature``).
+
+    Returns:
+        dict[str, Tensor]: the image of ``ScatterSolver.scatter_image``: ``fluence``, ``planar_fluence``,
+            ``signal_per_group`` [G, Rd, Cd] and ``signal`` [Rd, Cd].
+    """
     fields = _material_fields_or_build(solver, rho, grid, fields)
     scatter_source_moments = solver.multiple_collision_source_moments(
         fields, collided_moments.to(solver.device, solver.dtype))
@@ -255,31 +249,50 @@ def project_scatter(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float
 
 def citrus_step(solver: ScatterSolver, state: CitrusState, rho: Tensor, grid: Grid,
                 angle: float, fields: Optional[MaterialFields] = None) -> tuple[Tensor, Tensor, CitrusState]:
-    """One CITRUS scatter step for one view:
+    """One CITRUS scatter step of one view from the densities ``rho``.
 
-        phi_UC = uncollided_operator;
-        Phi    = accumulator_update_operator(phi_UC, Phi_previous)
-               (= first_collision_operator(phi_UC) + multiple_collision_operator(Phi_previous), one sweep);
-        s      = project_scatter(phi_UC, Phi)
+    The step computes the uncollided fluence, the new accumulator ``phi^(1) + K Phi`` in one sweep and the scatter
+    signal; with the densities held fixed, N steps equal N source iterations.
 
-    With the densities held fixed, N steps give Phi^(N) = sum_{n=1}^{N} K^{n-1} phi^(1), K = sweep o scatter, i.e.
-    exactly the source iteration after N iterations, so the recursion converges to `ScatterSolver.solve_view`.
-    rho [M, R, C, S] on grid (M library materials, `utilities.attenuation_to_densities`); angle must match
-    state.angle once set. Returns (scatter_signal [Rd, Cd], primary_signal [Rd, Cd], new state). The input state is
-    not modified; the returned state holds the new accumulator. fields: precomputed `solver.material_fields(rho,
-    grid)` (the densities are shared by every view of an outer iteration, so the caller may build them once); None
-    builds them here.
+    Args:
+        solver (ScatterSolver): the scatter solver.
+        state (CitrusState): state of the view; not modified.
+        rho (Tensor): [M, R, C, S] densities in g/cm^3 of the M library materials on ``grid``; unused when ``fields``
+            is given.
+        grid (Grid): the fine (reconstruction) grid.
+        angle (float): view angle in rad; must equal ``state.angle`` once that is set.
+        fields (MaterialFields, optional): prebuilt ``solver.material_fields(rho, grid)``, shared by the views of an
+            outer iteration. Defaults to None (built here).
+
+    Returns:
+        (Tensor, Tensor, CitrusState): scatter signal [Rd, Cd], Siddon primary signal [Rd, Cd] and the new state.
+
+    Raises:
+        ValueError: if ``angle`` differs from ``state.angle``.
     """
     return citrus_view_step(solver, state, _material_fields_or_build(solver, rho, grid, fields), angle)
 
 
 def citrus_view_step(solver: ScatterSolver, state: CitrusState, fields: MaterialFields, angle: float, *,
                      primary: bool = True) -> tuple[Tensor, Optional[Tensor], CitrusState]:
-    """`citrus_step` from prebuilt density fields: `solver.material_fields(rho, grid)` or, as in the CITRUS loop,
-    `solver.material_fields_from_attenuation(X, grid, density_model)` (no fine density volume). primary: also trace
-    the view's primary with the solver (`ScatterSolver.primary`, Siddon); False returns None in its place (the loop
-    computes the primaries of all views at once instead, `primary_signals`). Returns
-    (scatter_signal [Rd, Cd], primary_signal [Rd, Cd] or None, new state); the input state is not modified."""
+    """CITRUS scatter step of one view from prebuilt material fields, optionally without the primary.
+
+    Args:
+        solver (ScatterSolver): the scatter solver.
+        state (CitrusState): state of the view; not modified.
+        fields (MaterialFields): ``solver.material_fields(rho, grid)`` or, as in the CITRUS loop,
+            ``solver.material_fields_from_attenuation(X, grid, density_model)``.
+        angle (float): view angle in rad; must equal ``state.angle`` once that is set.
+        primary (bool, optional): also trace the view's primary with the solver (``ScatterSolver.primary``, Siddon).
+            Defaults to True.
+
+    Returns:
+        (Tensor, Tensor or None, CitrusState): scatter signal [Rd, Cd], primary signal [Rd, Cd] (None when
+            ``primary`` is False) and the new state.
+
+    Raises:
+        ValueError: if ``angle`` differs from ``state.angle``.
+    """
     if state.angle is not None and abs(float(state.angle) - float(angle)) > 1e-12:
         raise ValueError(f"state belongs to angle {state.angle}, got {angle}")
     grid = fields.grid_fine
@@ -310,26 +323,28 @@ def primary_signals(solver: ScatterSolver, fields: MaterialFields, angles: Union
                     projector: ViewChunkProjector, views_per_chunk: Optional[int] = None,
                     out: Optional[Tensor] = None,
                     quantity: Literal["signal", "planar_fluence"] = "signal") -> Tensor:
-    """Primary signals [V, Rd, Cd] of every view, one fine material map at a time:
+    """Primary signals of every view from MBIRTORCH projections of the material density maps.
 
-        P_m[v] = projector(rho_m)[v]   (g/cm^2; `projector.project` of the density map of material m,
-                                        `fields.fine_material`)
-        p[v]   = solver.primary_from_path_lengths(P[:, v], materials, angles[v])["signal"]
+    The path lengths ``P_m = A rho_m`` in g/cm^2 of the materials present are projected one material at a time in chunks
+    of views, and ``ScatterSolver.primary_from_path_lengths`` turns them into the primary of each view.
 
-    i.e. the solver's primary (fine-energy transmission, inverse square, source, detector and grid responses) on the
-    line integrals of `projector`, a `recon.mbir_bridge.ViewChunkProjector` (MBIRTORCH's separable-footprint
-    pixel-averaged line integrals, the reconstruction's operator A; all views of a chunk in one projection). It differs
-    from the solver's Siddon primary (`ScatterSolver.primary`, one ray to each pixel center) mainly on the pixels whose
-    rays graze a face of the object, where a center ray and a pixel average differ. Only the materials present
-    are projected (`fields.fine_materials`, or `uncollided.present_materials(rho_fine)`). The views are processed in
-    chunks of consecutive views so that the path lengths [M', V_chunk, Rd, Cd] (float32) and the projection being
-    copied stay within one sinogram: views_per_chunk None = max(1, V // (M' + 1)) (M' = number of materials
-    projected); each chunk evaluates the material maps once (cheap next to the projections; MBIRTORCH uses a cached
-    sub-model over the chunk's angles). The solver's sub-pixel sampling (primary_samples_per_pixel_axis) does not
-    apply: the projector already averages the line integral over the pixel. angles [V] (rad) must be the projector's
-    views. out: optional [V, Rd, Cd] tensor to fill. quantity:
-    "signal" (default, the detector signal, keV/cm^2) or "planar_fluence" (summed over the groups, photons/cm^2; the
-    denominator of the synthetic data's SPR, `utilities.synthesize_cone_beam_data`)."""
+    Args:
+        solver (ScatterSolver): the scatter solver (spectrum, detector and grid responses).
+        fields (MaterialFields): material fields of the current densities.
+        angles (Sequence[float] or ndarray): [V] view angles in rad; must be the views of ``projector``.
+        projector (ViewChunkProjector): MBIRTORCH projector of the reconstruction grid over the same views.
+        views_per_chunk (int, optional): views per projection chunk. Defaults to None (``max(1, V // (M' + 1))`` with
+            M' the number of materials projected).
+        out (Tensor, optional): [V, Rd, Cd] tensor to fill. Defaults to None (allocated).
+        quantity (str, optional): ``"signal"`` for the detector signal in keV/cm^2 or ``"planar_fluence"`` for the
+            planar fluence summed over the groups in photons/cm^2. Defaults to "signal".
+
+    Returns:
+        Tensor: [V, Rd, Cd] primary signal (or planar fluence) of every view.
+
+    Raises:
+        ValueError: if ``quantity`` is unknown or ``angles`` are not the projector's views.
+    """
     if quantity not in ("signal", "planar_fluence"):
         raise ValueError(f"quantity must be 'signal' or 'planar_fluence', got {quantity!r}")
     angle_array = np.asarray(angles, dtype=np.float64).reshape(-1)
@@ -372,17 +387,18 @@ def primary_signals(solver: ScatterSolver, fields: MaterialFields, angles: Union
 
 @dataclass
 class DensityModel:
-    """X (1/cm, MBIR's monoenergetic attenuation at E_eff) -> rho [M, ...] (g/cm^3, the library's M reference materials,
-    `library.materials`: by default air, lung, adipose, water, muscle, soft tissue, cortical bone; any set chosen with
-    `SolverConfig.materials`) for the solver: `utilities.attenuation_to_densities` (the interpolating model at E_eff:
-    the two reference materials whose nominal attenuations bracket X, at most two per voxel, a pure-bone voxel stays
-    pure bone;
-    below the lowest reference material that reference material alone of reduced density, above the highest that
-    reference material alone, denser) after
-    clamping X at 0 (FDK undershoot, noise). `last_negative_fraction` = fraction of voxels clamped in the last call
-    (`__call__` or `negative_fraction`). `material(X, m)` evaluates one material's map [R, C, S] (bit for bit the row
-    m of the full model, `utilities.attenuation_to_density`): the `scatter_solver.MaterialDensityModel` of
-    `ScatterSolver.material_fields_from_attenuation`, which never forms the [M, R, C, S] volume."""
+    """Density model of the solver: MBIR's attenuation X in 1/cm to the densities rho of the reference materials.
+
+    The interpolating model at E_eff (``utilities.attenuation_to_densities``) is applied to X clamped at 0; ``material``
+    evaluates one material's map without forming the [M, R, C, S] volume.
+
+    Attributes:
+        library (MultigroupLibrary): solver library whose reference materials ``library.materials`` define the model.
+        energy_kev (float): effective energy E_eff in keV of MBIR's monoenergetic attenuation.
+        last_negative_fraction (float): fraction of the voxels clamped at 0 in the last call of ``__call__`` or
+            ``negative_fraction``. Defaults to 0.0.
+        slab_voxels (int): voxels per slab of ``material`` and ``negative_fraction``. Defaults to ``1 << 22``.
+    """
 
     library: MultigroupLibrary
     energy_kev: float
@@ -391,26 +407,56 @@ class DensityModel:
 
     @classmethod
     def from_library(cls, library: MultigroupLibrary, energy_kev: Optional[float] = None) -> "DensityModel":
-        """The model of `library` (its reference materials `library.materials` and their nominal densities): E_eff =
-        energy_kev, or the spectrum-mean energy of the library (63.03 keV for the default spectrum)."""
+        """Density model of a library at an effective energy.
+
+        Args:
+            library (MultigroupLibrary): solver library with the reference materials and their nominal densities.
+            energy_kev (float, optional): effective energy E_eff in keV. Defaults to None (the spectrum-mean energy of
+                the library, ``utilities.effective_energy``).
+
+        Returns:
+            DensityModel: the density model.
+        """
         return cls(library, effective_energy(library) if energy_kev is None else float(energy_kev))
 
     def __call__(self, X: Tensor) -> Tensor:
-        """rho [M, ...] of X [...] (all materials at once)."""
+        """Densities of all reference materials of X; also sets ``last_negative_fraction``.
+
+        Args:
+            X (Tensor): [...] attenuation in 1/cm at E_eff; negative values are clamped at 0.
+
+        Returns:
+            Tensor: [M, ...] densities in g/cm^3.
+        """
         self.last_negative_fraction = float((X < 0).float().mean())
         return attenuation_to_densities(self.library, X.clamp_min(0), self.energy_kev)
 
     def _slabs(self, X: Tensor) -> list[slice]:
+        """Slices along the first axis of X with about ``slab_voxels`` voxels each.
+
+        Args:
+            X (Tensor): [...] volume.
+
+        Returns:
+            list[slice]: slices covering the first axis of X.
+        """
         voxels_per_index = max(1, int(np.prod(X.shape[1:]))) if X.dim() > 1 else 1
         indices_per_slab = max(1, int(self.slab_voxels) // voxels_per_index)
         num_indices = int(X.shape[0]) if X.dim() else 1
         return [slice(i, i + indices_per_slab) for i in range(0, num_indices, indices_per_slab)]
 
     def material(self, X: Tensor, m: int) -> Tensor:
-        """The density map [...] (g/cm^3) of library material m of X [...] (1/cm): `__call__(X)[m]` bit for bit,
-        without the other materials. Evaluated slab by slab along the first axis (about `slab_voxels` voxels per slab,
-        `utilities.attenuation_to_density`) into the result, so that the only full-size temporary is the result
-        itself (the elementwise model gives the same values in any slab layout)."""
+        """Density map of one library material of X, bit for bit ``self(X)[m]`` without the other materials.
+
+        The map is evaluated slab by slab along the first axis, so the result is the only full-size temporary.
+
+        Args:
+            X (Tensor): [...] attenuation in 1/cm at E_eff.
+            m (int): index of the library material.
+
+        Returns:
+            Tensor: [...] density in g/cm^3 of material m.
+        """
         if X.dim() == 0:
             return attenuation_to_density(self.library, X, m, self.energy_kev)
         out = torch.empty_like(X)
@@ -419,8 +465,14 @@ class DensityModel:
         return out
 
     def negative_fraction(self, X: Tensor) -> float:
-        """Fraction of the voxels of X below 0 (clamped by the model); also stored in last_negative_fraction.
-        Counted slab by slab (no temporary of X's size)."""
+        """Fraction of the voxels of X below 0, counted slab by slab; also stored in ``last_negative_fraction``.
+
+        Args:
+            X (Tensor): [...] attenuation in 1/cm.
+
+        Returns:
+            float: fraction of the voxels below 0.
+        """
         if X.dim() == 0:
             count = int(X < 0)
         else:
@@ -437,15 +489,29 @@ _FLOAT16_TARGET = 2.0 ** 14  # |q| <= 16384 (< 65504): the per-slice maximum map
 
 
 class StateStore:
-    """Compact storage of one CITRUS accumulator Phi [G, N, 4, Rc, Cc, Sc] per view (N = (L+1)^2 spherical-harmonic
-    moments): the linear-discontinuous cell mean only, in float16 with one scale per (group, moment) (the moments are
-    ~1e-6 per source photon/sr: plain float16 would underflow), i.e. 1/8 of the float32 bytes.
-    `put(slot, accumulator)` encodes a float32 device tensor; `get(slot)` returns the decoded float32 tensor of the
-    full shape on `device` (zero linear-discontinuous slopes) or None before the first put.
+    """Compact storage of one CITRUS accumulator per view: the linear-discontinuous cell mean in scaled float16.
 
-    location: "gpu" (default when the total fits `gpu_budget_mib`) or "cpu" (pinned host memory when the total is at
-    most `pinned_memory_limit_gib`, else pageable); "auto" chooses. `pinned` tells whether the host buffers are
-    pinned. `transfer_seconds` accumulates the time spent in put / get (synchronized on CUDA)."""
+    ``put`` stores an accumulator [G, N, 4, Rc, Cc, Sc] (N = (L+1)^2 moments) with one scale per group and moment, and
+    ``get`` returns it as float32 with zero linear-discontinuous slopes.
+
+    Args:
+        num_slots (int): number of stored accumulators (views).
+        full_shape (Sequence[int]): accumulator shape [G, N, 4, Rc, Cc, Sc].
+        device (torch.device or str): device of the accumulators passed to ``put`` and returned by ``get``.
+        location (str, optional): ``"gpu"``, ``"cpu"`` (host memory) or ``"auto"`` (the GPU when the total fits
+            ``gpu_budget_mib`` on a CUDA device). Defaults to "auto".
+        gpu_budget_mib (float, optional): largest total in MiB kept on the GPU by ``"auto"``. Defaults to 2600.0.
+        pinned_memory_limit_gib (float, optional): largest total in GiB stored in pinned host memory. Defaults to 8.0.
+
+    Attributes:
+        location (str): ``"gpu"`` or ``"cpu"``, where the accumulators are stored.
+        pinned (bool): whether the host buffers are pinned.
+        stored_shape (tuple[int, ...]): stored shape [G, N, 1, Rc, Cc, Sc].
+        transfer_seconds (float): seconds spent in ``put`` and ``get`` (synchronized on CUDA).
+
+    Raises:
+        ValueError: if ``full_shape`` does not have six axes or ``location`` is unknown.
+    """
 
     def __init__(self, num_slots: int, full_shape: Sequence[int], device, location: str = "auto",
                  gpu_budget_mib: float = 2600.0, pinned_memory_limit_gib: float = 8.0) -> None:
@@ -469,18 +535,30 @@ class StateStore:
 
     @property
     def bytes_per_view(self) -> int:
+        """Stored bytes of one accumulator, its scales included."""
         G, N = self.full_shape[:2]
         return int(np.prod(self.stored_shape)) * 2 + G * N * 4
 
     @property
     def total_bytes(self) -> int:
+        """Stored bytes of all accumulators."""
         return self.bytes_per_view * self.num_slots
 
     def _sync(self) -> None:
+        """Wait for the queued work of the device when it is a CUDA device."""
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
     def put(self, slot: int, accumulator: Tensor) -> None:
+        """Store an accumulator in a slot as its cell mean in scaled float16.
+
+        Args:
+            slot (int): slot (view) index in [0, num_slots).
+            accumulator (Tensor): [G, N, 4, Rc, Cc, Sc] accumulator.
+
+        Raises:
+            ValueError: if the shape of ``accumulator`` is not ``full_shape``.
+        """
         if tuple(accumulator.shape) != self.full_shape:
             raise ValueError(f"accumulator must be {self.full_shape}, got {tuple(accumulator.shape)}")
         self._sync()
@@ -503,6 +581,15 @@ class StateStore:
         self.transfer_seconds += time.perf_counter() - t0
 
     def get(self, slot: int) -> Optional[Tensor]:
+        """Decoded accumulator of a slot, or None before its first ``put``.
+
+        Args:
+            slot (int): slot (view) index in [0, num_slots).
+
+        Returns:
+            Tensor or None: [G, N, 4, Rc, Cc, Sc] float32 accumulator on ``device`` with zero linear-discontinuous
+                slopes.
+        """
         if self._data[slot] is None:
             return None
         self._sync()
@@ -516,10 +603,17 @@ class StateStore:
         return full
 
     def close(self) -> None:
+        """Release the stored accumulators."""
         self._data = [None] * self.num_slots
         self._scale = [None] * self.num_slots
 
     def describe(self) -> dict:
+        """Description of the storage for the diagnostics.
+
+        Returns:
+            dict: ``location``, ``pinned``, ``stored_shape``, ``full_shape``, ``bytes_per_view``, ``num_views`` and
+                ``total_gib``.
+        """
         return {"location": self.location, "pinned": self.pinned, "stored_shape": list(self.stored_shape),
                 "full_shape": list(self.full_shape), "bytes_per_view": self.bytes_per_view,
                 "num_views": self.num_slots, "total_gib": self.total_bytes / 2 ** 30}
@@ -531,59 +625,34 @@ class StateStore:
 
 @dataclass
 class CitrusConfig:
-    """Parameters of the CITRUS reconstruction loop (the scatter solver has its own SolverConfig).
+    """Parameters of the CITRUS reconstruction loop (the scatter solver has its own ``SolverConfig``).
 
-    num_outer_iterations : outer iterations N (each = one scatter step per view + ONE MBIR iteration at schedule
-                     position k)
-    energy_kev     : effective energy E_eff of the density model (None: spectrum mean of the solver's library)
-    min_counts     : lower clamp of the (corrected) counts before the log
-    base_seed      : numpy's global RNG is seeded with [base_seed, k] before MBIR iteration k (MBIRTORCH draws the
-                     partitions from it), so runs with identical inputs give identical MBIR sequences
-    gpu_state_budget_mib : the per-view accumulators stay on the GPU while their total is below this, else they go to
-                     (pinned) host memory (`StateStore`)
-    pinned_memory_limit_gib : largest pinned host allocation for the accumulators
-    verbose        : print one line per outer iteration
-    scatter_view_stride : n >= 1. 1 (default): the scatter step runs on every view. n > 1: only on every n-th view
-                     (views 0, n, 2n, ...: uniform over the angular range, starting at view 0; `scatter_view_indices`);
-                     the other views' scatter signal is interpolated in angle (scatter_view_interpolation_order) and
-                     divided by their primary (`primary_signals`, every view). Only the computed views keep an
-                     accumulator (1/n of the state memory).
-    scatter_view_interpolation_order : the per-pixel interpolation in angle of the skipped views' scatter signal
-                     from the computed views, circular in angle for a full rotation and along the arc for a short scan
-                     (the views beyond the last computed view hold its value; ignored at stride 1;
-                     `angular_neighbors`):
-                       3 (default)  cubic Catmull-Rom on the 4 nearest computed views: interpolating, continuous first
-                                    derivative, exact for polynomials of angle up to degree 2 on uniformly spaced
-                                    computed views (no local 4-point C1 scheme is exact for cubics)
-                       2            quadratic: 3-point Lagrange centered on the nearest computed view (exact for
-                                    quadratics of angle on any spacing; jumps where the nearest view changes)
-                       1            linear between the 2 bracketing computed views
-                       0            nearest computed view (zero-order hold)
-                       None         diagnostics only: no interpolation; the skipped views keep their most recent
-                                    computed scatter if any, else zero, i.e. with the fixed view subset they are NOT
-                                    scatter-corrected
-    scatter_every  : n >= 1. 1 (default): a scatter step at every outer iteration. n > 1: the scatter stage runs at
-                     the outer iterations 0, n, 2n, ... only and the previous scatter-to-primary ratio is reused in
-                     between (n MBIR iterations per scatter step; the accumulators keep their age). For a fixed number
-                     of scatter steps, spreading them over n times more outer iterations costs little (an MBIR
-                     iteration is cheap next to a scatter stage) and improves the reconstruction (module docstring).
-    primary_views_per_chunk : views per chunk of `primary_signals` (the MBIRTORCH projections of the material maps
-                     that give every view's primary signal, module docstring); None (default): max(1, V // (M' + 1))
-                     with M' the materials present, so the per-material path lengths [M', chunk, Rd, Cd] and the
-                     projection being copied stay within one sinogram [V, Rd, Cd]
-    resume_error_sinogram : keep MBIRTORCH's error sinogram between outer iterations (one sinogram, stored as -A X)
-                     and resume from it instead of recomputing y_c - A X with a forward projection per call (module
-                     docstring; equal to float rounding)
-    grouping_object_size : the object size (cm) for the energy groups of the solver's "scattered_fluence" rule
-                     (`SolverConfig.grouping_object_size_cm`): "auto" (default) measures it on the initial
-                     reconstruction (`utilities.object_size_cm` of the FDK volume, the mean chord 4 V / S of the
-                     object), a number (cm) sets it. With the solver's SolverConfig.grouping_medium "auto" the
-                     medium is measured on the FDK volume as well (`utilities.grouping_medium_estimate`: the mean
-                     densities of the reference materials over the object). Applied before the solver's library is
-                     built (a lazy solver, `ScatterSolver(None, ...)`, e.g. `utilities.wlab_solver`): the first
-                     scatter stage then builds the library for them (cached on disk per size and medium). A solver
-                     with a prebuilt library keeps its config (verbose prints a note). Ignored for the other group
-                     rules and explicit group edges
+    The options are described in docs/source/method.rst, "Options and secondary components".
+
+    Attributes:
+        num_outer_iterations (int): number N of outer iterations, each one scatter step per view and one MBIR iteration.
+            Defaults to 10.
+        energy_kev (float or None): effective energy E_eff in keV of the density model; None uses the spectrum mean of
+            the solver's library. Defaults to None.
+        min_counts (float): lower clamp of the (corrected) counts before the log. Defaults to 1.0.
+        base_seed (int): numpy's global random generator is seeded with ``[base_seed, k]`` before MBIR iteration k.
+            Defaults to 0.
+        gpu_state_budget_mib (float): largest total in MiB of the per-view accumulators kept on the GPU
+            (``StateStore``). Defaults to 2600.0.
+        pinned_memory_limit_gib (float): largest pinned host allocation in GiB for the accumulators. Defaults to 8.0.
+        verbose (bool): print one line per outer iteration. Defaults to False.
+        scatter_view_stride (int): the scatter step runs on the views 0, n, 2n, ... for stride n; the other views'
+            scatter is interpolated in angle. Defaults to 1.
+        scatter_view_interpolation_order (int or None): interpolation in angle of the skipped views' scatter: 3
+            Catmull-Rom, 2 quadratic, 1 linear, 0 nearest, None none (diagnostics). Defaults to 3.
+        scatter_every (int): the scatter stage runs at the outer iterations 0, n, 2n, ... for n; the previous
+            scatter-to-primary ratio is reused in between. Defaults to 1.
+        primary_views_per_chunk (int or None): views per chunk of ``primary_signals``; None keeps the path lengths
+            within one sinogram. Defaults to None.
+        resume_error_sinogram (bool): keep MBIRTORCH's error sinogram between outer iterations instead of recomputing
+            it. Defaults to True.
+        grouping_object_size (str or float): object size in cm of the solver's ``"scattered_fluence"`` energy groups;
+            ``"auto"`` measures it on the initial reconstruction. Defaults to "auto".
     """
 
     num_outer_iterations: int = 10
@@ -601,6 +670,11 @@ class CitrusConfig:
     grouping_object_size: Union[Literal["auto"], float] = "auto"
 
     def validate(self) -> None:
+        """Check the settings.
+
+        Raises:
+            ValueError: if a setting is out of range or of the wrong type.
+        """
         if self.num_outer_iterations < 1:
             raise ValueError("num_outer_iterations must be >= 1")
         if self.min_counts <= 0:
@@ -632,6 +706,15 @@ _TWO_PI = 2.0 * np.pi
 
 
 def _check_interpolation_order(order, allow_none: bool = True) -> None:
+    """Check a scatter-view interpolation order.
+
+    Args:
+        order (int or None): the order, one of ``SCATTER_VIEW_INTERPOLATION_ORDERS``.
+        allow_none (bool, optional): accept None. Defaults to True.
+
+    Raises:
+        ValueError: if ``order`` is not allowed.
+    """
     ok = (order is None and allow_none) or (
         not isinstance(order, bool) and isinstance(order, (int, np.integer)) and int(order) in (0, 1, 2, 3))
     if not ok:
@@ -640,8 +723,18 @@ def _check_interpolation_order(order, allow_none: bool = True) -> None:
 
 
 def scatter_view_indices(num_views: int, stride: int) -> np.ndarray:
-    """The views that get a scatter step at `stride`: 0, stride, 2 stride, ... < num_views (uniform over the angular
-    range of a uniformly sampled scan, starting at view 0). Stride 1 gives every view."""
+    """Views that get a scatter step at a view stride: 0, stride, 2 stride, ... below ``num_views``.
+
+    Args:
+        num_views (int): number of views V.
+        stride (int): view stride, at least 1.
+
+    Returns:
+        ndarray: [Vc] indices of the computed views.
+
+    Raises:
+        ValueError: if ``num_views`` or ``stride`` is below 1.
+    """
     if int(stride) < 1 or int(num_views) < 1:
         raise ValueError(f"need num_views >= 1 and stride >= 1, got {num_views}, {stride}")
     return np.arange(0, int(num_views), int(stride))
@@ -649,26 +742,25 @@ def scatter_view_indices(num_views: int, stride: int) -> np.ndarray:
 
 def angular_neighbors(computed_angles: Union[Sequence[float], np.ndarray], angle: float,
                       order: Literal[0, 1, 2, 3] = 3, circular: bool = True) -> list[tuple[int, float]]:
-    """Interpolation neighbors and weights of a view at `angle` (rad) from views at `computed_angles` (rad, any order,
-    any 2 pi offset), circular in angle (period 2 pi). circular=False (a scan over less than a full rotation): the
-    angles are taken as given (unwrapped along the arc), the neighbors stay among the computed views (the
-    cubic's ghost nodes beyond the end views are linear extrapolations, so it stays exact for linear functions of
-    the angle; the quadratic stencil shifts inside) and an angle outside [min, max] of the computed angles gets the
-    nearest end view with weight 1. Returns [(index into computed_angles, weight), ...], weights
-    summing to 1. With j0, j1 the computed views bracketing the angle (wrapping from the last computed angle to the
-    first + 2 pi) and t in [0, 1) its fractional position between them:
+    """Interpolation neighbors and weights of a view at ``angle`` from the views at ``computed_angles``.
 
-      0 : nearest computed view (zero-order hold; t = 1/2 goes to j0)
-      1 : linear, weights 1 - t, t on j0, j1
-      2 : quadratic, 3-point Lagrange on the nearest computed view and its two neighbors, at their actual angles:
-          exact for quadratics of angle on any spacing; discontinuous where the nearest view changes
-      3 : cubic Catmull-Rom on j0 - 1, j0, j1, j1 + 1 with parameter t: interpolating, continuous first derivative
-          (tangent (f[j1] - f[j0 - 1]) / 2 per interval at j0), exact for polynomials of angle up to degree 2 on
-          uniformly spaced computed views and for linear ones on any spacing; NOT exact for cubics (no local 4-point
-          C1 interpolant is); its outer weights are negative
+    Order 0 takes the nearest computed view, 1 is linear between the two bracketing views, 2 is the three-point
+    Lagrange interpolant on the nearest view and its two neighbors and 3 is Catmull-Rom on the four nearest views; with
+    fewer than ``order + 1`` computed views the order is lowered.
 
-    With fewer computed views than the order needs (order + 1), the order is lowered to (number of computed views) - 1;
-    one computed view gets weight 1."""
+    Args:
+        computed_angles (Sequence[float] or ndarray): [Vc] angles in rad of the computed views, in any order.
+        angle (float): angle in rad of the view to interpolate.
+        order (int, optional): interpolation order 0, 1, 2 or 3. Defaults to 3.
+        circular (bool, optional): True for a full rotation (period 2 pi); False interpolates along the arc of a short
+            scan and holds the end views outside it. Defaults to True.
+
+    Returns:
+        list[tuple[int, float]]: (index into ``computed_angles``, weight) pairs; the weights sum to 1.
+
+    Raises:
+        ValueError: if ``order`` is not 0, 1, 2 or 3, or there are no computed views.
+    """
     _check_interpolation_order(order, allow_none=False)
     order = int(order)
     computed_array = np.asarray(computed_angles, dtype=np.float64).reshape(-1)
@@ -738,8 +830,14 @@ def angular_neighbors(computed_angles: Union[Sequence[float], np.ndarray], angle
 
 
 def full_rotation(angles: Union[Sequence[float], np.ndarray]) -> bool:
-    """True when the views cover the circle without a large gap: the largest angular gap between consecutive views
-    (circularly, mod 2 pi) is at most 1.5 times the median gap. False for a short scan (the missing arc is the gap)."""
+    """Whether the views cover the circle: their largest circular gap is at most 1.5 times the median gap.
+
+    Args:
+        angles (Sequence[float] or ndarray): [V] view angles in rad.
+
+    Returns:
+        bool: True for a full rotation, False for a short scan.
+    """
     a = np.sort(np.mod(np.asarray(angles, dtype=np.float64).reshape(-1), _TWO_PI))
     if a.size < 3:
         return a.size == 2 and abs(float(a[1] - a[0]) - np.pi) < 1e-9
@@ -748,7 +846,14 @@ def full_rotation(angles: Union[Sequence[float], np.ndarray]) -> bool:
 
 
 def _unwrap_arc(angles: np.ndarray) -> np.ndarray:
-    """Angles of a short scan unwrapped along its arc: the arc starts after the largest circular gap."""
+    """Angles of a short scan unwrapped along its arc, which starts after the largest circular gap.
+
+    Args:
+        angles (ndarray): [V] view angles in rad.
+
+    Returns:
+        ndarray: [V] unwrapped angles in rad.
+    """
     a = np.mod(angles, _TWO_PI)
     srt = np.sort(a)
     gaps = np.diff(np.concatenate([srt, srt[:1] + _TWO_PI]))
@@ -758,11 +863,23 @@ def _unwrap_arc(angles: np.ndarray) -> np.ndarray:
 
 def interpolation_weights(angles: Union[Sequence[float], np.ndarray], computed: Union[Sequence[int], np.ndarray],
                           order: Literal[0, 1, 2, 3] | None = 3, circular: Optional[bool] = None) -> np.ndarray:
-    """The [V, Vc] matrix M with s_all = M s_c: row v holds the `angular_neighbors` weights of view v over the
-    computed views (indices `computed` into angles); the computed views' own rows are one-hot (they keep their value);
-    order None gives zero rows for the skipped views. circular: None (default) = `full_rotation(angles)`; False
-    interpolates along the arc of a short scan (angles unwrapped from the end of the missing arc), holding the end
-    computed views beyond them."""
+    """Interpolation matrix ``M`` with ``s_all = M s_computed`` from the ``angular_neighbors`` weights.
+
+    The rows of the computed views are one-hot; with order None the rows of the skipped views are zero.
+
+    Args:
+        angles (Sequence[float] or ndarray): [V] view angles in rad.
+        computed (Sequence[int] or ndarray): [Vc] distinct indices of the computed views into ``angles``.
+        order (int or None, optional): interpolation order 0 to 3, or None for no interpolation. Defaults to 3.
+        circular (bool, optional): interpolate circularly in angle; False interpolates along the arc of a short scan.
+            Defaults to None (``full_rotation(angles)``).
+
+    Returns:
+        ndarray: [V, Vc] interpolation weights.
+
+    Raises:
+        ValueError: if ``computed`` holds repeated or out-of-range indices, or ``order`` is not allowed.
+    """
     angle_array = np.asarray(angles, dtype=np.float64).reshape(-1)
     computed_index = np.asarray(computed, dtype=np.int64).reshape(-1)
     if (computed_index.size == 0 or computed_index.min() < 0 or computed_index.max() >= angle_array.size
@@ -787,12 +904,26 @@ def interpolate_scatter(computed_scatter: Tensor, angles: Union[Sequence[float],
                         computed: Union[Sequence[int], np.ndarray],
                         order: Literal[0, 1, 2, 3] | None = 3,
                         previous: Optional[Tensor] = None, weights: Optional[Tensor] = None) -> Tensor:
-    """Every view's scatter [V, ...] from the computed views' scatter computed_scatter [Vc, ...] (any per-view image,
-    any units; V views, Vc of them computed): the computed views keep computed_scatter exactly; a skipped view v gets
-    sum_j w_vj computed_scatter[j] (`angular_neighbors`, per pixel), clamped at 0 (the order 2 and 3 weights can be
-    negative). order None: no interpolation, the skipped views keep their
-    value in `previous` [V, ...] (their most recent estimate) if given, else zero. weights: a precomputed
-    `interpolation_weights(angles, computed, order)` as a tensor (saves rebuilding it every outer iteration)."""
+    """Scatter of every view from the scatter of the computed views, interpolated in angle per pixel.
+
+    The computed views keep their values exactly; a skipped view v gets ``max(0, sum_j w_vj s_j)``.
+
+    Args:
+        computed_scatter (Tensor): [Vc, ...] per-view images of the computed views (any units).
+        angles (Sequence[float] or ndarray): [V] view angles in rad.
+        computed (Sequence[int] or ndarray): [Vc] indices of the computed views into ``angles``.
+        order (int or None, optional): interpolation order 0 to 3; None keeps the skipped views' values of
+            ``previous``, or zero. Defaults to 3.
+        previous (Tensor, optional): [V, ...] most recent scatter of every view, used by order None. Defaults to None.
+        weights (Tensor, optional): [V, Vc] precomputed ``interpolation_weights(angles, computed, order)``.
+            Defaults to None (computed here).
+
+    Returns:
+        Tensor: [V, ...] scatter of every view.
+
+    Raises:
+        ValueError: if the shapes of ``computed_scatter``, ``previous`` or ``weights`` do not match the views.
+    """
     angle_array = np.asarray(angles, dtype=np.float64).reshape(-1)
     computed_index = np.asarray(computed, dtype=np.int64).reshape(-1)
     V, Vc = angle_array.size, computed_index.size
@@ -825,9 +956,16 @@ def interpolate_scatter(computed_scatter: Tensor, angles: Union[Sequence[float],
 
 
 def estimate_regularization(model, sinogram: Tensor, weights: Optional[Tensor] = None) -> dict:
-    """MBIRTORCH's automatic sigma_y / sigma_x / sigma_prox (`auto_set_regularization_params`, what the first `recon`
-    call would compute) for the line-integral sinogram [V, Rd, Cd] with `weights`; the values are then frozen in the
-    model (auto_regularize_flag False). Returns {"sigma_y", "sigma_x", "sigma_prox"}."""
+    """MBIRTORCH's automatic regularization of a sinogram, then frozen in the model.
+
+    Args:
+        model (ConeBeamModel): MBIRTORCH model.
+        sinogram (Tensor): [V, Rd, Cd] line integrals.
+        weights (Tensor, optional): [V, Rd, Cd] weights. Defaults to None.
+
+    Returns:
+        dict: the frozen ``sigma_y``, ``sigma_x`` and ``sigma_prox``.
+    """
     model.set_params(no_warning=True, auto_regularize_flag=True)
     model.auto_set_regularization_params(sinogram, weights=weights)
     model.set_params(auto_regularize_flag=False)
@@ -835,7 +973,12 @@ def estimate_regularization(model, sinogram: Tensor, weights: Optional[Tensor] =
 
 
 def apply_regularization(model, regularization: dict) -> None:
-    """Set the frozen sigma_y, sigma_x, sigma_prox and keep them (auto_regularize_flag False)."""
+    """Set a frozen regularization in the model (``auto_regularize_flag`` False).
+
+    Args:
+        model (ConeBeamModel): MBIRTORCH model.
+        regularization (dict): ``sigma_y``, ``sigma_x`` and ``sigma_prox``.
+    """
     model.set_params(no_warning=True, auto_regularize_flag=False,
                      **{k: float(regularization[k]) for k in REGULARIZATION_NAMES})
 
@@ -848,6 +991,11 @@ ScatterStage = Callable[[int, Tensor, dict], Tensor]
 
 
 def _sync(device: torch.device) -> None:
+    """Wait for the queued work of a CUDA device (nothing on another device).
+
+    Args:
+        device (torch.device): the device.
+    """
     if device.type == "cuda":
         torch.cuda.synchronize(device)
 
@@ -856,9 +1004,29 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
                 scatter_stage: Optional[ScatterStage], device: torch.device, *, regularization: Optional[dict],
                 init_recon: Optional[Tensor], model, callback, label: str,
                 after_initialization: Optional[Callable[[Tensor, dict], None]] = None) -> tuple[Tensor, dict]:
-    """The MBIR loop shared by citrus_recon and mbir_recon. scatter_stage(k, X_k, record) -> SPR [V, Rd, Cd] (or None
-    for no correction) is called before MBIR iteration k; after_initialization(X_0, info) once after the initial volume
-    (FDK or init_recon), before the first scatter stage."""
+    """MBIR loop of ``citrus_recon`` and ``mbir_recon``: per outer iteration a scatter stage and an MBIR iteration.
+
+    Args:
+        Y (Tensor): [V, Rd, Cd] measured counts.
+        I0 (float): flat-field counts per pixel.
+        angles (ndarray): [V] view angles in rad.
+        grid (Grid): reconstruction grid.
+        geometry (ConeGeometry): cone-beam geometry of the scan.
+        config (CitrusConfig): loop settings.
+        scatter_stage (callable or None): ``scatter_stage(k, X_k, record)`` returns the scatter-to-primary ratio
+            [V, Rd, Cd] before MBIR iteration k; None for no correction.
+        device (torch.device): device of the loop.
+        regularization (dict or None): frozen regularization; None estimates it on the first corrected sinogram.
+        init_recon (Tensor or None): [R, C, S] initial volume in 1/cm; None uses FDK of the uncorrected data.
+        model (ConeBeamModel or None): prebuilt MBIRTORCH model; None builds it.
+        callback (callable or None): ``callback(k, X_k, record)`` for the initial volume and every outer iteration.
+        label (str): prefix of the verbose lines.
+        after_initialization (callable, optional): ``after_initialization(X_0, info)``, called once after the initial
+            volume. Defaults to None.
+
+    Returns:
+        (Tensor, dict): reconstruction [R, C, S] in 1/cm and the info dict.
+    """
     config.validate()
     weights = Y / float(I0)
     measured_line_integrals = -torch.log(Y.clamp_min(config.min_counts) / float(I0))
@@ -945,6 +1113,19 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
 
 
 def _counts_and_angles(sinogram_counts, angles, device) -> tuple[Tensor, np.ndarray]:
+    """Measured counts as a float32 tensor and the view angles as a float64 array.
+
+    Args:
+        sinogram_counts (Tensor or ndarray): [V, Rd, Cd] measured counts.
+        angles (Sequence[float], ndarray or Tensor): [V] view angles in rad.
+        device (torch.device): device of the counts.
+
+    Returns:
+        (Tensor, ndarray): counts [V, Rd, Cd] and angles [V].
+
+    Raises:
+        ValueError: if the counts are not [V, rows, channels] for the V angles.
+    """
     Y = torch.as_tensor(sinogram_counts, dtype=torch.float32, device=device).contiguous()
     if isinstance(angles, Tensor):
         angles = angles.detach().cpu().numpy()
@@ -955,12 +1136,20 @@ def _counts_and_angles(sinogram_counts, angles, device) -> tuple[Tensor, np.ndar
 
 
 def _apply_grouping_estimates(solver: ScatterSolver, X: Tensor, grid: Grid, config: CitrusConfig) -> dict:
-    """Before the solver's library is built: set its grouping_object_size_cm from config.grouping_object_size ("auto":
-    `object_size_cm` of X, the initial volume) and, when its grouping_medium is "auto", grouping_medium to the mean
-    densities of the reference materials over the object (`grouping_medium_estimate` of X), for the
-    "scattered_fluence" rule without explicit edges. Returns the info entries grouping_object_size_cm (None for
-    another rule), grouping_medium (the medium in the solver's config afterwards) and grouping_applied (whether this
-    call changed the config; False for a prebuilt library, whose config stays)."""
+    """Set the solver's energy-group object size and medium from the initial volume.
+
+    This applies to the ``"scattered_fluence"`` group rule without explicit edges, before the solver's library is built.
+
+    Args:
+        solver (ScatterSolver): the scatter solver; its ``config`` is replaced.
+        X (Tensor): [R, C, S] initial volume in 1/cm.
+        grid (Grid): reconstruction grid.
+        config (CitrusConfig): loop settings (``grouping_object_size``, ``energy_kev``, ``verbose``).
+
+    Returns:
+        dict: ``grouping_object_size_cm``, ``grouping_medium`` and ``grouping_applied`` (whether the solver's config
+            changed).
+    """
     solver_config = solver.config
     if solver_config.group_edges_method != "scattered_fluence" or solver_config.group_edges_kev is not None:
         return {"grouping_object_size_cm": None, "grouping_medium": None, "grouping_applied": False}
@@ -988,6 +1177,14 @@ def _apply_grouping_estimates(solver: ScatterSolver, X: Tensor, grid: Grid, conf
 
 
 def _medium_text(medium) -> str:
+    """Printable text of a grouping medium.
+
+    Args:
+        medium (str or Sequence[tuple[str, float]]): a medium name, or (material name, density in g/cm^3) pairs.
+
+    Returns:
+        str: the text.
+    """
     if isinstance(medium, str):
         return medium
     return " + ".join(f"{name} {density:.3g} g/cm^3" for name, density in medium)
@@ -997,46 +1194,30 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
                  grid: Grid, geometry: ConeGeometry, solver: ScatterSolver, config: Optional[CitrusConfig] = None,
                  *, regularization: Optional[dict] = None, init_recon: Optional[Tensor] = None, model=None,
                  callback: Optional[Callable[[int, Tensor, dict], None]] = None) -> tuple[Tensor, dict]:
-    """CITRUS reconstruction (module docstring) of measured counts.
+    """CITRUS reconstruction of measured counts: MBIR with the scatter correction of the solver in the loop.
 
-    sinogram_counts [V, Rd, Cd]: measured counts Y (primary + scatter, flat-field I0 per pixel); angles [V] (rad);
-    grid / geometry: reconstruction grid and cone-beam geometry (MBIRTORCH conventions; also the solver's fine grid,
-    covered by its transport grid of solver.config.transport_cell_cm cells); solver: the ScatterSolver (its geometry,
-    detector and grid response describe the scanner; its device is used for everything); config: CitrusConfig
-    (default CitrusConfig()).
-    regularization: frozen {"sigma_y", "sigma_x", "sigma_prox"}; None estimates them once (MBIRTORCH's automatic
-    estimate) on the first scatter-corrected sinogram and freezes them. init_recon: initial volume [R, C, S]
-    (default: FDK of the uncorrected data). model: a prebuilt MBIRTORCH ConeBeamModel (`recon.mbir_bridge.
-    make_cone_model(grid, geometry, angles)`). callback(k, X_k, record) is called for the initial volume (k = 0) and
-    after every outer iteration.
+    The loop is described in docs/source/method.rst, "The CITRUS loop", and the info entries in docs/source/usage.rst,
+    "CITRUS".
 
-    Returns (recon [R, C, S] float32 on the solver device, info) with info:
-      records          per outer iteration (records[0] = the initial volume): outer_iteration (k), scatter_seconds,
-                       transfer_seconds, mbir_seconds, total_seconds, negative_fraction (voxels clamped by the density
-                       model), accumulator_change_mean / accumulator_change_max (relative accumulator change over the
-                       computed views), scatter_change_relative (mean |S_k - S_k-1| / mean |S_k| of the scatter-count
-                       estimate), gpu_peak_allocated_mib (peak allocated CUDA memory of the iteration, MiB)
-      spr              [V, Rd, Cd] the last scatter-to-primary ratio estimate
-      scatter_counts   [V, Rd, Cd] the last scatter-count estimate Y - Y_c
-      regularization   the frozen sigmas;  state: the accumulator storage (one slot per computed view);  init_recon,
-                       model, seconds, fdk_seconds
-      computed_views   [Vc] int array: the views with a scatter step (`scatter_view_indices`; every view at stride 1)
-      view_interpolated [V] bool array: True where the scatter is interpolated in angle (the skipped views at
-                       config.scatter_view_stride > 1 with an interpolation order), False where the scatter step
-                       computed it (and for the uncorrected skipped views of order None)
-      grouping_object_size_cm, grouping_medium  the object size (cm) and medium ((name, g/cm^3) pairs, or "auto"
-                       for an empty object mask) of the energy groups of the solver's library (CitrusConfig.
-                       grouping_object_size, SolverConfig.grouping_medium; None when the solver's group rule is not
-                       "scattered_fluence"); grouping_applied: whether citrus_recon set them (False for a prebuilt
-                       library); library_seconds: seconds to build (or load) a lazy solver's library in the first
-                       scatter stage
-    The records of a scatter stage hold primary_seconds (seconds for the primaries of all views, `primary_signals`,
-    included in scatter_seconds); with config.scatter_view_stride > 1 also interpolation_seconds (seconds per outer
-    iteration spent on the angular interpolation, included in scatter_seconds). The densities never exist as an
-    [M, R, C, S] volume: `ScatterSolver.material_fields_from_attenuation` with the `DensityModel` (module docstring).
-    Every record holds scatter_refreshed: True at the outer iterations with a scatter stage (all of them at
-    config.scatter_every = 1), False where the previous ratio was reused (then scatter_seconds ~ 0 and the accumulator
-    entries are absent).
+    Args:
+        sinogram_counts (Tensor or ndarray): [V, Rd, Cd] measured counts Y (primary plus scatter).
+        I0 (float): flat-field counts per pixel.
+        angles (Sequence[float] or ndarray): [V] view angles in rad.
+        grid (Grid): reconstruction grid (MBIRTORCH conventions), also the fine grid of the solver.
+        geometry (ConeGeometry): cone-beam geometry of the scan.
+        solver (ScatterSolver): scatter solver of the scanner; its device is used for everything.
+        config (CitrusConfig, optional): loop settings. Defaults to None (``CitrusConfig()``).
+        regularization (dict, optional): frozen ``sigma_y``, ``sigma_x`` and ``sigma_prox``. Defaults to None
+            (estimated once on the first corrected sinogram).
+        init_recon (Tensor, optional): [R, C, S] initial volume in 1/cm. Defaults to None (FDK of the uncorrected data).
+        model (ConeBeamModel, optional): prebuilt MBIRTORCH model (``recon.mbir_bridge.make_cone_model``). Defaults to
+            None.
+        callback (callable, optional): ``callback(k, X_k, record)``, called for the initial volume (k = 0) and after
+            every outer iteration. Defaults to None.
+
+    Returns:
+        (Tensor, dict): reconstruction [R, C, S] float32 in 1/cm on the solver's device, and the info dict (``records``
+            per outer iteration, ``spr``, ``scatter_counts``, ``regularization``, ``computed_views``, ...).
     """
     config = CitrusConfig() if config is None else config
     config.validate()
@@ -1139,12 +1320,31 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: Un
                spr: Optional[Union[Tensor, np.ndarray]] = None, regularization: Optional[dict] = None,
                init_recon: Optional[Tensor] = None, model=None, device=None,
                callback: Optional[Callable[[int, Tensor, dict], None]] = None) -> tuple[Tensor, dict]:
-    """The MBIR loop of `citrus_recon` without the scatter solver, for comparison: the same FDK initialization,
-    one warm-started MBIR iteration per outer iteration at schedule position k, the same weights W = Y / I0 and seeds.
+    """The MBIR loop of ``citrus_recon`` without the scatter solver: no correction, or a fixed correction.
 
-    spr None: no scatter correction (MBIR of -log(Y / I0)); spr [V, Rd, Cd]: a fixed correction Y_c = Y / (1 + spr)
-    (e.g. a scatter estimate from elsewhere). device: default the device of a tensor sinogram, else CUDA if available.
-    Other arguments and the returned (recon, info) as in `citrus_recon` (info has no accumulator entries).
+    Args:
+        sinogram_counts (Tensor or ndarray): [V, Rd, Cd] measured counts Y.
+        I0 (float): flat-field counts per pixel.
+        angles (Sequence[float] or ndarray): [V] view angles in rad.
+        grid (Grid): reconstruction grid.
+        geometry (ConeGeometry): cone-beam geometry of the scan.
+        config (CitrusConfig, optional): loop settings. Defaults to None (``CitrusConfig()``).
+        spr (Tensor or ndarray, optional): [V, Rd, Cd] fixed scatter-to-primary ratio, applied as ``Y / (1 + spr)``.
+            Defaults to None (no correction).
+        regularization (dict, optional): frozen ``sigma_y``, ``sigma_x`` and ``sigma_prox``. Defaults to None
+            (estimated once on the first sinogram).
+        init_recon (Tensor, optional): [R, C, S] initial volume in 1/cm. Defaults to None (FDK).
+        model (ConeBeamModel, optional): prebuilt MBIRTORCH model. Defaults to None.
+        device (torch.device or str, optional): device of the loop. Defaults to None (the device of a tensor sinogram,
+            else CUDA if available).
+        callback (callable, optional): ``callback(k, X_k, record)`` as in ``citrus_recon``. Defaults to None.
+
+    Returns:
+        (Tensor, dict): reconstruction [R, C, S] float32 in 1/cm and the info dict of ``citrus_recon`` without the
+            scatter-solver entries.
+
+    Raises:
+        ValueError: if ``spr`` does not have the shape of the sinogram.
     """
     config = CitrusConfig() if config is None else config
     if device is None:

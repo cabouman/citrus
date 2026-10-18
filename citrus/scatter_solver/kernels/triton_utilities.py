@@ -1,15 +1,9 @@
-"""Shared Triton helpers of the fused kernels (`ray_tracing_kernels.py`, `uncollided_kernels.py`, `sweep_kernels.py`).
+"""Shared Triton helpers of the fused kernels: the availability probe and the fast kernel launch.
 
-- `triton_available()`: compiles and runs a trivial probe kernel once per process and returns (usable, reason);
-  never raises. `CITRUS_DISABLE_TRITON=1` (`DISABLE_ENV_VAR`) is the kill switch: every kernel module then falls
-  back to its PyTorch path (backend "auto") or raises (backend "triton").
-- `launch(kernel, grid, args, constexprs, num_warps)`: launches a kernel compiled without value or alignment
-  specialization (`do_not_specialize*`) through its cached `CompiledKernel.run`, which skips the argument handling of
-  `JITFunction.run`. The binary is cached per (kernel, constexprs, num_warps, device). This uses
-  Triton's internal launcher signature, verified for triton 3.8 only; other versions (or
-  `CITRUS_TRITON_FAST_LAUNCH=0`) take the public launch path.
-
-`triton` / `tl` are None when the import fails (the error is reported by `triton_available()`).
+``triton_available`` runs a trivial probe kernel once per process; ``CITRUS_DISABLE_TRITON=1`` (``DISABLE_ENV_VAR``)
+turns every kernel off. ``launch`` launches a kernel through its cached compiled binary on triton 3.8, unless
+``CITRUS_TRITON_FAST_LAUNCH=0`` (``FAST_LAUNCH_ENV_VAR``). The module attributes ``triton`` and ``tl`` are None when
+Triton cannot be imported.
 """
 
 from __future__ import annotations
@@ -36,7 +30,11 @@ except Exception as e:  # noqa: BLE001
 
 
 def triton_available() -> tuple[bool, str]:
-    """(usable, reason): whether Triton kernels can run on this machine (cached per process, never raises)."""
+    """Report whether Triton kernels can run on this machine; cached per process, never raises.
+
+    Returns:
+        (bool, str): whether Triton is usable, and the reason.
+    """
     global _PROBE
     if _PROBE is None:
         _PROBE = _probe()
@@ -44,6 +42,11 @@ def triton_available() -> tuple[bool, str]:
 
 
 def _probe() -> tuple[bool, str]:
+    """Check the kill switch, the Triton import and CUDA, then compile and run the probe kernel.
+
+    Returns:
+        (bool, str): whether Triton is usable, and the reason.
+    """
     if os.environ.get(DISABLE_ENV_VAR, "0") == "1":
         return False, f"disabled by {DISABLE_ENV_VAR}=1"
     if _IMPORT_ERROR is not None:
@@ -67,6 +70,14 @@ if triton is not None:
 
     @triton.jit
     def _probe_kernel(x_ptr, y_ptr, out_ptr, BLOCK: tl.constexpr):
+        """Write ``out = x + y`` for one block.
+
+        Args:
+            x_ptr: [BLOCK] float32 input.
+            y_ptr: [BLOCK] float32 input.
+            out_ptr: [BLOCK] float32 output.
+            BLOCK (constexpr): lanes per program.
+        """
         offs = tl.arange(0, BLOCK)
         tl.store(out_ptr + offs, tl.load(x_ptr + offs) + tl.load(y_ptr + offs))
 
@@ -77,10 +88,17 @@ _LAUNCHERS: dict[tuple, tuple] = {}
 
 
 def launch(kernel, grid: tuple[int, int, int], args: tuple, constexprs: dict, num_warps: int) -> None:
-    """kernel[grid](*args, **constexprs, num_warps=num_warps), through the cached compiled kernel when allowed.
+    """Run ``kernel[grid](*args, **constexprs, num_warps=num_warps)``, through the cached compiled kernel when allowed.
 
-    The positional `args` must be exactly the kernel's non-constexpr parameters, in order, and the kernel must be
-    compiled without value / alignment specialization (otherwise one cached binary would not fit all values)."""
+    The kernel must be compiled without value or alignment specialization, so that one cached binary fits all values.
+
+    Args:
+        kernel (triton.JITFunction): the kernel.
+        grid (tuple[int, int, int]): the launch grid.
+        args (tuple): exactly the kernel's non-constexpr parameters, in order.
+        constexprs (dict): the constexpr parameters by name.
+        num_warps (int): warps per program.
+    """
     if not _FAST_LAUNCH:
         kernel[grid](*args, **constexprs, num_warps=num_warps)
         return

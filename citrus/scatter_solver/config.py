@@ -1,4 +1,8 @@
-"""Solver configuration: every discretization parameter of the LBTE source iteration solver."""
+"""Solver configuration: every discretization parameter of the LBTE source iteration solver.
+
+The module holds the frozen dataclass ``SolverConfig`` and the allowed values of its group-edge rule and of the node
+placement of its angular table.
+"""
 
 from __future__ import annotations
 
@@ -14,86 +18,41 @@ ANGULAR_TABLE_GRIDS = ("adaptive", "uniform")
 
 @dataclass(frozen=True)
 class SolverConfig:
-    """Discretization of the scatter solver (docs/source/method.rst).
+    """Discretization parameters of the LBTE scatter solver (docs/source/method.rst).
 
-    Energy
-      num_groups        number of energy groups G
-      group_edges_kev   explicit descending group edges (num_groups + 1 values, keV); None: the edges follow
-                        group_edges_method over [energy_min_kev, kVp]
-      group_edges_method  rule of the group edges when group_edges_kev is None
-                        (`cross_section_library.make_group_edges`):
-                        "scattered_fluence" (default): equal area per group under an estimate of the TOTAL photon
-                          fluence spectrum inside the object, source plus scattered photons (a one-dimensional
-                          slowing-down balance in water with a leakage loss, `scattered_fluence_spectrum`). The groups
-                          must resolve the downscattered photons, which carry the multiple-collision scatter: at MV
-                          most of them lie far below the source photons;
-                        "equal_fluence": equal area under the SOURCE spectrum (equal source photon count per group,
-                          the rule of citrus <= 0.5);
-                        "log": geometric spacing between energy_min_kev and the spectrum maximum
-      grouping_object_size_cm  characteristic chord length L (cm) of the object, used only by the
-                        "scattered_fluence" rule: photons leave the balance at the rate 1/L (escape), so L -> 0
-                        recovers "equal_fluence" and L -> infinity the spectrum of an infinite medium. Default 20 cm
-                        (a patient-sized object; mean chord about 4 V / S). `citrus.citrus_recon` (CitrusConfig.
-                        grouping_object_size "auto") replaces it by the mean chord of the FDK volume before the library
-                        is built
-      grouping_medium   the medium of that balance (used only by "scattered_fluence"): "auto" (default) is measured on
-                        the object, the mean densities of the reference materials over it (`citrus.citrus_recon` from
-                        the FDK volume, `citrus.utilities.synthesize_cone_beam_data` from the true object, before the
-                        library is built), and water at 1 g/cm^3 when nothing measured it; a catalogue name (that
-                        material at its nominal density; e.g. an object of one known material) or a mapping
-                        {reference material name: density g/cm^3} sets it. Named materials must be among `materials`.
-                        Stored as a tuple of (name, density) pairs sorted by name; the cache key and the balance use
-                        the densities rounded to 3 significant digits
-                        (`cross_section_library.grouping_medium_densities`)
-      energy_min_kev    lowest group edge (keV); Compton photons scattered below it are absorbed
-      legendre_order    Legendre order L of the scattering kernel (spherical harmonics up to degree L)
-      num_eta_table     nodes N of the tabulated per-steradian transfer in eta = cos(scattering angle)
-      angular_table_grid  placement of those nodes (`cross_section_library.compute_library`):
-                        "adaptive" (default): non-uniform in eta, dense where the transfer curves bend (the Rayleigh
-                          and Compton forward peaks), so that linear interpolation has about the same relative error
-                          everywhere; looked up through a small map table (`cross_sections.angular_table_position`);
-                        "uniform": equally spaced in eta (the table of citrus <= 0.5)
+    A ``grouping_medium`` given as a mapping or as pairs is stored as (name, density) pairs sorted by name, and
+    ``materials`` as a tuple.
 
-    Materials
-      materials         names of the REFERENCE materials of the density model, from `cross_sections.MATERIAL_CATALOGUE`
-                        (at least two, any order): the library is built for exactly this set (`build_solver_library`,
-                        `utilities.wlab_solver`; sorted by nominal attenuation, its cache key holds the set), and the
-                        density model interpolates between the two reference materials whose nominal attenuations
-                        bracket a voxel (`citrus.utilities.attenuation_to_densities`). Default: the seven
-                        `cross_sections.MATERIALS` (air, lung, adipose, water, muscle, soft_tissue, bone)
-
-    Angle (sweep quadrature: Gauss-Legendre in cos(theta) x equally spaced azimuths)
-      num_polar         polar nodes (>= L + 1)
-      num_azimuthal     azimuths (>= 2 L + 1)
-
-    Space (docs/source/conventions.rst, "Grids")
-      transport_cell_cm  edge length (cm) of the cubic transport cells: the transport grid C is the regular grid of this
-                        spacing that covers the fine (reconstruction) box, centred on it (ceil(extent / cell) cells per
-                        axis; the padding is empty space). Any ratio to the fine voxel size is allowed
-      quadrature_point_spacing_cm target spacing (cm) of the quadrature points of the first-collision source and the
-                        first-order scatter image: q^3 equal-weight points per transport cell on the midpoint lattice
-                        (the quadrature grid Q = C refined q times) with q = max(1, round(transport_cell_cm /
-                        quadrature_point_spacing_cm)), bounded by the data resolution, q = min(q, max(1, round(
-                        transport_cell_cm / largest fine voxel edge))), Python's round (halves to even: a ratio of 2.5
-                        gives 2), `quadrature_points`. Default 0.5 cm: 1 cm cells -> q = 2, 2 cm cells -> 4, 0.5 cm
-                        cells -> 1; 1 cm voxels in 1 cm cells -> 1 (the data bound)
-      uncollided_trace_grid  grid through which the uncollided fluence at the Q points is ray traced: "quadrature"
-                        (default: Q itself with rho_quadrature, material boundaries resolved at the Q spacing),
-                        "coarse" (the transport grid C with the resampled densities: smears a boundary inside a cell,
-                        which matters where rays run along it) or "fine" (the reconstruction
-                        grid; for validation); the cost is about the same for all three
-
-    Source iteration
-      source_iteration_tolerance  stop when ||phi_n|| / ||phi_total|| < source_iteration_tolerance (scalar-flux cell
-                        means; phi_n the n-times-collided fluence, phi_total their sum)
-      max_source_iterations  maximum number of sweeps (collision orders)
-
-    Scatter image (collapsed cone)
-      cone_num_polar, cone_num_azimuthal  product direction set over the cone that covers the panel
-      direction_chunk   directions per batch in the scatter image, and directions per octant per sweep chunk
-
-    Numerics
-      dtype             "float32" (GPU production) or "float64" (reference / tests)
+    Attributes:
+        num_groups (int): number of energy groups G. Defaults to 6.
+        group_edges_kev (Sequence[float] or None): explicit descending group edges in keV, num_groups + 1 values.
+            Defaults to None, the edges of ``group_edges_method``.
+        group_edges_method (str): rule of the group edges, "scattered_fluence", "equal_fluence" or "log". Defaults to
+            "scattered_fluence".
+        grouping_object_size_cm (float): characteristic chord length L in cm of the object for the "scattered_fluence"
+            rule. Defaults to 20.0.
+        grouping_medium (str or tuple[tuple[str, float], ...]): medium of the "scattered_fluence" rule: "auto", a
+            catalogue name or (reference material name, density in g/cm^3) pairs. Defaults to "auto".
+        energy_min_kev (float): lowest group edge in keV; photons scattered below it are absorbed. Defaults to 10.0.
+        legendre_order (int): Legendre order L of the scattering kernel. Defaults to 7.
+        num_eta_table (int): nodes N of the tabulated transfer in ``eta = cos(scattering angle)``. Defaults to 2001.
+        angular_table_grid (str): placement of the table nodes, "adaptive" or "uniform". Defaults to "adaptive".
+        materials (tuple[str, ...]): catalogue names of the reference materials of the library and the density model,
+            at least two. Defaults to the seven ``cross_sections.MATERIALS``.
+        num_polar (int): Gauss-Legendre polar nodes of the sweep quadrature, at least L + 1. Defaults to 8.
+        num_azimuthal (int): equally spaced azimuths of the sweep quadrature, at least 2 L + 1. Defaults to 16.
+        transport_cell_cm (float): edge in cm of the cubic transport cells. Defaults to 1.0.
+        quadrature_point_spacing_cm (float): target spacing in cm of the quadrature points (``quadrature_points``).
+            Defaults to 0.5.
+        uncollided_trace_grid (str): grid through which the uncollided fluence is traced, "quadrature", "coarse" or
+            "fine". Defaults to "quadrature".
+        source_iteration_tolerance (float): stop when ``||phi_n|| / ||phi_total||`` of the scalar-flux cell means
+            falls below it. Defaults to 1.0e-3.
+        max_source_iterations (int): maximum number of sweeps (collision orders). Defaults to 30.
+        cone_num_polar (int): polar directions of the cone direction set of the scatter image. Defaults to 16.
+        cone_num_azimuthal (int): azimuthal directions of the cone direction set of the scatter image. Defaults to 32.
+        direction_chunk (int): directions per batch of the scatter image and per octant per sweep chunk. Defaults to 8.
+        dtype (str): "float32" (production) or "float64" (reference and tests). Defaults to "float32".
     """
 
     # --- energy -----------------------------------------------------------------------------
@@ -132,6 +91,7 @@ class SolverConfig:
     dtype: Literal["float32", "float64"] = "float32"
 
     def __post_init__(self) -> None:
+        """Store ``materials`` as a tuple and a ``grouping_medium`` mapping or pairs as sorted (name, density) pairs."""
         if not isinstance(self.materials, str) and isinstance(self.materials, Sequence):
             object.__setattr__(self, "materials", tuple(self.materials))  # hashable, compares equal to a tuple
         medium = self.grouping_medium
@@ -145,20 +105,35 @@ class SolverConfig:
             object.__setattr__(self, "grouping_medium", medium)
 
     def to_dict(self) -> dict:
+        """Field values of the configuration.
+
+        Returns:
+            dict: ``dataclasses.asdict`` of the configuration.
+        """
         return asdict(self)
 
     def quadrature_points(self, fine_voxel_cm: float) -> int:
-        """Effective quadrature points per axis per transport cell for fine voxels whose largest edge is fine_voxel_cm:
-        q = min(max(1, round(transport_cell_cm / quadrature_point_spacing_cm)), max(1, round(transport_cell_cm /
-        fine_voxel_cm))) (Python's round, halves to even): the points are about quadrature_point_spacing_cm apart, and
-        their spacing does not go much below the fine voxel size. With the default 0.5 cm spacing: 1 cm cells give 2
-        (0.5 cm and smaller voxels; 1 cm voxels: 1; 0.4 cm: round(2.5) = 2), 2 cm cells give 4 (voxels of 0.5 cm and
-        less), 0.5 cm cells give 1."""
+        """Quadrature points per axis per transport cell for fine voxels of a given largest edge.
+
+        ``q = min(max(1, round(cell / spacing)), max(1, round(cell / fine_voxel_cm)))`` with Python's round (halves to
+        even), so the points are about ``quadrature_point_spacing_cm`` apart but not much closer than the fine voxels.
+
+        Args:
+            fine_voxel_cm (float): largest edge in cm of the fine voxels.
+
+        Returns:
+            int: number q of points per axis.
+        """
         cell = float(self.transport_cell_cm)
         target = max(1, round(cell / float(self.quadrature_point_spacing_cm)))
         return min(target, max(1, round(cell / float(fine_voxel_cm))))
 
     def _validate_grouping_medium(self) -> None:
+        """Check that ``grouping_medium`` is "auto", a catalogue name or densities of reference materials.
+
+        Raises:
+            ValueError: if it is not, or if its densities are negative or all zero.
+        """
         medium = self.grouping_medium
         if isinstance(medium, str):
             if medium == "auto":
@@ -183,6 +158,11 @@ class SolverConfig:
                              f"{tuple(self.materials)}")
 
     def validate(self) -> None:
+        """Check every field against its allowed values.
+
+        Raises:
+            ValueError: for the first field outside its allowed values.
+        """
         L = self.legendre_order
         if L < 0:
             raise ValueError("legendre_order must be >= 0")

@@ -1,20 +1,13 @@
-"""Peak GPU memory and time of CITRUS outer iterations on a WLAB grid (citrus.citrus_recon).
+"""Peak GPU memory and time of the CITRUS outer iterations (``citrus_recon``) on a WLAB grid.
+
+Runs ``citrus_recon`` on scatter-free counts of the WLAB phantom, started from the true attenuation, and splits the
+peak memory of every outer iteration into the scatter stage and the MBIR iteration. The first outer iteration
+includes the compilation of the kernels.
+
+Usage::
 
     python benchmarks/bench_citrus_memory.py [--delta-voxel 0.125] [--transport-cell-cm 1.0] [--views 180]
-        [--scatter-view-stride 8] [--outer-iterations 2]
-        [--resume-error-sinogram | --no-resume-error-sinogram]
-        [--panel full|small] [--memory-cap-mib 0]
-
-Synthesizes scatter-free counts Y = I0 exp(-A X_true) of the WLAB phantom on the `--delta-voxel` grid (A the
-MBIRTORCH projector; the memory and the time of the loop do not depend on the scatter in the data), starts from X_true
-(no FDK) and runs `--outer-iterations` outer iterations of `citrus_recon` with the scatter step on every
-`--scatter-view-stride`-th view. The MBIR call is wrapped so that the peak memory is split into the scatter stage (from
-the start of the outer iteration to the MBIR call: densities, material fields, the scatter steps, the primaries, the
-correction) and the MBIR iteration. Prints one line per outer iteration (the first one includes the compilation of the
-kernels: read the later ones) and the persistent allocation between iterations. `--resume-error-sinogram` sets
-CitrusConfig.resume_error_sinogram (version 0.3.0; ignored by older versions, which restart MBIR from the sinogram).
-The primaries are MBIRTORCH projections of the material maps (versions 0.3.0 and 0.4.0 also offered the solver's
-Siddon primary, CitrusConfig.primary_projector; up to 0.2.0 it was the only one).
+        [--scatter-view-stride 8] [--outer-iterations 2] [--panel full|small] [--memory-cap-mib 0]
 """
 
 from __future__ import annotations
@@ -44,6 +37,7 @@ MIB = 2.0 ** 20
 
 
 def main() -> None:
+    """Parse the command line, run the outer iterations and print the time and peak memory of each."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--delta-voxel", type=float, default=0.125,
                         help="fine voxel size (cm), default 0.125 (12.3 M voxels)")

@@ -1,11 +1,9 @@
-"""Grids and cone-beam system geometry, following MBIRTORCH conventions (docs/source/conventions.rst).
+"""Voxel grids, conservative resampling between them, and the flat-panel cone-beam geometry.
 
-All lengths in cm, angles in radians. Volumes are [rows, cols, slices] with col->x, row->y, slice->z.
-
-The solver's three grids (docs/source/conventions.rst, "Grids"): the fine reconstruction grid F, the transport grid
-C = `Grid.covering(F, cell)` (cubic cells covering the box of F, centred on it) and the quadrature grid
-Q = C.refine(q); densities are carried from F to C and Q by `resample_conservative` (exact cell averages of the
-voxel-wise constant field, any ratio of the voxel sizes).
+The conventions are MBIRTORCH's (docs/source/conventions.rst): lengths in cm, angles in radians, volumes
+[rows, cols, slices] with columns along x, rows along y and slices along z. :class:`Grid` builds the solver's fine,
+transport and quadrature grids, :func:`resample_conservative` carries densities between them by exact cell averages,
+and :class:`ConeGeometry` places the source and the panel of each view.
 """
 
 from __future__ import annotations
@@ -20,9 +18,14 @@ from torch import Tensor
 
 @dataclass(frozen=True)
 class Grid:
-    """Uniform cuboid voxel grid centered on the rotation axis.
+    """Uniform cuboid voxel grid centered on the rotation axis, in MBIRTORCH conventions.
 
-    shape: (num_rows, num_cols, num_slices) -> (y, x, z) extents in voxels.
+    Attributes:
+        shape (tuple[int, int, int]): (num_rows, num_cols, num_slices), the extents along (y, x, z) in voxels.
+        delta_voxel (float): voxel pitch along x in cm.
+        voxel_row_aspect (float): ratio of the pitch along y to ``delta_voxel``. Defaults to 1.0.
+        voxel_slice_aspect (float): ratio of the pitch along z to ``delta_voxel``. Defaults to 1.0.
+        recon_slice_offset (float): z of the grid center in cm. Defaults to 0.0.
     """
 
     shape: tuple[int, int, int]
@@ -34,40 +37,53 @@ class Grid:
     # ---- sizes ---------------------------------------------------------------------------
     @property
     def num_rows(self) -> int:
+        """Number of rows (along y) of the grid."""
         return self.shape[0]
 
     @property
     def num_cols(self) -> int:
+        """Number of columns (along x) of the grid."""
         return self.shape[1]
 
     @property
     def num_slices(self) -> int:
+        """Number of slices (along z) of the grid."""
         return self.shape[2]
 
     @property
     def num_voxels(self) -> int:
+        """Total number of voxels of the grid."""
         return self.shape[0] * self.shape[1] * self.shape[2]
 
     @property
     def deltas(self) -> tuple[float, float, float]:
-        """(dx, dy, dz) voxel pitches in cm."""
+        """Voxel pitches (dx, dy, dz) in cm."""
         d = self.delta_voxel
         return (d, self.voxel_row_aspect * d, self.voxel_slice_aspect * d)
 
     @property
     def voxel_volume(self) -> float:
+        """Volume of one voxel in cm^3."""
         dx, dy, dz = self.deltas
         return dx * dy * dz
 
     @property
     def extent(self) -> tuple[float, float, float]:
-        """Physical (x, y, z) side lengths in cm."""
+        """Side lengths (x, y, z) of the grid box in cm."""
         dx, dy, dz = self.deltas
         return (self.num_cols * dx, self.num_rows * dy, self.num_slices * dz)
 
     # ---- coordinates -----------------------------------------------------------------------
     def axis_coordinates(self, device=None, dtype=torch.float32) -> tuple[Tensor, Tensor, Tensor]:
-        """1-D center coordinates (x[num_cols], y[num_rows], z[num_slices]) in the recon frame."""
+        """Return the voxel-center coordinates along each axis in the recon frame.
+
+        Args:
+            device (torch.device, optional): device of the tensors. Defaults to None.
+            dtype (torch.dtype, optional): dtype of the tensors. Defaults to torch.float32.
+
+        Returns:
+            (Tensor, Tensor, Tensor): x [num_cols], y [num_rows] and z [num_slices] in cm.
+        """
         dx, dy, dz = self.deltas
         nr, nc, ns = self.shape
         x = dx * (torch.arange(nc, device=device, dtype=dtype) - (nc - 1) / 2)
@@ -76,7 +92,15 @@ class Grid:
         return x, y, z
 
     def center_coordinates(self, device=None, dtype=torch.float32) -> Tensor:
-        """Voxel-center positions as a [rows, cols, slices, 3] tensor of (x, y, z)."""
+        """Return the voxel-center positions in the recon frame.
+
+        Args:
+            device (torch.device, optional): device of the tensors. Defaults to None.
+            dtype (torch.dtype, optional): dtype of the tensor. Defaults to torch.float32.
+
+        Returns:
+            Tensor: [rows, cols, slices, 3] positions (x, y, z) in cm.
+        """
         x, y, z = self.axis_coordinates(device, dtype)
         X = x[None, :, None].expand(self.shape)
         Y = y[:, None, None].expand(self.shape)
@@ -84,7 +108,11 @@ class Grid:
         return torch.stack([X, Y, Z], dim=-1)
 
     def lower_corner(self) -> tuple[float, float, float]:
-        """Physical (x, y, z) of the minimum corner of the grid box."""
+        """Return the minimum corner of the grid box in the recon frame.
+
+        Returns:
+            (float, float, float): (x, y, z) of the corner in cm.
+        """
         dx, dy, dz = self.deltas
         nr, nc, ns = self.shape
         return (-nc * dx / 2, -nr * dy / 2, -ns * dz / 2 + self.recon_slice_offset)
@@ -92,13 +120,18 @@ class Grid:
     # ---- derived grids -----------------------------------------------------------------------
     @staticmethod
     def covering(grid: "Grid", cell_cm: float) -> "Grid":
-        """Regular grid of cubic cells of edge `cell_cm` that covers the box of `grid` and is centred on it: the
-        transport grid C of a fine grid F (docs/source/conventions.rst, "Grids").
+        """Build the grid of cubic cells that covers the box of ``grid`` and is centred on it, the transport grid C.
 
-        Per axis n = ceil(extent / cell_cm) cells (an extent within 1e-9 relative of a multiple of the cell counts as
-        that multiple, so a box that the cells tile exactly is not padded); the n cells extend the box symmetrically by
-        (n cell_cm - extent) / 2 on both sides (empty space). Same centre as `grid` (x = y = 0, z = recon_slice_offset),
-        unit aspect ratios. When the cells tile the box exactly this is `grid.coarsen(f)` for an integer ratio f."""
+        Each axis gets ``ceil(extent / cell_cm)`` cells (an extent within 1e-9 relative of a multiple counts as that
+        multiple), which pad the box symmetrically with empty space (docs/source/conventions.rst, "Grids").
+
+        Args:
+            grid (Grid): the grid to cover, the fine grid F.
+            cell_cm (float): cell edge in cm, > 0.
+
+        Returns:
+            Grid: the covering grid, with unit aspect ratios and the ``recon_slice_offset`` of ``grid``.
+        """
         c = float(cell_cm)
         if not c > 0:
             raise ValueError(f"cell size must be > 0, got {cell_cm}")
@@ -113,10 +146,17 @@ class Grid:
                     recon_slice_offset=grid.recon_slice_offset)
 
     def refine(self, factor: int) -> "Grid":
-        """Grid of the same box with `factor` voxels per voxel of this grid along each axis (shape * factor, pitch /
-        factor; the inverse of `coarsen`). Its voxel centers inside a voxel of this grid are the factor^3 points of
-        the midpoint lattice, local coordinates (2j + 1)/factor - 1 (`local_coordinates_of_fine_in_coarse`): the
-        quadrature grid Q = C.refine(q)."""
+        """Build the grid of the same box with ``factor`` voxels per voxel of this grid along each axis.
+
+        This is the inverse of ``coarsen``; the fine voxel centers inside a voxel of this grid form the midpoint
+        lattice at local coordinates ``(2j + 1)/factor - 1``, and the quadrature grid is ``Q = C.refine(q)``.
+
+        Args:
+            factor (int): refinement factor, >= 1.
+
+        Returns:
+            Grid: the refined grid (this grid itself for ``factor`` 1).
+        """
         f = int(factor)
         if f < 1:
             raise ValueError(f"refinement factor must be >= 1, got {factor}")
@@ -126,7 +166,15 @@ class Grid:
         return replace(self, shape=(nr * f, nc * f, ns * f), delta_voxel=self.delta_voxel / f)
 
     def axis_edges(self, device=None, dtype=torch.float64) -> tuple[Tensor, Tensor, Tensor]:
-        """1-D voxel boundary coordinates (x[num_cols + 1], y[num_rows + 1], z[num_slices + 1]) in the recon frame."""
+        """Return the voxel boundary coordinates along each axis in the recon frame.
+
+        Args:
+            device (torch.device, optional): device of the tensors. Defaults to None.
+            dtype (torch.dtype, optional): dtype of the tensors. Defaults to torch.float64.
+
+        Returns:
+            (Tensor, Tensor, Tensor): x [num_cols + 1], y [num_rows + 1] and z [num_slices + 1] in cm.
+        """
         dx, dy, dz = self.deltas
         nr, nc, ns = self.shape
         lx, ly, lz = self.lower_corner()
@@ -135,9 +183,13 @@ class Grid:
                 lz + dz * torch.arange(ns + 1, device=device, dtype=dtype))
 
     def coarsen(self, factor: int) -> "Grid":
-        """Supervoxel grid with `factor` fine voxels per coarse voxel along each axis.
+        """Build the supervoxel grid with ``factor`` voxels of this grid per coarse voxel along each axis.
 
-        Requires every shape entry to be divisible by factor so that the grid boundaries align.
+        Args:
+            factor (int): coarsening factor; every entry of ``shape`` must be divisible by it.
+
+        Returns:
+            Grid: the coarse grid (this grid itself for ``factor`` 1).
         """
         if factor == 1:
             return self
@@ -147,9 +199,17 @@ class Grid:
         return replace(self, shape=(nr // factor, nc // factor, ns // factor), delta_voxel=self.delta_voxel * factor)
 
     def local_coordinates_of_fine_in_coarse(self, factor: int, device=None, dtype=torch.float32) -> Tensor:
-        """Local linear-discontinuous coordinates u in [-1, 1] of each fine sub-voxel center inside its coarse cell.
+        """Return the local linear-discontinuous coordinates in [-1, 1] of the sub-voxel centers inside a coarse cell.
 
-        Returns a [factor] tensor; identical along each axis for a uniform integer coarsening.
+        The coordinates are the same along each axis for a uniform integer coarsening.
+
+        Args:
+            factor (int): number of sub-voxels per coarse cell along an axis.
+            device (torch.device, optional): device of the tensors. Defaults to None.
+            dtype (torch.dtype, optional): dtype of the tensor. Defaults to torch.float32.
+
+        Returns:
+            Tensor: [factor] local coordinates ``(2j + 1)/factor - 1``.
         """
         f = factor
         return (2 * torch.arange(f, device=device, dtype=dtype) + 1) / f - 1
@@ -165,13 +225,19 @@ _OVERLAP_SNAP = 1e-12  # overlap fractions within this of 0 or 1 are set to 0 or
 
 
 def overlap_matrix(edges_from: Tensor, edges_to: Tensor) -> Tensor:
-    """1-D overlap fractions between two partitions of an axis: W [n_to, n_from] with
+    """Compute the 1-D overlap fractions between two partitions of an axis.
 
-        W[j, i] = |[edges_from[i], edges_from[i+1]] n [edges_to[j], edges_to[j+1]]| / (edges_to[j+1] - edges_to[j])
+    ``W[j, i]`` is the length of the overlap of source cell i and target cell j over the length of target cell j, so
+    ``sum_i W[j, i] f_i`` is the exact average over target cell j of a piecewise-constant field (zero outside the source
+    partition). Fractions within 1e-12 of 0 or 1 are snapped to 0 or 1.
 
-    (float64 edges, ascending). A piecewise-constant field f_i on the `from` cells has the exact average sum_i W[j, i]
-    f_i over target cell j, parts of the target cell outside the `from` partition counting as zero. Fractions within
-    1e-12 of 0 or 1 are snapped (rounding of the edge coordinates of partitions that share boundaries)."""
+    Args:
+        edges_from (Tensor): [n_from + 1] ascending source cell edges.
+        edges_to (Tensor): [n_to + 1] ascending target cell edges.
+
+    Returns:
+        Tensor: [n_to, n_from] float64 overlap fractions W.
+    """
     ef = edges_from.to(torch.float64)
     et = edges_to.to(torch.float64)
     lo = torch.maximum(et[:-1, None], ef[None, :-1])
@@ -183,9 +249,19 @@ def overlap_matrix(edges_from: Tensor, edges_to: Tensor) -> Tensor:
 
 def resampling_matrices(grid_from: Grid, grid_to: Grid, device=None,
                         dtype: torch.dtype = torch.float32) -> tuple[Tensor, Tensor, Tensor]:
-    """The per-axis `overlap_matrix` of grid_from -> grid_to for rows (y) [R_to, R_from], cols (x) [C_to, C_from] and
-    slices (z) [S_to, S_from], on `device` in `dtype` (computed in float64; an LRU cache keyed by (grid_from, grid_to,
-    device, dtype) keeps the last 32 sets)."""
+    """Return the per-axis overlap matrices from ``grid_from`` to ``grid_to``, computed in float64 and cached.
+
+    The cache keeps the last 32 sets, keyed by the two grids, the device and the dtype.
+
+    Args:
+        grid_from (Grid): the source grid.
+        grid_to (Grid): the target grid.
+        device (torch.device, optional): device of the matrices; None is the CPU. Defaults to None.
+        dtype (torch.dtype, optional): dtype of the matrices. Defaults to torch.float32.
+
+    Returns:
+        (Tensor, Tensor, Tensor): rows (y) [R_to, R_from], cols (x) [C_to, C_from] and slices (z) [S_to, S_from].
+    """
     key = (grid_from, grid_to, str(torch.device(device) if device is not None else torch.device("cpu")), dtype)
     hit = _OVERLAP_CACHE.get(key)
     if hit is not None:
@@ -202,18 +278,20 @@ def resampling_matrices(grid_from: Grid, grid_to: Grid, device=None,
 
 
 def resample_conservative(field: Tensor, grid_from: Grid, grid_to: Grid) -> Tensor:
-    """Cell averages on grid_to of a field that is constant in each voxel of grid_from (conservative overlap
-    resampling): field [..., R, C, S] on grid_from -> [..., R', C', S'] on grid_to,
+    """Resample a voxel-wise constant field from one grid to another by exact cell averages.
 
-        out[j] = sum_i field[i] |V_i n V_j| / |V_j|
+    ``out[j] = sum_i field[i] |V_i n V_j| / |V_j|`` over the voxels V_i of ``grid_from`` and the cells V_j of
+    ``grid_to``, applied as three per-axis matrix products; parts of a target cell outside the box of ``grid_from``
+    count as zero, so the integral is conserved when ``grid_to`` covers ``grid_from``.
 
-    with V_i the voxels of grid_from and V_j the cells of grid_to; the parts of a target cell outside the box of
-    grid_from count as zero. The overlap is separable, so this is the tensor product of the three per-axis
-    `resampling_matrices`, applied as three matrix products (slices, cols, rows). The integral is conserved:
-    sum_j out[j] |V_j| = sum_i field[i] |V_i| when grid_to covers grid_from (`Grid.covering`). Returns `field` itself
-    when the grids are equal. Used for the transport-grid densities (`scatter_solver.coarsen_density`), the
-    quadrature-grid densities and `scatter_image.coarsen_mu_t`; for an integer block ratio with aligned boxes it equals
-    the block mean up to float rounding."""
+    Args:
+        field (Tensor): [..., R, C, S] values on ``grid_from``.
+        grid_from (Grid): the grid of ``field``.
+        grid_to (Grid): the grid to resample to.
+
+    Returns:
+        Tensor: [..., R', C', S'] cell averages on ``grid_to`` (``field`` itself when the grids are equal).
+    """
     if tuple(field.shape[-3:]) != tuple(grid_from.shape):
         raise ValueError(f"field spatial shape {tuple(field.shape[-3:])} != grid shape {grid_from.shape}")
     if grid_from == grid_to:
@@ -227,10 +305,20 @@ def resample_conservative(field: Tensor, grid_from: Grid, grid_to: Grid) -> Tens
 
 @dataclass(frozen=True)
 class ConeGeometry:
-    """Flat-panel cone-beam geometry, MBIRTORCH conventions.
+    """Flat-panel cone-beam geometry in MBIRTORCH conventions (docs/source/conventions.rst).
 
-    In the view frame the source sits at (0, +source_iso_dist, 0) and the panel lies in the plane
-    y_view = source_iso_dist - source_detector_dist, with u along +x_view (channels) and v along +z (rows).
+    In the view frame the source sits at ``(0, +source_iso_dist, 0)`` and the panel lies in the plane
+    ``y_view = source_iso_dist - source_detector_dist``, with u along +x_view (channels) and v along +z (rows).
+
+    Attributes:
+        source_iso_dist (float): distance from the source to the rotation axis in cm.
+        source_detector_dist (float): distance from the source to the panel in cm.
+        num_det_rows (int): number of detector rows.
+        num_det_channels (int): number of detector channels.
+        delta_det_row (float): detector row pitch in cm.
+        delta_det_channel (float): detector channel pitch in cm.
+        det_row_offset (float): offset in cm subtracted from the v of every pixel center. Defaults to 0.0.
+        det_channel_offset (float): offset in cm subtracted from the u of every pixel center. Defaults to 0.0.
     """
 
     source_iso_dist: float
@@ -244,23 +332,35 @@ class ConeGeometry:
 
     @property
     def magnification(self) -> float:
+        """Magnification at the rotation axis, ``source_detector_dist / source_iso_dist``."""
         return self.source_detector_dist / self.source_iso_dist
 
     @property
     def panel_y_view(self) -> float:
+        """y of the panel plane in the view frame in cm."""
         return self.source_iso_dist - self.source_detector_dist
 
     @property
     def image_shape(self) -> tuple[int, int]:
+        """Shape (num_det_rows, num_det_channels) of a detector image."""
         return (self.num_det_rows, self.num_det_channels)
 
     @property
     def pixel_area(self) -> float:
+        """Area of one detector pixel in cm^2."""
         return self.delta_det_row * self.delta_det_channel
 
     # ---- panel coordinates --------------------------------------------------------------------
     def pixel_uv(self, device=None, dtype=torch.float32) -> tuple[Tensor, Tensor]:
-        """Pixel-center panel coordinates (u[num_det_channels], v[num_det_rows]) in cm."""
+        """Return the panel coordinates of the pixel centers.
+
+        Args:
+            device (torch.device, optional): device of the tensors. Defaults to None.
+            dtype (torch.dtype, optional): dtype of the tensors. Defaults to torch.float32.
+
+        Returns:
+            (Tensor, Tensor): u [num_det_channels] and v [num_det_rows] in cm.
+        """
         nc, nr = self.num_det_channels, self.num_det_rows
         u = ((torch.arange(nc, device=device, dtype=dtype) - (nc - 1) / 2) * self.delta_det_channel
              - self.det_channel_offset)
@@ -268,40 +368,89 @@ class ConeGeometry:
         return u, v
 
     def panel_half_extent(self) -> tuple[float, float]:
-        """Half widths (u, v) of the active panel area in cm (edge to edge, including pixel size)."""
+        """Return the half widths of the active panel area, edge to edge (pixel size included).
+
+        Returns:
+            (float, float): half widths along u and v in cm.
+        """
         return (self.num_det_channels * self.delta_det_channel / 2, self.num_det_rows * self.delta_det_row / 2)
 
     # ---- recon-frame placement for a view -----------------------------------------------------
     @staticmethod
     def _rot(angle: float) -> tuple[float, float]:
+        """Return the cosine and sine of the view angle.
+
+        Args:
+            angle (float): view angle in rad.
+
+        Returns:
+            (float, float): ``cos(angle)`` and ``sin(angle)``.
+        """
         return math.cos(angle), math.sin(angle)
 
     def view_to_recon(self, p_view: Tensor, angle: float) -> Tensor:
-        """Rotate points [..., 3] from the view frame into the recon frame."""
+        """Rotate points from the view frame into the recon frame.
+
+        Args:
+            p_view (Tensor): [..., 3] points in the view frame.
+            angle (float): view angle in rad.
+
+        Returns:
+            Tensor: [..., 3] points in the recon frame.
+        """
         c, s = self._rot(angle)
         xv, yv, zv = p_view[..., 0], p_view[..., 1], p_view[..., 2]
         return torch.stack([c * xv + s * yv, -s * xv + c * yv, zv], dim=-1)
 
     def recon_to_view(self, p: Tensor, angle: float) -> Tensor:
-        """Rotate points [..., 3] from the recon frame into the view frame."""
+        """Rotate points from the recon frame into the view frame.
+
+        Args:
+            p (Tensor): [..., 3] points in the recon frame.
+            angle (float): view angle in rad.
+
+        Returns:
+            Tensor: [..., 3] points in the view frame.
+        """
         c, s = self._rot(angle)
         x, y, z = p[..., 0], p[..., 1], p[..., 2]
         return torch.stack([c * x - s * y, s * x + c * y, z], dim=-1)
 
     def source_position(self, angle: float) -> tuple[float, float, float]:
-        """Focal spot in the recon frame."""
+        """Return the focal spot position in the recon frame.
+
+        Args:
+            angle (float): view angle in rad.
+
+        Returns:
+            (float, float, float): (x, y, z) of the focal spot in cm.
+        """
         c, s = self._rot(angle)
         return (s * self.source_iso_dist, c * self.source_iso_dist, 0.0)
 
     def panel_center(self, angle: float) -> tuple[float, float, float]:
-        """Point where the central ray meets the panel (u = v = 0), recon frame."""
+        """Return the point where the central ray meets the panel (u = v = 0), in the recon frame.
+
+        Args:
+            angle (float): view angle in rad.
+
+        Returns:
+            (float, float, float): (x, y, z) of the panel center in cm.
+        """
         c, s = self._rot(angle)
         yv = self.panel_y_view
         return (s * yv, c * yv, 0.0)
 
     def panel_axes(self, angle: float) -> tuple[tuple[float, float, float], tuple[float, float, float],
                                                 tuple[float, float, float]]:
-        """Unit vectors (u_hat, v_hat, n_hat) of the panel in the recon frame; n_hat points toward the source."""
+        """Return the unit vectors of the panel in the recon frame.
+
+        Args:
+            angle (float): view angle in rad.
+
+        Returns:
+            (tuple, tuple, tuple): ``u_hat``, ``v_hat`` and ``n_hat`` as (x, y, z); ``n_hat`` points toward the source.
+        """
         c, s = self._rot(angle)
         u_hat = (c, -s, 0.0)
         v_hat = (0.0, 0.0, 1.0)
@@ -309,7 +458,16 @@ class ConeGeometry:
         return u_hat, v_hat, n_hat
 
     def pixel_centers(self, angle: float, device=None, dtype=torch.float32) -> Tensor:
-        """Pixel-center positions in the recon frame as [num_det_rows, num_det_channels, 3]."""
+        """Return the pixel-center positions in the recon frame.
+
+        Args:
+            angle (float): view angle in rad.
+            device (torch.device, optional): device of the tensors. Defaults to None.
+            dtype (torch.dtype, optional): dtype of the tensor. Defaults to torch.float32.
+
+        Returns:
+            Tensor: [num_det_rows, num_det_channels, 3] positions in cm.
+        """
         u, v = self.pixel_uv(device, dtype)
         u_hat, v_hat, _ = self.panel_axes(angle)
         pc = torch.tensor(self.panel_center(angle), device=device, dtype=dtype)
@@ -318,16 +476,32 @@ class ConeGeometry:
         return pc + u[None, :, None] * u_hat + v[:, None, None] * v_hat
 
     def primary_directions(self, angle: float, device=None, dtype=torch.float32) -> Tensor:
-        """Unit vectors from the focal spot to each pixel center, recon frame, [rows, channels, 3]."""
+        """Return the unit vectors from the focal spot to each pixel center in the recon frame.
+
+        Args:
+            angle (float): view angle in rad.
+            device (torch.device, optional): device of the tensors. Defaults to None.
+            dtype (torch.dtype, optional): dtype of the tensor. Defaults to torch.float32.
+
+        Returns:
+            Tensor: [rows, channels, 3] unit directions.
+        """
         source_position = torch.tensor(self.source_position(angle), device=device, dtype=dtype)
         d = self.pixel_centers(angle, device, dtype) - source_position
         return d / torch.linalg.norm(d, dim=-1, keepdim=True)
 
     def panel_distance_along(self, points: Tensor, omega: Tensor, angle: float) -> Tensor:
-        """Signed distance t such that points + t*omega lies on the panel plane.
+        """Compute the signed distance t such that ``points + t * omega`` lies on the panel plane.
 
-        points: [..., 3] recon frame; omega: [3] or [..., 3] unit direction. Returns [...].
-        Negative or infinite values mean the direction does not reach the panel.
+        Negative or infinite values mean that the direction does not reach the panel.
+
+        Args:
+            points (Tensor): [..., 3] points in the recon frame in cm.
+            omega (Tensor): [3] or [..., 3] unit directions.
+            angle (float): view angle in rad.
+
+        Returns:
+            Tensor: [...] distances in cm.
         """
         _, _, n_hat = self.panel_axes(angle)
         n = torch.tensor(n_hat, device=points.device, dtype=points.dtype)
@@ -336,7 +510,15 @@ class ConeGeometry:
         return ((pc - points) * n).sum(-1) / denom
 
     def panel_uv_of_points(self, points: Tensor, angle: float) -> tuple[Tensor, Tensor]:
-        """Panel coordinates (u, v) of points [..., 3] assumed to lie on the panel plane."""
+        """Return the panel coordinates of points that lie on the panel plane.
+
+        Args:
+            points (Tensor): [..., 3] points in the recon frame in cm.
+            angle (float): view angle in rad.
+
+        Returns:
+            (Tensor, Tensor): u and v [...] in cm.
+        """
         u_hat, v_hat, _ = self.panel_axes(angle)
         pc = torch.tensor(self.panel_center(angle), device=points.device, dtype=points.dtype)
         uh = torch.tensor(u_hat, device=points.device, dtype=points.dtype)

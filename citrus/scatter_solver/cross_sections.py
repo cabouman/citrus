@@ -1,84 +1,12 @@
-"""Multigroup cross-section library: container, per-voxel coefficients and a synthetic test library.
+"""Multigroup cross-section library: material catalogue, container, per-voxel coefficients and a synthetic test library.
 
-The container is filled by `cross_section_library.build_library` from NIST XCOM and xraylib data (`photon_data`);
-`synthetic_library` gives a fake but self-consistent library for tests that must not depend on those data.
-
-Besides the group constants the library carries a FINE-ENERGY attenuation table (fine_energy,
-fine_mu_t, fine_weight, fine_group). Because mu_t(E; r) = sum_m rho_m(r) m_m(E) is linear in the
-density maps, the optical depth of any ray at any energy is sum_m m_m(E) P_m with P_m the line
-integral of the density map rho_m (g/cm^2): one ray trace per material present gives the exact
-polychromatic transmission. `group_transmission` evaluates
-
-    T_g = sum_{e in g} w_e exp(-sum_m m_m(E_e) P_m)
-
-the group-integrated uncollided transmission, exact up to the fine energy quadrature, used by
-the uncollided fluence and the primary image (docs/source/design_notes.rst, "Cross sections").
-
-Materials
----------
-`MATERIAL_CATALOGUE` maps a material name to (nominal density g/cm^3, composition) for every material the library
-builder knows. The composition is a material string (`cross_section_library.parse_formula`): a chemical
-formula ('H2O', a stoichiometric compound) or 'a*F1 + b*F2 + ...' with a, b the mass fractions of the elements or
-compounds F1, F2 (normalized to sum 1). The NOMINAL density is the density of the material as it occurs in the body or
-in the scanner (the pure-material points of the density model). Nominal attenuation mu = rho^nom mu/rho at the
-spectrum-mean energy 63.03 keV of the default 125 kVp spectrum is listed for orientation:
-
-    name             density  mu (1/cm)  composition source
-    air              0.0012   0.00022    dry air: N2, O2, Ar, CO2 (the volume percentages read as mass fractions)
-    lung             0.26     0.0520     ICRP lung without the Ca, Fe, Zn traces (density of the WLAB lung)
-    adipose          0.95     0.1847     ICRP adipose tissue (NIST lists 0.92 g/cm^3)
-    water            1.0      0.2014     H2O
-    muscle           1.05     0.2102     ICRU Report 44 (1989), skeletal muscle
-    soft_tissue      1.06     0.2123     ICRU Report 44 (1989), soft tissue
-    bone             1.85     0.5365     ICRP cortical bone
-    trabecular_bone  1.18     0.2697     Woodard and White (1986) Br J Radiol 59:1209, skeleton spongiosa (ICRU
-                                         Report 46, 1992)
-    brain            1.04     0.2092     ICRU Report 44 (1989), brain (grey / white matter)
-    blood            1.06     0.2130     ICRU Report 44 (1989), whole blood
-    cartilage        1.10     0.2234     Woodard and White (1986), cartilage (ICRU Report 46, 1992)
-    skin             1.09     0.2160     ICRU Report 44 (1989), skin
-    pmma             1.18     0.2230     C5H8O2, polymethyl methacrylate
-    polyethylene     0.94     0.1826     C2H4
-    aluminium        2.699    0.7027     Al (NIST density)
-    titanium         4.54     3.0919     Ti (NIST density)
-    carbon_fibre     1.56     0.2756     carbon-fibre epoxy composite (treatment couch): 60 % fibre volume of carbon
-                                         fibre (C, 1.8 g/cm^3) in bisphenol-A epoxy (C21H24O4, 1.2 g/cm^3), i.e.
-                                         0.692 C + 0.308 C21H24O4 by mass at 1.56 g/cm^3 (a typical laminate, not a
-                                         reference composition)
-
-(The compositions of air, lung, adipose tissue, cortical bone, PMMA and polyethylene are the material strings of
-XrayPhysics, which CITRUS used up to version 0.6; they are kept because they define the WLAB validation materials.
-Cortical bone and adipose tissue have exactly the mass fractions of xraylib's NIST compounds 'Bone, Cortical (ICRP)'
-and 'Adipose Tissue (ICRP)'; lung is xraylib's 'Lung (ICRP)' without its Ca, Fe and Zn traces, every mass fraction
-within 4e-4; air reads the volume percentages of dry air as mass fractions, N 0.781, O 0.210, Ar 0.0093 by mass
-instead of the 0.755, 0.232, 0.0128 of xraylib's 'Air, Dry (near sea level)'. Brain, blood, skin, cartilage and
-spongiosa come from the ICRU-44 and Woodard-White tables as cited, the ICRU-44 ones as tabulated by Hubbell and
-Seltzer, NISTIR 5632.)
-
-Elements: after these compounds (`COMPOUND_NAMES`) the catalogue holds every element Z = 1..98 under its English
-(IUPAC) name, 'hydrogen' ... 'californium' (`ELEMENT_NAMES`, e.g. 'lead' 11.35 and 'tungsten' 19.3 g/cm^3), with the
-element symbol as the composition (`ELEMENT_SYMBOLS`, xraylib's ``AtomicNumberToSymbol``) and xraylib's element density
-(`ELEMENT_DENSITIES`, ``xraylib.ElementDensity``: NIST's densities of Hubbell and Seltzer, NISTIR 5632, Table 1, gases
-at 20 C and 1 atm); aluminium and titanium are the entries above. Z = 99, 100 are left out: xraylib has no scattering
-functions for them.
-
-REFERENCE materials. The library is built for a chosen subset of the catalogue, the reference materials of the density
-model (`config.SolverConfig.materials`, at least two names; default the seven `MATERIALS`):
-
-    air 0.0012, lung 0.26, adipose 0.95, water 1.0, muscle 1.05, soft tissue 1.06, cortical bone 1.85
-
-The builder sorts the reference materials by nominal attenuation (`cross_section_library.sort_material_table`) and
-asserts that the order is the same at every energy of the library (10-125 keV,
-`cross_section_library.check_material_order`: no two reference materials cross), so `MultigroupLibrary.materials` is
-always in order of INCREASING attenuation at the nominal density. Density maps are rho [M, rows, cols, slices] with
-M = the number of reference materials, in the library's order (look a row up by name:
-`material_index(library, "water")`); every coefficient is linear in rho. The density model
-(`citrus.utilities.attenuation_to_densities`) gives every voxel at most two nonzero materials, the two reference
-materials whose nominal attenuations bracket the voxel's attenuation; the first-collision source works on that compact
-pair representation (`MaterialPairs`, `material_pairs`) wherever its evaluation points have at most two nonzero
-materials (`material_pairs_if_compact`; block means of such a field can mix more, and are then evaluated densely over
-all M materials). The library, the solver and the kernels are general in M; `synthetic_library` builds test libraries
-of any M.
+``MATERIAL_CATALOGUE`` maps every known material name to its nominal density and composition, and
+:class:`MultigroupLibrary` holds the per-unit-density group constants, angular transfer tables and fine-energy
+attenuation table that :func:`~citrus.scatter_solver.cross_section_library.build_library` fills. The per-voxel
+functions turn density maps into attenuation, transfer and group-integrated transmission, and
+:func:`synthetic_library` gives a fake but self-consistent library for tests that must not depend on the photon data.
+The catalogue and the conventions are described in the documentation page "Conventions" (sections "Materials" and
+"Scattering convention").
 """
 
 from __future__ import annotations
@@ -92,7 +20,7 @@ import torch
 import xraylib
 from torch import Tensor
 
-# ---- material catalogue (module docstring) ----------------------------------------------------------------------
+# ---- material catalogue (docs/source/conventions.rst, "Materials") ----------------------------------------------
 # the material strings of XrayPhysics (the materials of citrus <= 0.6, verbatim; the air terms are read as mass
 # fractions of the compounds, `cross_section_library.parse_formula`)
 _AIR_DRY = "78.084*N2 + 20.946*O2 + 0.9340*Ar + 0.0397*CO2"
@@ -189,10 +117,20 @@ ELECTRON_REST_KEV = 510.998950
 
 
 def check_material_names(names: Sequence[str], minimum: int = 2) -> tuple[str, ...]:
-    """The reference material names as a tuple after checking them: a sequence (not a single string) of at least
-    `minimum`
-    distinct names of `MATERIAL_CATALOGUE`. Raises ValueError naming the problem (and the catalogue for an unknown
-    name)."""
+    """Check reference material names and return them as a tuple.
+
+    The names must be a sequence (not a single string) of at least ``minimum`` distinct names of ``MATERIAL_CATALOGUE``.
+
+    Args:
+        names (Sequence[str]): catalogue material names.
+        minimum (int, optional): smallest number of names. Defaults to 2.
+
+    Returns:
+        tuple[str, ...]: the names.
+
+    Raises:
+        ValueError: naming the problem (and the catalogue, for an unknown name).
+    """
     if isinstance(names, str) or not isinstance(names, Sequence):
         raise ValueError(f"materials must be a sequence of material names, e.g. ('air', 'water', 'bone'), got "
                          f"{names!r}")
@@ -209,17 +147,35 @@ def check_material_names(names: Sequence[str], minimum: int = 2) -> tuple[str, .
 
 
 def material_table(names: Sequence[str] = MATERIALS) -> tuple[tuple[str, float, str], ...]:
-    """(name, nominal density g/cm^3, composition) of the catalogue materials `names`, in the given order (the library
-    builder sorts them by attenuation, `cross_section_library.sort_material_table`). Raises ValueError for an unknown
-    or repeated name (`check_material_names`; one name is allowed here)."""
+    """Return (name, nominal density, composition) of catalogue materials, in the given order.
+
+    Args:
+        names (Sequence[str], optional): catalogue material names, checked by ``check_material_names`` with one name
+            allowed. Defaults to MATERIALS.
+
+    Returns:
+        tuple[tuple[str, float, str], ...]: (name, nominal density in g/cm^3, composition formula) per material.
+
+    Raises:
+        ValueError: for an unknown or repeated name.
+    """
     return tuple((n, float(MATERIAL_CATALOGUE[n][0]), MATERIAL_CATALOGUE[n][1])
                  for n in check_material_names(names, minimum=1))
 
 
 def material_index(materials: Union["MultigroupLibrary", Sequence[str]], name: str) -> int:
-    """Row of material `name` in a library (`library.materials`) or in a sequence of names. Raises ValueError naming
-    the available materials when it is absent (e.g. a WLAB phantom for a set of reference materials without water or
-    bone)."""
+    """Return the row of a material in a library or in a sequence of names.
+
+    Args:
+        materials (MultigroupLibrary or Sequence[str]): a library (its ``materials``) or material names.
+        name (str): material name.
+
+    Returns:
+        int: row index of ``name``.
+
+    Raises:
+        ValueError: if ``name`` is absent, naming the available materials.
+    """
     names = tuple(materials.materials if isinstance(materials, MultigroupLibrary) else materials)
     if name not in names:
         raise ValueError(f"material {name!r} is not among the materials {names}")
@@ -228,42 +184,30 @@ def material_index(materials: Union["MultigroupLibrary", Sequence[str]], name: s
 
 @dataclass
 class MultigroupLibrary:
-    """Per-unit-density (mass) multigroup coefficients for the basis materials.
+    """Per-unit-density (mass) multigroup coefficients of the reference materials.
 
-    Shapes (M = number of reference materials, 7 for the default `MATERIALS`; G = groups, L = Legendre order):
-      group_edges        [G+1]        keV, descending
-      group_energy       [G]          representative (spectrum-weighted mean) energy per group, keV
-      spectrum_fraction  [G]          f_g, sums to 1 (source photons per steradian per group)
-      mu_t               [M, G]       total mass attenuation, cm^2/g
-      mu_pe              [M, G]       photoelectric mass attenuation, cm^2/g
-      mu_s_l             [M, G, G, L+1]  Legendre moments of the transfer, [m, g_in, g_out, l], cm^2/g,
-                                      convention mu_s(Omega'->Omega) = sum_l (2l+1)/(4pi) mu_s_l P_l(eta)
-      eta_grid           [N_eta]      cos(scattering angle) of the table nodes, ascending from -1 to 1: equally
-                                      spaced (eta_map None) or placed by eta_map
-      mu_s_eta           [M, G, G, N_eta]  per-steradian transfer d mu / d Omega (eta), cm^2/g/sr,
-                                      Compton + Rayleigh, [m, g_in, g_out, eta], at the nodes eta_grid
-      eta_map            [K] or None  the node placement of a NON-UNIFORM table (`angular_table_position`): the table
-                                      coordinate u = h(eta) in [0, 1] (node j at u = j / (N_eta - 1)) at the K knots
-                                      q_k = k / (K - 1) of q = sin(theta / 2) = sqrt((1 - eta) / 2), decreasing from
-                                      1 (q = 0, eta = 1) to 0 (q = 1, eta = -1); linear in q between knots. None: the
-                                      nodes are equally spaced in eta (a uniform table)
-    Fine-energy attenuation table (E = number of fine energies: the build's energy quadrature, bins with
-    zero spectrum weight dropped):
-      fine_energy        [E]          keV, bin midpoints, ordered by group then ascending energy
-      fine_mu_t          [M, E]       total mass attenuation at fine_energy, cm^2/g
-      fine_weight        [E]          source photons per steradian in each fine bin (the spectrum integrated
-                                      over the bin), sum_e fine_weight = 1; the sum over the bins of group g
-                                      is spectrum_fraction[g]
-      fine_group         [E] int64    group index of each fine energy
-    Materials:
-      materials          tuple of M names (library order = increasing attenuation at nominal density; catalogue
-                         names, `MATERIAL_CATALOGUE`, for a library from `cross_section_library.build_library`; look
-                         a row up with `material_index(library, name)`)
-      nominal_density    [M] g/cm^3: the density of each material as it occurs in the body (the pure-material points
-                         of the density model, `citrus.utilities.attenuation_to_densities`)
-    Left empty / None, `materials` and `nominal_density` are filled in from the number of materials: `MATERIALS` /
-    `NOMINAL_DENSITIES` for M = 7, ("water", "bone") / (1.0, 1.85) for M = 2, "m0", "m1", ... / 1, 2, ... otherwise.
-    All floating tensors float64 on CPU when built; use `.to(device, dtype)` (fine_group stays int64).
+    Shapes: M materials, G groups, L Legendre order, N table nodes, K map knots, E fine energies. All floating tensors
+    are float64 on CPU when built.
+
+    Attributes:
+        group_edges (Tensor): [G+1] group edges in keV, descending.
+        group_energy (Tensor): [G] spectrum-weighted mean energy of each group in keV.
+        spectrum_fraction (Tensor): [G] fraction f_g of the source photons per steradian in each group; sums to 1.
+        mu_t (Tensor): [M, G] total mass attenuation in cm^2/g.
+        mu_pe (Tensor): [M, G] photoelectric mass attenuation in cm^2/g.
+        mu_s_l (Tensor): [M, G, G, L+1] Legendre moments of the transfer, [m, g_in, g_out, l], in cm^2/g.
+        eta_grid (Tensor): [N] cosines of the scattering angle at the table nodes, ascending from -1 to 1.
+        mu_s_eta (Tensor): [M, G, G, N] per-steradian transfer (Compton plus Rayleigh) at the nodes in cm^2/g/sr.
+        fine_energy (Tensor): [E] fine bin midpoints in keV, ordered by group and then by ascending energy.
+        fine_mu_t (Tensor): [M, E] total mass attenuation at ``fine_energy`` in cm^2/g.
+        fine_weight (Tensor): [E] source photons per steradian in each fine bin; sums to 1, and to
+            ``spectrum_fraction[g]`` over the bins of group g.
+        fine_group (Tensor): [E] int64 group index of each fine energy.
+        materials (tuple[str, ...]): M material names in library order (increasing attenuation at nominal density).
+            Defaults to () (filled in from M).
+        nominal_density (Tensor or None): [M] nominal densities in g/cm^3. Defaults to None (filled in from M).
+        eta_map (Tensor or None): [K] node placement of an adaptive table (``angular_table_position``); None for a
+            uniform table. Defaults to None.
     """
 
     group_edges: Tensor
@@ -283,6 +227,15 @@ class MultigroupLibrary:
     eta_map: Optional[Tensor] = None
 
     def __post_init__(self) -> None:
+        """Fill in default material names and nominal densities and check the shapes.
+
+        Empty ``materials`` become ``MATERIALS`` for M = 7, ("water", "bone") for M = 2 and "m0", "m1", ... otherwise; a
+        missing ``nominal_density`` becomes ``NOMINAL_DENSITIES`` for the names ``MATERIALS``, (1.0, 1.85) for ("water",
+        "bone") and 1, 2, ..., M otherwise.
+
+        Raises:
+            ValueError: if the names, ``nominal_density`` or ``eta_map`` do not match M.
+        """
         M = int(self.mu_t.shape[0])
         if not self.materials:
             self.materials = (MATERIALS if M == len(MATERIALS) else ("water", "bone") if M == 2
@@ -303,26 +256,40 @@ class MultigroupLibrary:
     # ---- derived ----------------------------------------------------------------------------
     @property
     def num_materials(self) -> int:
+        """Number of materials M."""
         return int(self.mu_t.shape[0])
 
     @property
     def num_groups(self) -> int:
+        """Number of energy groups G."""
         return int(self.mu_t.shape[1])
 
     @property
     def legendre_order(self) -> int:
+        """Legendre order L of ``mu_s_l``."""
         return int(self.mu_s_l.shape[-1]) - 1
 
     @property
     def num_fine_energies(self) -> int:
+        """Number of fine energies E."""
         return int(self.fine_energy.shape[0])
 
     @property
     def mu_s(self) -> Tensor:
-        """Group-to-group scattering coefficient [M, G_in, G_out] = l=0 moment."""
+        """Group-to-group scattering coefficient [M, G_in, G_out] in cm^2/g, the l = 0 moment."""
         return self.mu_s_l[..., 0]
 
     def to(self, device=None, dtype=None) -> "MultigroupLibrary":
+        """Return a copy of the library on another device and/or dtype.
+
+        Args:
+            device (torch.device or str, optional): target device. Defaults to None (unchanged).
+            dtype (torch.dtype, optional): target floating dtype; ``fine_group`` stays int64. Defaults to None
+                (unchanged).
+
+        Returns:
+            MultigroupLibrary: the converted library.
+        """
         keywords = {}
         if device is not None:
             keywords["device"] = device
@@ -347,14 +314,26 @@ class MultigroupLibrary:
         )
 
     def save(self, path: str) -> None:
+        """Write every field of the library to a file with ``torch.save``.
+
+        Args:
+            path (str): file path.
+        """
         torch.save({k: getattr(self, k) for k in self.__dataclass_fields__}, path)
 
     @staticmethod
     def load(path: str) -> "MultigroupLibrary":
-        """Load a library written by `save`. Raises KeyError if the file lacks a field (a file written by an older
-        version: no fine-energy table, no material names or no nominal densities); `cross_section_library.build_library`
-        then rebuilds its cache entry. A file without `eta_map` (citrus <= 0.5) holds a uniform table and loads with
-        eta_map None."""
+        """Load a library written by ``save``; a file without ``eta_map`` loads as a uniform table.
+
+        Args:
+            path (str): file path.
+
+        Returns:
+            MultigroupLibrary: the library.
+
+        Raises:
+            KeyError: if the file lacks a field; ``build_library`` then rebuilds its cache entry.
+        """
         fields = torch.load(path)
         fields.setdefault("eta_map", None)
         missing = [k for k in MultigroupLibrary.__dataclass_fields__ if k not in fields]
@@ -367,14 +346,15 @@ class MultigroupLibrary:
 
 @dataclass(frozen=True, eq=False)
 class MaterialPairs:
-    """At most two materials per voxel (the density model's output, `citrus.utilities.attenuation_to_densities`).
+    """At most two materials per voxel, the output of the density model (``citrus.utilities.attenuation_to_densities``).
 
-    index   [2, ...spatial] int32: library material index of each slot (slot 0 < slot 1 where both are used; an
-            unused slot holds index 0 with density 0)
-    density [2, ...spatial]      : density of each slot (g/cm^3)
-    num_materials                : M of the dense maps it came from
-    The dense maps are rho[m] = sum_p density[p] [index[p] == m] (`dense`). The first-collision source gathers the two
-    table rows of each voxel by index, so its cost is that of a two-material basis for any M.
+    The dense maps are ``rho[m] = sum_p density[p] [index[p] == m]`` (``dense``).
+
+    Attributes:
+        index (Tensor): [2, ...spatial] int32 library material index of each slot; slot 0 < slot 1 where both are used,
+            and an unused slot holds index 0 with density 0.
+        density (Tensor): [2, ...spatial] density of each slot in g/cm^3.
+        num_materials (int): number of materials M of the dense maps.
     """
 
     index: Tensor
@@ -382,20 +362,44 @@ class MaterialPairs:
     num_materials: int
 
     def dense(self) -> Tensor:
-        """rho [M, ...spatial] (same device / dtype as density)."""
+        """Return the dense density maps.
+
+        Returns:
+            Tensor: [M, ...spatial] densities in g/cm^3, on the device and in the dtype of ``density``.
+        """
         out = torch.zeros((self.num_materials,) + tuple(self.density.shape[1:]), device=self.density.device,
                           dtype=self.density.dtype)
         out.scatter_add_(0, self.index.long(), self.density)
         return out
 
     def to(self, device=None, dtype=None) -> "MaterialPairs":
+        """Return a copy of the pairs on another device and/or dtype; ``index`` keeps its dtype.
+
+        Args:
+            device (torch.device or str, optional): target device. Defaults to None (unchanged).
+            dtype (torch.dtype, optional): target dtype of ``density``. Defaults to None (unchanged).
+
+        Returns:
+            MaterialPairs: the converted pairs.
+        """
         return MaterialPairs(self.index.to(device=device), self.density.to(device=device, dtype=dtype),
                              self.num_materials)
 
 
 def material_pairs(rho: Tensor) -> MaterialPairs:
-    """Compact pair representation of density maps rho [M, ...] with AT MOST TWO nonzero materials per voxel (raises
-    ValueError otherwise; one host synchronization when M > 2). The nonzero materials keep ascending index order."""
+    """Return the compact pair representation of density maps with at most two nonzero materials per voxel.
+
+    The nonzero materials keep ascending index order; one host synchronization when M > 2.
+
+    Args:
+        rho (Tensor): [M, ...spatial] densities in g/cm^3.
+
+    Returns:
+        MaterialPairs: the pairs.
+
+    Raises:
+        ValueError: if a voxel has more than two nonzero materials.
+    """
     M = int(rho.shape[0])
     spatial = tuple(rho.shape[1:])
     nonzero = rho != 0
@@ -416,19 +420,30 @@ def material_pairs(rho: Tensor) -> MaterialPairs:
 
 
 def max_materials_per_point(rho: Tensor) -> int:
-    """Largest number of nonzero materials at any point of rho [M, ...] (one host synchronization; 0 for an empty or
-    all-zero volume)."""
+    """Return the largest number of nonzero materials at any point (one host synchronization).
+
+    Args:
+        rho (Tensor): [M, ...spatial] densities.
+
+    Returns:
+        int: the count, 0 for an empty or all-zero volume.
+    """
     if rho.numel() == 0:
         return 0
     return int((rho != 0).sum(0).max())
 
 
 def material_pairs_if_compact(rho: Tensor) -> Optional[MaterialPairs]:
-    """`material_pairs(rho)` when rho [M, ...] has M > 2 materials and at most two nonzero ones at every point, else
-    None (M <= 2, or some point mixes three or more materials: the first-collision source then evaluates all M
-    materials densely). One host synchronization when M > 2. Block means of a density field that obeys the
-    two-material convention (`citrus.utilities.attenuation_to_densities`) can mix more materials, so the solver
-    decides per quadrature grid (`scatter_solver.MaterialFields.pairs_quadrature`)."""
+    """Return ``material_pairs(rho)`` when M > 2 and every point has at most two nonzero materials, else None.
+
+    None means that the first-collision source evaluates all M materials densely; one host synchronization when M > 2.
+
+    Args:
+        rho (Tensor): [M, ...spatial] densities in g/cm^3.
+
+    Returns:
+        MaterialPairs or None: the pairs, or None for M <= 2 or when a point mixes three or more materials.
+    """
     if int(rho.shape[0]) <= 2 or max_materials_per_point(rho) > 2:
         return None
     return material_pairs(rho)
@@ -437,9 +452,14 @@ def material_pairs_if_compact(rho: Tensor) -> Optional[MaterialPairs]:
 # ---- per-voxel coefficients from density maps ----------------------------------------------------
 
 def mu_t_volume(library: MultigroupLibrary, rho: Tensor) -> Tensor:
-    """Total attenuation per group on a grid.
+    """Return the total attenuation per group on a grid.
 
-    rho: [M, rows, cols, slices] g/cm^3. Returns [G, rows, cols, slices] in 1/cm.
+    Args:
+        library (MultigroupLibrary): the cross-section library.
+        rho (Tensor): [M, rows, cols, slices] densities in g/cm^3.
+
+    Returns:
+        Tensor: [G, rows, cols, slices] total attenuation coefficient mu_t in cm^-1.
     """
     mu = library.mu_t.to(rho.device, rho.dtype)  # [M, G]
     return torch.einsum("mg,mijk->gijk", mu, rho)
@@ -450,7 +470,16 @@ _TRANSMISSION_BLOCK = 1 << 22
 
 
 def fine_group_weights(library: MultigroupLibrary, device=None, dtype=None) -> Tensor:
-    """[G, E] matrix W[g, e] = fine_weight[e] where fine_group[e] == g, else 0 (fine-to-group summation)."""
+    """Return the fine-to-group summation matrix: ``W[g, e] = fine_weight[e]`` if ``fine_group[e] == g``, else 0.
+
+    Args:
+        library (MultigroupLibrary): the cross-section library.
+        device (torch.device or str, optional): device of the result. Defaults to None (the library's).
+        dtype (torch.dtype, optional): dtype of the result. Defaults to None (the library's).
+
+    Returns:
+        Tensor: [G, E] weights.
+    """
     fine_group = library.fine_group.to(device=device)
     weights = library.fine_weight.to(device=device, dtype=dtype)
     in_group = fine_group[None, :] == torch.arange(library.num_groups, device=fine_group.device)[:, None]
@@ -459,19 +488,21 @@ def fine_group_weights(library: MultigroupLibrary, device=None, dtype=None) -> T
 
 def group_transmission(library: MultigroupLibrary, path: Tensor, block: int = _TRANSMISSION_BLOCK,
                        materials: Optional[Sequence[int]] = None) -> Tensor:
-    """Group-integrated transmission from material line integrals, exact in energy up to the fine quadrature.
+    """Return the group-integrated transmission from material line integrals, exact in energy up to the fine quadrature.
 
-        T_g = sum_{e: fine_group[e] = g} fine_weight[e] exp(-sum_m fine_mu_t[m, e] path[m])
+    ``T_g = sum_{e: fine_group[e] = g} fine_weight[e] exp(-sum_m fine_mu_t[m, e] path[m])``, evaluated in blocks of at
+    most ``block`` (fine energy, ray) pairs.
 
-    path: [M, ...] line integrals of the density maps (g/cm^2), e.g. projectors.upstream_cumulative(rho) or
-    projectors.primary_project(rho). Returns [G, ...] in the dtype/device of `path` (source photons per steradian
-    per group surviving the path; sum_g T_g is the spectrum-weighted polychromatic transmission, 1 for path = 0).
-    Evaluated in blocks of at most `block` (fine energy, ray) pairs: per block one optical-depth tensor [e, n]
-    (M fused multiply-adds), an in-place exp and one [G, e] x [e, n] matmul accumulated into the [G, n] result
-    (the float32 matmul assumes TF32 is off, `torch.backends.cuda.matmul.allow_tf32 = False`, the PyTorch default).
-    materials: library indices of the rows of `path` when it holds only a subset of the materials (e.g. the ones
-    present in a volume, `uncollided.present_materials`: an absent material has zero line integrals and adds exactly 0
-    to the optical depth); None = all, in library order.
+    Args:
+        library (MultigroupLibrary): the cross-section library.
+        path (Tensor): [M', ...] line integrals of the density maps in g/cm^2.
+        block (int, optional): maximum number of (fine energy, ray) pairs per block. Defaults to ``2**22``.
+        materials (Sequence[int] or None, optional): library indices of the rows of ``path`` when it holds a subset of
+            the materials. Defaults to None (all, in library order).
+
+    Returns:
+        Tensor: [G, ...] source photons per steradian per group surviving the path (sum 1 over g for a zero path), in
+        the dtype and on the device of ``path``.
     """
     device, dtype = path.device, path.dtype
     M = path.shape[0]
@@ -504,7 +535,15 @@ def group_transmission(library: MultigroupLibrary, path: Tensor, block: int = _T
 
 
 def transfer_moments_volume(library: MultigroupLibrary, rho: Tensor) -> Tensor:
-    """Legendre transfer moments per voxel: [G_in, G_out, L+1, rows, cols, slices] in 1/cm."""
+    """Return the Legendre transfer moments per voxel.
+
+    Args:
+        library (MultigroupLibrary): the cross-section library.
+        rho (Tensor): [M, rows, cols, slices] densities in g/cm^3.
+
+    Returns:
+        Tensor: [G_in, G_out, L+1, rows, cols, slices] moments in cm^-1.
+    """
     transfer = library.mu_s_l.to(rho.device, rho.dtype)  # [M, Gi, Go, L+1]
     return torch.einsum("mabl,mijk->ablijk", transfer, rho)
 
@@ -515,16 +554,21 @@ ANGULAR_MAP_KNOTS = 512
 
 
 def angular_table_position(eta: Tensor, num_nodes: int, eta_map: Optional[Tensor] = None) -> tuple[Tensor, Tensor]:
-    """Interpolation position in the transfer table: (i0, w) with i0 [...] int64 in [0, N - 2] the lower node and
-    w [...] in [0, 1] the weight of node i0 + 1, for cos-angles eta [...] (clamped to [-1, 1]) and N = num_nodes.
+    """Return the interpolation position of cosines eta in a transfer table of ``num_nodes`` nodes.
 
-    Uniform table (eta_map None): pos = (eta + 1) / 2 (N - 1).
-    Adaptive table (eta_map [K], `MultigroupLibrary.eta_map`): q = sqrt(max((1 - eta) / 2, 0)) = sin(theta / 2),
-    p = q (K - 1), k0 = clamp(floor(p), 0, K - 2), a = clamp(p - k0, 0, 1),
-    u = eta_map[k0] + (eta_map[k0 + 1] - eta_map[k0]) a, pos = u (N - 1).
-    Then i0 = clamp(floor(pos), 0, N - 2) and w = clamp(pos - i0, 0, 1). Index arithmetic only (the map is one lookup
-    in a K-value table); the fused first-collision kernel (`kernels/uncollided_kernels.py`) performs the same
-    operations in the same order. Computed in the dtype of eta (eta_map is cast to it)."""
+    Uniform table (``eta_map`` None): ``pos = (eta + 1) / 2 (N - 1)``; adaptive table: ``pos = u(q) (N - 1)`` with u
+    interpolated linearly in the map at ``q = sin(theta/2)``. The fused first-collision kernel performs the same
+    operations in the same order.
+
+    Args:
+        eta (Tensor): [...] cosines of the scattering angle, clamped to [-1, 1].
+        num_nodes (int): number of table nodes N.
+        eta_map (Tensor or None, optional): [K] map of an adaptive table (``MultigroupLibrary.eta_map``), cast to the
+            dtype of ``eta``. Defaults to None (uniform table).
+
+    Returns:
+        (Tensor, Tensor): lower node i0 [...] int64 in [0, N - 2] and weight [...] in [0, 1] of node i0 + 1.
+    """
     n = int(num_nodes)
     eta = eta.clamp(-1.0, 1.0)
     if eta_map is None:
@@ -546,11 +590,22 @@ def angular_table_position(eta: Tensor, num_nodes: int, eta_map: Optional[Tensor
 
 
 def angular_table_nodes(num_nodes: int, eta_map: Optional[Tensor] = None) -> Tensor:
-    """cos-angles eta_j [N] (float64, ascending, eta_0 = -1, eta_{N-1} = 1) of the nodes of a table with N = num_nodes
-    nodes: equally spaced for eta_map None, else node j at the table coordinate u_j = j / (N - 1) of the map,
-    eta_j = 1 - 2 q_j^2 with q_j the inverse of the piecewise-linear map u(q) of `angular_table_position` (the nodes
-    are where that function returns integer positions, up to rounding). Raises ValueError unless eta_map decreases
-    strictly."""
+    """Return the cosines eta of the nodes of a transfer table, ascending from -1 to 1.
+
+    The nodes are equally spaced for ``eta_map`` None; otherwise node j sits at the table coordinate ``u = j / (N - 1)``
+    of the map, ``eta_j = 1 - 2 q_j^2`` with q_j from the inverse of the piecewise-linear map.
+
+    Args:
+        num_nodes (int): number of nodes N.
+        eta_map (Tensor or None, optional): [K] map of an adaptive table, strictly decreasing. Defaults to None
+            (uniform table).
+
+    Returns:
+        Tensor: [N] float64 node cosines.
+
+    Raises:
+        ValueError: unless ``eta_map`` decreases strictly.
+    """
     n = int(num_nodes)
     if eta_map is None:
         return torch.linspace(-1.0, 1.0, n, dtype=torch.float64)
@@ -570,11 +625,15 @@ def angular_table_nodes(num_nodes: int, eta_map: Optional[Tensor] = None) -> Ten
 
 
 def transfer_eta_at(library: MultigroupLibrary, rho: Tensor, eta: Tensor) -> Tensor:
-    """Per-steradian transfer evaluated at cos-angles eta for every voxel.
+    """Return the per-steradian transfer at cosines eta for every voxel, interpolated linearly between table nodes.
 
-    rho: [M, ...spatial]; eta: [...spatial] broadcastable to rho[0]. Returns [G_in, G_out, ...spatial] (1/cm/sr).
-    Linear interpolation between the two table nodes around eta (`angular_table_position`: linear in eta for a
-    uniform table, in the table coordinate u for an adaptive one).
+    Args:
+        library (MultigroupLibrary): the cross-section library.
+        rho (Tensor): [M, ...spatial] densities in g/cm^3.
+        eta (Tensor): [...spatial] cosines of the scattering angle, broadcastable to ``rho[0]``.
+
+    Returns:
+        Tensor: [G_in, G_out, ...spatial] transfer in cm^-1 sr^-1.
     """
     i0, w1 = angular_table_position(eta, library.mu_s_eta.shape[-1], library.eta_map)
     table = library.mu_s_eta.to(eta.device, eta.dtype)  # [M, Gi, Go, N]
@@ -588,10 +647,15 @@ def transfer_eta_at(library: MultigroupLibrary, rho: Tensor, eta: Tensor) -> Ten
 
 
 def transfer_eta_at_pairs(library: MultigroupLibrary, pairs: MaterialPairs, eta: Tensor) -> Tensor:
-    """`transfer_eta_at` for the pair representation: the two table rows of each voxel gathered by material index.
+    """Return ``transfer_eta_at`` for the pair representation, gathering the two table rows of each voxel by index.
 
-    pairs: index / density [2, ...spatial]; eta: [...spatial] or [k, ...spatial] (the pairs broadcast over the leading
-    direction axis). Returns [G_in, G_out, *eta.shape] (1/cm/sr). Peak memory that of a two-material basis for any M.
+    Args:
+        library (MultigroupLibrary): the cross-section library.
+        pairs (MaterialPairs): material index and density [2, ...spatial].
+        eta (Tensor): [...spatial] or [k, ...spatial] cosines; the pairs broadcast over the leading direction axis.
+
+    Returns:
+        Tensor: [G_in, G_out, ...] transfer in cm^-1 sr^-1, with the trailing shape of ``eta``.
     """
     i0, w1 = angular_table_position(eta, library.mu_s_eta.shape[-1], library.eta_map)
     table = library.mu_s_eta.to(eta.device, eta.dtype)  # [M, Gi, Go, N]
@@ -611,9 +675,16 @@ def transfer_eta_at_pairs(library: MultigroupLibrary, pairs: MaterialPairs, eta:
 # ---- synthetic library for tests ---------------------------------------------------------------------
 
 def synthetic_angular_map(num_knots: int = ANGULAR_MAP_KNOTS) -> Tensor:
-    """A fixed adaptive node placement for tests (`MultigroupLibrary.eta_map`, float64 [num_knots]):
-    u(q) = 1 - 0.6 log(1 + q / 0.02) / log(51) - 0.4 q^2 at q_k = k / (num_knots - 1), strictly decreasing from 1 to 0
-    (dense nodes near eta = 1, as for a forward peak). Not derived from a kernel."""
+    """Return a fixed adaptive node placement for tests, dense near eta = 1 as for a forward peak.
+
+    The map is ``u(q) = 1 - 0.6 log(1 + q / 0.02) / log(51) - 0.4 q^2`` at ``q_k = k / (num_knots - 1)``.
+
+    Args:
+        num_knots (int, optional): number of knots K. Defaults to ANGULAR_MAP_KNOTS.
+
+    Returns:
+        Tensor: [K] float64 map values, strictly decreasing from 1 to 0.
+    """
     q = torch.arange(num_knots, dtype=torch.float64) / (num_knots - 1)
     u = 1.0 - 0.6 * torch.log1p(q / 0.02) / math.log(51.0) - 0.4 * q * q
     u[0], u[-1] = 1.0, 0.0
@@ -623,29 +694,26 @@ def synthetic_angular_map(num_knots: int = ANGULAR_MAP_KNOTS) -> Tensor:
 def synthetic_library(num_groups: int = 4, legendre_order: int = 5, num_eta: int = 401, num_fine_per_group: int = 4,
                       fine_spread: float = 0.0, num_materials: int = 2,
                       angular_table_grid: str = "uniform") -> MultigroupLibrary:
-    """Self-consistent fake library (isotropic + mildly forward-peaked transfer) for unit tests.
+    """Return a self-consistent fake library (isotropic plus mildly forward-peaked transfer) for unit tests.
 
-    The eta table and the Legendre moments are generated from the same analytic kernel, so
-    tests of the moment/ordinate machinery hold exactly. Not physical.
-    angular_table_grid: "uniform" (default: num_eta nodes equally spaced in eta; the kernel, linear in eta, is then
-    interpolated exactly) or "adaptive" (the nodes of `synthetic_angular_map`, eta_map set; the kernel is evaluated at
-    those nodes and interpolated linearly in the table coordinate, which is not exact for a kernel linear in eta).
+    The eta table and the Legendre moments come from the same analytic kernel ``a (1 + b eta) / (4 pi)``, linear in
+    eta, so the moment machinery holds exactly and a uniform table interpolates the kernel exactly. The fine-energy
+    table has n equal-weight bins per group whose weighted mean of ``fine_mu_t`` is exactly ``mu_t``; not physical.
 
-    Fine-energy table: each group is cut into `num_fine_per_group` = n equal bins of equal weight
-    spectrum_fraction[g] / n, and fine_mu_t[m, e] = mu_t[m, g] (1 + fine_spread x_e) with x_e running linearly
-    from +1 (lowest-energy bin of the group) to -1 (highest), zero mean, so the weighted group mean of fine_mu_t is
-    exactly mu_t[m, g]. fine_spread = 0 (default): attenuation constant within each group, the fine-energy
-    transmission equals the group-wise f_g exp(-mu_t,g L) exactly. 0 < fine_spread < 1 models within-group beam
-    hardening.
+    Args:
+        num_groups (int, optional): number of groups G. Defaults to 4.
+        legendre_order (int, optional): Legendre order L. Defaults to 5.
+        num_eta (int, optional): number of table nodes. Defaults to 401.
+        num_fine_per_group (int, optional): fine bins per group n. Defaults to 4.
+        fine_spread (float, optional): relative spread of ``fine_mu_t`` within a group, from +spread at the lowest
+            energy bin to -spread at the highest (0: constant; below 1 it models beam hardening). Defaults to 0.0.
+        num_materials (int, optional): M; 2 gives ("water", "bone"), 7 the default reference materials, any other M > 2
+            blends of the two named "m0", "m1" and so on. Defaults to 2.
+        angular_table_grid (str, optional): "uniform" (nodes equally spaced in eta) or "adaptive" (the nodes of
+            ``synthetic_angular_map``). Defaults to "uniform".
 
-    Materials: two base materials A ("water"-like) and B ("bone"-like, more attenuating per gram).
-      num_materials = 2 (default): ("water", "bone") = (A, B), nominal densities (1.0, 1.85).
-      num_materials = 7: the package's table (`MATERIALS`, `NOMINAL_DENSITIES`) with water = A and bone = B (so a
-        density volume with only water and bone gives exactly the two-material results) and the other rows
-        s ((1 - t) A + t B) with (s, t) = air (0.90, 0), lung (0.95, 0.02), adipose (0.97, 0), muscle (1.0, 0.02),
-        soft tissue (1.0, 0.04): distinct, self-consistent and in increasing nominal attenuation at every energy.
-      any other M > 2: material 0 = A, 1 = B, material m >= 2 = ((1 - t) A + t B) (1 + 0.1 m), t = (m - 1) / (M - 1),
-        named "m0", "m1", ...; nominal densities 1, 2, ..., M (no attenuation order).
+    Returns:
+        MultigroupLibrary: the library, float64 on CPU.
     """
     G, L = num_groups, legendre_order
     edges = torch.linspace(125.0, 10.0, G + 1, dtype=torch.float64)
@@ -655,7 +723,7 @@ def synthetic_library(num_groups: int = 4, legendre_order: int = 5, num_eta: int
         raise ValueError(f"angular_table_grid must be 'uniform' or 'adaptive', got {angular_table_grid!r}")
     eta_map = synthetic_angular_map() if angular_table_grid == "adaptive" else None
     eta = angular_table_nodes(num_eta, eta_map) if eta_map is not None else torch.linspace(-1.0, 1.0, num_eta,
-                                                                                            dtype=torch.float64)
+                                                                                           dtype=torch.float64)
     # kernel per (material, g_in, g_out): a * (1 + b eta)/(4 pi) with b depending on the pair (|b|<1 keeps it positive)
     mu_s_eta = torch.zeros(2, G, G, num_eta, dtype=torch.float64)
     mu_s_l = torch.zeros(2, G, G, L + 1, dtype=torch.float64)

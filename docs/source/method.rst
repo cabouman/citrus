@@ -231,6 +231,7 @@ system has the closed-form solution
 
 The scheme conserves particles cell by cell (tested against a dense Galerkin assembly, a 1-D slab solution and the
 particle balance). No negative-flux fix-up is applied.
+The rare negative cell means of the collided fluence are kept; they integrate correctly in the moments.
 
 Transport sweep
 ~~~~~~~~~~~~~~~
@@ -265,6 +266,20 @@ under-integrate it; each view therefore rescales the samples per quadrature poin
 :math:`S_m \leftarrow a\,S_m\,(1 + \beta\,\boldsymbol\Omega_m\cdot\boldsymbol\Omega_{UC})`, so that the quadrature
 reproduces the exact :math:`l = 0` and :math:`l = 1` moments of the first-collision source about
 :math:`\boldsymbol\Omega_{UC}` (with :math:`\beta\in[-1,1]` keeping the source non-negative).
+
+The exact moments follow from the Legendre transfer moments,
+:math:`E_l = \int P_l(\boldsymbol\Omega\cdot\boldsymbol\Omega_{UC})\,S_{FC,g}\,d\Omega = \sum_{g'\le g}
+\mu_{s,l}^{g'\to g}\,\phi_{UC,g'}`. With the quadrature sums :math:`I_k = \sum_m w_m \mu_m^k S_m`,
+:math:`\mu_m = \boldsymbol\Omega_m\cdot\boldsymbol\Omega_{UC}`, and :math:`c = E_1/E_0`, the factors are
+:math:`\beta = (c I_0 - I_1)/(I_2 - c I_1)` clamped to :math:`[-1, 1]` (0 where :math:`E_0 \le 0` or the denominator
+vanishes) and :math:`a = E_0/(I_0 + \beta I_1)` (1 where that denominator is not positive). The :math:`l = 0` moment
+is always matched, the :math:`l = 1` moment unless :math:`\beta` was clamped.
+
+On the :math:`f^3` midpoint lattice of a cell (local coordinates :math:`u_j = (2j+1)/f - 1`), the slope moments are
+:math:`\mathrm{mean}_j(S_j u_{a,j}) / \mathrm{mean}_j(u_{a,j}^2)`. The discrete second moment is
+:math:`(1 - 1/f^2)/3`, not :math:`1/3`, so the continuous Galerkin formula :math:`3\,\mathrm{mean}(S u)` would return
+:math:`s(1 - 1/f^2)` for a field :math:`c + s u`; dividing by the discrete moment reproduces a field linear within the
+cell exactly. For :math:`f = 1` the slopes are zero.
 
 Collapsed-cone scatter image
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -302,6 +317,22 @@ photons emitted at height :math:`h` above the panel within that cell land on an 
 rectangle. The projected image of each direction is therefore box-blurred with these widths at the emission-weighted
 mean height of the direction, which removes most of the ray effects of a finite direction set.
 
+The cell of cone node :math:`(i, j)` spans, in :math:`(\cos\theta, \phi)` about the cone axis :math:`\mathbf a`, the
+interval between the cumulative Gauss weights of the polar nodes times :math:`[j\,\Delta\phi, (j+1)\,\Delta\phi]`, so
+its solid angle equals its weight. In the gnomonic coordinates :math:`(\alpha, \beta) = (\mathbf d\cdot\mathbf u /
+\mathbf d\cdot\mathbf a,\ \mathbf d\cdot\mathbf v / \mathbf d\cdot\mathbf a)` along the panel axes :math:`\mathbf u`,
+:math:`\mathbf v`, its widths are :math:`\sqrt{12}` times the standard deviation of :math:`\alpha` (:math:`\beta`)
+over the cell, sampled on an equal-area midpoint lattice (``subsamples`` per side, default 16); for a rectangle in the
+gnomonic plane this is the exact side length.
+
+The blur is exact up to the height spread of the emission along the direction and the cell shape (a box with the
+same marginal widths as the polar x azimuth cell); a direction whose attenuated emission vanishes uses the height
+of the centre of the grid box. The box window of width :math:`w` pixels is centred on each pixel, clipped to the
+panel and renormalized there, so a width of at most one pixel leaves the image unchanged. The in-cell attenuation
+:math:`\tau_j` is exact for a uniform cell whose rays leave through the same face as the ray from the cell centre.
+The image is linear in the uncollided fluence and the multiple-collision moments apart from the footprint heights,
+which follow the summed emission.
+
 Detector and grid responses
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -315,6 +346,69 @@ The detector and grid responses are per incident photon: the signal of group :ma
 with :math:`\theta_0` the angle to the panel normal, :math:`D` the detector response (keV deposited per photon) and
 :math:`G` the anti-scatter-grid transmission at the grid angles. Both are lookup tables, so responses from a Monte
 Carlo simulation of a real detector and grid can replace the analytic models.
+
+Every image, primary and scatter, holds four arrays per view: ``fluence``, the scalar fluence
+:math:`\Phi_g = \sum_k w_k\, \psi_{D,g}` (photons per cm^2 perpendicular to each direction); ``planar_fluence``,
+:math:`\sum_k w_k \cos\theta_{0,k}\, \psi_{D,g}`, the photons crossing unit panel area; ``signal_per_group``, the
+signal above (keV/cm^2, or photons/cm^2 for a counting detector); and ``signal``, its sum over the groups. All are
+per source photon per steradian.
+
+**Grid angles.** The anti-scatter grid is one-dimensional: its lamellae run along :math:`u` (channels), repeat along
+:math:`v` (rows) and are focused on the line parallel to :math:`u` at the focal distance from the panel along the
+panel normal :math:`\hat n` (by default the source-detector distance, a grid focused at the focal spot). With
+:math:`\mathbf a = -\boldsymbol\Omega` and :math:`\mathbf f` the vector from the pixel to the focal line,
+
+.. math::
+
+   \theta_1 = \operatorname{atan2}(\mathbf a\cdot\hat v, \mathbf a\cdot\hat n)
+            - \operatorname{atan2}(\mathbf f\cdot\hat v, \mathbf f\cdot\hat n), \qquad
+   \theta_2 = \operatorname{atan2}(\mathbf a\cdot\hat u, \mathbf a\cdot\hat n),
+
+:math:`\theta_1` in the plane spanned by :math:`\hat v` and :math:`\hat n` (perpendicular to the lamellae) from the
+focusing direction and :math:`\theta_2` in the plane spanned by :math:`\hat u` and :math:`\hat n` from the normal.
+A primary ray of a grid focused at the focal spot has :math:`\theta_1 = 0` exactly and
+:math:`\theta_2 = -\arctan(u / \text{SDD})`.
+
+**Analytic models.** ``csi_response`` assumes that every interacting photon deposits its full energy (no escape, no
+fluorescence) along the oblique path :math:`t/\cos\theta_0`:
+:math:`D(E, \theta_0) = E\,\big(1 - e^{-\mu_{CsI}(E)\,\rho\,t/\cos\theta_0}\big)`. ``focused_1d_grid`` is a
+geometric lamella-shadow model for lamellae of thickness :math:`t` and height :math:`h` at pitch :math:`p`. A photon
+tilted by :math:`\theta_1` passes the interspace only with the open fraction
+:math:`o = \max(0, (p - t) - h|\tan\theta_1|)/p`; the mean lead path over all photons is
+:math:`(t/p)\,h/\cos\theta_1`, so the shadowed photons cross the mean lead path
+:math:`L_s = (t/p)\,h/\cos\theta_1/(1 - o)` (:math:`h` at :math:`\theta_1 = 0`), and
+:math:`G = o + (1 - o)\,e^{-\mu_{Pb}(E)\,\rho_{Pb}\,L_s}`. A tilt along the lamellae does not change the shadow, so
+:math:`G` does not depend on :math:`\theta_2`; the interspace material and the cover are ignored. The geometry is
+set by :math:`(t, h, p)` alone: the nominal ratio is only a label (with the default lamellae,
+:math:`h/(p - t) = 11.5` and :math:`h/p = 9.0` for a nominal 10:1 grid).
+
+**Attenuation of the models.** The mass attenuation of CsI and lead are coarse tables of NIST XCOM total
+attenuation (coherent scattering included), rounded to 2 to 3 significant digits and interpolated in log-log
+(linear extrapolation in log-log outside them). Each absorption edge is a pair of nodes 1 eV apart (I K 33.17 keV,
+Cs K 35.98 keV, Pb L3 13.04 keV, Pb K 88.00 keV; the lead L2 and L1 edges are omitted since lead is opaque there).
+The interpolation is adequate for detector modelling, not for dosimetry.
+
+One view of the solver
+~~~~~~~~~~~~~~~~~~~~~~
+
+``ScatterSolver.solve_view`` computes one view in this order:
+
+1. the density-only fields (``MaterialFields``): the transport grid C and the quadrature grid Q of the fine grid,
+   the densities resampled onto both, and the total attenuation and Legendre transfer moments on C;
+2. the uncollided fluence at the points of Q, traced through the grid set by ``uncollided_trace_grid``;
+3. source iteration on C, driven by the first-collision source: evaluated at the points of Q for the sweep
+   directions with the exact transfer table, rescaled by the sampling correction and restricted to the
+   linear-discontinuous moments of the transport cells;
+4. the cell-mean moments of the multiple-collision source from the collided fluence;
+5. the scatter image of both sources in one collapsed-cone pass;
+6. the primary image on the fine grid, and the scatter fraction :math:`S/(P+S)` of the signals.
+
+The collided transport (sweeps and multiple-collision source) uses the library truncated to Legendre order
+:math:`L`; the uncollided fluence, the first-collision source and the primary use the full library (true
+:math:`\mu_t` and the exact transfer table). The solver keeps no state between calls apart from caches of objects
+that depend only on the grids, the quadratures and the view (transport grids, sweep contexts, collapsed-cone
+direction sets, and the ``direction_context_cache_size`` most recently used direction contexts);
+``ScatterSolver.clear_caches`` drops them.
 
 The primary
 -----------
@@ -330,6 +424,12 @@ the per-material line integrals :math:`P_m = \int \rho_m\,dl` (a projector) and 
   pixel-integrated primary is the physical model of a detector pixel, and it is consistent with the synthetic data,
   whose scatter is defined through the same primary;
 * in the standalone solver (``solve_view``), the solver's Siddon projector, one ray to each pixel centre.
+
+In the loop the views are projected in chunks of ``max(1, V // (M' + 1))`` consecutive views (``M'`` materials
+present; ``CitrusConfig.primary_views_per_chunk`` overrides it), so that the path lengths ``[M', chunk, rows,
+channels]`` and the projection being copied stay within one sinogram. The solver's sub-pixel sampling of the Siddon
+primary (``primary_samples_per_pixel_axis``) does not apply there: the projector already averages the line integral
+over the pixel.
 
 The scatter fraction is :math:`S/(P+S)`.
 
@@ -385,6 +485,9 @@ across the skipped iterations (the recursion is unchanged, it is advanced less o
 to a scatter stage, so for a given number of scatter steps the extra MBIR iterations cost little; choose
 ``num_outer_iterations`` as :math:`n` times the number of scatter steps you can afford.
 
+At a fixed number of outer iterations the trade-off reverses: a larger :math:`n` leaves fewer scatter stages, and
+between two of them MBIR converges towards a correction that is no longer refreshed.
+
 Scatter step on every m-th view
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -397,6 +500,21 @@ while the ratio carries the object's shadow edges. ``scatter_view_interpolation_
 ``None`` (diagnostics) leaves the skipped views uncorrected. The weights are circular in angle for a
 full rotation and run along the arc for a short scan.
 
+With :math:`j_0, j_1` the computed views bracketing a skipped view and :math:`t \in [0, 1)` its fractional position
+between them, order 0 takes the nearer of the two (:math:`t = 1/2` goes to :math:`j_0`), order 1 the weights
+:math:`1 - t, t`, order 2 the three-point Lagrange interpolant on the nearest computed view and its two neighbours
+at their actual angles (exact for quadratics of the angle on any spacing, but discontinuous where the nearest view
+changes), and order 3 Catmull-Rom on :math:`j_0 - 1, j_0, j_1, j_1 + 1` (interpolating, with a continuous first
+derivative, exact for polynomials of the angle up to degree 2 on uniformly spaced computed views and for linear ones
+on any spacing; no local four-point :math:`C^1` interpolant is exact for cubics, and its outer weights are
+negative, hence the clamp at zero). With fewer computed views than the order needs, the order is lowered to the
+number of computed views minus one. For a short scan the angles are unwrapped along the arc (starting after the
+largest gap), the Catmull-Rom nodes beyond the end views are linear extrapolations (so it stays exact for linear
+functions), the quadratic stencil shifts inside, and a view outside the computed arc gets the nearest end view. A
+view set counts as a full rotation when its largest circular gap is at most 1.5 times the median gap. With order
+``None`` the skipped views keep their most recent computed scatter, which with the fixed view subset is zero, so they
+are not corrected.
+
 Short scans
 ~~~~~~~~~~~
 
@@ -406,6 +524,23 @@ in-plane fan angle of the panel. MBIRTORCH's FDK assumes a full rotation, so bef
 scan of range :math:`\Lambda` are weighted with :math:`(\Lambda/\pi)\, w(\beta, \gamma)`, the Parker weights in the
 overscan form of Wesarg et al., which make the two measurements of every in-plane line sum to one. MBIR itself needs no
 weighting.
+
+With the view position :math:`\beta = (i + 1/2)\,\Lambda / V` along the arc, the overscan
+:math:`\delta = (\Lambda - \pi)/2` and the in-plane fan angle :math:`\gamma = -\arctan(u / \mathrm{SDD})` of channel
+:math:`u` (the sign of MBIRTORCH's frame),
+
+.. math::
+
+   w(\beta, \gamma) = \begin{cases}
+     \sin^2\!\big(\tfrac{\pi}{4}\,\beta / (\delta - \gamma)\big) & 0 \le \beta < 2(\delta - \gamma), \\
+     1 & 2(\delta - \gamma) \le \beta < \pi - 2\gamma, \\
+     \sin^2\!\big(\tfrac{\pi}{4}\,(\pi + 2\delta - \beta) / (\delta + \gamma)\big)
+       & \pi - 2\gamma \le \beta \le \pi + 2\delta.
+   \end{cases}
+
+The weights need :math:`\delta \ge \gamma_m`, i.e. a range of at least :math:`\pi` plus the fan angle; a shorter
+range gets no weights and a warning (the data are incomplete). They act per channel, the in-plane Parker weighting,
+approximate off the central plane like FDK itself.
 
 MBIR resume
 ~~~~~~~~~~~

@@ -1,26 +1,14 @@
-"""Benchmark of the fused first-collision source kernel (citrus/scatter_solver/kernels/uncollided_kernels.py).
+"""Benchmark of the fused Triton first-collision source kernel against the PyTorch path on the WLAB phantom.
 
-Usage:
+Measures, per fine voxel size, the time and peak memory of ``first_collision_source_at_directions`` for chunks of 8
+directions on each backend with its deviation from a float64 evaluation, and the time, peak memory and detector
+signal of the first-order scatter image computed with each backend. The records and a Markdown table are written to
+``--out``.
+
+Usage::
+
     python benchmarks/bench_uncollided_kernel.py [--fine 1.0 0.5] [--cones 16x32 32x64]
-                                                  [--out _cache/runs/bench_uncollided_kernel] [--skip-image]
-                                                  [--repeats 15]
-
-Setting: WLAB phantom (utilities.wlab_setup), angle 0, real XCOM / xraylib library (G = 6, 2001-point eta table),
-CsI 0.6 mm response, no grid, float32, CUDA, caching-allocator cap 5000 MiB (Windows spills VRAM
-overflow into system RAM silently). phi_uncollided from the Siddon upstream operator.
-
-Parts:
- 1. per chunk: `uncollided.first_collision_source_at_directions` for chunks of 8 directions of the 16x32 cone set (the
-    chunks of the scatter image), backend "torch" (first_collision_chunk = 4, as the scatter image calls it) and
-    "triton"; median wall ms over --repeats calls x 4 different chunks (CUDA synchronized), peak MiB above the resident
-    inputs (max_memory_allocated - memory_allocated before the call) and the max deviation between the backends
-    (relative to the field maximum) and of each backend vs a float64 evaluation.
- 2. first-order image on the fine grid (`scatter_image.combined_scatter_image` with q = 1 on that grid and a zero
-    multiple-collision source, chunk=8, first_collision_chunk=4) with the default fused Siddon projectors
-    (`SiddonProjectors()`) on the cone sets --cones, first-collision source on each backend (the backend is selected by
-    patching the name that scatter_image resolves); wall seconds after a warm-up, peak MiB (max_memory_allocated,
-    absolute), and the rel RMS of the detector signal between the two first-collision backends.
-Outputs: <out>/records.json and <out>/bench_uncollided_kernel.md (also printed).
+        [--out _cache/runs/bench_uncollided_kernel] [--skip-image] [--repeats 15]
 """
 
 from __future__ import annotations
@@ -56,39 +44,78 @@ CAP_MIB = 5000
 
 
 def sync() -> None:
+    """Wait for every CUDA kernel on the current device to finish."""
     torch.cuda.synchronize()
 
 
 class use_first_collision_backend:
-    """Context manager: route uncollided.first_collision_source_at_directions (as resolved by scatter_image and by
-    uncollided's own callers) to the
-    given backend."""
+    """Context manager that routes ``first_collision_source_at_directions`` (in ``uncollided`` and ``scatter_image``)
+    to one backend.
+
+    Attributes:
+        fn (Callable): ``first_collision_source_at_directions`` with the backend bound.
+    """
 
     def __init__(self, backend: str):
+        """Bind the backend.
+
+        Args:
+            backend (str): first-collision backend, ``"torch"`` or ``"triton"``.
+        """
         self.fn = functools.partial(ORIGINAL_FIRST_COLLISION, backend=backend)
 
     def __enter__(self):
+        """Patch both module names to the bound function.
+
+        Returns:
+            use_first_collision_backend: this context manager.
+        """
         uncollided_module.first_collision_source_at_directions = self.fn
         scatter_image_module.first_collision_source_at_directions = self.fn
         return self
 
     def __exit__(self, *exc):
+        """Restore the original function.
+
+        Args:
+            *exc: exception type, value and traceback (ignored).
+
+        Returns:
+            bool: False, so exceptions propagate.
+        """
         uncollided_module.first_collision_source_at_directions = ORIGINAL_FIRST_COLLISION
         scatter_image_module.first_collision_source_at_directions = ORIGINAL_FIRST_COLLISION
         return False
 
 
 class Bench:
-    """WLAB setups (fine grid, geometry, densities, mu_t, phi_uncollided) and the first-order image, cached per fine
-    voxel."""
+    """WLAB inputs, cached per fine voxel size, and the first-order scatter image.
+
+    Attributes:
+        device (torch.device): the CUDA device.
+        library (MultigroupLibrary): cross-section library (6 groups, Legendre order 10).
+        detector (DetectorResponse): CsI 0.6 mm detector response.
+        grid_response (GridResponse): anti-scatter grid response (no grid).
+        setups (dict): the inputs of ``setup`` by fine voxel size.
+    """
 
     def __init__(self):
+        """Load the cross-section library and the detector model."""
         self.device = torch.device("cuda")
         self.library = build_solver_library(SolverConfig(num_groups=6, legendre_order=10))  # cached on disk
         self.detector, self.grid_response = csi_response(0.06), no_grid()
         self.setups: dict[float, tuple] = {}
 
     def setup(self, fine: float):
+        """Inputs on the WLAB grid of voxel size ``fine``, computed once.
+
+        Args:
+            fine (float): voxel size in cm.
+
+        Returns:
+            tuple: (grid, geometry, rho [M, R, C, S] in g/cm^3, mu [G, R, C, S] in cm^-1, phi_uncollided [G, R, C, S]);
+                phi_uncollided comes from the Siddon upstream operator.
+        """
         if fine not in self.setups:
             grid, geometry, rho = wlab_setup(fine, device=self.device, dtype=torch.float32)
             mu = mu_t_volume(self.library, rho)
@@ -98,12 +125,29 @@ class Bench:
         return self.setups[fine]
 
     def quadrature(self, fine: float, cone: tuple[int, int]):
+        """Direction set of the scatter image in the cone that covers the grid, at angle 0.
+
+        Args:
+            fine (float): voxel size in cm.
+            cone (tuple[int, int]): numbers of polar and azimuthal directions, e.g. (16, 32).
+
+        Returns:
+            Quadrature: the direction set.
+        """
         grid, geometry = self.setup(fine)[:2]
         return scatter_image_module.panel_direction_set(geometry, 0.0, cone, max_polar_angle=grid, device=self.device,
                                                         dtype=torch.float32)
 
     def first_order(self, fine: float, quadrature) -> dict:
-        """First-order image on the fine grid: the combined pass at q = 1 with a zero multiple-collision source."""
+        """First-order scatter image on the fine grid (one quadrature point per cell, zero multiple-collision source).
+
+        Args:
+            fine (float): voxel size in cm.
+            quadrature (Quadrature): direction set.
+
+        Returns:
+            dict: the image dict of ``combined_scatter_image`` (``signal`` [Rd, Cd], ...).
+        """
         grid, geometry, rho, mu, phi_uncollided = self.setup(fine)
         T0 = torch.zeros(self.library.num_groups, 1, *grid.shape, device=self.device)
         return scatter_image_module.combined_scatter_image(self.library, rho, phi_uncollided, grid, 1, T0, 0, geometry,
@@ -111,6 +155,14 @@ class Bench:
                                                            self.grid_response, chunk=8, first_collision_chunk=4)
 
     def timed(self, fn) -> tuple[dict, float, float]:
+        """Run a function once, synchronized, after emptying the allocator cache and resetting the peak memory.
+
+        Args:
+            fn (Callable): the function to run, without arguments.
+
+        Returns:
+            (result, seconds, peak_mib): the function's result, the wall time in s and the peak allocation in MiB.
+        """
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
@@ -122,12 +174,32 @@ class Bench:
 
 
 def toward_panel(quadrature, geometry) -> torch.Tensor:
+    """Directions of a set that point toward the panel at angle 0.
+
+    Args:
+        quadrature (Quadrature): direction set.
+        geometry (ConeGeometry): scanner geometry.
+
+    Returns:
+        Tensor: [D, 3] unit directions with a positive component along ``-n`` of the panel.
+    """
     directions = quadrature.omega
     _, _, n = geometry.panel_axes(0.0)
     return directions[(directions * (-torch.tensor(n, device=directions.device, dtype=directions.dtype))).sum(-1) > 0]
 
 
 def per_chunk(b: Bench, fine: float, reps: int) -> dict:
+    """Time, peak memory and accuracy of the first-collision source for 4 chunks of 8 directions of the 16x32 set.
+
+    Args:
+        b (Bench): the benchmark inputs.
+        fine (float): voxel size in cm.
+        reps (int): timed passes over the 4 chunks.
+
+    Returns:
+        dict: per backend the median and minimum ms and the peak extra MiB, and the deviations between the backends
+            and from float64.
+    """
     grid, geometry, rho, mu, phi_uncollided = b.setup(fine)
     directions_all = toward_panel(b.quadrature(fine, (16, 32)), geometry)
     starts = np.linspace(0, directions_all.shape[0] - 8, 4).astype(int)
@@ -172,6 +244,17 @@ def per_chunk(b: Bench, fine: float, reps: int) -> dict:
 
 
 def first_order(b: Bench, fine: float, cones: list[tuple[int, int]]) -> dict:
+    """Time and peak memory of the first-order image with each first-collision backend, after a warm-up.
+
+    Args:
+        b (Bench): the benchmark inputs.
+        fine (float): voxel size in cm.
+        cones (list[tuple[int, int]]): numbers of polar and azimuthal directions of each direction set.
+
+    Returns:
+        dict: per set and backend the seconds, peak MiB and directions, and per set the relative RMS difference of
+            the detector signals.
+    """
     out = {}
     # warm-up: every projector kernel variant and both first-collision paths
     with use_first_collision_backend("triton"), torch.no_grad():
@@ -196,6 +279,16 @@ def first_order(b: Bench, fine: float, cones: list[tuple[int, int]]) -> dict:
 
 
 def markdown(records: dict, fines: list[float], cones: list[tuple[int, int]]) -> str:
+    """Markdown tables of the records.
+
+    Args:
+        records (dict): the records of ``per_chunk`` and ``first_order`` by key.
+        fines (list[float]): voxel sizes in cm.
+        cones (list[tuple[int, int]]): numbers of polar and azimuthal directions of each direction set.
+
+    Returns:
+        str: the Markdown text.
+    """
     md = ["## Per chunk of 8 directions (first_collision_source_at_directions, G = 6, median ms)", "",
           "| fine | voxels | torch (first_collision_chunk 4) ms | triton ms | speedup | torch peak extra MiB | "
           "triton peak extra MiB (= output) | max dev triton vs torch | torch vs f64 | triton vs f64 |",
@@ -227,6 +320,7 @@ def markdown(records: dict, fines: list[float], cones: list[tuple[int, int]]) ->
 
 
 def main() -> None:
+    """Parse the command line, run both parts per fine voxel size, then write and print the tables."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--fine", type=float, nargs="+", default=[1.0, 0.5])
     parser.add_argument("--cones", nargs="+", default=["16x32", "32x64"])

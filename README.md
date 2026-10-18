@@ -65,29 +65,37 @@ Install PyTorch first if you need a specific CUDA build. Every dependency instal
   it, or on the CPU, the PyTorch reference paths are used automatically (`CITRUS_DISABLE_TRITON=1` forces them).
 
 Developer tools: `dev_scripts/` (conda test environment, clean install, tests, docs, CUDA check);
-`benchmarks/` (benchmarks of the sweep, the first-collision source and the ray tracer, and a profile of the CITRUS
-step).
+`benchmarks/` (benchmarks of the sweep, the first-collision source and the ray tracer, a profile of the CITRUS
+step, and the CITRUS study script `citrus_study.py`).
 
 ## Quick start
 
 ```bash
-python demo/demo_scatter_solver.py   # the scatter solver on one view of the WLAB phantom
-python demo/demo_citrus.py           # CITRUS vs uncorrected MBIR: 180 views over a short scan, 0.5 cm grid,
-                                     # 80 outer iterations, scatter step on every 8th view at every 8th iteration
-python demo/demo_citrus.py --end-view-angle 360      # the same over a full rotation
-python demo/demo_citrus.py --full    # 180 views over a full rotation, 0.5 cm grid, 20 iterations,
-                                     # scatter step on every view at every iteration
-python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 --scatter-every 1
-                                     # a quick run
-python demo/demo_citrus.py --materials air,water,bone   # three reference materials in the density model
+python demo/demo_1_scatter_solver.py   # the scatter solver on one view of the WLAB phantom
+python demo/demo_2_citrus.py           # CITRUS vs uncorrected MBIR: 180 views over a short scan, 0.5 cm voxels
 ```
 
-The views are evenly spaced over `[start, end)` (`--start-view-angle`, `--end-view-angle` in degrees); the default
-end is a short scan, start + 180 degrees + the in-plane fan angle of the detector (`utilities.view_angles`,
-`utilities.fan_angle`). MBIRTORCH's FDK, which initializes the loop, has no short-scan weighting, so CITRUS applies
-Parker weights before it for a short scan (`recon.mbir_bridge.short_scan_weights`).
+The two demos are short scripts that show the API step by step, with every setting (spectrum, reference materials,
+panel, voxel pitch, views, loop and solver settings) a variable at the top. The first run of demo 1 downloads the
+photon data and builds the cross-section library (both cached); demo 2 caches its synthetic data in `demo/input/`.
+For studies (other sparse-view and sparse-iteration scatter schedules, a finer ground truth, the RMSE history and run
+statistics), `benchmarks/citrus_study.py` takes the settings as flags and writes figures and a summary JSON to
+`demo/output/`:
 
-Figures are written to `demo/output/`. In Python:
+```bash
+python benchmarks/citrus_study.py          # 180 views over a short scan, 0.5 cm grid, 80 outer iterations,
+                                           # scatter step on every 8th view at every 8th iteration
+python benchmarks/citrus_study.py --full   # 180 views over a full rotation, 0.5 cm grid, 20 iterations,
+                                           # scatter step on every view at every iteration
+python benchmarks/citrus_study.py --help   # every flag
+```
+
+The views are evenly spaced over `[start, end)`; the default end is a short scan, start + 180 degrees + the in-plane
+fan angle of the detector (`utilities.view_angles`, `utilities.fan_angle`). MBIRTORCH's FDK, which initializes the
+loop, has no short-scan weighting, so CITRUS applies Parker weights before it for a short scan
+(`recon.mbir_bridge.short_scan_weights`).
+
+In Python:
 
 ```python
 from citrus import CitrusConfig, citrus_recon
@@ -111,7 +119,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.7.0},
+  note = {Version 0.7.1},
   year = 2026
 }
 ```

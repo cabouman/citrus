@@ -1,75 +1,12 @@
-"""Collapsed-cone scatter image of the last-collided source and the primary image, for one view.
+"""Collapsed-cone scatter image of the last-collided source and primary image of one view.
 
-One view angle, recon frame, any device; the dtype of the inputs decides the computation dtype.
-
-Collapsed-cone scatter image
-----------------------------
-For a last-collided emission density E(r, Omega) [photons/(cm^3 sr) per source photon/sr] the angular
-fluence arriving at panel point r_D along Omega is the attenuated line integral
-
-    psi_D(r_D, Omega) = int_0^inf dl S(r_D - l Omega, Omega) exp(-tau(r_D - l Omega -> r_D))
-                      = int_0^inf dl E_Omega(r_D - l Omega),     E_Omega(r) = S(r, Omega) exp(-tau_down(r, Omega))
-
-with tau_down(r, Omega) = int mu_t along Omega from r to the panel (`downstream_cumulative`). Because
-E_Omega already contains the attenuation to the panel, it is a plain volumetric field for each fixed
-Omega, and the line integral through each pixel center is `oblique_project` [photons/(cm^2 sr)].
-The scalar fluence is the angular integral, done with the direction quadrature {Omega_k, w_k}:
-
-    Phi(r_D) = int dOmega psi_D(r_D, Omega) ~ sum_k w_k psi_D(r_D, Omega_k)          [photons/cm^2]
-
-No 1/r^2 appears: in the point-to-point form one integrates over the volume,
-Phi(r_D) = int dV E(r) exp(-tau) / |r_D - r|^2, and the spherical volume element about r_D is
-dV = l^2 dl dOmega, which cancels the 1/l^2 exactly, leaving int dOmega int dl E. The inverse square
-law is therefore carried by the solid angle geometry of the direction set, not by an explicit factor.
-
-Detector signal
----------------
-"fluence" is the scalar fluence (photons per cm^2 perpendicular to each direction). The number of photons crossing
-unit PANEL area is the planar fluence
-
-    planar_fluence(r_D) = sum_k w_k cos(theta0_k) psi_D(r_D, Omega_k)                        [photons/cm^2]
-
-with theta0_k the angle between Omega_k and the inward panel normal -n_hat (the same for every pixel of a
-flat panel). The detector and grid responses are PER INCIDENT PHOTON (`detector.DetectorResponse`: keV
-deposited per photon hitting the panel; `GridResponse`: transmitted fraction of the photons incident on the
-grid), so the detector signal is
-
-    signal_g(r_D) = sum_k w_k cos(theta0_k) psi_D,g(r_D, Omega_k) G_g(theta1_k(r_D), theta2_k(r_D)) D_g(theta0_k)
-
-[keV/cm^2]. The primary image uses the same rule with the per-pixel primary direction.
-
-Grids
------
-`combined_scatter_image` evaluates the first-collision source S_FC at the quadrature points (the voxel centers of the
-quadrature grid Q = C.refine(q): q^3 equal-weight points per transport cell, docs/source/conventions.rst, "Grids")
-and the multiple-collision source S_MC per transport cell, attenuates their sum with tau_down traced on the transport
-grid C plus its first-order variation inside the cell (`supervoxel_subpoint_emission`), and projects the sub-point
-emission on Q (each point traced to the panel separately), once per direction chunk (docs/source/design_notes.rst,
-"Scatter image"). Nothing of the image touches the fine reconstruction grid.
-`scatter_image_from_source` is the generic single-grid image of an arbitrary emission (constant per voxel,
-exp(-tau_down) at the voxel center), used by tests and diagnostics.
-
-Directions and the finite-cone footprint
-----------------------------------------
-The collapsed-cone set is a cone product set about -n_hat (toward the panel), `panel_direction_set`,
-independent of the sweep quadrature. `covering_polar_angle` gives the smallest cone that contains every
-direction from the grid box to the panel (directions outside it contribute exactly zero). Each direction stands
-for a solid-angle cell; the finite-cone footprint blurs the projected image of direction k with a box of
-(cell width) x (emission-weighted mean height above the panel), the panel footprint of the cell (`_Footprint`).
-The scatter image functions take `footprint=False` only to compare single rays with brute-force references in the
-tests; the solver always applies it.
-
-Primary
--------
-`primary_image` is exact in energy: it projects the density maps of the materials present (g/cm^2) and sums the
-transmission over the library's fine-energy table within each group (`cross_sections.group_transmission`), per
-sub-ray before the pixel average, instead of exp(-int mu_t,g dl) with group-averaged mu_t (which misses the
-within-group beam hardening). It is
-the composition of two steps that can be fed separately: `primary_path_lengths` (the projector: per-material density
-line integrals [M', Rd n, Cd n] of the maps given, one material at a time if the caller wishes) and
-`primary_from_path_lengths` (the fine-energy transmission, the source and inverse-square factors and the detector and
-anti-scatter-grid responses). The CITRUS loop feeds the second with MBIRTORCH projections of the material maps of all
-views at once (`citrus.citrus.primary_signals`, the reconstruction's own operator).
+The scatter image traces the attenuated first- and multiple-collision emission to the panel along a cone product set of
+directions with a finite-cone footprint per direction (:func:`combined_scatter_image`); :class:`DirectionSetContext`
+holds everything of an image that depends only on the view and the direction set. The primary image is exact in
+energy and is formed from per-material density line integrals (:func:`primary_path_lengths`,
+:func:`primary_from_path_lengths`). The equations are in docs/source/method.rst, "Collapsed-cone scatter image",
+"Detector and grid responses" and "The primary"; every function works on one view angle in the recon frame, in the
+dtype of its inputs.
 """
 
 from __future__ import annotations
@@ -119,13 +56,19 @@ tl = triton_utilities.tl
 # =====================================================================================================
 
 def covering_polar_angle(grid: Grid, geometry: ConeGeometry, angle: float, margin: float = 1e-6) -> float:
-    """Smallest polar angle about -n_hat containing every direction from a point of the grid box to a
-    point of the active panel area (radians, plus `margin`, capped at pi/2).
+    """Smallest polar angle about the inward panel normal that contains every direction from the grid box to the panel.
 
-    The polar angle of d = p - r is atan(|d_lateral| / d_normal); its sublevel sets are convex cones, so
-    over the polytope {p - r} (a Minkowski difference of the box and the panel rectangle) the maximum is
-    attained at a vertex, i.e. at a (panel corner) - (box corner) pair. Returns pi/2 if any box corner
-    is not strictly on the source side of the panel plane.
+    The maximum is attained at a pair of a panel corner and a box corner; the result is pi/2 when a box corner is not
+    strictly on the source side of the panel plane.
+
+    Args:
+        grid (Grid): the grid whose box is covered.
+        geometry (ConeGeometry): cone-beam geometry.
+        angle (float): view angle in radians.
+        margin (float, optional): added to the angle, in radians. Defaults to 1e-6.
+
+    Returns:
+        float: cone half-angle in radians, at most pi/2.
     """
     lower = grid.lower_corner()
     extent = grid.extent
@@ -149,14 +92,24 @@ def panel_direction_set(geometry: ConeGeometry, angle: float,
                         config_or_counts: Union[SolverConfig, tuple[int, int]], *,
                         max_polar_angle: Union[float, Grid] = math.pi / 2,
                         device=None, dtype: torch.dtype = torch.float32) -> Quadrature:
-    """Collapsed-cone direction set about -n_hat (the directions that reach the panel).
+    """Collapsed-cone direction set about the inward panel normal: the directions that reach the panel.
 
-    The Gauss-Legendre (in cos theta) x equal-azimuth product set of `angular_quadrature.hemisphere_quadrature`
-    with config_or_counts = a SolverConfig (uses cone_num_polar, cone_num_azimuthal) or a (num_polar, num_azimuthal)
-    tuple. max_polar_angle: cone half-angle in rad (default pi/2, the full hemisphere), or a Grid, in which case
-    `covering_polar_angle(grid, geometry, angle)` is used (exact: no lost contribution). The cell widths
-    (`Quadrature.cell_width` [M, 2], gnomonic coordinates about -n_hat along (u_hat, v_hat)) used by the finite-cone
-    footprint are always filled. Returns a Quadrature (omega [M, 3], weight [M] sr) on `device` with `dtype`.
+    A Gauss-Legendre (in cos theta) by equal-azimuth product set
+    (:func:`~citrus.scatter_solver.angular_quadrature.hemisphere_quadrature`) with the cell widths of the finite-cone
+    footprint filled.
+
+    Args:
+        geometry (ConeGeometry): cone-beam geometry.
+        angle (float): view angle in radians.
+        config_or_counts (SolverConfig or tuple): a configuration (``cone_num_polar``, ``cone_num_azimuthal``) or a
+            (num_polar, num_azimuthal) tuple.
+        max_polar_angle (float or Grid, optional): cone half-angle in radians, or a grid whose box the cone covers
+            (:func:`covering_polar_angle`). Defaults to pi/2.
+        device (torch.device, optional): device of the set. Defaults to None.
+        dtype (torch.dtype, optional): dtype of the set. Defaults to torch.float32.
+
+    Returns:
+        Quadrature: omega [K, 3], weight [K] in sr and cell_width [K, 2] (gnomonic widths along u_hat, v_hat).
     """
     if isinstance(config_or_counts, SolverConfig):
         num_polar, num_azimuthal = config_or_counts.cone_num_polar, config_or_counts.cone_num_azimuthal
@@ -176,42 +129,35 @@ def panel_direction_set(geometry: ConeGeometry, angle: float,
 
 @dataclass(eq=False)
 class DirectionSetContext:
-    """Everything of a collapsed-cone image that depends only on the direction set, the panel geometry, the
-    view angle, the detector / grid responses and the group energies (not on the emission).
-    Built by `make_direction_context`; pass it as `context=` to the scatter-image functions to reuse it across
-    images of the same view (the scatter image of every solve and of every CITRUS outer iteration).
+    """Everything of a collapsed-cone image that depends only on the view, the direction set and the responses.
 
-    K = number of panel-facing directions (Omega . (-n_hat) > 0; the others never reach the panel), G groups,
-    Rd x Cd pixels (num_det_rows x num_det_channels).
+    Built by :func:`make_direction_context` and passed as ``context`` to the image functions to reuse it across the
+    images of one view; direction-only tables (harmonics, sub-cell offsets, footprint heights) are cached in it on first
+    use. K is the number of panel-facing directions, G the number of groups and Rd x Cd the detector rows x channels.
 
-    quadrature, geometry, angle, detector, grid_response : what the context was built from (checked on use)
-    omega          [K, 3]  panel-facing directions, one contiguous tensor (the projectors key their host copy of the
-                           directions by storage, so the chunk slices of one context synchronize at most once)
-    weight         [K]     quadrature weights (sr)
-    cos_theta0     [K]     Omega_k . (-n_hat)
-    detector_weight [K, G] D_g(theta0_k) (keV per incident photon)
-    grid_weight    [K, G, Rd, 1]  G_g(theta1_k(row), theta2_k) when `separable` (always for the flat ConeGeometry:
-                           theta1 = atan2(a.v, a.n) - atan2(f.v, f.n) with f = focus - pixel, and f.v = -v_row,
-                           f.n = focal distance do not depend on the channel; theta2 = atan2(a.u, a.n) depends on the
-                           direction only); None otherwise (factorize=False or a non-separable panel: only the
-                           per-pixel signal_weight is kept, Cg = Cd)
-    signal_weight  [K, G, Rd, Cg]  w_k cos(theta0_k) D_g(theta0_k) G_g(...)
-    accumulation_weight  separable: [G * Rd, 3, K], the fused accumulation weights (w_k, w_k cos(theta0_k),
-                   signal_weight) laid out for one batched matmul per chunk (`accumulate`); else None
-    chunk, chunk_bounds  directions per chunk and the (start, stop) of every chunk; omega_chunks / weight_chunks are
-                   the matching views of omega / weight
-    cell_width     [K, 2] or None: quadrature.cell_width of the kept directions (gnomonic widths of each direction's
-                   cell along u_hat, v_hat; needed by the finite-cone footprint)
-
-    Representation choice (exact, smallest): the detector response depends on the direction only through theta0 ->
-    [K, G]; the grid response depends on (theta1, theta2), which for the flat panel vary with the direction and the
-    detector ROW only -> [K, G, Rd] (per group because the table is energy dependent). The fused weights are
-    [G * Rd, 3, K], a factor Cd / 3 smaller than a per-pixel [K, G, Rd, Cd] table per weight. All responses are
-    evaluated in float64 and stored in the context dtype.
-
-    Lazily cached per context: real spherical harmonics of the directions per order L (`spherical_harmonics`),
-    the sub-cell offsets Omega_k . (r_j - r_cell) per (quadrature grid, q) (`subcell_offsets`) and the panel heights of
-    the finite-cone footprint per grid (`_Footprint`), so that repeated images of a view need no host synchronization.
+    Attributes:
+        quadrature (Quadrature): the direction set the context was built from (checked on use).
+        geometry (ConeGeometry): the geometry it was built for.
+        angle (float): view angle in radians.
+        detector (DetectorResponse): detector response.
+        grid_response (GridResponse): anti-scatter-grid response.
+        group_energy (Tensor): [G] group energies in keV.
+        omega (Tensor): [K, 3] panel-facing directions, one contiguous tensor.
+        weight (Tensor): [K] quadrature weights in sr.
+        cos_theta0 (Tensor): [K] cosine of the angle theta0 between each direction and the inward panel normal.
+        detector_weight (Tensor): [K, G] detector response ``D_g(theta0_k)`` in keV per incident photon.
+        grid_weight (Tensor): [K, G, Rd, 1] grid transmission per detector row when separable, else None.
+        signal_weight (Tensor): [K, G, Rd, Cg] signal weights ``w_k cos(theta0_k) D_g G_g`` (Cg = 1 when separable,
+            else Cd).
+        accumulation_weight (Tensor): [G Rd, 3, K] fused weights of :meth:`accumulate` when separable, else None.
+        separable (bool): the grid response depends on the detector row only (flat panel).
+        chunk (int): directions per chunk.
+        chunk_bounds (tuple): (start, stop) of every chunk.
+        omega_chunks (tuple): [k, 3] views of ``omega`` per chunk.
+        weight_chunks (tuple): [k] views of ``weight`` per chunk.
+        image_shape (tuple): (Rd, Cd).
+        cell_width (Tensor): [K, 2] gnomonic cell widths of the directions for the finite-cone footprint, or None.
+            Defaults to None.
     """
 
     quadrature: Quadrature
@@ -239,18 +185,22 @@ class DirectionSetContext:
     # ---- sizes ----------------------------------------------------------------------------------
     @property
     def num_directions(self) -> int:
+        """Number of panel-facing directions K."""
         return int(self.omega.shape[0])
 
     @property
     def num_groups(self) -> int:
+        """Number of energy groups G."""
         return int(self.group_energy.numel())
 
     @property
     def device(self) -> torch.device:
+        """Device of the context's tensors."""
         return self.omega.device
 
     @property
     def dtype(self) -> torch.dtype:
+        """Dtype of the context's tensors."""
         return self.omega.dtype
 
     @property
@@ -270,8 +220,21 @@ class DirectionSetContext:
     # ---- checks ----------------------------------------------------------------------------------
     def check(self, geometry: ConeGeometry, angle: float, quadrature: Quadrature, detector: DetectorResponse,
               grid_response: GridResponse, num_groups: int, device: torch.device, dtype: torch.dtype) -> None:
-        """Raise ValueError unless the context was built for these arguments (host-side checks only: identity of
-        the direction set and the responses, geometry and angle equality, group count, device and dtype)."""
+        """Check that the context was built for these image arguments (host-side checks only).
+
+        Args:
+            geometry (ConeGeometry): cone-beam geometry of the image.
+            angle (float): view angle in radians.
+            quadrature (Quadrature): direction set; must be the context's own object.
+            detector (DetectorResponse): detector response; must be the context's own object.
+            grid_response (GridResponse): grid response; must be the context's own object.
+            num_groups (int): number of groups G of the image.
+            device (torch.device): device of the image.
+            dtype (torch.dtype): dtype of the image.
+
+        Raises:
+            ValueError: if any argument does not match.
+        """
         mismatches = []
         if quadrature is not self.quadrature:
             mismatches.append("direction set (quadrature)")
@@ -294,7 +257,14 @@ class DirectionSetContext:
 
     # ---- lazily cached direction-only tables --------------------------------------------------------
     def spherical_harmonics(self, L: int) -> tuple[Tensor, ...]:
-        """Real spherical harmonics of the context directions, one [k, (L+1)^2] view per chunk (cached per L)."""
+        """Real spherical harmonics of the context's directions per chunk (cached per order).
+
+        Args:
+            L (int): Legendre order.
+
+        Returns:
+            tuple: one [k, (L+1)^2] tensor per chunk.
+        """
         key = ("spherical_harmonics", int(L))
         cached = self._cache.get(key)
         if cached is None:
@@ -304,9 +274,15 @@ class DirectionSetContext:
         return cached[1:]
 
     def subcell_offsets(self, grid_quadrature: Grid, q: int) -> tuple[Tensor, ...]:
-        """Omega_k . (r_j - r_cell) for the q^3 quadrature points r_j of a transport cell (the voxel centers of
-        grid_quadrature inside the cell, `supervoxel_subpoint_emission`), one [k, q, q, q] view per chunk (axes: rows,
-        cols, slices), cached per (grid_quadrature voxel deltas, q)."""
+        """Offsets ``Omega_k . (r_j - r_cell)`` of the q^3 quadrature points of a transport cell, per chunk (cached).
+
+        Args:
+            grid_quadrature (Grid): the quadrature grid Q.
+            q (int): quadrature points per axis per transport cell.
+
+        Returns:
+            tuple: one [k, q, q, q] tensor per chunk in cm (axes rows, cols, slices).
+        """
         f = int(q)
         key = ("subcell", tuple(float(d) for d in grid_quadrature.deltas), f)
         cached = self._cache.get(key)
@@ -318,17 +294,27 @@ class DirectionSetContext:
 
     # ---- accumulation ------------------------------------------------------------------------------
     def new_accumulator(self) -> Tensor:
-        """Zeroed image accumulator: [G * Rd, 3, Cd] (separable) or [3, G, Rd, Cd]."""
+        """Zeroed image accumulator for :meth:`accumulate`.
+
+        Returns:
+            Tensor: [G Rd, 3, Cd] when separable, else [3, G, Rd, Cd].
+        """
         G, (Rd, Cd) = self.num_groups, self.image_shape
         if self.separable:
             return torch.zeros(G * Rd, 3, Cd, device=self.device, dtype=self.dtype)
         return torch.zeros(3, G, Rd, Cd, device=self.device, dtype=self.dtype)
 
     def accumulate(self, accumulator: Tensor, image: Tensor, chunk_index: int) -> None:
-        """accumulator += the weighted chunk image: image [k, G, Rd, Cd] = the projected attenuated emission of chunk
-        `chunk_index` (k directions) in photons/(cm^2 sr). Separable: ONE batched matmul (baddbmm, no copy when image
-        is contiguous):
-        accumulator[(g, r), j, c] += sum_k W[(g, r), j, k] image[k, g, r, c], j = (fluence, planar, signal)."""
+        """Add the weighted image of one direction chunk to the accumulator in place (fluence, planar fluence, signal).
+
+        When separable this is one batched matrix product,
+        ``accumulator[(g, r), j, c] += sum_k W[(g, r), j, k] image[k, g, r, c]``.
+
+        Args:
+            accumulator (Tensor): the accumulator of :meth:`new_accumulator`.
+            image (Tensor): [k, G, Rd, Cd] projected attenuated emission of the chunk in photons/(cm^2 sr).
+            chunk_index (int): index of the chunk.
+        """
         start, stop = self.chunk_bounds[chunk_index]
         k = stop - start
         G, (Rd, Cd) = self.num_groups, self.image_shape
@@ -342,7 +328,14 @@ class DirectionSetContext:
         accumulator[2].add_((image * self.signal_weight[start:stop]).sum(0))
 
     def finalize(self, accumulator: Tensor) -> dict[str, Tensor]:
-        """The image dict of `scatter_image_from_source` from an accumulator."""
+        """Image dict from an accumulator.
+
+        Args:
+            accumulator (Tensor): the accumulator filled by :meth:`accumulate`.
+
+        Returns:
+            dict: fluence, planar_fluence and signal_per_group [G, Rd, Cd] and signal [Rd, Cd].
+        """
         G, (Rd, Cd) = self.num_groups, self.image_shape
         if self.separable:
             accumulator = accumulator.reshape(G, Rd, 3, Cd).permute(2, 0, 1, 3)
@@ -352,8 +345,16 @@ class DirectionSetContext:
 
 
 def _subcell_offsets(omega: Tensor, grid_quadrature: Grid, f: int) -> Tensor:
-    """Omega_k . (r_j - r_cell) [K, q_r, q_c, q_s] for the q^3 = f^3 voxel centers of grid_quadrature inside one cell of
-    grid_quadrature.coarsen(f); omega [K, 3]."""
+    """Offsets ``Omega_k . (r_j - r_cell)`` of the f^3 voxel centers of ``grid_quadrature`` inside one coarsened cell.
+
+    Args:
+        omega (Tensor): [K, 3] directions.
+        grid_quadrature (Grid): the quadrature grid Q.
+        f (int): points per axis per cell of ``grid_quadrature.coarsen(f)``.
+
+    Returns:
+        Tensor: [K, f, f, f] offsets in cm (axes rows, cols, slices).
+    """
     device, dtype = omega.device, omega.dtype
     dx, dy, dz = grid_quadrature.deltas
     centered_index = torch.arange(f, device=device, dtype=dtype) - (f - 1) / 2.0
@@ -368,20 +369,29 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
                            device=None, dtype: Optional[torch.dtype] = None, *,
                            group_energy: Optional[Tensor] = None, chunk: int = 8,
                            factorize: bool = True) -> DirectionSetContext:
-    """Precompute the emission-independent part of a collapsed-cone image for one (view, direction set).
+    """Precompute the emission-independent part of the collapsed-cone images of one view and direction set.
 
-    quadrature: direction set (omega [M, 3], weight [M]); only the panel-facing directions are kept (K of them, selected
-      here once, with the only host synchronization of the context's life).
-    library / group_energy: group energies [G] keV for the response lookups (group_energy wins).
-    device, dtype: of the images the context will serve (default: quadrature's device, float32 / quadrature's float
-    dtype). chunk: directions per chunk of the image loop (the context's chunking is used by every image
-      it serves).
-    factorize: store the grid response per detector row ([K, G, Rd, 1], exact for the flat panel; checked here
-      numerically, a non-separable panel falls back automatically) and accumulate with one batched matmul per
-      chunk; False keeps a per-pixel [K, G, Rd, Cd] table (reference path, 4 x K x G x pixels bytes).
-    No grid argument: nothing in the per-chunk response work depends on the voxel grid, so one context serves every
-    image of a view, on any grid. Grid-dependent tables (sub-cell offsets) are cached lazily by grid.
-    Returns a DirectionSetContext (its docstring has the shapes and the representation).
+    Only the panel-facing directions are kept (the only host synchronization of the context); the context does not
+    depend on the voxel grid, so it serves every image of the view.
+
+    Args:
+        quadrature (Quadrature): direction set, omega [M, 3] and weight [M].
+        geometry (ConeGeometry): cone-beam geometry.
+        angle (float): view angle in radians.
+        detector (DetectorResponse): detector response.
+        grid_response (GridResponse): anti-scatter-grid response.
+        library (MultigroupLibrary, optional): source of the group energies when ``group_energy`` is None. Defaults to
+            None.
+        device (torch.device, optional): device of the images. Defaults to None, the device of ``quadrature``.
+        dtype (torch.dtype, optional): dtype of the images. Defaults to None, the dtype of ``quadrature`` (float32 if
+            it is not a float type).
+        group_energy (Tensor, optional): [G] group energies in keV; takes precedence over ``library``. Defaults to None.
+        chunk (int, optional): directions per chunk of the image loop. Defaults to 8.
+        factorize (bool, optional): store the grid response per detector row when the panel is separable (checked
+            numerically) and accumulate with one batched matrix product, else per-pixel weights. Defaults to True.
+
+    Returns:
+        DirectionSetContext: the context of the view (:class:`DirectionSetContext` lists the shapes).
     """
     if group_energy is None:
         if library is None:
@@ -465,7 +475,23 @@ def _resolve_context(context: Optional[DirectionSetContext], quadrature: Quadrat
                      angle: float, detector: DetectorResponse, grid_response: GridResponse,
                      library: Optional[MultigroupLibrary], mu_t: Tensor, chunk: int,
                      group_energy: Optional[Tensor]) -> DirectionSetContext:
-    """The given context (checked against the arguments) or a new one built for them on mu_t's device / dtype."""
+    """Return the given context after checking it against the arguments, or build one for them.
+
+    Args:
+        context (DirectionSetContext): the context to check, or None to build one.
+        quadrature (Quadrature): direction set.
+        geometry (ConeGeometry): cone-beam geometry.
+        angle (float): view angle in radians.
+        detector (DetectorResponse): detector response.
+        grid_response (GridResponse): anti-scatter-grid response.
+        library (MultigroupLibrary): source of the group energies, or None.
+        mu_t (Tensor): [G, ...] attenuation whose group count, device and dtype the context must match.
+        chunk (int): directions per chunk of a new context.
+        group_energy (Tensor): [G] group energies in keV, or None.
+
+    Returns:
+        DirectionSetContext: the checked or new context.
+    """
     G = int(mu_t.shape[0])
     if context is None:
         if group_energy is None and library is None:
@@ -490,33 +516,38 @@ def scatter_image_from_source(source_function: SourceFunction, grid: Grid, geome
                               group_energy: Optional[Tensor] = None,
                               context: Optional[DirectionSetContext] = None, *,
                               footprint: bool = True) -> dict[str, Tensor]:
-    """Collapsed-cone image of a last-collided emission source on ONE grid (module docstring).
+    """Collapsed-cone image of an arbitrary last-collided emission on one grid, for tests and diagnostics.
 
-    The generic single-grid form of the collapsed-cone image (the solver's pass is `combined_scatter_image`; this
-    function serves tests and diagnostics with an arbitrary emission).
-    source_function(omegas [k, 3]) -> [k, G, rows, cols, slices]: emission density S_g(r, Omega_k) at the
-      voxel centers of `grid` in photons/(cm^3 sr) per source photon/sr (treated as constant per voxel).
-    mu_t: [G, rows, cols, slices] (1/cm) on `grid`, used for the attenuation to the panel.
-    quadrature: direction set (e.g. `panel_direction_set`); directions with Omega . (-n_hat) <= 0 are skipped
-      (they never reach the panel).
-    group_energy [G] keV for the response lookups: taken from `library.group_energy` unless given.
-    chunk: directions per batch (peak memory ~ 3 chunk G |grid| scalars plus the projector's working set).
-    context: optional `make_direction_context(quadrature, geometry, angle, detector, grid_response, library, ...)` of
-      this view (built here when None). It holds the panel-facing directions, their chunking (its `chunk` replaces
-      the argument) and the precomputed response weights; it must match the other arguments (checked).
-    footprint: apply the finite-cone footprint (`_Footprint`, heights weighted by this emission; needs
-      quadrature.cell_width); False projects every direction as a single ray per pixel.
+    The emission is constant per voxel and attenuated from the voxel center to the panel (docs/source/method.rst,
+    "Collapsed-cone scatter image").
 
-    For each chunk: tau = downstream_cumulative(mu_t, Omega_k); E_k = S(Omega_k) exp(-tau) (exp(-inf) = 0);
-    img_k = oblique_project(E_k) [photons/(cm^2 sr)], then one fused weighted accumulation
-    (`DirectionSetContext.accumulate`): fluence += w_k img_k; planar_fluence += w_k cos(theta0_k) img_k;
-    signal_per_group += w_k img_k cos(theta0_k) G_g(theta1_k, theta2_k) D_g(theta0_k) (module docstring).
+    Args:
+        source_function (callable): maps directions [k, 3] to the emission density [k, G, rows, cols, slices] at the
+            voxel centers of ``grid``, in photons/(cm^3 sr) per source photon per sr.
+        grid (Grid): grid of the emission and of ``mu_t``.
+        geometry (ConeGeometry): cone-beam geometry.
+        angle (float): view angle in radians.
+        quadrature (Quadrature): direction set (e.g. :func:`panel_direction_set`); directions away from the panel are
+            skipped.
+        mu_t (Tensor): [G, rows, cols, slices] total attenuation coefficient mu_t in cm^-1 on ``grid``.
+        projectors (Projectors): ray tracers.
+        detector (DetectorResponse): detector response.
+        grid_response (GridResponse): anti-scatter-grid response.
+        library (MultigroupLibrary, optional): source of the group energies when ``group_energy`` is None. Defaults to
+            None.
+        chunk (int, optional): directions per batch; a given ``context`` sets its own. Defaults to 8.
+        group_energy (Tensor, optional): [G] group energies in keV. Defaults to None, ``library.group_energy``.
+        context (DirectionSetContext, optional): direction context of the view, checked against the arguments.
+            Defaults to None, built here.
+        footprint (bool, optional): apply the finite-cone footprint (needs ``quadrature.cell_width``); False projects
+            one ray per pixel and direction. Defaults to True.
 
-    Returns dict:
-      fluence          [G, num_det_rows, num_det_channels]  scalar fluence, photons/cm^2 per source photon/sr
-      planar_fluence   [G, num_det_rows, num_det_channels]  photons crossing unit panel area (no grid/detector)
-      signal_per_group [G, num_det_rows, num_det_channels]  keV/cm^2 (or photons/cm^2 for a counting D)
-      signal           [num_det_rows, num_det_channels]     sum over groups
+    Returns:
+        dict: fluence and planar_fluence [G, Rd, Cd] in photons/cm^2, signal_per_group [G, Rd, Cd] in keV/cm^2
+            and signal [Rd, Cd], per source photon per sr.
+
+    Raises:
+        ValueError: if ``context`` does not match the arguments.
     """
     context = _resolve_context(context, quadrature, geometry, angle, detector, grid_response, library, mu_t, chunk,
                                group_energy)
@@ -548,8 +579,17 @@ def scatter_image_from_source(source_function: SourceFunction, grid: Grid, geome
 
 def _check_subpoint_shapes(source_quadrature: Tensor, tau_coarse: Tensor, grid_quadrature: Grid,
                            f: int) -> tuple[int, int, int]:
-    """Validate source_quadrature [k, G, Rq, Cq, Sq] on grid_quadrature and tau_coarse [k, G, Rc, Cc, Sc]; returns
-    (Rc, Cc, Sc)."""
+    """Check the shapes of a quadrature-point source and a transport-grid optical depth.
+
+    Args:
+        source_quadrature (Tensor): [k, G, Rq, Cq, Sq] source on ``grid_quadrature``.
+        tau_coarse (Tensor): [k, G, Rc, Cc, Sc] optical depth on the transport grid.
+        grid_quadrature (Grid): the quadrature grid Q.
+        f (int): quadrature points per axis per transport cell.
+
+    Returns:
+        tuple: (Rc, Cc, Sc), the shape of the transport grid.
+    """
     coarse = grid_quadrature.coarsen(f)
     k, G = source_quadrature.shape[:2]
     Rc, Cc, Sc = coarse.shape
@@ -563,23 +603,27 @@ def _check_subpoint_shapes(source_quadrature: Tensor, tau_coarse: Tensor, grid_q
 
 def supervoxel_subpoint_emission(source_quadrature: Tensor, tau_coarse: Tensor, mu_t_coarse: Tensor, omegas: Tensor,
                                  grid_quadrature: Grid, q: int, *, offsets: Optional[Tensor] = None) -> Tensor:
-    """Attenuated emission at every quadrature point, kept on the quadrature grid Q (before the projection and the sum
-    over j).
+    """Attenuated emission ``e_j = S_j exp(-tau_j)`` at every quadrature point, kept on the quadrature grid.
 
-    The quadrature points r_j of a transport cell of C = grid_quadrature.coarsen(q) are the q^3 voxel centers of
-    grid_quadrature inside it (equal weights 1/q^3):
+    ``tau_j = max(0, tau_cell - mu_t_cell (Omega_k . (r_j - r_cell)))`` is the optical depth of the transport-cell
+    center corrected to first order inside the cell; for q = 1 the result is ``S exp(-tau)``.
 
-        e[k, g, r_j] = S[k, g, r_j] exp(-tau_j),
-        tau_j = max(0, tau_coarse[k, g, cell] - mu_t_coarse[g, cell] (Omega_k . (r_j - r_cell)))
+    Args:
+        source_quadrature (Tensor): [k, G, Rq, Cq, Sq] emission density on ``grid_quadrature`` in photons/(cm^3 sr).
+        tau_coarse (Tensor): [k, G, Rc, Cc, Sc] optical depth to the panel from the transport-cell centers (+inf
+            allowed).
+        mu_t_coarse (Tensor): [G, Rc, Cc, Sc] total attenuation coefficient mu_t in cm^-1 on the transport grid.
+        omegas (Tensor): [k, 3] directions.
+        grid_quadrature (Grid): the quadrature grid Q.
+        q (int): quadrature points per axis per transport cell.
+        offsets (Tensor, optional): [k, q, q, q] precomputed ``Omega_k . (r_j - r_cell)``
+            (:meth:`DirectionSetContext.subcell_offsets`). Defaults to None, computed here.
 
-    i.e. the downstream attenuation at the supervoxel center plus its first-order variation inside the cell (moving
-    along Omega_k toward the panel shortens the path); exact for a uniform cell whose rays leave through the same
-    face as the center ray. Projecting this field on grid_quadrature traces each point to the panel separately.
-    source_quadrature [k, G, Rq, Cq, Sq] on grid_quadrature; tau_coarse [k, G, Rc, Cc, Sc] on C
-    (projectors.downstream_cumulative; +inf allowed); mu_t_coarse [G, Rc, Cc, Sc] (1/cm); omegas [k, 3]. Returns
-    e [k, G, Rq, Cq, Sq] in photons/(cm^3 sr) on grid_quadrature, in the device / dtype of tau_coarse. For q = 1 this is
-    S exp(-tau) (no clamp). Peak extra memory ~ one quadrature-grid field [k, G, Rq, Cq, Sq]. offsets: optional
-    precomputed Omega_k . (r_j - r_cell) [k, q, q, q] (`DirectionSetContext.subcell_offsets`), computed here when None.
+    Returns:
+        Tensor: [k, G, Rq, Cq, Sq] attenuated emission in photons/(cm^3 sr), on the device and dtype of ``tau_coarse``.
+
+    Raises:
+        ValueError: if a shape does not match.
     """
     f = int(q)
     k, G = source_quadrature.shape[:2]
@@ -606,10 +650,17 @@ def supervoxel_subpoint_emission(source_quadrature: Tensor, tau_coarse: Tensor, 
 
 
 def coarsen_mu_t(mu_t_fine: Tensor, grid_fine: Grid, grid_coarse: Grid) -> Tensor:
-    """Cell average of an attenuation map [G, R, C, S] on grid_fine over the cells of grid_coarse -> [G, Rc, Cc, Sc]
-    (1/cm; `geometry.resample_conservative`, zero outside the box of grid_fine).
+    """Average an attenuation map over the cells of a coarser grid by conservative overlap resampling.
 
-    Because mu_t is linear in the densities this equals mu_t_volume(library, resampled rho).
+    Zero outside the fine box; equals the attenuation of the resampled densities, since mu_t is linear in them.
+
+    Args:
+        mu_t_fine (Tensor): [G, R, C, S] total attenuation coefficient mu_t in cm^-1 on ``grid_fine``.
+        grid_fine (Grid): the grid of ``mu_t_fine``.
+        grid_coarse (Grid): the target grid.
+
+    Returns:
+        Tensor: [G, Rc, Cc, Sc] cell-averaged attenuation in cm^-1 on ``grid_coarse``.
     """
     return resample_conservative(mu_t_fine, grid_fine, grid_coarse)
 
@@ -619,12 +670,19 @@ def coarsen_mu_t(mu_t_fine: Tensor, grid_fine: Grid, grid_coarse: Grid) -> Tenso
 # =====================================================================================================
 
 def box_blur_rows_cols(image: Tensor, width_channels: Tensor, width_rows: Tensor) -> Tensor:
-    """Separable box filter of image [k, G, Rd, Cd] with a per-image width (in PIXELS, fractional allowed) along the
-    channels (width_channels [k]) and the rows (width_rows [k]): out[c] = (1/|W|) int_W x over the window
-    W = [c + 1/2 - w/2, c + 1/2 + w/2] clipped to the panel [0, Cd] (pixel j covers [j, j + 1]; x is piecewise constant;
-    the window is renormalized at the panel edges). A width <= 1 pixel leaves a pixel unchanged (the window stays inside
-    the pixel). Done as two batched matmuls with the [k, N, N] window-overlap matrices (`box_matrix`; cheaper than
-    gathers from a cumulative sum). Returns [k, G, Rd, Cd]."""
+    """Separable box blur of each image with its own fractional width in pixels along the channels and the rows.
+
+    The window is centred on each pixel, clipped to the panel and renormalized there; a width of at most one pixel
+    leaves the image unchanged.
+
+    Args:
+        image (Tensor): [k, G, Rd, Cd] images.
+        width_channels (Tensor): [k] widths along the channels in pixels.
+        width_rows (Tensor): [k] widths along the rows in pixels.
+
+    Returns:
+        Tensor: [k, G, Rd, Cd] blurred images.
+    """
     k, G, Rd, Cd = image.shape
     channel_matrix = box_matrix(Cd, width_channels, image.dtype)  # [k, Cd, Cd]
     row_matrix = box_matrix(Rd, width_rows, image.dtype)  # [k, Rd, Rd]
@@ -633,9 +691,19 @@ def box_blur_rows_cols(image: Tensor, width_channels: Tensor, width_rows: Tensor
 
 
 def box_matrix(N: int, w: Tensor, dtype: Optional[torch.dtype] = None) -> Tensor:
-    """[k, N, N] matrices of the 1-D box filter of box_blur_rows_cols: B[c, j] = |[j, j + 1] n W_c| / |W_c|, W_c =
-    [c + 1/2 - w/2, c + 1/2 + w/2] n [0, N], for widths w [k] (pixels; clamped below at 1e-3). float32 CUDA: one
-    Triton launch (`_box_matrix_kernel`; the PyTorch expression below takes ~17 launches, ~0.3 ms per call)."""
+    """Overlap matrices of the one-dimensional box filter of :func:`box_blur_rows_cols`.
+
+    ``B[c, j] = |[j, j + 1] n W_c| / |W_c|`` with ``W_c = [c + 1/2 - w/2, c + 1/2 + w/2] n [0, N]``; one Triton launch
+    on float32 CUDA.
+
+    Args:
+        N (int): number of pixels.
+        w (Tensor): [k] widths in pixels, clamped below at 1e-3.
+        dtype (torch.dtype, optional): dtype of the result. Defaults to None, the dtype of ``w``.
+
+    Returns:
+        Tensor: [k, N, N] filter matrices.
+    """
     dtype = dtype if dtype is not None else w.dtype
     if dtype == torch.float32 and w.is_cuda and triton_utilities.triton_available()[0]:
         widths = w.to(torch.float32).contiguous()
@@ -658,7 +726,14 @@ if triton is not None:
 
     @triton.jit(do_not_specialize=["N"], do_not_specialize_on_alignment=["w_ptr", "out_ptr"])
     def _box_matrix_kernel(w_ptr, out_ptr, N, BLOCK: tl.constexpr):
-        """Row c = program_id(1) of box matrix k = program_id(0) (box_matrix)."""
+        """Row ``c = program_id(1)`` of box matrix ``k = program_id(0)`` (:func:`box_matrix`).
+
+        Args:
+            w_ptr: [k] float32 widths in pixels.
+            out_ptr: [k, N, N] float32 output matrices.
+            N: number of pixels.
+            BLOCK (constexpr): lanes per program, a power of two at least N.
+        """
         k = tl.program_id(0)
         c = tl.program_id(1)
         w = tl.load(w_ptr + k)
@@ -675,10 +750,21 @@ if triton is not None:
 
 def panel_height_field(grid: Grid, geometry: ConeGeometry, angle: float, device=None,
                        dtype: torch.dtype = torch.float32) -> Tensor:
-    """Normal distance of every voxel center from the panel plane, h(r) = (r - panel_center) . n_hat [R, C, S] (cm,
-    positive on the source side). A ray from r along a direction with gnomonic coordinates (alpha, beta) about -n_hat
-    hits the panel at the foot of r plus h (alpha, beta) (along u_hat, v_hat): the footprint of a direction CELL of
-    gnomonic widths (W_alpha, W_beta) is an h W_alpha x h W_beta rectangle."""
+    """Normal distance ``h(r) = (r - panel_center) . n_hat`` of every voxel center from the panel plane.
+
+    A direction cell of gnomonic widths (W_alpha, W_beta) seen from height h covers an h W_alpha x h W_beta rectangle of
+    the panel.
+
+    Args:
+        grid (Grid): the voxel grid.
+        geometry (ConeGeometry): cone-beam geometry.
+        angle (float): view angle in radians.
+        device (torch.device, optional): device of the result. Defaults to None.
+        dtype (torch.dtype, optional): dtype of the result. Defaults to torch.float32.
+
+    Returns:
+        Tensor: [R, C, S] heights in cm, positive on the source side.
+    """
     _, _, n_hat = geometry.panel_axes(angle)
     r = grid.center_coordinates(device, torch.float64)
     panel_center = torch.tensor(geometry.panel_center(angle), device=device, dtype=torch.float64)
@@ -686,19 +772,31 @@ def panel_height_field(grid: Grid, geometry: ConeGeometry, angle: float, device=
 
 
 class _Footprint:
-    """Finite-cone footprint of the direction chunks of one image (combined_scatter_image / scatter_image_from_source;
-    docs/source/design_notes.rst, "Scatter image").
+    """Finite-cone footprint of the direction chunks of one image (docs/source/method.rst, "Collapsed-cone scatter
+    image").
 
-    Direction k stands for a solid-angle cell of gnomonic widths (W_alpha,k, W_beta,k) about -n_hat
-    (`context.cell_width`).
-    A point at height h above the panel sends that cell onto an h W_alpha x h W_beta rectangle of the panel, so the
-    projected single-ray image of direction k is box-blurred with widths hbar_k (W_alpha,k, W_beta,k) / pixel, hbar_k =
-    the emission-weighted mean panel height of the attenuated emission of the image along Omega_k (`mean_height`). A
-    direction whose emission vanishes uses the height of the box centre. Exact up to the height spread of the emission
-    and the cell shape (a box with the same marginal widths as the polar x azimuth cell)."""
+    The single-ray image of direction k is box-blurred with the panel footprint ``hbar_k (W_alpha_k, W_beta_k)`` of
+    its solid-angle cell, ``hbar_k`` the emission-weighted mean height above the panel.
+
+    Attributes:
+        context (DirectionSetContext): direction context of the view.
+        scale (Tensor): [2] inverse pixel pitches (channels, rows) in cm^-1.
+        heights (Tensor): [voxels] panel heights of the voxel centers of the grid in cm.
+        center_height (float): panel height of the center of the grid box in cm.
+    """
 
     def __init__(self, grid: Grid, geometry: ConeGeometry, angle: float, context: DirectionSetContext) -> None:
-        """grid: grid of the emission that is projected."""
+        """Look up or compute the footprint tables of a grid in the context's cache.
+
+        Args:
+            grid (Grid): grid of the emission that is projected.
+            geometry (ConeGeometry): cone-beam geometry of the context.
+            angle (float): view angle of the context in radians.
+            context (DirectionSetContext): direction context with cell widths.
+
+        Raises:
+            ValueError: if ``context.cell_width`` is None.
+        """
         if context.cell_width is None:
             raise ValueError("the finite-cone footprint needs quadrature.cell_width (panel_direction_set fills it)")
         self.context = context
@@ -721,8 +819,14 @@ class _Footprint:
         self.scale, self.heights, self.center_height = cached
 
     def mean_height(self, emission: Tensor) -> Tensor:
-        """Emission-weighted mean panel height [k] of an attenuated emission [k, G, *grid] (the box centre where the
-        emission vanishes)."""
+        """Emission-weighted mean panel height of an attenuated emission per direction.
+
+        Args:
+            emission (Tensor): [k, G, rows, cols, slices] attenuated emission on the grid.
+
+        Returns:
+            Tensor: [k] mean heights in cm (the box-center height where the emission vanishes).
+        """
         k = int(emission.shape[0])
         total = emission.sum(dim=1).reshape(k, -1)  # [k, voxels]
         numerator, denominator = total @ self.heights, total.sum(-1)
@@ -731,8 +835,16 @@ class _Footprint:
                            torch.full_like(denominator, self.center_height))
 
     def blur(self, image: Tensor, chunk_index: int, mean_heights: Tensor) -> Tensor:
-        """Footprint image [k, G, Rd, Cd] of the single-ray image of chunk `chunk_index` with mean heights
-        mean_heights [k]."""
+        """Apply the footprint blur to the single-ray images of one direction chunk.
+
+        Args:
+            image (Tensor): [k, G, Rd, Cd] single-ray images.
+            chunk_index (int): index of the chunk.
+            mean_heights (Tensor): [k] mean panel heights in cm (:meth:`mean_height`).
+
+        Returns:
+            Tensor: [k, G, Rd, Cd] footprint images.
+        """
         start, stop = self.context.chunk_bounds[chunk_index]
         # [k, 2] pixels (channels, rows)
         widths = mean_heights[:, None] * self.context.cell_width[start:stop] * self.scale
@@ -750,36 +862,44 @@ def combined_scatter_image(library: MultigroupLibrary, rho_quadrature: Tensor, p
                            grid_response: GridResponse, context: Optional[DirectionSetContext] = None,
                            chunk: int = 8, *, first_collision_chunk: int = 4, footprint: bool = True,
                            pairs=None, grid_coarse: Optional[Grid] = None) -> dict[str, Tensor]:
-    """Total scatter image (first-order + multiple-collision) in ONE collapsed-cone pass: the first- and
-    multiple-collision sources are summed and ray-traced to the detector together, on the transport grid with q^3
-    quadrature points per cell.
+    """Total scatter image (first order plus multiple collision) of one view in one collapsed-cone pass.
 
-    library; rho_quadrature [M, Rq, Cq, Sq] g/cm^3 and phi_uncollided [G, Rq, Cq, Sq] (uncollided.uncollided_fluence at
-    the points) on the quadrature grid grid_quadrature, whose voxel centers are the q^3 equal-weight quadrature points
-    of each cell of the transport grid C = grid_quadrature.coarsen(q) (grid_coarse: C itself when given, e.g. the
-    solver's transport grid, of which grid_quadrature = C.refine(q); it then also fixes the attenuation grid exactly);
-    scatter_source_moments [G, (L+1)^2, Rc, Cc, Sc]: cell-mean spherical-harmonic moments of the multiple-collision
-    emission (already contracted with the transfer moments, `ScatterSolver.multiple_collision_source_moments`), or the
-    6-D [G, (L+1)^2, 4, Rc, Cc, Sc] tensor whose linear-discontinuous mean is used; mu_t_coarse [G, Rc, Cc, Sc] on C
-    (None -> the cell average of mu_t_volume(library, rho_quadrature)). context: the view's `make_direction_context`
-    (built here when None; its chunking replaces `chunk`). first_collision_chunk: directions per inner batch of the
-    first-collision source (PyTorch path). pairs: the material representation of rho_quadrature
-    (`uncollided.resolve_pairs`: a `cross_sections.MaterialPairs`, `uncollided.DENSE`, or None to decide here once).
+    Per direction chunk the first-collision source at the quadrature points and the multiple-collision source of the
+    transport cells are summed, attenuated (:func:`supervoxel_subpoint_emission`), projected from the quadrature points,
+    footprint-blurred and accumulated (docs/source/method.rst, "Collapsed-cone scatter image").
 
-    Per direction chunk (Omega_k, k of them):
-      tau    = downstream_cumulative(mu_t_coarse, C, Omega_k)   [k, G, Rc, Cc, Sc]
-      S_FC,j = first_collision_source_at_directions at the quadrature points r_j (exact eta table)    [k, G, Rq, Cq, Sq]
-      S_MC   = Y(Omega_k) . T per cell (one matmul with the cached harmonics), broadcast to its quadrature points
-      e_j    = (S_FC,j + S_MC) exp(-tau_j)   (`supervoxel_subpoint_emission`: tau at the cell center plus its in-cell
-               variation)
-    ONE oblique_project of e on grid_quadrature (each point traced to the panel separately; the attenuation stays on C),
-    the finite-cone footprint blur (`_Footprint` with the heights of the Q points, footprint=True) and ONE fused
-    accumulation (`DirectionSetContext.accumulate`). q = 1 is the single-grid image `scatter_image_from_source` of
-    S_FC + S_MC on C. The image is linear in (phi_uncollided, scatter_source_moments) apart from the footprint heights,
-    which follow the summed emission.
+    Args:
+        library (MultigroupLibrary): cross-section library.
+        rho_quadrature (Tensor): [M, Rq, Cq, Sq] densities in g/cm^3 on the quadrature grid.
+        phi_uncollided (Tensor): [G, Rq, Cq, Sq] uncollided fluence at the quadrature points.
+        grid_quadrature (Grid): the quadrature grid Q, q^3 equal-weight points per transport cell.
+        q (int): quadrature points per axis per transport cell.
+        scatter_source_moments (Tensor): [G, (L+1)^2, Rc, Cc, Sc] cell-mean moments T of the multiple-collision source,
+            or [G, (L+1)^2, 4, Rc, Cc, Sc] whose cell means are used.
+        L (int): Legendre order of the moments.
+        geometry (ConeGeometry): cone-beam geometry.
+        angle (float): view angle in radians.
+        quadrature (Quadrature): collapsed-cone direction set.
+        mu_t_coarse (Tensor): [G, Rc, Cc, Sc] total attenuation coefficient mu_t in cm^-1 on the transport grid, or
+            None for the cell average of the attenuation of ``rho_quadrature``.
+        projectors (Projectors): ray tracers.
+        detector (DetectorResponse): detector response.
+        grid_response (GridResponse): anti-scatter-grid response.
+        context (DirectionSetContext, optional): direction context of the view; its chunking replaces ``chunk``.
+            Defaults to None, built here.
+        chunk (int, optional): directions per chunk. Defaults to 8.
+        first_collision_chunk (int, optional): directions per inner batch of the first-collision source. Defaults to 4.
+        footprint (bool, optional): apply the finite-cone footprint. Defaults to True.
+        pairs (MaterialPairs, optional): material representation of ``rho_quadrature`` (or ``uncollided.DENSE``).
+            Defaults to None, decided here.
+        grid_coarse (Grid, optional): the transport grid C, with ``grid_quadrature = C.refine(q)``. Defaults to None,
+            ``grid_quadrature.coarsen(q)``.
 
-    Returns the image dict of the total scatter (fluence, planar_fluence, signal_per_group [G, Rd, Cd],
-    signal [Rd, Cd]). Peak extra memory per chunk ~ 2-3 quadrature-grid fields [k, G, Rq, Cq, Sq].
+    Returns:
+        dict: fluence, planar_fluence and signal_per_group [G, Rd, Cd] and signal [Rd, Cd] of the total scatter.
+
+    Raises:
+        ValueError: if a shape or the direction context does not match.
     """
     device, dtype = phi_uncollided.device, phi_uncollided.dtype
     rho = rho_quadrature.to(device=device, dtype=dtype)
@@ -849,9 +969,17 @@ def combined_scatter_image(library: MultigroupLibrary, rho_quadrature: Tensor, p
 # =====================================================================================================
 
 def primary_subpixel_geometry(geometry: ConeGeometry, samples_per_pixel_axis: int) -> ConeGeometry:
-    """The panel of n = samples_per_pixel_axis times finer pixels on which `primary_path_lengths` traces the n^2
-    sub-rays of every pixel: sub-pixel (i, j) of pixel (r, c) is pixel (r n + i, c n + j) of the returned geometry
-    (same panel, same offsets). n = 1 returns geometry itself."""
+    """Panel with n times finer pixels on which the n^2 sub-rays of every pixel are traced.
+
+    Sub-pixel (i, j) of pixel (r, c) is pixel (r n + i, c n + j) of the returned geometry.
+
+    Args:
+        geometry (ConeGeometry): cone-beam geometry.
+        samples_per_pixel_axis (int): sub-pixel samples n per axis, at least 1.
+
+    Returns:
+        ConeGeometry: the refined geometry (``geometry`` itself for n = 1).
+    """
     n = int(samples_per_pixel_axis)
     if n < 1:
         raise ValueError("samples_per_pixel_axis must be >= 1")
@@ -862,6 +990,15 @@ def primary_subpixel_geometry(geometry: ConeGeometry, samples_per_pixel_axis: in
 
 
 def _primary_samples_per_pixel_axis(projectors: Projectors, samples_per_pixel_axis: Optional[int]) -> int:
+    """Sub-pixel samples per axis of the primary: the given value, else the projector's own, else 1.
+
+    Args:
+        projectors (Projectors): ray tracers.
+        samples_per_pixel_axis (int): requested samples per axis, or None.
+
+    Returns:
+        int: samples per axis, at least 1.
+    """
     n = (int(samples_per_pixel_axis) if samples_per_pixel_axis is not None
          else int(getattr(projectors, "samples_per_pixel_axis", 1) or 1))
     if n < 1:
@@ -871,14 +1008,23 @@ def _primary_samples_per_pixel_axis(projectors: Projectors, samples_per_pixel_ax
 
 def primary_path_lengths(projectors: Projectors, rho: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
                          samples_per_pixel_axis: Optional[int] = None) -> Tensor:
-    """Primary density line integrals P_m = int_{r_0}^{r_D} rho_m dl (g/cm^2) from the focal spot to the pixel (or
-    sub-pixel) centers: rho [M', R, C, S] (g/cm^3; any subset of the materials, e.g. one map at a time, or the maps
-    of the materials present) on `grid` -> [M', Rd n, Cd n] on the sub-pixel panel
-    `primary_subpixel_geometry(geometry, n)`. n = samples_per_pixel_axis: sub-pixel sampling per axis (None: the
-    projector's own `samples_per_pixel_axis` attribute, 1 if it has none); the projector's own sub-sampling is switched
-    off (the sub-rays are traced as pixels of the finer panel and the pixel average is taken AFTER the fine-energy
-    transmission, by `primary_from_path_lengths`). The projector is linear and acts channel by channel, so tracing the
-    materials one at a time and concatenating gives the same path lengths."""
+    """Density line integrals ``P_m`` from the focal spot to the pixel (or sub-pixel) centers.
+
+    The sub-rays are traced as the pixels of :func:`primary_subpixel_geometry` with the projector's own sub-sampling
+    off; the materials can be traced one at a time and concatenated.
+
+    Args:
+        projectors (Projectors): ray tracers.
+        rho (Tensor): [M', R, C, S] density maps in g/cm^3 of any subset of the materials.
+        grid (Grid): the grid of ``rho``.
+        geometry (ConeGeometry): cone-beam geometry.
+        angle (float): view angle in radians.
+        samples_per_pixel_axis (int, optional): sub-pixel samples n per axis. Defaults to None, the projector's own
+            ``samples_per_pixel_axis`` or 1.
+
+    Returns:
+        Tensor: [M', Rd n, Cd n] line integrals in g/cm^2.
+    """
     n = _primary_samples_per_pixel_axis(projectors, samples_per_pixel_axis)
     subpixel_geometry = primary_subpixel_geometry(geometry, n)
     if getattr(projectors, "samples_per_pixel_axis", None) is not None:  # disable the projector's own sub-sampling
@@ -890,23 +1036,25 @@ def primary_path_lengths(projectors: Projectors, rho: Tensor, grid: Grid, geomet
 def primary_from_path_lengths(library: MultigroupLibrary, path: Tensor, materials: Optional[Sequence[int]],
                               geometry: ConeGeometry, angle: float, source: SourceModel, detector: DetectorResponse,
                               grid_response: GridResponse) -> dict[str, Tensor]:
-    """Primary image of one view from its per-material density line integrals (the second half of `primary_image`):
+    """Primary image of one view from its per-material density line integrals, exact in energy.
 
-        T_g(u)              = < sum_{E in g} w_E exp(-sum_m P_m m_m(E)) >_pixel        (`group_transmission`)
-        fluence_g(u)        = b(Omega_p) / |r_D - r_0|^2 T_g(u)                          photons/cm^2
-        planar_fluence_g(u) = cos(theta0(u)) fluence_g(u)                               photons/cm^2
-        signal_g(u)         = planar_fluence_g(u) G_g(theta1, theta2) D_g(theta0)      keV/cm^2
+    The fine-energy transmission is averaged over the n x n sub-pixels of every pixel; the inverse-square and
+    collimation factors and the responses are evaluated at the pixel centers (docs/source/method.rst, "The primary").
 
-    path: [M', Rd n, Cd n] line integrals P_m (g/cm^2) on the panel refined n times per axis (n >= 1 inferred from the
-    shape, `primary_subpixel_geometry`; the transmission is averaged over the n x n sub-pixels of every pixel), from
-    any projector: `primary_path_lengths` (Siddon, one ray to each (sub-)pixel center) or a pixel-averaged projector
-    such as MBIRTORCH's (`citrus.citrus.primary_signals`, n = 1). materials: library indices of the rows of
-    path (None = all materials in library order; an absent material contributes nothing, so the rows of the materials
-    present suffice). The 1/r^2 and b factors and the responses are evaluated at the pixel centers, the grid angles
-    from `grid_angles` for the primary direction (theta1 = 0 when the grid is focused at the focal spot;
-    theta2 = -atan(u/SDD)), theta0(u) the angle between Omega_p and the inward panel normal. Returns dict with fluence
-    [G, Rd, Cd], planar_fluence [G, Rd, Cd], signal_per_group [G, Rd, Cd], signal [Rd, Cd], in the dtype and on the
-    device of path."""
+    Args:
+        library (MultigroupLibrary): cross-section library.
+        path (Tensor): [M', Rd n, Cd n] line integrals P_m in g/cm^2 from any projector, n >= 1 inferred from the shape.
+        materials (Sequence[int]): library indices of the rows of ``path``, or None for all materials in library order.
+        geometry (ConeGeometry): cone-beam geometry.
+        angle (float): view angle in radians.
+        source (SourceModel): source model.
+        detector (DetectorResponse): detector response.
+        grid_response (GridResponse): anti-scatter-grid response.
+
+    Returns:
+        dict: fluence and planar_fluence [G, Rd, Cd] in photons/cm^2, signal_per_group [G, Rd, Cd] in keV/cm^2
+            and signal [Rd, Cd], on the device and dtype of ``path``.
+    """
     device, dtype = path.device, path.dtype
     Rd, Cd = geometry.num_det_rows, geometry.num_det_channels
     n = int(path.shape[1]) // Rd if path.dim() == 3 else 0
@@ -936,32 +1084,27 @@ def primary_from_path_lengths(library: MultigroupLibrary, path: Tensor, material
 def primary_image(library: MultigroupLibrary, rho: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
                   source: SourceModel, projectors: Projectors, detector: DetectorResponse,
                   grid_response: GridResponse, samples_per_pixel_axis: Optional[int] = None) -> dict[str, Tensor]:
-    """Primary image, per group at the pixels, exact in energy:
+    """Primary image of one view, exact in energy, from the density maps.
 
-        fluence_g(u)        = b(Omega_p) / |r_D - r_0|^2 T_g(u)                                photons/cm^2
-        T_g(u)              = < sum_{E in g} w_E exp(-sum_m P_m m_m(E)) >_pixel
-        planar_fluence_g(u) = cos(theta0(u)) fluence_g(u)                                     photons/cm^2
-        signal_g(u)         = planar_fluence_g(u) G_g(theta1, theta2) D_g(theta0)            keV/cm^2
+    Projects the density map of every material present (:func:`primary_path_lengths`) and forms the transmission and the
+    responses with :func:`primary_from_path_lengths`.
 
-    P_m = int_{r_0}^{r_D} rho_m dl: line integrals of the density maps (g/cm^2; one projection per material PRESENT,
-    `projectors.primary_project(rho[present])`, `uncollided.present_materials`), w_E / m_m(E) the library's fine-energy
-    table (library.fine_weight, library.fine_mu_t; `cross_sections.group_transmission`). fluence_g is the fine-energy
-    sum within group g, so the per-group detector and grid responses (at library.group_energy) apply, and
-    fluence.sum(0) / planar_fluence.sum(0) is the exact polychromatic primary (up to the fine quadrature; the
-    group-averaged exp(-int mu_t,g dl) ignores within-group beam hardening).
-    theta0(u) = angle between Omega_p and the inward panel normal (per incident photon responses, module docstring).
+    Args:
+        library (MultigroupLibrary): cross-section library.
+        rho (Tensor): [M, R, C, S] densities in g/cm^3 of the library's materials on ``grid``.
+        grid (Grid): the grid of ``rho``.
+        geometry (ConeGeometry): cone-beam geometry.
+        angle (float): view angle in radians.
+        source (SourceModel): source model.
+        projectors (Projectors): ray tracers.
+        detector (DetectorResponse): detector response.
+        grid_response (GridResponse): anti-scatter-grid response.
+        samples_per_pixel_axis (int, optional): sub-pixel samples per axis. Defaults to None, the projector's own
+            ``samples_per_pixel_axis`` or 1.
 
-    with Omega_p the direction focal spot -> pixel center. The grid angles come from `grid_angles` for the
-    primary direction (theta1 = 0 when the grid is focused at the focal spot; theta2 = -atan(u/SDD)).
-    samples_per_pixel_axis: sub-pixel sampling per axis (None: the projector's own `samples_per_pixel_axis` attribute, 1
-    if it has none). With n > 1 the density line integrals are traced to the n x n midpoint lattice of sub-pixel centers
-    (a panel of n-times finer pixels), the fine-energy transmission is formed per sub-ray and THEN averaged over the
-    pixel (<.>_pixel above: the exact pixel-averaged transmission, no -log(mean(exp)) per group); the 1/r^2 and b
-    factors are evaluated at the pixel center.
-    Equals `primary_from_path_lengths(library, primary_path_lengths(projectors, rho[present], grid, geometry, angle,
-    samples_per_pixel_axis), present, geometry, angle, source, detector, grid_response)`.
-    rho [M, rows, cols, slices]. Returns dict with fluence [G, Rd, Cd], planar_fluence [G, Rd, Cd],
-    signal_per_group [G, Rd, Cd], signal [Rd, Cd].
+    Returns:
+        dict: fluence and planar_fluence [G, Rd, Cd] in photons/cm^2, signal_per_group [G, Rd, Cd] in keV/cm^2
+            and signal [Rd, Cd].
     """
     _primary_samples_per_pixel_axis(projectors, samples_per_pixel_axis)
     if int(rho.shape[0]) != library.num_materials:
@@ -974,7 +1117,15 @@ def primary_image(library: MultigroupLibrary, rho: Tensor, grid: Grid, geometry:
 
 
 def scatter_fraction(scatter_signal: Tensor, primary_signal: Tensor) -> Tensor:
-    """SF = S / (P + S) elementwise (0 where P + S = 0)."""
+    """Scatter fraction ``S / (P + S)`` elementwise, 0 where ``P + S = 0``.
+
+    Args:
+        scatter_signal (Tensor): scatter signal S.
+        primary_signal (Tensor): primary signal P, same shape.
+
+    Returns:
+        Tensor: the scatter fraction.
+    """
     denominator = primary_signal + scatter_signal
     safe_denominator = torch.where(denominator > 0, denominator, torch.ones_like(denominator))
     return torch.where(denominator > 0, scatter_signal / safe_denominator, torch.zeros_like(denominator))

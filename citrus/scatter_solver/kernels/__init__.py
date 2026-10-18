@@ -1,10 +1,8 @@
-"""Fused Triton kernels of the scatter solver (float32 CUDA only; every kernel has a PyTorch reference path that
-serves CPU and float64 tensors and is used automatically when Triton is unavailable).
+"""Fused Triton kernels of the scatter solver, for float32 CUDA tensors.
 
-    triton_utilities     shared Triton probe, kill switch (CITRUS_DISABLE_TRITON=1) and fast launch
-    ray_tracing_kernels  exact Siddon ray tracer: line integrals, upstream / downstream cumulative, projections
-    uncollided_kernels   first-collision source evaluation
-    sweep_kernels        linear-discontinuous cell solve of one wavefront plane of the transport sweep
+Every kernel has a PyTorch reference path that serves CPU and float64 tensors and runs when Triton is unavailable.
+The modules are ``triton_utilities`` (probe and launch), ``ray_tracing_kernels`` (the Siddon ray tracer),
+``uncollided_kernels`` (the first-collision source) and ``sweep_kernels`` (the plane solve of the transport sweep).
 """
 
 from .triton_utilities import triton_available

@@ -1,27 +1,9 @@
-"""Exact ray-box line integrals (Siddon / Amanatides-Woo parametric traversal) and the `Projectors` interface.
+"""Exact line integrals of voxel fields (Siddon / Amanatides-Woo traversal) and the ``Projectors`` interface.
 
-`Projectors` is the protocol of the five field-level ray-tracing operations the scatter solver needs (all batched
-over a leading group axis G, for one view angle, in the recon frame, the volume being zero outside the grid box):
-
-    upstream_cumulative    line integral from the focal spot to every voxel center          (uncollided fluence)
-    upstream_to_points     line integral from the focal spot to arbitrary points           (uncollided fluence at the
-                                                                                            quadrature-grid points)
-    primary_project        line integral from the focal spot to every pixel center          (primary image)
-    downstream_cumulative  line integral from every voxel center to the panel along Omega_k  (scatter attenuation)
-    oblique_project        line integral of a field along Omega_k through every pixel center (scatter projection)
-
-`SiddonProjectors` implements it exactly. Core idea (Siddon 1985): parametrize a segment as p(a) = p0 + a (p1 - p0),
-a in [0, 1]. Clip it to the grid box (slab method) giving [a_lo, a_hi]; the parameters where it crosses the interior
-voxel planes of each axis are clamped to [a_lo, a_hi], merged with a_lo and a_hi, and sorted. Consecutive sorted
-parameters bound sub-segments that each lie inside exactly one voxel, found from the sub-segment midpoint. The
-integral is sum(value(voxel) * length). Zero-length sub-segments (from clamped or coincident crossings, e.g. through
-voxel corners) contribute nothing, so the result is exact to rounding for any segment, including axis-aligned ones
-and ones starting/ending inside.
-
-The PyTorch path below is batched over rays with a fixed number of planes per ray (the merged list always has
-nx + ny + nz - 1 entries), so there is no per-ray Python loop. Memory is bounded by chunking over rays: a chunk
-holds at most `ray_chunk` rays and at most `element_budget` (ray, plane) pairs. On float32 CUDA tensors the fused
-Triton kernels of `kernels/ray_tracing_kernels.py` are used instead (same results to float32 rounding).
+``Projectors`` is the protocol of the five ray-tracing operations of the scatter solver, each batched over a leading
+group axis for one view angle in the recon frame. ``SiddonProjectors`` implements it with the PyTorch traversal of
+``line_integrals``, or with the fused Triton kernels of
+:mod:`citrus.scatter_solver.kernels.ray_tracing_kernels` on float32 CUDA tensors.
 """
 
 from __future__ import annotations
@@ -43,49 +25,88 @@ __all__ = ["Projectors", "SiddonProjectors", "line_integrals"]
 # ------------------------------------------------------------------------------------------------
 
 class Projectors(Protocol):
-    def upstream_cumulative(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float) -> Tensor:
-        """Line integral of mu from the focal spot to every voxel center.
+    """Protocol of the five ray-tracing operations of the scatter solver.
 
-        mu: [G, rows, cols, slices] (1/cm). Returns tau_up: [G, rows, cols, slices] (dimensionless).
+    Every operation works on one view angle in the recon frame, batched over a leading group axis G, with the volume
+    zero outside the box of its grid.
+    """
+
+    def upstream_cumulative(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float) -> Tensor:
+        """Line integral of ``mu`` from the focal spot to every voxel center.
+
+        Args:
+            mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
+            grid (Grid): the grid of ``mu``.
+            geometry (ConeGeometry): the cone-beam geometry.
+            angle (float): view angle in radians.
+
+        Returns:
+            Tensor: [G, rows, cols, slices] upstream optical depth ``tau_up`` (dimensionless).
         """
         ...
 
     def upstream_to_points(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
                            points: Tensor) -> Tensor:
-        """Line integral of mu (on `grid`, zero outside its box) from the focal spot to arbitrary points.
+        """Line integral of ``mu`` from the focal spot to arbitrary points.
 
-        mu: [G, rows, cols, slices]; points: [N, 3] (recon frame, cm; inside or outside the box).
-        Returns [G, N]. Used for the uncollided fluence at the quadrature-grid points traced through another grid.
+        Args:
+            mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
+            grid (Grid): the grid of ``mu``.
+            geometry (ConeGeometry): the cone-beam geometry.
+            angle (float): view angle in radians.
+            points (Tensor): [N, 3] end points (recon frame, cm), inside or outside the box of ``grid``.
+
+        Returns:
+            Tensor: [G, N] optical depth from the focal spot to each point.
         """
         ...
 
     def primary_project(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float) -> Tensor:
-        """Line integral of mu from the focal spot to every pixel center.
+        """Line integral of ``mu`` from the focal spot to every pixel center.
 
-        mu: [G, rows, cols, slices]. Returns [G, num_det_rows, num_det_channels].
-        Implementations may sub-sample pixels internally; the returned value is the pixel-average
-        of exp(-integral) re-expressed as -log(mean(exp(-integral))) when sub-sampling is used.
+        With sub-pixel sampling the result is ``-log(mean(exp(-tau)))`` over the sub-rays of each pixel.
+
+        Args:
+            mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
+            grid (Grid): the grid of ``mu``.
+            geometry (ConeGeometry): the cone-beam geometry.
+            angle (float): view angle in radians.
+
+        Returns:
+            Tensor: [G, num_det_rows, num_det_channels] optical depth per pixel.
         """
         ...
 
     def downstream_cumulative(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
                               omegas: Tensor) -> Tensor:
-        """Line integral of mu from every voxel center to the panel plane along each direction.
+        """Line integral of ``mu`` from every voxel center to the panel plane along each direction.
 
-        mu: [G, rows, cols, slices]; omegas: [K, 3] unit vectors (recon frame) pointing toward the panel.
-        Returns tau_down: [K, G, rows, cols, slices]. Where a direction does not reach the panel
-        plane (component along the panel normal toward the panel <= 0) the value is +inf.
+        Args:
+            mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
+            grid (Grid): the grid of ``mu``.
+            geometry (ConeGeometry): the cone-beam geometry.
+            angle (float): view angle in radians.
+            omegas (Tensor): [K, 3] unit directions (recon frame).
+
+        Returns:
+            Tensor: [K, G, rows, cols, slices] downstream optical depth ``tau_down``; +inf for directions that do
+            not head toward the panel.
         """
         ...
 
     def oblique_project(self, field: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
                         omegas: Tensor) -> Tensor:
-        """Line integral of a volumetric field along each direction, landing on the panel.
+        """Line integral of a field along each direction through every pixel center.
 
-        field: [K, G, rows, cols, slices] or [G, rows, cols, slices] (broadcast over K);
-        omegas: [K, 3] unit vectors (recon frame). For pixel (r, c) the line passes through the
-        pixel center with direction omega_k. Returns [K, G, num_det_rows, num_det_channels] in units of
-        field x cm.
+        Args:
+            field (Tensor): [K, G, rows, cols, slices], or [G, rows, cols, slices] shared by all directions.
+            grid (Grid): the grid of ``field``.
+            geometry (ConeGeometry): the cone-beam geometry.
+            angle (float): view angle in radians.
+            omegas (Tensor): [K, 3] unit directions (recon frame).
+
+        Returns:
+            Tensor: [K, G, num_det_rows, num_det_channels] line integrals in units of field times cm.
         """
         ...
 
@@ -95,7 +116,17 @@ class Projectors(Protocol):
 # ------------------------------------------------------------------------------------------------
 
 def _box_tensors(grid: Grid, device, dtype) -> tuple[Tensor, Tensor, Tensor, tuple[int, int, int]]:
-    """(lo[3], hi[3], delta[3], (nx, ny, nz)) for the grid box in (x, y, z) order."""
+    """Return the corners, voxel sizes and voxel counts of the grid box in (x, y, z) order.
+
+    Args:
+        grid (Grid): the grid.
+        device (torch.device): device of the returned tensors.
+        dtype (torch.dtype): dtype of the returned tensors.
+
+    Returns:
+        (lo, hi, delta, n): lo and hi are the [3] lower and upper corners in cm, delta the [3] voxel sizes in cm and
+        n the voxel counts (nx, ny, nz).
+    """
     lo = torch.tensor(grid.lower_corner(), device=device, dtype=dtype)
     delta = torch.tensor(grid.deltas, device=device, dtype=dtype)
     n = (grid.num_cols, grid.num_rows, grid.num_slices)
@@ -105,11 +136,22 @@ def _box_tensors(grid: Grid, device, dtype) -> tuple[Tensor, Tensor, Tensor, tup
 
 def _trace_chunk(flat_volume: Tensor, lo: Tensor, hi: Tensor, delta: Tensor, n: tuple[int, int, int],
                  planes: list[Tensor], p0: Tensor, p1: Tensor, volume_offset: Tensor | None = None) -> Tensor:
-    """Exact integrals of the voxel field along segments p0 -> p1 for one chunk of rays.
+    """Exact integrals of a flattened voxel field along the segments ``p0 -> p1`` of one chunk of rays.
 
-    flat_volume: [V, G] volume flattened in (row, col, slice) order (or [K*V, G] for K stacked volumes, with
-    volume_offset [N] = k(ray) * V selecting each ray's volume); p0, p1: [N, 3] (x, y, z).
-    planes: interior plane coordinates per axis (x, y, z), each [n_a - 1]. Returns [N, G].
+    Args:
+        flat_volume (Tensor): [V, G] volume flattened in (row, col, slice) order, or [K*V, G] for K stacked volumes.
+        lo (Tensor): [3] lower corner of the grid box (x, y, z) in cm.
+        hi (Tensor): [3] upper corner of the grid box (x, y, z) in cm.
+        delta (Tensor): [3] voxel sizes (x, y, z) in cm.
+        n (tuple[int, int, int]): voxel counts (nx, ny, nz).
+        planes (list[Tensor]): interior plane coordinates per axis (x, y, z) in cm, each [n_a - 1].
+        p0 (Tensor): [N, 3] segment starts (x, y, z) in cm.
+        p1 (Tensor): [N, 3] segment ends (x, y, z) in cm.
+        volume_offset (Tensor, optional): [N] row offset ``k * V`` of each ray's volume in ``flat_volume``.
+            Defaults to None.
+
+    Returns:
+        Tensor: [N, G] line integrals in units of the field times cm.
     """
     d = p1 - p0  # [N, 3]
     nonzero = d != 0
@@ -159,14 +201,23 @@ def _trace_chunk(flat_volume: Tensor, lo: Tensor, hi: Tensor, delta: Tensor, n: 
 def line_integrals(volume: Tensor, starts: Tensor, ends: Tensor, grid: Grid, *,
                    ray_chunk: int = 1 << 20, element_budget: int = 1 << 23,
                    volume_index: Tensor | None = None) -> Tensor:
-    """Exact line integrals of a voxel field along segments starts -> ends (recon frame, cm).
+    """Exact line integrals of a voxel field along the segments ``starts -> ends``, clipped to the grid box.
 
-    volume: [G, rows, cols, slices] (zero outside the grid box); starts, ends: [N, 3] (x, y, z).
-    Alternatively volume: [K, G, rows, cols, slices] with volume_index: [N] integers in [0, K), so ray n
-    integrates volume[volume_index[n]] (all K volumes traced in one batched pass).
-    Segments are clipped to the box. Returns [G, N] in units of volume x cm, with volume's
-    device and dtype. Rays are processed in chunks of at most `ray_chunk` rays and at most
-    `element_budget` (ray, plane) pairs.
+    Rays are processed in chunks of at most ``ray_chunk`` rays and ``element_budget`` (ray, plane) pairs.
+
+    Args:
+        volume (Tensor): [G, rows, cols, slices] field, zero outside the grid box, or [K, G, rows, cols, slices]
+            with ``volume_index``.
+        starts (Tensor): [N, 3] segment starts (x, y, z) in the recon frame in cm.
+        ends (Tensor): [N, 3] segment ends (x, y, z) in the recon frame in cm.
+        grid (Grid): the grid of ``volume``.
+        ray_chunk (int, optional): maximum rays per chunk. Defaults to 2**20.
+        element_budget (int, optional): maximum (ray, plane) pairs per chunk. Defaults to 2**23.
+        volume_index (Tensor, optional): [N] integers in [0, K): ray n integrates ``volume[volume_index[n]]``.
+            Required for a 5-D ``volume``. Defaults to None.
+
+    Returns:
+        Tensor: [G, N] line integrals in units of the field times cm, with the device and dtype of ``volume``.
     """
     if volume.dim() == 5:
         if volume_index is None:
@@ -191,7 +242,20 @@ def line_integrals(volume: Tensor, starts: Tensor, ends: Tensor, grid: Grid, *,
 
 def _line_integrals_flat(flat_volume: Tensor, offset: Tensor | None, starts: Tensor, ends: Tensor, grid: Grid,
                          ray_chunk: int, element_budget: int) -> Tensor:
-    """line_integrals on a flattened volume flat_volume [V or K*V, G] with optional per-ray offsets [N]. -> [G, N]."""
+    """Compute ``line_integrals`` on a flattened volume, chunk by chunk.
+
+    Args:
+        flat_volume (Tensor): [V, G] or [K*V, G] volume flattened in (row, col, slice) order.
+        offset (Tensor | None): [N] row offset of each ray's volume in ``flat_volume``, or None.
+        starts (Tensor): [N, 3] segment starts in cm.
+        ends (Tensor): [N, 3] segment ends in cm.
+        grid (Grid): the grid of the volume.
+        ray_chunk (int): maximum rays per chunk.
+        element_budget (int): maximum (ray, plane) pairs per chunk.
+
+    Returns:
+        Tensor: [G, N] line integrals in units of the field times cm.
+    """
     device, dtype = flat_volume.device, flat_volume.dtype
     starts = starts.to(device=device, dtype=dtype).reshape(-1, 3)
     ends = ends.to(device=device, dtype=dtype).reshape(-1, 3)
@@ -221,20 +285,25 @@ def _line_integrals_flat(flat_volume: Tensor, offset: Tensor | None, starts: Ten
 # ------------------------------------------------------------------------------------------------
 
 class SiddonProjectors:
-    """Exact (Siddon) implementation of the `Projectors` protocol: the default projector of the solver (backend
-    "auto", the fused Triton kernels on float32 CUDA) and, with backend="torch", the PyTorch reference.
+    """Exact (Siddon) implementation of the ``Projectors`` protocol, the default projector of the solver.
 
-    ray_chunk: maximum rays per traversal chunk. element_budget: maximum (ray, plane) pairs per
-    chunk; peak working memory is roughly element_budget x (G + ~12) scalars.
-    samples_per_pixel_axis: default sub-pixel sampling per axis for `primary_project` (samples_per_pixel_axis^2 sub-rays
-    per pixel).
+    Float32 CUDA tensors use the fused Triton kernels when they pass their per-device self-check; float64 and CPU
+    tensors always use the PyTorch traversal.
 
-    backend: "auto" (default: the fused Triton ray tracer of `kernels/ray_tracing_kernels.py` for float32 CUDA
-      tensors when `ray_tracing_kernels.kernels_usable(device)` passes its per-device self-check against the PyTorch
-      path, else PyTorch), "torch" (the PyTorch traversal below: the reference and test oracle), or "triton" (raises
-      if the kernels are unusable). float64 and CPU tensors always use PyTorch, so
-      "auto" equals "torch" bit for bit there. The kernels need no chunking (ray_chunk / element_budget only
-      apply to the PyTorch path) and equal it to float32 rounding.
+    Args:
+        ray_chunk (int, optional): maximum rays per chunk of the PyTorch traversal. Defaults to 2**20.
+        element_budget (int, optional): maximum (ray, plane) pairs per chunk of the PyTorch traversal.
+            Defaults to 2**23.
+        samples_per_pixel_axis (int, optional): default sub-rays per pixel axis of ``primary_project``.
+            Defaults to 1.
+        backend (str, optional): "auto" (Triton where usable, else PyTorch), "torch" (the PyTorch reference) or
+            "triton" (raises if the kernels are unusable). Defaults to "auto".
+
+    Attributes:
+        ray_chunk (int): maximum rays per chunk of the PyTorch traversal.
+        element_budget (int): maximum (ray, plane) pairs per chunk of the PyTorch traversal.
+        samples_per_pixel_axis (int): default sub-rays per pixel axis of ``primary_project``.
+        backend (str): "auto", "torch" or "triton".
     """
 
     def __init__(self, ray_chunk: int = 1 << 20, element_budget: int = 1 << 23, samples_per_pixel_axis: int = 1,
@@ -256,7 +325,14 @@ class SiddonProjectors:
 
     # ---- backend --------------------------------------------------------------------------------
     def kernel_status(self, device: torch.device) -> tuple[bool, str]:
-        """(uses Triton, reason) for float32 tensors on `device` under this instance's backend setting."""
+        """Report whether float32 tensors on ``device`` use the Triton kernels under this instance's backend.
+
+        Args:
+            device (torch.device): the device to check.
+
+        Returns:
+            (bool, str): whether the kernels are used, and the reason.
+        """
         if self.backend == "torch":
             return False, "backend='torch'"
         if torch.device(device).type != "cuda":
@@ -267,6 +343,14 @@ class SiddonProjectors:
         return ok, why
 
     def _use_triton(self, t: Tensor) -> bool:
+        """Decide whether an operation on ``t`` runs the Triton kernels, caching the result per device.
+
+        Args:
+            t (Tensor): the input tensor of the operation.
+
+        Returns:
+            bool: True for a float32 CUDA tensor on a device where the kernels are usable and allowed.
+        """
         if self.backend == "torch" or t.device.type != "cuda" or t.dtype != torch.float32:
             return False
         key = str(t.device)
@@ -276,7 +360,16 @@ class SiddonProjectors:
         return ok
 
     def _toward_panel(self, directions: Tensor, geometry: ConeGeometry, angle: float) -> Tensor:
-        """[K] uint8 flags omega . (-n_hat) > 0 with the PyTorch path's expression (cached -n_hat, no upload)."""
+        """Flag the directions that head toward the panel, ``omega . (-n_hat) > 0``, as the PyTorch path computes it.
+
+        Args:
+            directions (Tensor): [K, 3] unit directions (recon frame).
+            geometry (ConeGeometry): the cone-beam geometry.
+            angle (float): view angle in radians.
+
+        Returns:
+            Tensor: [K] uint8 flags, 1 for a direction toward the panel.
+        """
         n_hat = tuple(geometry.panel_axes(angle)[2])
         key = (n_hat, str(directions.device), directions.dtype)
         neg = self._negative_normals.get(key)
@@ -288,7 +381,17 @@ class SiddonProjectors:
 
     # ---- core ---------------------------------------------------------------------------------
     def line_integrals(self, volume: Tensor, starts: Tensor, ends: Tensor, grid: Grid) -> Tensor:
-        """See module-level `line_integrals`: volume [G, rows, cols, slices], starts/ends [N, 3] -> [G, N]."""
+        """Exact line integrals along the segments ``starts -> ends`` with this instance's backend and chunking.
+
+        Args:
+            volume (Tensor): [G, rows, cols, slices] field, zero outside the grid box.
+            starts (Tensor): [N, 3] segment starts (x, y, z) in the recon frame in cm.
+            ends (Tensor): [N, 3] segment ends (x, y, z) in the recon frame in cm.
+            grid (Grid): the grid of ``volume``.
+
+        Returns:
+            Tensor: [G, N] line integrals in units of the field times cm.
+        """
         if self._use_triton(volume):
             return ray_tracing_kernels.line_integrals_triton(volume, starts, ends, grid)
         return line_integrals(volume, starts, ends, grid, ray_chunk=self.ray_chunk,
@@ -296,9 +399,16 @@ class SiddonProjectors:
 
     # ---- (a) ----------------------------------------------------------------------------------
     def upstream_cumulative(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float) -> Tensor:
-        """Line integral of mu from the focal spot to every voxel center.
+        """Line integral of ``mu`` from the focal spot to every voxel center.
 
-        mu: [G, rows, cols, slices] (1/cm). Returns tau_up: [G, rows, cols, slices].
+        Args:
+            mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
+            grid (Grid): the grid of ``mu``.
+            geometry (ConeGeometry): the cone-beam geometry.
+            angle (float): view angle in radians.
+
+        Returns:
+            Tensor: [G, rows, cols, slices] upstream optical depth ``tau_up`` (dimensionless).
         """
         if self._use_triton(mu):
             return ray_tracing_kernels.upstream_cumulative(mu, grid, geometry, angle)
@@ -309,11 +419,17 @@ class SiddonProjectors:
 
     def upstream_to_points(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
                            points: Tensor) -> Tensor:
-        """Line integral of mu from the focal spot to each of points [N, 3] (recon frame; the segment is clipped to the
-        box of `grid`, so a point outside the box gets the integral of the part of its ray inside it).
+        """Line integral of ``mu`` from the focal spot to each point, clipped to the box of ``grid``.
 
-        mu: [G, rows, cols, slices] on grid. Returns [G, N]. One ray per point (`line_integrals`; the fused kernel on
-        float32 CUDA): the cost follows the number of points and the traversal of `grid`.
+        Args:
+            mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
+            grid (Grid): the grid of ``mu``.
+            geometry (ConeGeometry): the cone-beam geometry.
+            angle (float): view angle in radians.
+            points (Tensor): [N, 3] end points (recon frame, cm), inside or outside the box of ``grid``.
+
+        Returns:
+            Tensor: [G, N] optical depth from the focal spot to each point.
         """
         pts = points.to(device=mu.device, dtype=mu.dtype).reshape(-1, 3)
         source_position = torch.tensor(geometry.source_position(angle), device=mu.device, dtype=mu.dtype)
@@ -322,11 +438,21 @@ class SiddonProjectors:
     # ---- (b) ----------------------------------------------------------------------------------
     def primary_project(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
                         samples_per_pixel_axis: int | None = None) -> Tensor:
-        """Line integral of mu from the focal spot to every pixel center.
+        """Line integral of ``mu`` from the focal spot to every pixel center, or averaged over sub-rays.
 
-        mu: [G, rows, cols, slices]. Returns [G, num_det_rows, num_det_channels].
-        With samples_per_pixel_axis > 1 (per axis), samples_per_pixel_axis^2 sub-rays on a regular midpoint lattice
-        inside each pixel are traced and the result is -log(mean(exp(-integral))).
+        With ``n = samples_per_pixel_axis > 1``, ``n * n`` sub-rays on a midpoint lattice inside each pixel are traced
+        and the result is ``-log(mean(exp(-tau)))``.
+
+        Args:
+            mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
+            grid (Grid): the grid of ``mu``.
+            geometry (ConeGeometry): the cone-beam geometry.
+            angle (float): view angle in radians.
+            samples_per_pixel_axis (int, optional): sub-rays per pixel axis. Defaults to None (the instance's
+                ``samples_per_pixel_axis``).
+
+        Returns:
+            Tensor: [G, num_det_rows, num_det_channels] optical depth per pixel.
         """
         samples_per_pixel_axis = (self.samples_per_pixel_axis if samples_per_pixel_axis is None
                                   else int(samples_per_pixel_axis))
@@ -357,11 +483,18 @@ class SiddonProjectors:
     # ---- (c) ----------------------------------------------------------------------------------
     def downstream_cumulative(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
                               omegas: Tensor) -> Tensor:
-        """Line integral of mu from every voxel center to the panel plane along each direction.
+        """Line integral of ``mu`` from every voxel center to the panel plane along each direction.
 
-        mu: [G, rows, cols, slices]; omegas: [K, 3]. Returns tau_down [K, G, rows, cols, slices];
-        +inf where omega . (-n_hat) <= 0 (direction does not head toward the panel). Voxels on the
-        far side of the panel plane (never the case in CT) get 0.
+        Args:
+            mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
+            grid (Grid): the grid of ``mu``.
+            geometry (ConeGeometry): the cone-beam geometry.
+            angle (float): view angle in radians.
+            omegas (Tensor): [K, 3] unit directions (recon frame).
+
+        Returns:
+            Tensor: [K, G, rows, cols, slices] downstream optical depth ``tau_down``; +inf where
+            ``omega . (-n_hat) <= 0`` and 0 for voxels beyond the panel plane.
         """
         if self._use_triton(mu):
             directions = omegas.to(device=mu.device, dtype=mu.dtype).reshape(-1, 3).contiguous()
@@ -397,11 +530,19 @@ class SiddonProjectors:
     # ---- (d) ----------------------------------------------------------------------------------
     def oblique_project(self, field: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
                         omegas: Tensor) -> Tensor:
-        """Full line integral of a field along the line through each pixel center with direction omega_k.
+        """Full line integral of a field along the line through each pixel center with direction ``omega_k``.
 
-        field: [K, G, rows, cols, slices] or [G, rows, cols, slices] (shared over K); omegas: [K, 3].
-        Returns [K, G, num_det_rows, num_det_channels] (field x cm). The line is clipped to the box
-        on both sides of the pixel center.
+        The line is clipped to the grid box on both sides of the pixel center.
+
+        Args:
+            field (Tensor): [K, G, rows, cols, slices], or [G, rows, cols, slices] shared by all directions.
+            grid (Grid): the grid of ``field``.
+            geometry (ConeGeometry): the cone-beam geometry.
+            angle (float): view angle in radians.
+            omegas (Tensor): [K, 3] directions (recon frame).
+
+        Returns:
+            Tensor: [K, G, num_det_rows, num_det_channels] line integrals in units of field times cm.
         """
         if self._use_triton(field):
             return ray_tracing_kernels.oblique_project(field, grid, geometry, angle, omegas)

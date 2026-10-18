@@ -4,49 +4,78 @@ Usage and demos
 Demos
 -----
 
-Both demos write their figures to ``demo/output/`` (not tracked); the CITRUS demo caches its synthetic data in
-``demo/input/``.
+Two quick-start scripts in ``demo/`` show how to write a Python script with the CITRUS API, one step per comment.
 
 .. code-block:: bash
 
-   python demo/demo_scatter_solver.py              # one view of the WLAB phantom
-   python demo/demo_citrus.py                      # 180 views over a short scan, 0.5 cm grid, 80 outer iterations,
-                                                   # scatter step on every 8th view and at every 8th outer iteration
-   python demo/demo_citrus.py --end-view-angle 360 # the same over a full rotation
-   python demo/demo_citrus.py --full               # 180 views over a full rotation, 0.5 cm grid, 20 outer
-                                                   # iterations, scatter step on every view at every iteration
-   python demo/demo_citrus.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 --scatter-every 1
-                                                   # a quick run
-   python demo/demo_citrus.py --materials air,water,bone   # three reference materials in the density model
+   python demo/demo_1_scatter_solver.py   # the scatter solver on one view of the WLAB phantom
+   python demo/demo_2_citrus.py           # CITRUS vs uncorrected MBIR on synthetic data
 
-``demo_scatter_solver.py`` builds the library of the reference materials (once, then cached), rasterizes the WLAB
-phantom (a 30 x 20 x 40 cm water prism with lung, air and bone inserts) and solves one view with the default
-configuration (6 groups, Legendre order 7, 8 x 16 sweep directions, 16 x 32 collapsed-cone directions). It plots the
-primary and scatter detector signals, the scatter fraction and central-row profiles. Options: ``--delta-voxel``,
-``--transport-cell-cm``, ``--angle-deg``, ``--panel small|full``, ``--grid`` (focused anti-scatter grid),
-``--materials`` (comma-separated catalogue names, water and bone among them).
+``demo_1_scatter_solver.py`` builds the cross-section library of the default reference materials (on first use it
+downloads the NIST XCOM photon data and builds the library; both are cached), rasterizes the WLAB phantom (a 30 x 20 x
+40 cm water prism with lung, air and bone inserts) on a 1 cm grid, solves one view with the default configuration and
+shows the primary signal, the scatter signal and the scatter fraction on the detector.
 
-``demo_citrus.py`` synthesizes a cone-beam dataset (primary from MBIRTORCH's projector at the effective energy, scatter
-from the solver's scatter-to-primary ratio, Poisson noise), runs CITRUS and the uncorrected MBIR loop with the same
-initialization, weights, partition sequence and frozen regularization, and plots central slices, central-row profiles,
-the relative RMSE per outer iteration and the estimated vs true scatter-to-primary ratio of one view; a summary JSON
-records the settings, the reference materials and the run statistics. Options:
+``demo_2_citrus.py`` defines every setting in a parameter block at the top: the spectrum file (two columns, energy in
+keV and relative photons per keV; the example is the package's 125 kVp spectrum), the reference materials, the
+detector panel and the source distances, the voxel pitch of the WLAB phantom, the number of views and the angular
+range, the flat field, the CITRUS loop settings (outer iterations, ``scatter_every``, ``scatter_view_stride``) and the
+solver settings (transport cell size, energy groups, Legendre order). It synthesizes scatter-contaminated cone-beam
+counts with ``synthesize_cone_beam_data`` (cached in ``demo/input/`` under a name built from the settings, so later
+runs load them), builds the scatter solver from ``SolverConfig`` and the spectrum, reconstructs with ``citrus_recon``
+and, for comparison, with ``mbir_recon`` from the same FDK volume with the same regularization, prints the relative
+RMSE of both against the true attenuation and shows the central slices and central-row profiles. With the values in
+the file (180 views over a short scan, 0.5 cm voxels, 80 outer iterations with the scatter step on every 8th view at
+every 8th iteration) the first run synthesizes the data and takes a few minutes on a GPU.
+
+CITRUS studies
+--------------
+
+``benchmarks/citrus_study.py`` runs the same comparison with every setting as a flag and writes figures (central
+slices, central-row profiles, relative RMSE per outer iteration, estimated vs true scatter-to-primary ratio of view 0),
+a summary JSON (the settings, the reference materials, the object size and medium of the energy groups, the RMSE
+history, the run times and the peak allocated GPU memory) and optionally the CITRUS volume to ``demo/output/``. The
+data sets are cached in ``demo/input/``.
+
+.. code-block:: bash
+
+   python benchmarks/citrus_study.py                      # 180 views over a short scan, 0.5 cm grid, 80 outer
+                                                          # iterations, scatter step on every 8th view and at every
+                                                          # 8th outer iteration (the setting of demo 2)
+   python benchmarks/citrus_study.py --end-view-angle 360 # the same over a full rotation
+   python benchmarks/citrus_study.py --full               # 180 views over a full rotation, 0.5 cm grid, 20 outer
+                                                          # iterations, scatter step on every view at every iteration
+   python benchmarks/citrus_study.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 \
+       --scatter-every 1                                  # a quick run
+   python benchmarks/citrus_study.py --materials air,water,bone   # three reference materials in the density model
+
+Flags:
 
 * ``--views`` (default 180), ``--delta-voxel`` (default 0.5), ``--transport-cell-cm`` (default 1, any ratio to the
-  voxel pitch), ``--outer-iterations`` (default 80);
+  voxel pitch; used by the loop's and the truth's solver), ``--outer-iterations`` (default 80);
 * ``--start-view-angle`` / ``--end-view-angle`` (degrees; the default end is a short scan), ``--full`` (the full
   rotation configuration above);
 * ``--scatter-view-stride`` (default 8), ``--scatter-view-interpolation-order`` (``0``-``3`` or ``none``, default
   ``3``), ``--scatter-every`` (default 8);
 * ``--materials`` (the reference materials of the loop's density model, comma-separated catalogue names, at least two;
-  default ``air,lung,adipose,water,muscle,soft_tissue,bone``; output suffix ``_materials-<names>`` for another set);
-* ``--no-resume-error-sinogram`` (restart MBIR from the sinogram every outer iteration; suffix ``_restart``);
-* ``--I0``, ``--seed``, ``--no-noise``, ``--regenerate``, ``--truth-sweep``, ``--truth-cone``, ``--save-recon`` (also
-  write the CITRUS volume as ``.npy``), ``--memory-cap-mib`` (default 4400).
+  default ``air,lung,adipose,water,muscle,soft_tissue,bone``);
+* ``--no-resume-error-sinogram`` (restart MBIR from the sinogram every outer iteration);
+* ``--I0`` (flat-field counts, default 1e5), ``--seed``, ``--no-noise``, ``--regenerate``, ``--truth-sweep``,
+  ``--truth-cone``, ``--save-recon`` (also write the CITRUS volume as ``.npy``), ``--memory-cap-mib`` (PyTorch CUDA
+  allocator cap; default 85 percent of the device memory, 0 for none).
 
-The truth solver of the data always uses the seven default reference materials, so ``--materials`` changes only the
-reconstruction loop and every set runs on the same data. The cache name ``demo/input/<tag>.npz`` and the outputs carry
-the data-set format (``_v2``); files of other formats are never loaded.
+Names: the data set is ``demo/input/<tag>.npz`` (with ``<tag>.json``), the tag recording the number of views, the voxel
+pitch, the angular range (``_short`` for the default short scan), ``_nonoise``, a transport cell size other than 1 cm,
+a finer truth discretization and the data-set format (``_v2``); files of other formats are never loaded. The outputs
+are ``demo/output/citrus_<tag>[suffixes]_<figure>.png`` and ``citrus_<tag>[suffixes].json``, with the suffixes
+``_materials-<names>`` (a set of reference materials other than the default), ``_restart``
+(``--no-resume-error-sinogram``), ``_stride<n>`` (with ``_order<k>`` for an interpolation order other than 3) and
+``_every<n>`` for the values other than 1.
+
+The truth solver of the data always uses the seven default reference materials (the phantom is water and bone only),
+so ``--materials`` changes only the reconstruction loop and every set runs on the same data. Both reconstructions use
+the same frozen regularization (MBIRTORCH's automatic estimate on the scatter-free sinogram), the same FDK
+initialization, weights and partition sequence, so they differ only by the scatter correction.
 
 Angular range: the views are evenly spaced over ``[start, end)`` (endpoint excluded, MBIRTORCH's angle convention).
 The default end is a short scan, start + 180 degrees + the in-plane fan angle of the panel,
@@ -58,8 +87,9 @@ along the arc.
 Ground truth: the scatter of every view is computed by the scatter solver from the TRUE densities with a fully
 converged source iteration, stored as the scatter-to-primary ratio and applied to MBIRTORCH's primary counts, then
 Poisson noise is drawn. This is an intentional inverse crime for the scatter (the truth and the correction come from
-the same solver); ``--truth-sweep 16x32 --truth-cone 32x64`` generates the truth with finer angular discretizations
-than the loop (8x16, 16x32) to expose the solver's own discretization error.
+the same solver), so the study measures how well the coupled loop converges, not the accuracy of the scatter model;
+``--truth-sweep 16x32 --truth-cone 32x64`` generates the truth with finer angular discretizations than the loop (8x16,
+16x32) to expose the solver's own discretization error.
 
 CITRUS
 ------
@@ -77,8 +107,30 @@ CITRUS
 ``Y`` are the measured counts ``[views, rows, channels]`` with flat field ``I0``; ``grid`` / ``geometry`` describe the
 reconstruction grid and the scanner in MBIRTORCH conventions (:doc:`conventions`). ``info`` holds the per-iteration
 records (timings, accumulator change, scatter change), the final scatter-to-primary ratio and scatter-count estimate,
-and the frozen regularization. A ``callback(k, X_k, record)`` can track the iterates (the demo computes the RMSE
+and the frozen regularization. A ``callback(k, X_k, record)`` can track the iterates (the study script computes the RMSE
 against the truth with it).
+
+The entries of ``info``:
+
+* ``records``: one dict per outer iteration (``records[0]`` for the initial volume) with ``outer_iteration``,
+  ``scatter_seconds``, ``mbir_seconds``, ``total_seconds``, ``scatter_refreshed`` (False where the previous ratio was
+  reused, ``scatter_every > 1``), ``scatter_change_relative`` (mean absolute change of the scatter-count estimate
+  over its mean absolute value) and, on CUDA, ``gpu_peak_allocated_mib``; a record with a scatter stage also holds
+  ``negative_fraction`` (voxels clamped by the density model), ``accumulator_change_mean`` /
+  ``accumulator_change_max`` (relative accumulator change over the computed views), ``transfer_seconds``,
+  ``primary_seconds`` and, at ``scatter_view_stride > 1``, ``interpolation_seconds`` (the last two are part of
+  ``scatter_seconds``);
+* ``spr`` and ``scatter_counts``: the last scatter-to-primary ratio and scatter-count estimate ``Y - Y_c``,
+  ``[views, rows, channels]``;
+* ``regularization`` (the frozen sigmas), ``state`` (a description of the accumulator storage, one slot per computed
+  view), ``init_recon``, ``model``, ``config``, ``seconds`` and ``fdk_seconds``;
+* ``computed_views`` (``[Vc]`` views with a scatter step) and ``view_interpolated`` (``[V]`` bool, True where the
+  scatter is interpolated in angle);
+* ``grouping_object_size_cm``, ``grouping_medium`` (the object size and medium of the solver's energy groups, None
+  when its group rule is not ``"scattered_fluence"``), ``grouping_applied`` (whether ``citrus_recon`` set them;
+  False for a prebuilt library) and ``library_seconds`` (time to build or load a lazy solver's library).
+
+``mbir_recon`` returns the same entries without those of the scatter solver.
 
 The scatter schedule (:doc:`method`, "Scatter step every n-th outer iteration" and "Scatter step on every m-th
 view"):
@@ -159,6 +211,9 @@ Two settings of ``SolverConfig`` shape the library (:doc:`method`, "Uncollided f
   materials.
 * ``angular_table_grid``: ``"adaptive"`` (default; ``num_eta_table`` nodes placed by the curvature of the transfer) or
   ``"uniform"``.
+  The medium is stored as (name, density) pairs sorted by name; the library cache key and the balance use the
+  densities rounded to 3 significant digits, with traces below 1e-3 of the largest density dropped
+  (``cross_section_library.grouping_medium_densities``), so nearly equal media share a cached library.
 
 .. code-block:: python
 
@@ -209,6 +264,23 @@ images and metadata. The primary uses MBIRTORCH's own projector, the scatter is 
 scatter-to-primary ratio of one fully converged solve of ``solver`` per view, whose primary is the loop's primary
 model (``meta["data_format"]`` = 2). The truth solver may use a finer angular discretization than the solver of the
 reconstruction loop. ``synthesize_wlab_dataset(num_views, delta_voxel, I0, noise, seed, out_path, config=...,
-geometry=..., start_view_angle=0.0, end_view_angle=None)`` is the WLAB wrapper used by the CITRUS demo
+geometry=..., start_view_angle=0.0, end_view_angle=None)`` is the WLAB wrapper used by the demo and the study script
 (``end_view_angle`` None: the short scan start + pi + fan angle; ``2 pi`` for a full rotation); ``save_dataset`` /
 ``load_dataset`` write and read ``.npz`` + ``.json``.
+
+The primary in the denominator of the synthetic scatter-to-primary ratio is the planar fluence summed over the
+groups (``citrus.citrus.primary_signals(..., quantity="planar_fluence")``), in photons/cm^2, rather than the
+detector signal.
+
+The solver's images are in photons/cm^2 per source photon/sr; its primary carries the inverse-square and obliquity
+factors of the point source and the polychromatic transmission. MBIRTORCH's model is the flat, monochromatic line
+integral :math:`l = AX` at the effective energy with ``I0`` the flat-field count, which absorbs the inverse-square and
+obliquity factor ``phi_air`` (the solver's primary of an empty volume, saved with the data). The data tie the two
+models through the dimensionless per-pixel ratio, ``S = SPR P``: the scatter-to-primary ratio of the data equals the
+solver's physical ratio, and the CITRUS correction :math:`Y / (1 + \mathrm{SPR}(X))` does not depend on ``I0`` or on
+the monochromatic / polychromatic primary mismatch. The density volume itself is not stored (it is M fine volumes;
+``WlabPhantom`` rebuilds it).
+
+The Poisson draws use ``torch.Generator(seed)``, but the rates vary between runs at the float32 rounding level
+(atomic accumulation in the CUDA kernels of MBIRTORCH and of the solver), which flips a few draws; save and reuse a
+data set when bitwise identity matters.

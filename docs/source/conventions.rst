@@ -7,8 +7,8 @@ Units
 -----
 
 * Length: cm. Energy: keV. Attenuation: 1/cm. Mass coefficients: cm^2/g. Density: g/cm^3.
-* Angles: radians everywhere inside the package (degrees only in demo options); scattering angles enter the cross
-  sections as :math:`\eta = \cos	heta`.
+* Angles: radians everywhere inside the package (degrees only in the options of the study script); scattering
+  angles enter the cross sections as :math:`\eta = \cos\theta`.
 * Source strength: 1 photon per steradian at the focal spot (spectrum fractions sum to 1).
 * Angular fluence: photons / (cm^2 sr) per source photon/sr. Scatter and primary images are reported both as photon
   fluence at the panel (photons/cm^2) and as detector signal (keV deposited per cm^2) after the detector / grid
@@ -80,6 +80,17 @@ Scattering convention
 * Moments ``phi_n = sum_m w_m Y_n(Omega_m) psi_m``; scattering source
   ``S(Omega) = sum_g' sum_n mu_s_l(n) phi_n(g') Y_n(Omega)``.
 * Octant code: ``(omega_x < 0) * 4 + (omega_y < 0) * 2 + (omega_z < 0)``; a zero component counts as non-negative.
+* Explicitly, with the polar angle theta from +z and the azimuth phi from +x toward +y,
+  ``Y_l0 = N_l0 P_l(cos theta)``, ``Y_l,+k = sqrt(2) N_lk P_l^k(cos theta) cos(k phi)`` and
+  ``Y_l,-k = sqrt(2) N_lk P_l^k(cos theta) sin(k phi)`` for k = 1..l, with ``N_lk = sqrt((2l+1)/(4 pi) (l-k)!/(l+k)!)``
+  and ``P_l^k`` the associated Legendre function without the ``(-1)^k`` Condon-Shortley factor (``P_1^1 = +sin theta``).
+  Hence ``Y_1,+1 = sqrt(3/(4 pi)) x``, ``Y_1,-1 = sqrt(3/(4 pi)) y``, ``Y_1,0 = sqrt(3/(4 pi)) z``, and
+  ``int Y_n Y_n' dOmega = delta_nn'`` over the sphere.
+
+* Compton scattering to energies below the lowest group edge is not in ``mu_s_l`` / ``mu_s_eta``; it stays in
+  ``mu_t`` and is absorbed. Its group-weighted size is ``BuildInfo.compton_below_cutoff [M, G]``, and per material m
+  and source group g, ``sum_g' mu_s_l[m, g, g', 0] + compton_below_cutoff[m, g] = <sigma_C + sigma_R>_g``. With the
+  default lower edge of 10 keV it is nonzero only for source energies below about 10.4 keV (the backscatter limit).
 
 Linear-discontinuous cell moments
 ---------------------------------
@@ -179,6 +190,22 @@ entries above), with the element as the composition and xraylib's element densit
 Seltzer, NISTIR 5632; gases at 20 °C and 1 atm) as the nominal density. xraylib has no scattering functions for
 Z = 99, 100.
 
+A composition is a material string (``cross_section_library.parse_formula``): a chemical formula (``H2O``, a
+stoichiometric compound) or a mixture ``a*F1 + b*F2 + ...`` with a, b the relative mass fractions of the elements or
+compounds F1, F2 (normalized to sum 1). A term's number is the mass fraction of its compound even when the compound
+is a molecule, so ``78.084*N2`` weighs N2 by 78.084; element counts are converted with the atomic weights of XCOM.
+
+The compositions of air, lung, adipose tissue, cortical bone, PMMA and polyethylene are those of the WLAB validation
+materials. Cortical bone and adipose tissue have exactly the mass fractions of xraylib's NIST compounds
+'Bone, Cortical (ICRP)' and 'Adipose Tissue (ICRP)' (NIST lists 0.92 g/cm³ for adipose tissue, the catalogue uses
+0.95); lung is xraylib's 'Lung (ICRP)' without its Ca, Fe and Zn traces, every mass fraction within 4e-4; air reads
+the volume percentages of dry air as mass fractions of the compounds (N 0.781, O 0.210, Ar 0.0093 by mass, against
+0.755, 0.232, 0.0128 for xraylib's 'Air, Dry (near sea level)'). Cortical bone is the ICRP composition, not the
+ICRU-44 one. The ICRU-44 compositions (muscle, soft tissue, brain, blood, skin) are as tabulated by Hubbell and
+Seltzer, NISTIR 5632; spongiosa and cartilage are from Woodard and White (1986), Br J Radiol 59:1209-1219, also in
+ICRU Report 46 (1992). Muscle lies below soft tissue at every library energy (lower density, nearly the same
+composition), hence its place in the default order.
+
 * Reference materials: the library is built for ``SolverConfig.materials`` (at least two catalogue names, any order),
   sorted by increasing attenuation at the nominal density (the order must hold at every library energy). Default: the
   seven ``cross_sections.MATERIALS``, in library order 0 air (0.0012 g/cm^3), 1 lung (0.26), 2 adipose (0.95), 3 water
@@ -194,6 +221,27 @@ Z = 99, 100.
   ``rho_quadrature`` has at most two nonzero materials and evaluates all M materials densely otherwise; the choice is
   made once per density field (``ScatterSolver.material_fields`` -> ``MaterialFields.pairs_quadrature``, None for
   dense).
+
+WLAB phantom
+------------
+
+The WLAB phantom (``citrus.utilities.wlab_phantom``, ``WlabPhantom``) is a water prism (1.0 g/cm^3) of 30 cm along
+x (columns), 20 cm along y (rows, the source-detector axis at view angle 0) and 40 cm along z (slices), centred at
+the isocenter, with three full-length inserts (40 cm along z): lung (6 x 6 cm^2, 0.26 g/cm^3) centred at
+(x, y) = (-5, 0) cm, air (2 x 2 cm^2, 0.001205 g/cm^3) at (+3, 0) cm and bone (2 x 2 cm^2, 1.85 g/cm^3) at (+7, 0) cm
+(keyword arguments of ``wlab_phantom``). Outside the prism the density is 0. Voxels are assigned by the membership
+of their centres in half-open intervals. The phantom uses two rows of the library's material basis, looked up by
+name: lung and air are water of the stated density (the "water" row) and bone is cortical bone (the "bone" row), so
+a set of reference materials without water or bone cannot hold it.
+
+``wlab_grid(delta_voxel)`` tiles the prism exactly. ``wlab_geometry()`` is a full-fan kV geometry with source-axis
+distance 100 cm, source-detector distance 150 cm and a centred 40 x 30 cm^2 panel of 100 x 75 pixels of 4 mm, on
+which the lateral and z ends of the prism fall outside the field of view. ``full_field_wlab_geometry()`` widens the
+panel to 150 x 184 pixels (60 x 73.6 cm) so that the whole prism projects onto it at every view angle, as
+reconstruction needs: the transaxial half-diagonal of the prism, 18.03 cm, subtends
+``|u| <= 150 tan(asin(18.03 / 100)) = 27.5 cm`` (at least 138 channels), and the z ends (``|z| = 20`` cm) of the
+prism edge nearest to the source are magnified by up to ``150 / (100 - 18.03) = 1.83``, so ``|v| <= 36.6 cm`` (at
+least 183 rows).
 
 Device and dtype
 ----------------

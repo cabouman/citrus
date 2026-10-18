@@ -1,27 +1,9 @@
-"""Detector and anti-scatter-grid responses.
+"""Detector and anti-scatter-grid responses as lookup tables, and the angles at which they are evaluated.
 
-Both responses are lookup tables, so that tables from a Monte Carlo simulation of the detector and the grid can be
-dropped in:
-
-* `DetectorResponse`: D(E, theta0) in keV deposited per incident photon, a 2-D table over energy and
-  the angle theta0 between the photon direction and the panel normal.
-* `GridResponse`: G(E, theta1, theta2), the transmitted fraction of a 1-D anti-scatter grid, a 3-D
-  table over energy and the two grid angles of `grid_angles` (theta1 in the plane perpendicular to the lamellae,
-  measured from the focusing direction; theta2 in the plane along the lamellae, from the panel normal).
-
-The detector signal of photons arriving at a pixel along Omega with planar fluence F is
-F G(E, theta1, theta2) D(E, theta0) (keV/cm^2).
-
-The analytic builders here (`csi_response`, `focused_1d_grid`) are simple models: a 1/cos(theta)
-path-length scaling of the normal-incidence CsI absorption and a geometric lamella-shadow model of a
-focused lead grid.
-
-Attenuation data: coarse log-log tables of total mass attenuation (coherent included) for CsI and Pb,
-values read from NIST XCOM (Berger et al., XCOM: Photon Cross Sections Database, NIST Standard
-Reference Database 8, https://physics.nist.gov/xcom), rounded to 2 to 3 significant digits.
-K-edges are included as a pair of points 1 eV apart (I 33.17 keV, Cs 35.98 keV, Pb 88.00 keV;
-Pb L3 13.04 keV). The interpolation between the nodes is approximate: adequate for detector modelling, not for
-dosimetry.
+:class:`DetectorResponse` tabulates D(E, theta0), the energy deposited per incident photon, and :class:`GridResponse`
+tabulates G(E, theta1, theta2), the transmitted fraction of a 1-D anti-scatter grid; tables from a Monte Carlo
+simulation can replace the analytic builders :func:`csi_response` and :func:`focused_1d_grid`. :func:`detector_angle`
+and :func:`grid_angles` give the angles of the photons arriving at the panel.
 """
 
 from __future__ import annotations
@@ -96,7 +78,15 @@ _LEAD_TABLE = np.array([
 
 
 def _log_log_interpolation(table: np.ndarray, energy_kev: ArrayLike) -> np.ndarray:
-    """Log-log interpolation (linear extrapolation in log-log outside the table) of a (E, mu) table."""
+    """Interpolate an (E, mu) table linearly in log-log, extrapolating linearly in log-log outside it.
+
+    Args:
+        table (np.ndarray): [N, 2] energies in keV (ascending) and mass attenuation coefficients in cm^2/g.
+        energy_kev (ArrayLike): photon energies in keV, positive.
+
+    Returns:
+        np.ndarray: mass attenuation coefficients in cm^2/g, the shape of ``energy_kev``.
+    """
     e = np.asarray(torch.as_tensor(energy_kev).detach().cpu().numpy() if isinstance(energy_kev, Tensor)
                    else energy_kev, dtype=np.float64)
     if np.any(e <= 0):
@@ -115,19 +105,42 @@ def _log_log_interpolation(table: np.ndarray, energy_kev: ArrayLike) -> np.ndarr
 
 
 def csi_mass_attenuation(energy_kev: ArrayLike) -> np.ndarray:
-    """Total mass attenuation of CsI (cm^2/g) at energies (keV), coarse XCOM table, log-log interpolated."""
+    """Return the total mass attenuation of CsI from a coarse XCOM table, interpolated in log-log.
+
+    Args:
+        energy_kev (ArrayLike): photon energies in keV.
+
+    Returns:
+        np.ndarray: total mass attenuation (coherent scattering included) in cm^2/g, the shape of ``energy_kev``.
+    """
     return _log_log_interpolation(_CSI_TABLE, energy_kev)
 
 
 def lead_mass_attenuation(energy_kev: ArrayLike) -> np.ndarray:
-    """Total mass attenuation of Pb (cm^2/g) at energies (keV), coarse XCOM table, log-log interpolated."""
+    """Return the total mass attenuation of lead from a coarse XCOM table, interpolated in log-log.
+
+    Args:
+        energy_kev (ArrayLike): photon energies in keV.
+
+    Returns:
+        np.ndarray: total mass attenuation (coherent scattering included) in cm^2/g, the shape of ``energy_kev``.
+    """
     return _log_log_interpolation(_LEAD_TABLE, energy_kev)
 
 
 # ---- interpolation helper -------------------------------------------------------------------------
 
 def _bracket(nodes: Tensor, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    """(i0, i1, w1) for linear interpolation of x on ascending nodes [N]; clamped to the end nodes."""
+    """Find the two bracketing nodes and the interpolation weight of each query, clamped to the end nodes.
+
+    Args:
+        nodes (Tensor): [N] ascending node values.
+        x (Tensor): [...] query values.
+
+    Returns:
+        (Tensor, Tensor, Tensor): i0 and i1 [...] indices of the lower and upper nodes, w1 [...] weight of the upper
+        node.
+    """
     n = nodes.numel()
     if n == 1:
         z = torch.zeros_like(x, dtype=torch.long)
@@ -144,13 +157,16 @@ def _bracket(nodes: Tensor, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
 
 @dataclass(frozen=True, eq=False)
 class DetectorResponse:
-    """Detector response LUT D(E, theta0).
+    """Detector response lookup table D(E, theta0), in keV deposited per incident photon.
 
-    energy_kev : [E] ascending node energies (keV).
-    theta_rad  : [T] ascending node angles in [0, pi/2] between the photon direction and the panel
-                 normal (the absolute value of the query angle is used).
-    response   : [E, T] keV deposited per incident photon (or 1 per photon for a counting detector).
-    Queries outside the table are clamped to the end nodes.
+    Queries are interpolated bilinearly and clamped to the end nodes; the absolute value of the query angle is used.
+
+    Attributes:
+        energy_kev (Tensor): [E] ascending node energies in keV.
+        theta_rad (Tensor): [T] ascending node angles in rad, in [0, pi/2], between the photon direction and the panel
+            normal.
+        response (Tensor): [E, T] keV deposited per incident photon (1 per photon for a counting detector).
+        name (str): label of the response. Defaults to "detector".
     """
 
     energy_kev: Tensor
@@ -159,14 +175,20 @@ class DetectorResponse:
     name: str = "detector"
 
     def __post_init__(self) -> None:
+        """Check that ``response`` is [E, T]."""
         if self.response.shape != (self.energy_kev.numel(), self.theta_rad.numel()):
             raise ValueError(f"response must be [E, T] = [{self.energy_kev.numel()}, {self.theta_rad.numel()}], "
                              f"got {tuple(self.response.shape)}")
 
     def at(self, group_energy: Tensor, theta: Tensor) -> Tensor:
-        """Bilinear interpolation of the table.
+        """Interpolate the table bilinearly at group energies and angles.
 
-        group_energy: [G] keV; theta: [...] rad. Returns [G, ...] with theta's device and dtype.
+        Args:
+            group_energy (Tensor): [G] energies in keV.
+            theta (Tensor): [...] angles to the panel normal in rad.
+
+        Returns:
+            Tensor: [G, ...] response, on the device and in the dtype of ``theta``.
         """
         device, dtype = theta.device, theta.dtype
         energy_nodes = self.energy_kev.to(device, dtype)
@@ -184,6 +206,15 @@ class DetectorResponse:
 
 
 def _theta_nodes_detector(n: int = 181, max_deg: float = 89.5) -> np.ndarray:
+    """Return angle nodes uniform from 0 to ``max_deg`` degrees.
+
+    Args:
+        n (int, optional): number of nodes. Defaults to 181.
+        max_deg (float, optional): largest angle in degrees. Defaults to 89.5.
+
+    Returns:
+        np.ndarray: [n] angles in rad.
+    """
     # uniform in angle; D varies smoothly in theta (the 1/cos path scaling saturates at large theta)
     return np.radians(np.linspace(0.0, max_deg, n))
 
@@ -192,15 +223,22 @@ def csi_response(thickness_cm: float = 0.06, density: float = RHO_CSI,
                  energies: Optional[ArrayLike] = None,
                  mass_attenuation: Optional[MassAttenuation] = None,
                  thetas: Optional[ArrayLike] = None) -> DetectorResponse:
-    """Energy-integrating CsI scintillator model:
+    """Build the response of an energy-integrating CsI scintillator with the oblique path length ``t / cos(theta)``.
 
-        D(E, theta) = E * (1 - exp(-mu_CsI(E) * rho * t / cos(theta)))      keV per incident photon
+    Every interacting photon deposits its full energy, ``D(E, theta) = E * (1 - exp(-mu(E) * rho * t / cos(theta)))``
+    in keV per incident photon.
 
-    i.e. every interacting photon deposits its full energy (no escape, no fluorescence), with the
-    oblique path length t / cos(theta). mass_attenuation: callable keV -> cm^2/g (numpy in/out); default
-    `csi_mass_attenuation` (coarse XCOM table). energies: table energies in keV (default 10..150 keV
-    every 0.5 keV; pass the group energies to make the table exact at the groups). thetas: table
-    angles in rad (default 0..89.5 deg, 181 nodes). float64 CPU tables.
+    Args:
+        thickness_cm (float, optional): scintillator thickness t in cm. Defaults to 0.06.
+        density (float, optional): density rho in g/cm^3. Defaults to ``RHO_CSI`` (4.51).
+        energies (ArrayLike, optional): table energies in keV; None uses 10 to 150 keV every 0.5 keV (pass the group
+            energies to make the table exact at the groups). Defaults to None.
+        mass_attenuation (Callable, optional): mass attenuation mu in cm^2/g as a function of keV (numpy in and out);
+            None uses :func:`csi_mass_attenuation`. Defaults to None.
+        thetas (ArrayLike, optional): table angles in rad; None uses 181 nodes from 0 to 89.5 degrees. Defaults to None.
+
+    Returns:
+        DetectorResponse: the response, float64 tables on the CPU.
     """
     if thickness_cm < 0:
         raise ValueError("thickness must be non-negative")
@@ -218,16 +256,23 @@ def csi_response(thickness_cm: float = 0.06, density: float = RHO_CSI,
 
 
 def ideal_counting_response() -> DetectorResponse:
-    """D = 1 per photon: the signal equals the photon fluence (fluence-mode output)."""
+    """Build the response D = 1 per photon, so that the signal is the photon fluence.
+
+    Returns:
+        DetectorResponse: the constant table.
+    """
     e = torch.tensor([1.0, 1000.0], dtype=torch.float64)
     th = torch.tensor([0.0, math.pi / 2], dtype=torch.float64)
     return DetectorResponse(e, th, torch.ones(2, 2, dtype=torch.float64), name="ideal counting")
 
 
 def energy_weighted_response() -> DetectorResponse:
-    """D = E per photon (keV): ideal energy-integrating detector, angle independent.
+    """Build the response D = E per photon in keV of an ideal, angle-independent energy-integrating detector.
 
-    Linear in E, so the bilinear interpolation reproduces E exactly between the end nodes 1..1000 keV.
+    The table is linear in E, so the bilinear interpolation reproduces E exactly between its end nodes, 1 and 1000 keV.
+
+    Returns:
+        DetectorResponse: the table.
     """
     e = torch.tensor([1.0, 1000.0], dtype=torch.float64)
     th = torch.tensor([0.0, math.pi / 2], dtype=torch.float64)
@@ -238,17 +283,18 @@ def energy_weighted_response() -> DetectorResponse:
 
 @dataclass(frozen=True, eq=False)
 class GridResponse:
-    """Anti-scatter-grid transmission LUT G(E, theta1, theta2).
+    """Anti-scatter-grid transmission lookup table G(E, theta1, theta2) at the grid angles of :func:`grid_angles`.
 
-    energy_kev   : [E] ascending (keV).
-    theta1_rad   : [T1] ascending, >= 0: angle in the v-source plane from the focusing direction
-                   (|theta1| is looked up; the model grid is symmetric).
-    theta2_rad   : [T2] ascending, >= 0: angle in the u-source plane from the panel normal (|theta2|).
-    transmission : [E, T1, T2] transmitted fraction of the photons incident on the grid.
-    focal_distance_cm: distance of the focal line from the panel used by `grid_angles` to define the
-                   focusing direction (None: the geometry's source-detector distance, i.e. the grid is
-                   focused at the focal spot).
-    Queries outside the table are clamped to the end nodes. Trilinear interpolation.
+    Queries are interpolated trilinearly and clamped to the end nodes; the absolute values of the angles are used.
+
+    Attributes:
+        energy_kev (Tensor): [E] ascending node energies in keV.
+        theta1_rad (Tensor): [T1] ascending angles >= 0 in rad in the v-source plane, from the focusing direction.
+        theta2_rad (Tensor): [T2] ascending angles >= 0 in rad in the u-source plane, from the panel normal.
+        transmission (Tensor): [E, T1, T2] transmitted fraction of the photons incident on the grid.
+        focal_distance_cm (float, optional): distance of the focal line from the panel in cm, which defines the
+            focusing direction; None uses the source-detector distance (focused at the focal spot). Defaults to None.
+        name (str): label of the response. Defaults to "grid".
     """
 
     energy_kev: Tensor
@@ -259,12 +305,22 @@ class GridResponse:
     name: str = "grid"
 
     def __post_init__(self) -> None:
+        """Check that ``transmission`` is [E, T1, T2]."""
         shape = (self.energy_kev.numel(), self.theta1_rad.numel(), self.theta2_rad.numel())
         if tuple(self.transmission.shape) != shape:
             raise ValueError(f"transmission must be [E, T1, T2] = {list(shape)}, got {tuple(self.transmission.shape)}")
 
     def at(self, group_energy: Tensor, theta1: Tensor, theta2: Tensor) -> Tensor:
-        """group_energy [G] keV; theta1, theta2 [...] rad (broadcastable). Returns [G, ...] (theta1's device/dtype)."""
+        """Interpolate the table trilinearly at group energies and grid angles.
+
+        Args:
+            group_energy (Tensor): [G] energies in keV.
+            theta1 (Tensor): [...] angles in the v-source plane in rad.
+            theta2 (Tensor): [...] angles in the u-source plane in rad, broadcastable with ``theta1``.
+
+        Returns:
+            Tensor: [G, ...] transmission, on the device and in the dtype of ``theta1``.
+        """
         device, dtype = theta1.device, theta1.dtype
         theta1, theta2 = torch.broadcast_tensors(theta1, theta2.to(device, dtype))
         energy_nodes = self.energy_kev.to(device, dtype)
@@ -286,13 +342,22 @@ class GridResponse:
 
 
 def no_grid() -> GridResponse:
-    """Transmission 1 for every energy and angle."""
+    """Build the response of no grid, transmission 1 for every energy and angle.
+
+    Returns:
+        GridResponse: the constant table.
+    """
     e = torch.tensor([1.0, 1000.0], dtype=torch.float64)
     t = torch.tensor([0.0, math.pi / 2], dtype=torch.float64)
     return GridResponse(e, t, t.clone(), torch.ones(2, 2, 2, dtype=torch.float64), name="no grid")
 
 
 def _theta_nodes_grid() -> np.ndarray:
+    """Return theta1 nodes, dense from 0 to 10 degrees where the lamella shadow opens and coarser up to 89.5 degrees.
+
+    Returns:
+        np.ndarray: [N] angles in rad.
+    """
     # dense near 0 where the lamella shadow opens (cut-off at atan((pitch - t)/h) ~ 5 deg for the default grid)
     return np.radians(np.unique(np.concatenate([np.linspace(0.0, 10.0, 401), np.linspace(10.0, 89.5, 160)])))
 
@@ -301,27 +366,29 @@ def focused_1d_grid(ratio: float = 10.0, lamella_thickness_cm: float = 0.0036, l
                     pitch_cm: float = 1.0 / 60.0, focal_distance_cm: float = 150.0,
                     mass_attenuation: Optional[MassAttenuation] = None, lead_density: float = RHO_LEAD,
                     energies: Optional[ArrayLike] = None, theta1: Optional[ArrayLike] = None) -> GridResponse:
-    """Geometric model of a focused 1-D lead grid (nominal 10:1, 60 lp/cm, 36 um lamellae, 1.5 mm high, focused at
-    150 cm).
+    """Build the transmission of a focused 1-D lead grid with a geometric lamella-shadow model.
 
-    Lamellae of thickness t and height
-    h repeat with pitch p along v and run along u; they are focused on a line through the focal spot
-    parallel to u, so a photon arriving along the focusing direction (theta1 = 0) sees only the lamella
-    cross sections. For a photon tilted by theta1 in the v-source plane:
+    Lamellae of thickness t and height h repeat with pitch p along v and are focused on a line through the focal spot
+    parallel to u; a photon tilted by theta1 passes the interspace (open fraction) or crosses a mean lead path L_s,
+    ``G = open + (1 - open) * exp(-mu_Pb(E) * rho_Pb * L_s)``, independent of theta2.
 
-        open  = max(0, (p - t) - h |tan theta1|) / p          fraction passing through the interspace only
-              = (p - t)/p * max(0, 1 - h |tan theta1| / (p - t))
-        lead path of the rest (mean over the shadowed photons): the mean lead path over all photons is
-              (t/p) h / cos theta1 (lead volume fraction times the slant height), so
-        L_s   = (t/p) h / cos theta1 / (1 - open)              (= h at theta1 = 0)
-        G     = open + (1 - open) * exp(-mu_Pb(E) rho_Pb L_s)
+    Args:
+        ratio (float, optional): nominal grid ratio, used only in the name (the geometry is set by t, h and p).
+            Defaults to 10.0.
+        lamella_thickness_cm (float, optional): lamella thickness t in cm. Defaults to 0.0036.
+        lamella_height_cm (float, optional): lamella height h in cm. Defaults to 0.15.
+        pitch_cm (float, optional): lamella pitch p in cm. Defaults to 1/60 (60 lines per cm).
+        focal_distance_cm (float, optional): distance of the focal line from the panel in cm, stored for
+            :func:`grid_angles`. Defaults to 150.0.
+        mass_attenuation (Callable, optional): mass attenuation ``mu_Pb`` in cm^2/g as a function of keV (numpy in and
+            out); None uses :func:`lead_mass_attenuation`. Defaults to None.
+        lead_density (float, optional): lead density ``rho_Pb`` in g/cm^3. Defaults to ``RHO_LEAD`` (11.35).
+        energies (ArrayLike, optional): table energies in keV; None uses 10 to 150 keV every 0.5 keV. Defaults to None.
+        theta1 (ArrayLike, optional): table angles theta1 in rad; None uses nodes dense from 0 to 10 degrees.
+            Defaults to None.
 
-    Independent of theta2 (a tilt along the lamellae does not change the shadow). The interspace
-    material and the cover are ignored. `ratio` is the manufacturer's nominal label and is not used: the
-    geometry is set by (t, h, p); with the default specifications h / (p - t) = 11.5 and h / p = 9.0, so
-    "10:1" is only nominal. focal_distance_cm is stored for `grid_angles`.
-    mass_attenuation: callable keV -> cm^2/g; default `lead_mass_attenuation` (coarse XCOM table).
-    energies (keV, default 10..150 every 0.5) and theta1 (rad, default dense in [0, 10 deg]) set the nodes.
+    Returns:
+        GridResponse: the response, float64 tables on the CPU.
     """
     p, t, h = float(pitch_cm), float(lamella_thickness_cm), float(lamella_height_cm)
     if not (0.0 <= t < p) or h < 0:
@@ -354,7 +421,16 @@ def focused_1d_grid(ratio: float = 10.0, lamella_thickness_cm: float = 0.0036, l
 # ---- angles -------------------------------------------------------------------------------------------
 
 def detector_angle(omega: Tensor, geometry: ConeGeometry, angle: float) -> Tensor:
-    """Angle theta0 between the photon direction omega [..., 3] and the inward panel normal -n_hat. Returns [...]."""
+    """Compute the angle theta0 between the photon direction and the inward panel normal ``-n_hat``.
+
+    Args:
+        omega (Tensor): [..., 3] photon directions in the recon frame (any length).
+        geometry (ConeGeometry): the scan geometry.
+        angle (float): view angle in rad.
+
+    Returns:
+        Tensor: [...] angles theta0 in rad.
+    """
     _, _, n_hat = geometry.panel_axes(angle)
     n = torch.tensor(n_hat, device=omega.device, dtype=omega.dtype)
     c = (omega * (-n)).sum(-1) / torch.linalg.norm(omega, dim=-1)
@@ -363,22 +439,24 @@ def detector_angle(omega: Tensor, geometry: ConeGeometry, angle: float) -> Tenso
 
 def grid_angles(omega: Tensor, pixel_positions: Tensor, geometry: ConeGeometry, angle: float,
                 focal_distance: Optional[float] = None) -> tuple[Tensor, Tensor]:
-    """Grid angles (theta1, theta2) of photons arriving at pixels.
+    """Compute the grid angles (theta1, theta2) of photons arriving at pixels.
 
-    ASSUMPTIONS: 1-D grid whose lamellae run along u (channels) and repeat along v (rows), focused on
-    the line through the focal point parallel to u, at distance `focal_distance` from the panel along
-    n_hat (default geometry.source_detector_dist, i.e. through the focal spot). With a = -omega (unit
-    vector from the pixel back toward where the photon came from) and f = focus - pixel:
+    The grid is 1-D, its lamellae run along u and repeat along v, focused on the line parallel to u at
+    ``focal_distance`` from the panel along ``n_hat``; theta1 is the angle in the v-source plane from the focusing
+    direction and theta2 the angle in the u-source plane from the panel normal.
 
-        theta1 = atan2(a.v_hat, a.n_hat) - atan2(f.v_hat, f.n_hat)   angle in the v-source plane (the plane
-                 spanned by v_hat and n_hat, perpendicular to the lamella direction) from the focusing direction
-        theta2 = atan2(a.u_hat, a.n_hat)                             angle in the u-source plane from the normal
+    Args:
+        omega (Tensor): [K, 3] or [..., 3] unit photon directions in the recon frame.
+        pixel_positions (Tensor): [rows, channels, 3], or [..., 3] broadcastable with ``omega``, pixel positions in
+            cm in the recon frame.
+        geometry (ConeGeometry): the scan geometry.
+        angle (float): view angle in rad.
+        focal_distance (float, optional): distance of the focal line from the panel in cm; None uses
+            ``geometry.source_detector_dist`` (focused at the focal spot). Defaults to None.
 
-    The u component of f is irrelevant because the focal line is parallel to u. A primary ray (a = f/|f|
-    with focal_distance = SDD) has theta1 = 0 exactly and theta2 = -atan(u / SDD).
-
-    Shapes: omega [K, 3] with pixel_positions [rows, channels, 3] -> [K, rows, channels]; otherwise omega
-    [..., 3] and pixel_positions [..., 3] are broadcast elementwise -> [...]. Recon frame, cm, rad.
+    Returns:
+        (Tensor, Tensor): theta1 and theta2 in rad, [K, rows, channels] for ``omega`` [K, 3] with ``pixel_positions``
+        [rows, channels, 3], else the broadcast shape [...].
     """
     device, dtype = pixel_positions.device, pixel_positions.dtype
     omega = omega.to(device, dtype)
