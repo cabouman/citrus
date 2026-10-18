@@ -174,12 +174,19 @@ of mean densities :math:`\bar\rho_m` of the reference materials, :math:`p(E \mid
 distribution of a Compton photon,
 Rayleigh scattering left out (it does not change the energy), photons below ``energy_min_kev`` absorbed, solved by
 one sweep from the highest energy down. :math:`L` (``grouping_object_size_cm``, default 20 cm) is the characteristic
-chord length of the object: :math:`L \to 0` gives the source spectrum, :math:`L \to \infty` an infinite medium. The
-CITRUS loop measures both on the initial reconstruction, before it builds the library: :math:`L` as the mean chord
-:math:`4V/S` of the object (the voxels above the attenuation midway between air and water;
-``CitrusConfig.grouping_object_size = "auto"``) and :math:`\bar\rho` as the density model's densities averaged over
-those voxels (``SolverConfig.grouping_medium = "auto"``; a catalogue name or a mapping of densities sets a known
-medium instead). The balance is only a grouping heuristic. Under this rule the energies within each group are weighted
+size of the object, whose leakage cross section is :math:`1/L`: :math:`L \to 0` gives the source spectrum,
+:math:`L \to \infty` an infinite medium. The CITRUS loop measures both on the initial reconstruction, before it
+builds the library (``CitrusConfig.grouping_object_size = "auto"``). :math:`L` comes from the escape probability of
+the object: random rays start at points drawn in proportion to the attenuation, in isotropic directions, and
+accumulate the optical depth to the edge of the volume (``citrus.utilities.escape_probability``); under the balance's
+leakage model photons escape with probability :math:`P = 1 / (1 + \bar\mu L)`, so
+:math:`L = (1/P - 1) / \bar\mu` with :math:`\bar\mu` the attenuation-weighted mean attenuation. The volume is
+averaged onto 1 cm cells first, so the estimate depends neither on the voxel pitch nor on the noise of the
+reconstruction, and it needs no threshold or mask: a lattice, a shell or a lung-like region count through their
+optical depth. For a convex homogeneous body it is close to the mean chord :math:`4V/S`. :math:`\bar\rho` is the
+density model's densities averaged over the voxels above the attenuation midway between air and water
+(``SolverConfig.grouping_medium = "auto"``; a catalogue name or a mapping of densities sets a known medium instead).
+The balance is only a grouping heuristic. Under this rule the energies within each group are weighted
 by :math:`\phi(E)` for the group constants too (the other rules weight them by the source spectrum): the photons a
 group transports are the source photons in the upper groups and the scattered ones in the lower groups, where the
 source spectrum can be flat or empty. ``"equal_fluence"`` gives every group the same number of source

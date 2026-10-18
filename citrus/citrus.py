@@ -1257,7 +1257,7 @@ def _apply_grouping_estimates(solver: ScatterSolver, X: Tensor, grid: Grid, conf
     if requested == "auto" or medium == "auto":
         mask = object_mask(X, solver, energy_kev=config.energy_kev)
         if requested == "auto":
-            size = object_size_cm(X, grid, solver, energy_kev=config.energy_kev, default=current_size)
+            size = object_size_cm(X, grid, default=current_size)
         if medium == "auto":
             medium = grouping_medium_estimate(X, solver, energy_kev=config.energy_kev, mask=mask) or "auto"
     if solver.library_built:

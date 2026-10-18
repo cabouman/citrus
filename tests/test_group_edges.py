@@ -176,26 +176,29 @@ def test_config_validation():
 
 # ---- object size --------------------------------------------------------------------------------------------------
 
-def test_object_size_of_boxes_and_empty_mask():
-    """4 V / S of voxel boxes, rounded to whole cm: a 30 x 20 x 40 cm box (the WLAB prism without inserts, 18.5 cm)
-    at 1 cm and 0.5 cm voxels, a box touching the grid boundary (its faces there are exposed), the default for an
-    empty mask and a lower bound of 1 cm."""
-    from citrus.utilities import object_size_cm
+def test_object_size_from_the_escape_probability():
+    """The size of a 30 x 20 x 40 cm water box (mean chord 18.5 cm) is 17 cm at 1 cm and 0.5 cm voxels, with and
+    without noise; a 1 cm plate is a few cm; an empty volume gives the default; the size does not depend on the
+    seed by more than 1 cm."""
+    from citrus.utilities import escape_probability, object_size_cm
 
     for delta in (1.0, 0.5):
         n = int(round(1 / delta))
-        grid = Grid((24 * n, 34 * n, 44 * n), delta)  # rows (y), cols (x), slices (z)
-        X = torch.zeros(grid.shape)
-        X[2 * n:22 * n, 2 * n:32 * n, 2 * n:42 * n] = 0.2
-        assert object_size_cm(X, grid, 0.1) == 18.0  # 4 * 24000 / 5200 = 18.46
-        grid_tight = Grid((20 * n, 30 * n, 40 * n), delta)
-        assert object_size_cm(torch.full(grid_tight.shape, 0.2), grid_tight, 0.1) == 18.0
+        grid = Grid((20 * n, 30 * n, 40 * n), delta)  # rows (y), cols (x), slices (z)
+        X = torch.full(grid.shape, 0.2)
+        escape, mean_attenuation = escape_probability(X, grid)
+        assert mean_attenuation == pytest.approx(0.2) and 0.22 < escape < 0.24
+        assert abs(object_size_cm(X, grid) - 17.0) <= 1.0
+        torch.manual_seed(0)
+        assert abs(object_size_cm(X + 0.03 * torch.randn(grid.shape), grid) - 17.0) <= 1.0
+        assert abs(object_size_cm(X, grid, seed=1) - 17.0) <= 1.0
+    grid = Grid((40, 60, 80), 0.5)
+    plate = torch.zeros(grid.shape)
+    plate[19:21] = 0.2  # 1 x 30 x 40 cm (mean chord 1.9 cm)
+    assert 1.0 <= object_size_cm(plate, grid) <= 4.0
     grid = Grid((8, 8, 8), 1.0)
-    assert object_size_cm(torch.zeros(grid.shape), grid, 0.1) == 20.0
-    assert object_size_cm(-torch.ones(grid.shape), grid, 0.1, default=7.0) == 7.0
-    single = torch.zeros(grid.shape)
-    single[3, 3, 3] = 1.0
-    assert object_size_cm(single, grid, 0.1) == 1.0  # 4 / 6 cm, at least 1 cm
+    assert object_size_cm(torch.zeros(grid.shape), grid) == 20.0
+    assert object_size_cm(-torch.ones(grid.shape), grid, default=7.0) == 7.0
 
 
 def test_grouping_estimates_on_the_wlab_phantom(library_module):
@@ -215,7 +218,7 @@ def test_grouping_estimates_on_the_wlab_phantom(library_module):
     assert abs(medium["water"] - 22240 / 22400) < 1e-4 and abs(medium["bone_cortical_icrp"] - 160 / 22400 * 1.85) < 1e-4
     assert sum(d for n, d in medium.items() if n not in ("water", "bone_cortical_icrp")) < 1e-5
     assert not solver.library_built
-    assert _set_grouping_object_size(solver, phantom, grid, None, "cpu") == 14.0
+    assert _set_grouping_object_size(solver, phantom, grid, None, "cpu") in (15.0, 16.0)  # 15.5 rounds either way
     true = dict(solver.config.grouping_medium)
     assert set(true) == {"water", "bone_cortical_icrp"} and abs(true["water"] - 22240 / 22400) < 1e-9
     assert not solver.library_built
@@ -237,8 +240,7 @@ def test_object_size_of_the_wlab_phantom(library_module, delta_voxel):
     library = library_module.compute_library(SolverConfig(num_groups=3, legendre_order=2, num_eta_table=51),
                                              SPECTRUM_125KVP, fine_bin_width_kev=2.0, gauss_legendre_nodes=8)[0]
     X = WlabPhantom(grid, library.materials).attenuation(library)
-    assert object_size_cm(X, grid, solver) == 14.0
-    assert object_size_cm(X, grid, library) == 14.0
+    assert object_size_cm(X, grid) in (15.0, 16.0)  # 15.5 cm, the same at 1 cm and 0.5 cm voxels
     assert abs(air_water_threshold(library) / threshold - 1.0) < 0.01
 
 
@@ -311,7 +313,8 @@ def test_citrus_recon_measures_the_object_and_builds_once(monkeypatch):
     assert info["library_seconds"] >= 0.0 and bool(torch.isfinite(X).all())
     prebuilt = wlab_solver(2.0, config=config, geometry=geometry, library=library, device="cuda")
     _, info2 = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, prebuilt,
-                            CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=1, grouping_object_size=11.0))
+                            CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=1,
+                                         grouping_object_size=11.0))
     assert info2["grouping_object_size_cm"] == 20.0 and not info2["grouping_applied"]
     assert info2["grouping_medium"] == "auto"
     assert len(built) == 1

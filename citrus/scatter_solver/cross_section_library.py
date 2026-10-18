@@ -619,7 +619,8 @@ def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend:
         spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]) of the source S.
         backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
         energy_min_kev (float, optional): lowest energy in keV; photons below it are absorbed. Defaults to 10.0.
-        object_size_cm (float, optional): characteristic chord length L of the object in cm. Defaults to 20.0.
+        object_size_cm (float, optional): characteristic size L of the object in cm (the leakage cross section is
+            1/L). Defaults to 20.0.
         medium (Sequence[tuple[str, float]], optional): (catalogue name, density in g/cm^3) per material of the medium.
             Defaults to (("water", 1.0),).
         fine_bin_width_kev (float or None, optional): minimum bin width in keV; None for

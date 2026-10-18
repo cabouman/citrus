@@ -43,7 +43,8 @@ scattered photons are, so equal source counts leave a single wide group there, w
 coarse. The edges therefore follow an estimate of the total fluence, which the groups have to resolve. A transport
 solution is not needed for a grouping: a slowing-down balance in energy alone, with Klein-Nishina downscatter, is
 cheap and places the edges where the photons are. Escape matters as much as absorption in an object of patient size,
-so the balance has a leakage term set by the object's mean chord, and its medium is the object's mean composition;
+so the balance has a leakage term set by the object's escape probability, and its medium is the object's mean
+composition;
 the CITRUS loop measures both on the FDK volume and builds the library only after that (a lazy library in
 ``ScatterSolver``), once per run and cached per size and medium. A known medium (an industrial part of one material)
 can be named instead. The same estimate weights the energies within each group: a group constant is an average over

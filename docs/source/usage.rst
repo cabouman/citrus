@@ -275,7 +275,7 @@ descriptions. The first setting of each group names the group.
      - explicit descending group edges in keV (num_groups + 1 values) instead of the rule
    * - ``grouping_object_size_cm``
      - ``20.0``
-     - chord length in cm of the object in the scattered-fluence rule (CITRUS sets it from the FDK)
+     - size in cm of the object in the scattered-fluence rule (CITRUS measures it on the FDK volume)
    * - ``grouping_medium``
      - ``"auto"``
      - medium of that rule: auto (the object's mean densities), a catalogue name or (name, density) pairs
@@ -360,7 +360,7 @@ Two settings of ``SolverConfig`` shape the library (:doc:`method`, "Uncollided f
 "Multigroup and spherical-harmonic discretization"):
 
 * ``group_edges_method``: ``"scattered_fluence"`` (default; equal areas under the estimated source-plus-scattered
-  fluence of an object of chord ``grouping_object_size_cm``, default 20 cm, made of ``grouping_medium``),
+  fluence of an object of size ``grouping_object_size_cm``, default 20 cm, made of ``grouping_medium``),
   ``"equal_fluence"`` (equal source photon counts) or ``"log"`` (geometric spacing). ``group_edges_kev`` overrides
   the rule.
 * ``grouping_medium``: ``"auto"`` (default: measured on the object, water until then), a reference material's name
@@ -385,7 +385,8 @@ Two settings of ``SolverConfig`` shape the library (:doc:`method`, "Uncollided f
 
 ``wlab_solver`` (and ``ScatterSolver(None, config, ...)``) returns a solver whose library is built on first use, so
 ``citrus_recon`` can first measure the object: with ``CitrusConfig.grouping_object_size = "auto"`` (default) it sets
-``grouping_object_size_cm`` to the mean chord of the FDK volume (``citrus.utilities.object_size_cm``) and, for
+``grouping_object_size_cm`` to the size measured from the escape probability of the FDK volume
+(``citrus.utilities.object_size_cm``) and, for
 ``grouping_medium = "auto"``, the medium to the object's mean densities (``grouping_medium_estimate``) before the
 first scatter stage builds the library (cached per size and medium); ``info["grouping_object_size_cm"]`` and
 ``info["grouping_medium"]`` record them. A number in cm sets the size, a named medium skips its estimate; a solver

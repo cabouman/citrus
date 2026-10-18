@@ -29,7 +29,7 @@ class SolverConfig:
             Defaults to None, the edges of ``group_edges_method``.
         group_edges_method (str): rule of the group edges, "scattered_fluence", "equal_fluence" or "log". Defaults to
             "scattered_fluence".
-        grouping_object_size_cm (float): characteristic chord length L in cm of the object for the "scattered_fluence"
+        grouping_object_size_cm (float): characteristic size L in cm of the object for the "scattered_fluence"
             rule. Defaults to 20.0.
         grouping_medium (str or tuple[tuple[str, float], ...]): medium of the "scattered_fluence" rule: "auto", a
             catalogue name or (reference material name, density in g/cm^3) pairs. Defaults to "auto".

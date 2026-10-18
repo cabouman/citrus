@@ -47,6 +47,7 @@ __all__ = [
     "wlab_solver",
     "air_water_threshold",
     "object_mask",
+    "escape_probability",
     "object_size_cm",
     "grouping_medium_estimate",
     "fan_angle",
@@ -779,36 +780,88 @@ def grouping_medium_estimate(X: Tensor, reference: Union[MultigroupLibrary, Scat
     return tuple((name, float(d)) for name, d in zip(names, densities) if d > 0)
 
 
-def object_size_cm(X: Tensor, grid: Grid, reference: Union[MultigroupLibrary, ScatterSolver, float], *,
-                   energy_kev: Optional[float] = None, default: float = 20.0) -> float:
-    """Characteristic chord length of the object for ``SolverConfig.grouping_object_size_cm``.
+def escape_probability(X: Tensor, grid: Grid, *, cell_cm: float = 1.0, num_rays: int = 100_000,
+                       seed: int = 0) -> tuple[float, float]:
+    """Escape probability of photons born in an object, from random rays through its attenuation volume.
 
-    The length is the mean chord ``4 V / S`` of ``object_mask``, with V its volume and S the area of its exposed voxel
-    faces (cavities add their walls), rounded to whole centimetres and at least 1 cm.
+    The volume is averaged onto cubic cells of ``cell_cm`` (so the estimate does not depend on the voxel pitch or its
+    noise); rays start at points drawn in proportion to the attenuation, in isotropic directions, and accumulate the
+    optical depth to the edge of the box in steps of a quarter cell.
+
+    Args:
+        X (Tensor): [R, C, S] attenuation in 1/cm (negative values count as 0).
+        grid (Grid): grid of X.
+        cell_cm (float, optional): edge of the averaging cells in cm. Defaults to 1.0.
+        num_rays (int, optional): number of rays. Defaults to 100000.
+        seed (int, optional): seed of the rays. Defaults to 0.
+
+    Returns:
+        (float, float): the mean of exp(-optical depth) over the rays, and the attenuation-weighted mean attenuation
+        of the object in 1/cm (0 for an empty volume, with escape probability 1).
+    """
+    from .scatter_solver.geometry import resample_conservative
+
+    coarse_grid = Grid.covering(grid, float(cell_cm))
+    mu = resample_conservative(X.clamp_min(0).to(torch.float32)[None], grid, coarse_grid)[0]  # [R', C', S']
+    weights = mu.flatten().to(torch.float64)
+    total = float(weights.sum())
+    if not total > 0:
+        return 1.0, 0.0
+    device = mu.device
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+    index = torch.multinomial(weights / total, int(num_rays), replacement=True, generator=generator)
+    rows, cols, slices = torch.unravel_index(index, mu.shape)
+    dx, dy, dz = coarse_grid.deltas
+    lower = torch.tensor(coarse_grid.lower_corner(), device=device, dtype=torch.float32)
+    extent = torch.tensor(coarse_grid.extent, device=device, dtype=torch.float32)
+    jitter = torch.rand((int(num_rays), 3), generator=generator, device=device)
+    start = torch.stack([(cols + jitter[:, 0]) * dx, (rows + jitter[:, 1]) * dy, (slices + jitter[:, 2]) * dz],
+                        dim=1) + lower  # (x, y, z) in cm
+    direction = torch.randn((int(num_rays), 3), generator=generator, device=device)
+    direction = direction / direction.norm(dim=1, keepdim=True)
+    step = 0.25 * float(cell_cm)
+    num_steps = int(math.ceil(float(extent.norm()) / step))
+    t = (torch.arange(num_steps, device=device, dtype=torch.float32) + 0.5) * step
+    volume = mu.permute(2, 0, 1)[None, None]  # grid_sample order (depth z, height y, width x)
+    optical_depth = torch.empty(int(num_rays), device=device, dtype=torch.float32)
+    chunk = 16384
+    for i in range(0, int(num_rays), chunk):
+        points = start[i:i + chunk, None, :] + direction[i:i + chunk, None, :] * t[None, :, None]  # (n, T, 3)
+        coords = 2.0 * (points - lower) / extent - 1.0  # (x, y, z) in [-1, 1] over the box
+        sampled = torch.nn.functional.grid_sample(volume, coords[None, :, :, None, :], mode="bilinear",
+                                                  padding_mode="zeros", align_corners=False)[0, 0, :, :, 0]
+        optical_depth[i:i + chunk] = sampled.sum(dim=1) * step
+    escape = float(torch.exp(-optical_depth.to(torch.float64)).mean())
+    mean_attenuation = float((weights * weights).sum() / total)
+    return escape, mean_attenuation
+
+
+def object_size_cm(X: Tensor, grid: Grid, *, cell_cm: float = 1.0, num_rays: int = 100_000, default: float = 20.0,
+                   seed: int = 0) -> float:
+    """Characteristic size L of the object for ``SolverConfig.grouping_object_size_cm``, from its escape probability.
+
+    The scattered-fluence balance treats leakage as the cross section 1/L, under which photons born in a homogeneous
+    object escape with probability ``1 / (1 + mu L)``; L is the size that reproduces the escape probability of
+    ``escape_probability`` with the object's mean attenuation mu, rounded to whole centimetres and at least 1 cm.
+    For a convex homogeneous body it is close to the mean chord 4 V / S.
 
     Args:
         X (Tensor): [R, C, S] attenuation in 1/cm.
         grid (Grid): grid of X.
-        reference (MultigroupLibrary or ScatterSolver or float): library or solver for ``air_water_threshold``, or
-            the threshold itself in 1/cm.
-        energy_kev (float, optional): energy in keV of the threshold. Defaults to None, the effective energy E_eff.
-        default (float): size in cm returned for an empty mask. Defaults to 20.0.
+        cell_cm (float, optional): edge of the averaging cells in cm. Defaults to 1.0.
+        num_rays (int, optional): number of rays. Defaults to 100000.
+        default (float, optional): size in cm returned for an empty volume. Defaults to 20.0.
+        seed (int, optional): seed of the rays. Defaults to 0.
 
     Returns:
         float: object size in cm.
     """
-    mask = object_mask(X, reference, energy_kev=energy_kev)
-    count = int(mask.sum())
-    if count == 0:
+    escape, mean_attenuation = escape_probability(X, grid, cell_cm=cell_cm, num_rays=num_rays, seed=seed)
+    if not mean_attenuation > 0 or escape >= 1.0:
         return float(default)
-    dx, dy, dz = grid.deltas  # cols (x), rows (y), slices (z)
-    padded = torch.nn.functional.pad(mask[None, None].to(torch.int8), (1, 1, 1, 1, 1, 1))[0, 0]
-    faces_rows = int((padded[1:] != padded[:-1]).sum())  # faces normal to y (rows), area dx dz
-    faces_cols = int((padded[:, 1:] != padded[:, :-1]).sum())  # normal to x, area dy dz
-    faces_slices = int((padded[:, :, 1:] != padded[:, :, :-1]).sum())  # normal to z, area dx dy
-    volume = count * dx * dy * dz
-    surface = faces_rows * dx * dz + faces_cols * dy * dz + faces_slices * dx * dy
-    return float(max(1, round(4.0 * volume / surface)))
+    size = (1.0 / max(escape, 1e-12) - 1.0) / mean_attenuation
+    return float(max(1, round(size)))
 
 
 def fan_angle(geometry: ConeGeometry) -> float:
@@ -1011,7 +1064,8 @@ def _set_grouping_object_size(solver: ScatterSolver, densities, grid: Grid, ener
     """Set the grouping object size and medium of a lazy solver from the true object, without building its library.
 
     With the "scattered_fluence" group rule ``grouping_object_size_cm`` becomes ``object_size_cm`` of the true
-    attenuation and, for grouping_medium "auto", ``grouping_medium`` the true mean densities over the object mask.
+    attenuation (its escape probability) and, for grouping_medium "auto", ``grouping_medium`` the true mean densities
+    over the object mask.
 
     Args:
         solver (ScatterSolver): the solver; its config is replaced.
@@ -1033,7 +1087,7 @@ def _set_grouping_object_size(solver: ScatterSolver, densities, grid: Grid, ener
     X = torch.zeros(*grid.shape, device=device, dtype=torch.float32)
     for m in range(len(materials)):
         X.add_(densities.material(None, m).to(device=device, dtype=torch.float32), alpha=float(mass[m]))
-    size = object_size_cm(X, grid, solver, energy_kev=energy, default=float(config.grouping_object_size_cm))
+    size = object_size_cm(X, grid, default=float(config.grouping_object_size_cm))
     changes: dict = {"grouping_object_size_cm": size}
     if config.grouping_medium == "auto":
         mask = object_mask(X, solver, energy_kev=energy)

@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.11.0 - 2026-10-18
+
+- **The grouping object size comes from the escape probability.** `utilities.object_size_cm` no longer takes the
+  mean chord 4V/S of a thresholded mask, whose exposed-face area grew with the noise speckles of a fine
+  reconstruction (a 0.5 mm FDK gave 1 cm for the 14 cm WLAB phantom). `utilities.escape_probability` averages the
+  attenuation onto 1 cm cells and traces random rays from points drawn in proportion to the attenuation, in isotropic
+  directions, accumulating the optical depth to the edge of the volume; the size is the L for which the balance's
+  leakage model, escape probability 1 / (1 + mu L), reproduces it. The estimate is independent of the voxel pitch
+  and of the noise, needs no threshold, and handles thin or lattice-like objects through their optical depth; the
+  WLAB phantom gives 16 cm at every pitch (a water box of mean chord 18.5 cm gives 17 cm). It takes 0.2 s at 0.5 mm.
+  The `reference` and `energy_kev` arguments of `object_size_cm` are gone; the library cache keys include the size,
+  so libraries rebuild once.
+
 ## v0.10.2 - 2026-10-18
 
 - Fix: MBIRTORCH's "cone angle is more than 45 degrees" warning appeared for tall panels of small pixels (736 rows
