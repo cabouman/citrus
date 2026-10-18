@@ -112,12 +112,17 @@ def _rmse(X, data) -> float:
 def test_citrus_recon_runs_and_beats_no_correction(tiny):
     data, grid, geometry, solver, regularization = tiny
     config = CitrusConfig(num_outer_iterations=3)
-    seen = []
+    seen, mbir_seen = [], []
     X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
                            regularization=regularization,
-                           callback=lambda k, X, record: seen.append((k, _rmse(X, data))))
+                           callback=lambda k, X, record: seen.append((k, _rmse(X, data))),
+                           mbir_callback=lambda i, X, r: mbir_seen.append((i, _rmse(X, data), r)))
     assert X.shape == grid.shape and X.device.type == "cuda" and bool(torch.isfinite(X).all())
     assert [k for k, _ in seen] == [0, 1, 2, 3] and len(info["records"]) == 4
+    assert [(i, e) for i, e, _ in mbir_seen] == seen  # one MBIR iteration per outer iteration: the same volumes
+    residuals = [r["sinogram_nrmse"] for _, _, r in mbir_seen]
+    assert all(0 < r < 1 for r in residuals) and residuals[1] < residuals[0]  # the FDK's data fit improves
+    assert [(r["outer_iteration"], r["mbir_iteration"]) for _, _, r in mbir_seen] == [(0, 0), (1, 1), (2, 1), (3, 1)]
     assert info["regularization"] == regularization
     model = info["model"]
     assert model.get_params("auto_regularize_flag") is False
@@ -189,9 +194,14 @@ def test_mbir_iterations_per_outer_iteration(tiny):
     former and the MBIR iterations of the latter)."""
     data, grid, geometry, solver, regularization = tiny
     config = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration=2)
+    mbir_seen, seen = [], []
     X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
-                           regularization=regularization)
+                           regularization=regularization, callback=lambda k, X, r: seen.append((k, _rmse(X, data))),
+                           mbir_callback=lambda i, X, r: mbir_seen.append((i, _rmse(X, data))))
     assert bool(torch.isfinite(X).all())
+    # the MBIR callback sees the FDK and every MBIR iteration; the outer callback every second one
+    assert [i for i, _ in mbir_seen] == [0, 1, 2, 3, 4] and [k for k, _ in seen] == [0, 1, 2]
+    assert [e for _, e in seen] == [mbir_seen[0][1], mbir_seen[2][1], mbir_seen[4][1]]
     records = info["records"][1:]
     assert len(records) == 2 and all("accumulator_change_mean" in r for r in records)
     assert [r["mbir_iterations"] for r in records] == [2, 2]

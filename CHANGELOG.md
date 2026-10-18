@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.9.2 - 2026-10-18
+
+- `citrus_recon` and `mbir_recon` take `mbir_callback(i, X, record)`, called for the FDK initialization (i = 0) and
+  after every MBIR iteration, next to the per-outer-iteration `callback`; `record["sinogram_nrmse"]` is the relative
+  RMSE of the forward projection of X against the scatter-corrected sinogram of its outer iteration, a convergence
+  measure that needs no ground truth (free with the resumed error sinogram, one forward projection per iteration
+  otherwise).
+- demo 2 records, after every MBIR iteration of CITRUS and of the uncorrected MBIR, the relative RMSE of the volume
+  against the truth and of its projection against the corrected sinogram, and plots both convergence curves
+  (`plot_history`); its slices use the maximum of the truth as the upper end of the gray scale.
+
 ## v0.9.1 - 2026-10-17
 
 - **Automatic fine energy grid.** `fine_bin_width_kev` of the library build defaults to None: every group is cut into

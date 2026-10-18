@@ -13,17 +13,17 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
 from citrus import CitrusConfig, citrus_recon, mbir_recon
 from citrus.scatter_solver import (ConeGeometry, ScatterSolver, SolverConfig, ideal_counting_response,  # noqa: F401
                                    load_spectrum_txt, monoenergetic_spectrum, no_grid)
-from citrus.utilities import (WlabPhantom, load_dataset, plot_profiles, plot_slices, save_dataset,
+from citrus.utilities import (WlabPhantom, load_dataset, plot_history, plot_profiles, plot_slices, save_dataset,
                               synthesize_cone_beam_data, wlab_grid)
 
 # ---- Parameters -----------------------------------------------------------------------------------------------
 # Source spectrum, (energies in keV, relative photons per keV), with a short name for the data file: a text file of
-# two columns ('#' starts a comment), or a monoenergetic source.  demo/spectra has a 125 kVp tube spectrum and a
-# 6 MV linac spectrum.
+# two columns ('#' starts a comment; demo/spectra has a 125 kVp tube and a 6 MV linac spectrum) or a monoenergetic line.
 demo_dir = os.path.dirname(os.path.abspath(__file__))
 spectrum, spectrum_name = load_spectrum_txt(os.path.join(demo_dir, "spectra", "spectrum_125kvp.txt")), "125kvp"
 # spectrum, spectrum_name = load_spectrum_txt(os.path.join(demo_dir, "spectra", "spectrum_6mv.txt")), "6mv"
@@ -72,21 +72,29 @@ else:
 Y, X_true = data["Y"], data["X_true"]  # counts [views, rows, channels], true attenuation [rows, cols, slices] in 1/cm
 
 # ---- CITRUS, and MBIR without scatter correction from the same start and regularization ------------------------
-# The solver's library is built (and cached on disk) on first use, with energy groups fitted to the FDK volume.
+# The solver's library is built (and cached on disk) on first use.  After every MBIR iteration (0 = the FDK) two
+# relative RMSEs are recorded: of the volume against the truth, and of its projection against the corrected sinogram.
 solver = ScatterSolver(None, config, geometry, detector=detector, grid_response=grid_response, device="cuda",
                        spectrum=spectrum)
 config_citrus = CitrusConfig(num_outer_iterations=num_outer_iterations,
                              mbir_iterations_per_outer_iteration=mbir_iterations_per_outer_iteration,
                              scatter_view_stride=scatter_view_stride, verbose=True)
-X_citrus, info = citrus_recon(Y, I0, angles, grid, geometry, solver, config_citrus)
+truth, history = torch.as_tensor(X_true, device="cuda"), {n: {"volume": [], "sinogram": []} for n in ("CITRUS", "MBIR")}
+track = lambda name: (lambda i, X, record: (history[name]["volume"].append(float((X - truth).norm() / truth.norm())),
+                                            history[name]["sinogram"].append(record["sinogram_nrmse"])))  # noqa: E731
+X_citrus, info = citrus_recon(Y, I0, angles, grid, geometry, solver, config_citrus, mbir_callback=track("CITRUS"))
 X_uncorrected, _ = mbir_recon(Y, I0, angles, grid, geometry, config_citrus, regularization=info["regularization"],
-                              init_recon=info["init_recon"], model=info["model"])
+                              init_recon=info["init_recon"], model=info["model"], mbir_callback=track("MBIR"))
 
 # ---- Results ----------------------------------------------------------------------------------------------------
 X_citrus, X_uncorrected = X_citrus.cpu().numpy(), X_uncorrected.cpu().numpy()
-for label, X in (("no scatter correction", X_uncorrected), ("CITRUS", X_citrus)):
-    print(f"Relative RMSE, {label}: {np.linalg.norm(X - X_true) / np.linalg.norm(X_true):.4f}")
+print(f"Relative RMSE: CITRUS {history['CITRUS']['volume'][-1]:.4f}, no correction {history['MBIR']['volume'][-1]:.4f}")
 volumes = [("Truth", X_true), ("MBIR, no scatter correction", X_uncorrected), ("CITRUS", X_citrus)]
-plot_slices(volumes, grid, title="Central slice z = 0")
+plot_slices(volumes, grid, title="Central slice z = 0", vmax=np.max(X_true))
 plot_profiles(volumes, grid, title="Central row y = 0 (lung -8..-2 cm, air 2..4 cm, bone 6..8 cm)")
+curves = [("CITRUS", "CITRUS"), ("MBIR", "MBIR, no scatter correction")]
+plot_history([(label, history[n]["volume"]) for n, label in curves], xlabel="MBIR iteration (0 = FDK)",
+             title="Relative RMSE of the volume against the truth")
+plot_history([(label, history[n]["sinogram"]) for n, label in curves], xlabel="MBIR iteration (0 = FDK)",
+             title="Relative RMSE of A X against the corrected sinogram")
 plt.show()

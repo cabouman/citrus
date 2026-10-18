@@ -110,7 +110,11 @@ CITRUS
 ``Y`` are the measured counts ``[views, rows, channels]`` with flat field ``I0``; ``grid`` / ``geometry`` describe the
 reconstruction grid and the scanner in MBIRTORCH conventions (:doc:`conventions`). ``info`` holds the per-iteration
 records (timings, accumulator change, scatter change), the final scatter-to-primary ratio and scatter-count estimate,
-and the frozen regularization. A ``callback(k, X_k, record)`` can track the iterates (the study script computes the RMSE
+and the frozen regularization. A ``callback(k, X_k, record)`` can track the iterates per outer iteration and an
+``mbir_callback(i, X, record)`` per MBIR iteration, i = 0 for the FDK initialization, with
+``record["sinogram_nrmse"]`` the relative RMSE of the forward projection of X against the corrected sinogram of its
+outer iteration, a convergence measure without ground truth (demo 2 plots it next to the error against the truth; the
+study script computes the RMSE
 against the truth with it).
 
 The entries of ``info``:

@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .recon.mbir_bridge import ViewChunkProjector, fdk, make_cone_model, mbir_iterations
+from .recon.mbir_bridge import ViewChunkProjector, fdk, forward_project, make_cone_model, mbir_iterations
 from .scatter_solver.angular_quadrature import Quadrature
 from .scatter_solver.cross_sections import MultigroupLibrary
 from .scatter_solver.geometry import ConeGeometry, Grid
@@ -1002,7 +1002,7 @@ def _sync(device: torch.device) -> None:
 
 def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: ConeGeometry, config: CitrusConfig,
                 scatter_stage: Optional[ScatterStage], device: torch.device, *, regularization: Optional[dict],
-                init_recon: Optional[Tensor], model, callback, label: str,
+                init_recon: Optional[Tensor], model, callback, label: str, mbir_callback=None,
                 after_initialization: Optional[Callable[[Tensor, dict], None]] = None) -> tuple[Tensor, dict]:
     """Outer loop of ``citrus_recon`` and ``mbir_recon``: a scatter stage, then n MBIR iterations, per outer iteration.
 
@@ -1024,6 +1024,10 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
         model (ConeBeamModel or None): prebuilt MBIRTORCH model; None builds it.
         callback (callable or None): ``callback(k, X_k, record)`` for the initial volume (k = 0) and after every
             outer iteration k = 1, ..., N.
+        mbir_callback (callable or None, optional): ``mbir_callback(i, X, record)`` for the initial volume (i = 0)
+            and after every MBIR iteration i = 1, ..., N n; the record holds ``outer_iteration``, ``mbir_iteration``
+            and ``sinogram_nrmse``, the relative RMSE of A X against the corrected sinogram of the outer iteration
+            (a forward projection per call unless the error sinogram is resumed). Defaults to None.
         label (str): prefix of the verbose lines.
         after_initialization (callable, optional): ``after_initialization(X_0, info)``, called once after the initial
             volume. Defaults to None.
@@ -1071,6 +1075,9 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
         corrected_line_integrals = -torch.log(corrected_counts.clamp_min(config.min_counts) / float(I0))
         if regularization is None:  # estimated once on the first sinogram MBIR inverts, then frozen
             regularization = estimate_regularization(model, corrected_line_integrals, weights)
+        if mbir_callback is not None and k == 0:  # the initial volume against the first corrected sinogram
+            mbir_callback(0, X, {"outer_iteration": 0, "mbir_iteration": 0,
+                                 "sinogram_nrmse": _sinogram_nrmse(model, X, corrected_line_integrals)})
         _sync(device)
         t1 = time.perf_counter()
         for j in range(n):
@@ -1085,10 +1092,17 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
                 X, _, checkpoint = mbir_iterations(model, corrected_line_integrals, X.clone(),
                                                    first_iteration=iteration, weights=weights,
                                                    error_sinogram=error_sinogram, return_checkpoint=True)
+                residual = (float(checkpoint["error_sinogram"].norm() / corrected_line_integrals.norm())
+                            if mbir_callback is not None else None)  # e = y_c - A X, before the shift
                 negative_projection = checkpoint["error_sinogram"].sub_(corrected_line_integrals)
                 del error_sinogram, checkpoint
             else:
                 X, _ = mbir_iterations(model, corrected_line_integrals, X, first_iteration=iteration, weights=weights)
+                residual = (_sinogram_nrmse(model, X, corrected_line_integrals) if mbir_callback is not None
+                            else None)
+            if mbir_callback is not None:
+                mbir_callback(iteration + 1, X, {"outer_iteration": k + 1, "mbir_iteration": j + 1,
+                                                 "sinogram_nrmse": residual})
         _sync(device)
         t2 = time.perf_counter()
         scatter_estimate = Y - corrected_counts
@@ -1113,6 +1127,20 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
     info.update(seconds=time.perf_counter() - t_start, regularization=regularization, spr=spr,
                 scatter_counts=scatter_estimate)
     return X, info
+
+
+def _sinogram_nrmse(model, X: Tensor, line_integrals: Tensor) -> float:
+    """Relative RMSE of the forward projection of a volume against a sinogram, ``|A X - y| / |y|``.
+
+    Args:
+        model (ConeBeamModel): MBIRTORCH model.
+        X (Tensor): [R, C, S] volume in 1/cm.
+        line_integrals (Tensor): [V, Rd, Cd] sinogram y.
+
+    Returns:
+        float: the relative RMSE.
+    """
+    return float((forward_project(model, X) - line_integrals).norm() / line_integrals.norm())
 
 
 def _counts_and_angles(sinogram_counts, angles, device) -> tuple[Tensor, np.ndarray]:
@@ -1196,7 +1224,8 @@ def _medium_text(medium) -> str:
 def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: Union[Sequence[float], np.ndarray],
                  grid: Grid, geometry: ConeGeometry, solver: ScatterSolver, config: Optional[CitrusConfig] = None,
                  *, regularization: Optional[dict] = None, init_recon: Optional[Tensor] = None, model=None,
-                 callback: Optional[Callable[[int, Tensor, dict], None]] = None) -> tuple[Tensor, dict]:
+                 callback: Optional[Callable[[int, Tensor, dict], None]] = None,
+                 mbir_callback: Optional[Callable[[int, Tensor], None]] = None) -> tuple[Tensor, dict]:
     """CITRUS reconstruction of measured counts: MBIR with the scatter correction of the solver in the loop.
 
     The loop is described in docs/source/method.rst, "The CITRUS loop", and the info entries in docs/source/usage.rst,
@@ -1217,6 +1246,9 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
             None.
         callback (callable, optional): ``callback(k, X_k, record)``, called for the initial volume (k = 0, the FDK)
             and after every outer iteration k = 1, ..., N. Defaults to None.
+        mbir_callback (callable, optional): ``mbir_callback(i, X, record)``, called for the initial volume (i = 0)
+            and after every MBIR iteration i = 1, ..., N n, with ``record["sinogram_nrmse"]`` the relative RMSE of
+            A X against the corrected sinogram of its outer iteration (``_outer_loop``). Defaults to None.
 
     Returns:
         (Tensor, dict): reconstruction [R, C, S] float32 in 1/cm on the solver's device, and the info dict (``records``
@@ -1308,7 +1340,8 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
     try:
         X, info = _outer_loop(Y, float(I0), angle_array, grid, geometry, config, scatter_stage, device,
                               regularization=regularization, init_recon=init_recon, model=model, callback=callback,
-                              label="citrus", after_initialization=after_initialization)
+                              label="citrus", after_initialization=after_initialization,
+                              mbir_callback=mbir_callback)
         info["library_seconds"] = library_seconds[0]
         info["state"] = state_store.describe()
         info["computed_views"] = computed.copy()
@@ -1322,7 +1355,8 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: Un
                grid: Grid, geometry: ConeGeometry, config: Optional[CitrusConfig] = None, *,
                spr: Optional[Union[Tensor, np.ndarray]] = None, regularization: Optional[dict] = None,
                init_recon: Optional[Tensor] = None, model=None, device=None,
-               callback: Optional[Callable[[int, Tensor, dict], None]] = None) -> tuple[Tensor, dict]:
+               callback: Optional[Callable[[int, Tensor, dict], None]] = None,
+               mbir_callback: Optional[Callable[[int, Tensor], None]] = None) -> tuple[Tensor, dict]:
     """The MBIR loop of ``citrus_recon`` without the scatter solver: no correction, or a fixed correction.
 
     Args:
@@ -1341,6 +1375,7 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: Un
         device (torch.device or str, optional): device of the loop. Defaults to None (the device of a tensor sinogram,
             else CUDA if available).
         callback (callable, optional): ``callback(k, X_k, record)`` as in ``citrus_recon``. Defaults to None.
+        mbir_callback (callable, optional): ``mbir_callback(i, X, record)`` as in ``citrus_recon``. Defaults to None.
 
     Returns:
         (Tensor, dict): reconstruction [R, C, S] float32 in 1/cm and the info dict of ``citrus_recon`` without the
@@ -1361,4 +1396,4 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: Un
     scatter_stage = None if fixed_spr is None else (lambda k, X, record: fixed_spr)
     return _outer_loop(Y, float(I0), angle_array, grid, geometry, config, scatter_stage, device,
                        regularization=regularization, init_recon=init_recon, model=model, callback=callback,
-                       label="mbir")
+                       label="mbir", mbir_callback=mbir_callback)
