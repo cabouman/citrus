@@ -14,24 +14,23 @@ Outer iteration
 
 MBIR reconstructs a monoenergetic attenuation map :math:`X` at an effective energy :math:`E_{eff}` (the spectrum mean)
 from the measured counts :math:`Y`, primary plus scatter, with flat field :math:`I_0`. The loop starts from the FDK
-reconstruction :math:`X_0` of the uncorrected data, and every outer iteration :math:`k`
+reconstruction :math:`X_0` of the uncorrected data, and outer iteration :math:`k = 1, \dots, N`
 
-1. converts :math:`X_k` into the densities :math:`\rho_k` of the library's reference materials (the density model,
-   below);
+1. converts :math:`X_{k-1}` into the densities :math:`\rho_k` of the library's reference materials (the density
+   model, below);
 2. advances the collided fluence of every view by one transport sweep and projects its scatter signal :math:`s_v`;
 3. computes the primary signal :math:`p_v` of every view from :math:`\rho_k`;
-4. divides the measured counts by :math:`1 + s_v / p_v` and runs one warm-started MBIR iteration on the corrected data,
-   which gives :math:`X_{k+1}`.
+4. divides the measured counts by :math:`1 + s_v / p_v` and runs :math:`n` warm-started MBIR iterations on the
+   corrected data (``mbir_iterations_per_outer_iteration``), which give :math:`X_k`.
 
-The scatter stage (steps 1 to 3) need not run at every outer iteration: with ``scatter_every`` :math:`n` it runs at
-:math:`k = 0, n, 2n, \dots` and the iterations in between reuse its correction, so :math:`n` MBIR iterations follow
-each scatter update ("Scatter step every n-th outer iteration", below).
+Steps 1 to 3 are the scatter stage, step 4 the MBIR stage; :math:`n` sets how many MBIR iterations follow each scatter
+correction ("MBIR iterations per outer iteration", below).
 
 Age-ordered source iteration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 A converged scatter solve repeats transport sweeps, one per collision order, until the collided fluence has converged
-(source iteration, below). CITRUS spends a single sweep per view per scatter step instead and carries the collided
+(source iteration, below). CITRUS spends a single sweep per view per outer iteration instead and carries the collided
 fluence from one outer iteration to the next. Per view :math:`v` it keeps the accumulated collided moments
 :math:`\Phi_v = \sum_{n\ge1}\phi_v^{(n)}` and performs in outer iteration :math:`k` the step
 
@@ -71,10 +70,11 @@ so the weights :math:`W = Y/I_0` of the measured counts are the exact weights of
 Warm-started MBIR
 ~~~~~~~~~~~~~~~~~
 
-Each outer iteration runs one vectorized coordinate descent (VCD) iteration of MBIRTORCH on :math:`y_c`, started from
-:math:`X_k` at position :math:`k` of the partition schedule, with the weights :math:`W` and a regularization that is
-estimated once and then frozen. The partitions are drawn from a random generator seeded with ``[base_seed, k]``, so
-runs with identical inputs give identical MBIR sequences. ``mbir_recon`` runs the same loop without the solver (no
+Each outer iteration runs :math:`n` vectorized coordinate descent (VCD) iterations of MBIRTORCH on :math:`y_c`,
+started from :math:`X_{k-1}` at position :math:`(k-1)n` of the partition schedule, with the weights :math:`W` and a
+regularization that is estimated once and then frozen. The partitions are drawn from a random generator seeded with
+``[base_seed, i]`` before MBIR iteration :math:`i`, so runs with identical inputs give identical MBIR sequences.
+``mbir_recon`` runs the same loop without the solver (no
 correction, or a fixed SPR), so a comparison can share the initialization, the weights, the partition sequence and the
 regularization with CITRUS.
 
@@ -261,7 +261,7 @@ Source iteration orders the collided fluence by collision number:
 
 where :math:`\mathcal L^{-1}` is one transport sweep and :math:`\mathcal S` the scattering-source operator. The
 standalone solver iterates until :math:`\|\phi^{(n)}\| / \|\phi_C\| <` ``source_iteration_tolerance`` (default
-:math:`10^{-3}`, scalar-flux cell means); the CITRUS loop takes one of these steps per scatter step.
+:math:`10^{-3}`, scalar-flux cell means); the CITRUS loop takes one of these steps per outer iteration.
 
 The first-collision source enters the sweep as linear-discontinuous moments on the transport cells, restricted from
 samples at the quadrature points of each cell (mean and the three slopes of the midpoint quadrature, exact for a source
@@ -480,16 +480,15 @@ Uncollided trace
 ``"quadrature"`` (default; boundaries resolved at the point spacing), ``"coarse"`` (the transport grid, which smears a
 material boundary inside a cell) or ``"fine"`` (the reconstruction grid, for validation).
 
-Scatter step every n-th outer iteration
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+MBIR iterations per outer iteration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-With ``scatter_every`` :math:`n > 1` the scatter stage runs at the outer iterations :math:`k = 0, n, 2n, \dots` only; in
-between the previous :math:`\mathrm{SPR}` is reused and only the MBIR iteration runs. The accumulators keep their age
-across the skipped iterations (the recursion is unchanged, it is advanced less often). An MBIR iteration is cheap next
-to a scatter stage, so for a given number of scatter steps the extra MBIR iterations cost little; choose
-``num_outer_iterations`` as :math:`n` times the number of scatter steps you can afford.
+With ``mbir_iterations_per_outer_iteration`` :math:`n > 1` every outer iteration runs :math:`n` MBIR iterations on the
+same corrected counts before the next scatter correction. An MBIR iteration is cheap next to a scatter stage, so for a
+given number of outer iterations (scatter steps) the extra MBIR iterations cost little and let MBIR converge further
+towards each correction; the recursion of the accumulators is unchanged, it is advanced once per outer iteration.
 
-At a fixed number of outer iterations the trade-off reverses: a larger :math:`n` leaves fewer scatter stages, and
+At a fixed total number of MBIR iterations the trade-off reverses: a larger :math:`n` leaves fewer scatter stages, and
 between two of them MBIR converges towards a correction that is no longer refreshed.
 
 Scatter step on every m-th view

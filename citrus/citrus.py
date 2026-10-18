@@ -630,14 +630,15 @@ class CitrusConfig:
     The options are described in docs/source/method.rst, "Options and secondary components".
 
     Attributes:
-        num_outer_iterations (int): number N of outer iterations, one MBIR iteration each; the scatter stage runs at
-            every ``scatter_every``-th one.
-            Defaults to 10.
+        num_outer_iterations (int): number N of outer iterations; each one is a scatter correction followed by
+            ``mbir_iterations_per_outer_iteration`` MBIR iterations. Defaults to 10.
+        mbir_iterations_per_outer_iteration (int): number n of warm-started MBIR iterations on the corrected counts of
+            each outer iteration. Defaults to 1.
         energy_kev (float or None): effective energy E_eff in keV of the density model; None uses the spectrum mean of
             the solver's library. Defaults to None.
         min_counts (float): lower clamp of the (corrected) counts before the log. Defaults to 1.0.
-        base_seed (int): numpy's global random generator is seeded with ``[base_seed, k]`` before MBIR iteration k.
-            Defaults to 0.
+        base_seed (int): numpy's global random generator is seeded with ``[base_seed, i]`` before MBIR iteration i
+            (counted over the whole loop). Defaults to 0.
         gpu_state_budget_mib (float): largest total in MiB of the per-view accumulators kept on the GPU
             (``StateStore``). Defaults to 2600.0.
         pinned_memory_limit_gib (float): largest pinned host allocation in GiB for the accumulators. Defaults to 8.0.
@@ -646,8 +647,6 @@ class CitrusConfig:
             scatter is interpolated in angle. Defaults to 1.
         scatter_view_interpolation_order (int or None): interpolation in angle of the skipped views' scatter: 3
             Catmull-Rom, 2 quadratic, 1 linear, 0 nearest, None none (diagnostics). Defaults to 3.
-        scatter_every (int): the scatter stage runs at the outer iterations 0, n, 2n, ... for n; the previous
-            scatter-to-primary ratio is reused in between. Defaults to 1.
         primary_views_per_chunk (int or None): views per chunk of ``primary_signals``; None keeps the path lengths
             within one sinogram. Defaults to None.
         resume_error_sinogram (bool): keep MBIRTORCH's error sinogram between outer iterations instead of recomputing
@@ -657,6 +656,7 @@ class CitrusConfig:
     """
 
     num_outer_iterations: int = 10
+    mbir_iterations_per_outer_iteration: int = 1
     energy_kev: Optional[float] = None
     min_counts: float = 1.0
     base_seed: int = 0
@@ -665,7 +665,6 @@ class CitrusConfig:
     verbose: bool = False
     scatter_view_stride: int = 1
     scatter_view_interpolation_order: Literal[0, 1, 2, 3] | None = 3
-    scatter_every: int = 1
     primary_views_per_chunk: Optional[int] = None
     resume_error_sinogram: bool = True
     grouping_object_size: Union[Literal["auto"], float] = "auto"
@@ -678,15 +677,15 @@ class CitrusConfig:
         """
         if self.num_outer_iterations < 1:
             raise ValueError("num_outer_iterations must be >= 1")
+        n = self.mbir_iterations_per_outer_iteration
+        if isinstance(n, bool) or not isinstance(n, (int, np.integer)) or n < 1:
+            raise ValueError(f"mbir_iterations_per_outer_iteration must be an integer >= 1, got {n!r}")
         if self.min_counts <= 0:
             raise ValueError("min_counts must be > 0")
         stride = self.scatter_view_stride
         if isinstance(stride, bool) or not isinstance(stride, (int, np.integer)) or stride < 1:
             raise ValueError(f"scatter_view_stride must be an integer >= 1, got {stride!r}")
         _check_interpolation_order(self.scatter_view_interpolation_order)
-        every = self.scatter_every
-        if isinstance(every, bool) or not isinstance(every, (int, np.integer)) or every < 1:
-            raise ValueError(f"scatter_every must be an integer >= 1, got {every!r}")
         chunk = self.primary_views_per_chunk
         if chunk is not None and (isinstance(chunk, bool) or not isinstance(chunk, (int, np.integer)) or chunk < 1):
             raise ValueError(f"primary_views_per_chunk must be None or an integer >= 1, got {chunk!r}")
@@ -1005,8 +1004,10 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
                 scatter_stage: Optional[ScatterStage], device: torch.device, *, regularization: Optional[dict],
                 init_recon: Optional[Tensor], model, callback, label: str,
                 after_initialization: Optional[Callable[[Tensor, dict], None]] = None) -> tuple[Tensor, dict]:
-    """MBIR loop of ``citrus_recon`` and ``mbir_recon``: an MBIR iteration per outer iteration, a scatter stage every
-    ``scatter_every``-th one.
+    """Outer loop of ``citrus_recon`` and ``mbir_recon``: a scatter stage, then n MBIR iterations, per outer iteration.
+
+    X_0 is the initial volume; outer iteration k = 1, ..., N corrects the counts with the scatter of X_{k-1} and runs
+    ``config.mbir_iterations_per_outer_iteration`` warm-started MBIR iterations on them, which give X_k.
 
     Args:
         Y (Tensor): [V, Rd, Cd] measured counts.
@@ -1015,13 +1016,14 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
         grid (Grid): reconstruction grid.
         geometry (ConeGeometry): cone-beam geometry of the scan.
         config (CitrusConfig): loop settings.
-        scatter_stage (callable or None): ``scatter_stage(k, X_k, record)`` returns the scatter-to-primary ratio
-            [V, Rd, Cd] before MBIR iteration k; None for no correction.
+        scatter_stage (callable or None): ``scatter_stage(k, X, record)`` returns the scatter-to-primary ratio
+            [V, Rd, Cd] of the volume X at the start of outer iteration k + 1 (k = 0, 1, ...); None for no correction.
         device (torch.device): device of the loop.
         regularization (dict or None): frozen regularization; None estimates it on the first corrected sinogram.
         init_recon (Tensor or None): [R, C, S] initial volume in 1/cm; None uses FDK of the uncorrected data.
         model (ConeBeamModel or None): prebuilt MBIRTORCH model; None builds it.
-        callback (callable or None): ``callback(k, X_k, record)`` for the initial volume and every outer iteration.
+        callback (callable or None): ``callback(k, X_k, record)`` for the initial volume (k = 0) and after every
+            outer iteration k = 1, ..., N.
         label (str): prefix of the verbose lines.
         after_initialization (callable, optional): ``after_initialization(X_0, info)``, called once after the initial
             volume. Defaults to None.
@@ -1058,37 +1060,35 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
     # resume: MBIRTORCH's error sinogram minus the corrected data, -A X (one sinogram)
     negative_projection: Optional[Tensor] = None
     t_start = time.perf_counter()
+    n = int(config.mbir_iterations_per_outer_iteration)
     for k in range(config.num_outer_iterations):
-        record: dict = {"outer_iteration": k + 1}
+        record: dict = {"outer_iteration": k + 1, "mbir_iterations": n}
         _sync(device)
         t0 = time.perf_counter()
         if scatter_stage is not None:
-            # scatter stage at the outer iterations 0, n, 2n, ... (n = config.scatter_every); the previous
-            # scatter-to-primary ratio is reused in between
-            refresh = (k % int(config.scatter_every) == 0) or spr is None
-            record["scatter_refreshed"] = refresh
-            if refresh:
-                spr = scatter_stage(k, X, record)
+            spr = scatter_stage(k, X, record)
         corrected_counts = Y if spr is None else Y / (1.0 + spr)
         corrected_line_integrals = -torch.log(corrected_counts.clamp_min(config.min_counts) / float(I0))
         if regularization is None:  # estimated once on the first sinogram MBIR inverts, then frozen
             regularization = estimate_regularization(model, corrected_line_integrals, weights)
         _sync(device)
         t1 = time.perf_counter()
-        np.random.seed([int(config.base_seed), int(k)])
-        if resume:
-            # e = y_c - A X: the kept -A X shifted by the current corrected data (A X is unchanged by the scatter
-            # stage); MBIRTORCH updates e and its init volume in place, so it gets a copy of X
-            error_sinogram = (None if negative_projection is None
-                              else negative_projection.add_(corrected_line_integrals))
-            negative_projection = None
-            X, _, checkpoint = mbir_iterations(model, corrected_line_integrals, X.clone(), first_iteration=k,
-                                               weights=weights, error_sinogram=error_sinogram,
-                                               return_checkpoint=True)
-            negative_projection = checkpoint["error_sinogram"].sub_(corrected_line_integrals)
-            del error_sinogram, checkpoint
-        else:
-            X, _ = mbir_iterations(model, corrected_line_integrals, X, first_iteration=k, weights=weights)
+        for j in range(n):
+            iteration = k * n + j  # MBIR iteration count over the whole loop: the seed and the schedule position
+            np.random.seed([int(config.base_seed), int(iteration)])
+            if resume:
+                # e = y_c - A X: the kept -A X shifted by the current corrected data (A X is unchanged by the scatter
+                # stage); MBIRTORCH updates e and its init volume in place, so it gets a copy of X
+                error_sinogram = (None if negative_projection is None
+                                  else negative_projection.add_(corrected_line_integrals))
+                negative_projection = None
+                X, _, checkpoint = mbir_iterations(model, corrected_line_integrals, X.clone(),
+                                                   first_iteration=iteration, weights=weights,
+                                                   error_sinogram=error_sinogram, return_checkpoint=True)
+                negative_projection = checkpoint["error_sinogram"].sub_(corrected_line_integrals)
+                del error_sinogram, checkpoint
+            else:
+                X, _ = mbir_iterations(model, corrected_line_integrals, X, first_iteration=iteration, weights=weights)
         _sync(device)
         t2 = time.perf_counter()
         scatter_estimate = Y - corrected_counts
@@ -1108,7 +1108,8 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
             extra = (f" dPhi {record['accumulator_change_mean']:.2e}" if "accumulator_change_mean" in record
                      else "")
             print(f"[{label}] outer iteration {k + 1}/{config.num_outer_iterations}: scatter "
-                  f"{record['scatter_seconds']:.1f} s, MBIR {record['mbir_seconds']:.1f} s{extra}", flush=True)
+                  f"{record['scatter_seconds']:.1f} s, MBIR ({n} iteration{'s' if n > 1 else ''}) "
+                  f"{record['mbir_seconds']:.1f} s{extra}", flush=True)
     info.update(seconds=time.perf_counter() - t_start, regularization=regularization, spr=spr,
                 scatter_counts=scatter_estimate)
     return X, info
@@ -1214,8 +1215,8 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
         init_recon (Tensor, optional): [R, C, S] initial volume in 1/cm. Defaults to None (FDK of the uncorrected data).
         model (ConeBeamModel, optional): prebuilt MBIRTORCH model (``recon.mbir_bridge.make_cone_model``). Defaults to
             None.
-        callback (callable, optional): ``callback(k, X_k, record)``, called for the initial volume (k = 0) and after
-            every outer iteration. Defaults to None.
+        callback (callable, optional): ``callback(k, X_k, record)``, called for the initial volume (k = 0, the FDK)
+            and after every outer iteration k = 1, ..., N. Defaults to None.
 
     Returns:
         (Tensor, dict): reconstruction [R, C, S] float32 in 1/cm on the solver's device, and the info dict (``records``

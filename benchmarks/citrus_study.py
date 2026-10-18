@@ -7,15 +7,15 @@ docs/source/usage.rst, "CITRUS studies".
 
 Usage::
 
-    python benchmarks/citrus_study.py                  # 180 views over a short scan, 0.5 cm grid, 80 outer iterations,
-                                                       # scatter step on every 8th view at every 8th outer iteration
+    python benchmarks/citrus_study.py                  # 180 views over a short scan, 0.5 cm grid, 10 outer iterations
+                                                       # of 8 MBIR iterations, scatter step on every 8th view
     python benchmarks/citrus_study.py --full           # 180 views over a full rotation, 0.5 cm grid, 20 outer
-                                                       # iterations, scatter step on every view at every iteration
+                                                       # iterations of 1 MBIR iteration, scatter step on every view
     python benchmarks/citrus_study.py --end-view-angle 360                     # the default over a full rotation
     python benchmarks/citrus_study.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 \
-        --scatter-every 1                              # a quick run
+        --mbir-iterations 1                            # a quick run
     python benchmarks/citrus_study.py --transport-cell-cm 0.5                  # 0.5 cm transport cells
-    python benchmarks/citrus_study.py --materials air,water,bone               # three reference materials
+    python benchmarks/citrus_study.py --materials air,water,bone_cortical_icrp             # three reference materials
     python benchmarks/citrus_study.py --truth-sweep 16x32 --truth-cone 32x64   # truth finer than the loop's solver
 """
 
@@ -76,12 +76,15 @@ def main() -> None:
     parser.add_argument("--transport-cell-cm", type=float, default=1.0,
                         help="transport cell edge length in cm, for the loop's and the truth's solver (default 1; any "
                              "ratio to --delta-voxel)")
-    parser.add_argument("--outer-iterations", type=int, default=80, help="outer iterations (default 80)")
+    parser.add_argument("--outer-iterations", type=int, default=10,
+                        help="outer iterations, one scatter correction each (default 10)")
+    parser.add_argument("--mbir-iterations", type=int, default=8,
+                        help="MBIR iterations per outer iteration (default 8)")
     parser.add_argument("--full", action="store_true",
                         help="the report study: 180 views over a FULL rotation (end view angle = start + 360 degrees, "
-                             "set explicitly; --end-view-angle is ignored), 0.5 cm grid, 20 outer iterations, scatter "
-                             "step on every view at every outer iteration (--views, --delta-voxel, --outer-iterations, "
-                             "--scatter-view-stride and --scatter-every are overridden)")
+                             "set explicitly; --end-view-angle is ignored), 0.5 cm grid, 20 outer iterations of one "
+                             "MBIR iteration, scatter step on every view (--views, --delta-voxel, --outer-iterations, "
+                             "--scatter-view-stride and --mbir-iterations are overridden)")
     parser.add_argument("--start-view-angle", type=float, default=0.0,
                         help="first view angle in degrees (default 0; MBIRTORCH's angle convention)")
     parser.add_argument("--end-view-angle", type=float, default=None,
@@ -104,9 +107,6 @@ def main() -> None:
     parser.add_argument("--scatter-view-interpolation-order", default="3", choices=["none", "0", "1", "2", "3"],
                         help="angular interpolation of the skipped views (with --scatter-view-stride > 1): 0 nearest, "
                              "1 linear, 2 quadratic, 3 cubic Catmull-Rom (default), none = not corrected (diagnostics)")
-    parser.add_argument("--scatter-every", type=int, default=8,
-                        help="scatter step at every n-th outer iteration only; the previous correction is reused in "
-                             "between (default 8)")
     parser.add_argument("--materials", default=",".join(SolverConfig().materials),
                         help="reference materials of the loop's density model, comma-separated names from the "
                              "catalogue "
@@ -125,7 +125,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.full:
         args.views, args.delta_voxel, args.outer_iterations = 180, 0.5, 20
-        args.scatter_view_stride, args.scatter_every = 1, 1
+        args.scatter_view_stride, args.mbir_iterations = 1, 1
         args.end_view_angle = args.start_view_angle + 360.0  # the report's full rotation
     if not args.transport_cell_cm > 0:
         raise SystemExit("--transport-cell-cm must be > 0")
@@ -133,8 +133,8 @@ def main() -> None:
                            else int(args.scatter_view_interpolation_order))
     if args.scatter_view_stride < 1:
         raise SystemExit("--scatter-view-stride must be >= 1")
-    if args.scatter_every < 1:
-        raise SystemExit("--scatter-every must be >= 1")
+    if args.mbir_iterations < 1:
+        raise SystemExit("--mbir-iterations must be >= 1")
     try:
         materials = check_material_names(tuple(name.strip() for name in args.materials.split(",") if name.strip()))
     except ValueError as exc:
@@ -232,7 +232,8 @@ def main() -> None:
 
     config = CitrusConfig(num_outer_iterations=args.outer_iterations, verbose=True,
                           scatter_view_stride=args.scatter_view_stride,
-                          scatter_view_interpolation_order=interpolation_order, scatter_every=args.scatter_every,
+                          scatter_view_interpolation_order=interpolation_order,
+                          mbir_iterations_per_outer_iteration=args.mbir_iterations,
                           resume_error_sinogram=args.resume_error_sinogram)
     out_tag = tag
     if set(materials) != set(SolverConfig().materials):
@@ -244,11 +245,10 @@ def main() -> None:
                                                            else f"_order{interpolation_order}")
         print(f"sparse-view scatter: scatter step on {len(range(0, len(angles), args.scatter_view_stride))} of "
               f"{len(angles)} views (stride {args.scatter_view_stride}), interpolation order {interpolation_order}")
-    if args.scatter_every > 1:
-        out_tag += f"_every{args.scatter_every}"
-        print(f"scatter step at every {args.scatter_every}-th outer iteration "
-              f"({len(range(0, args.outer_iterations, args.scatter_every))} scatter steps in "
-              f"{args.outer_iterations} outer iterations)")
+    if args.mbir_iterations > 1:
+        out_tag += f"_mbir{args.mbir_iterations}"
+        print(f"{args.mbir_iterations} MBIR iterations per outer iteration ({args.outer_iterations} scatter steps, "
+              f"{args.outer_iterations * args.mbir_iterations} MBIR iterations)")
 
     # ---- 2. CITRUS ------------------------------------------------------------------------------------------
     citrus_history: list = []
@@ -294,8 +294,9 @@ def main() -> None:
         "outer": args.outer_iterations,
         "truth_sweep": [truth_polar, truth_azimuthal], "truth_cone": [cone_polar, cone_azimuthal],
         "scatter_view_stride": args.scatter_view_stride, "scatter_view_interp_order": interpolation_order,
-        "scatter_every": args.scatter_every, "resume_error_sinogram": bool(args.resume_error_sinogram),
-        "scatter_steps": int(sum(1 for r in records if r.get("scatter_refreshed", True))),
+        "mbir_iterations_per_outer_iteration": args.mbir_iterations,
+        "resume_error_sinogram": bool(args.resume_error_sinogram),
+        "scatter_steps": len(records),
         "computed_views": [int(v) for v in citrus_info["computed_views"]],
         "regularization": regularization,
         "citrus": {"rmse_rel": citrus_history[-1]["rmse_rel"], "rmse_rel_core": citrus_history[-1]["rmse_rel_core"],

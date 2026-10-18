@@ -20,7 +20,8 @@ shows the primary signal, the scatter signal and the scatter fraction on the det
 keV and relative photons per keV; the example is the sample 125 kVp spectrum of ``demo/spectra``), the reference
 materials, the
 detector panel and the source distances, the voxel pitch of the WLAB phantom, the number of views and the angular
-range, the flat field, the CITRUS loop settings (outer iterations, ``scatter_every``, ``scatter_view_stride``) and the
+range, the flat field, the CITRUS loop settings (outer iterations, ``mbir_iterations_per_outer_iteration``,
+``scatter_view_stride``) and the
 solver settings (transport cell size, energy groups, Legendre order). It synthesizes scatter-contaminated cone-beam
 counts with ``synthesize_cone_beam_data`` (cached in ``demo/input/`` under a name built from the settings, so later
 runs load them), builds the scatter solver from ``SolverConfig`` and the spectrum, reconstructs with ``citrus_recon``
@@ -40,26 +41,27 @@ data sets are cached in ``demo/input/``.
 
 .. code-block:: bash
 
-   python benchmarks/citrus_study.py                      # 180 views over a short scan, 0.5 cm grid, 80 outer
-                                                          # iterations, scatter step on every 8th view and at every
-                                                          # 8th outer iteration (the setting of demo 2)
+   python benchmarks/citrus_study.py                      # 180 views over a short scan, 0.5 cm grid, 10 outer
+                                                          # iterations of 8 MBIR iterations, scatter step on every
+                                                          # 8th view (the setting of demo 2)
    python benchmarks/citrus_study.py --end-view-angle 360 # the same over a full rotation
    python benchmarks/citrus_study.py --full               # 180 views over a full rotation, 0.5 cm grid, 20 outer
-                                                          # iterations, scatter step on every view at every iteration
+                                                          # iterations of 1 MBIR iteration, scatter step on every view
    python benchmarks/citrus_study.py --views 36 --delta-voxel 1 --outer-iterations 10 --scatter-view-stride 1 \
-       --scatter-every 1                                  # a quick run
-   python benchmarks/citrus_study.py --materials air,water,bone   # three reference materials in the density model
+       --mbir-iterations 1                                # a quick run
+   python benchmarks/citrus_study.py --materials air,water,bone_cortical_icrp   # three reference materials
 
 Flags:
 
 * ``--views`` (default 180), ``--delta-voxel`` (default 0.5), ``--transport-cell-cm`` (default 1, any ratio to the
-  voxel pitch; used by the loop's and the truth's solver), ``--outer-iterations`` (default 80);
+  voxel pitch; used by the loop's and the truth's solver), ``--outer-iterations`` (default 10),
+  ``--mbir-iterations`` per outer iteration (default 8);
 * ``--start-view-angle`` / ``--end-view-angle`` (degrees; the default end is a short scan), ``--full`` (the full
   rotation configuration above);
 * ``--scatter-view-stride`` (default 8), ``--scatter-view-interpolation-order`` (``0``-``3`` or ``none``, default
-  ``3``), ``--scatter-every`` (default 8);
+  ``3``);
 * ``--materials`` (the reference materials of the loop's density model, comma-separated catalogue names, at least two;
-  default ``air,lung,adipose,water,muscle,soft_tissue,bone``);
+  default ``air,lung_icrp,adipose_icrp,water,muscle_icru44,soft_tissue_icru44,bone_cortical_icrp``);
 * ``--no-resume-error-sinogram`` (restart MBIR from the sinogram every outer iteration);
 * ``--I0`` (flat-field counts, default 1e5), ``--seed``, ``--no-noise``, ``--regenerate``, ``--truth-sweep``,
   ``--truth-cone``, ``--save-recon`` (also write the CITRUS volume as ``.npy``), ``--memory-cap-mib`` (PyTorch CUDA
@@ -71,7 +73,7 @@ a finer truth discretization and the data-set format (``_v2``); files of other f
 are ``demo/output/citrus_<tag>[suffixes]_<figure>.png`` and ``citrus_<tag>[suffixes].json``, with the suffixes
 ``_materials-<names>`` (a set of reference materials other than the default), ``_restart``
 (``--no-resume-error-sinogram``), ``_stride<n>`` (with ``_order<k>`` for an interpolation order other than 3) and
-``_every<n>`` for the values other than 1.
+``_mbir<n>`` for the values other than 1.
 
 The truth solver of the data always uses the seven default reference materials (the phantom is water and bone only),
 so ``--materials`` changes only the reconstruction loop and every set runs on the same data. Both reconstructions use
@@ -113,9 +115,9 @@ against the truth with it).
 
 The entries of ``info``:
 
-* ``records``: one dict per outer iteration (``records[0]`` for the initial volume) with ``outer_iteration``,
-  ``scatter_seconds``, ``mbir_seconds``, ``total_seconds``, ``scatter_refreshed`` (False where the previous ratio was
-  reused, ``scatter_every > 1``), ``scatter_change_relative`` (mean absolute change of the scatter-count estimate
+* ``records``: one dict per outer iteration (``records[0]`` for the initial volume X_0, ``records[k]`` for X_k) with
+  ``outer_iteration``, ``mbir_iterations``, ``scatter_seconds``, ``mbir_seconds`` (of all its MBIR iterations),
+  ``total_seconds``, ``scatter_change_relative`` (mean absolute change of the scatter-count estimate
   over its mean absolute value) and, on CUDA, ``gpu_peak_allocated_mib``; a record with a scatter stage also holds
   ``negative_fraction`` (voxels clamped by the density model), ``accumulator_change_mean`` /
   ``accumulator_change_max`` (relative accumulator change over the computed views), ``transfer_seconds``,
@@ -138,17 +140,16 @@ view"):
 
 .. code-block:: python
 
-   # scatter stage at every 2nd outer iteration: 20 scatter steps, 40 MBIR iterations
-   config = CitrusConfig(num_outer_iterations=40, scatter_every=2)
+   # 20 outer iterations of 2 MBIR iterations: 20 scatter steps, 40 MBIR iterations
+   config = CitrusConfig(num_outer_iterations=20, mbir_iterations_per_outer_iteration=2)
    # scatter step on every 4th view, the others interpolated in angle (Catmull-Rom, order 3, by default)
    config = CitrusConfig(num_outer_iterations=10, scatter_view_stride=4, scatter_view_interpolation_order=1)
    recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, config)
    info["computed_views"], info["view_interpolated"]                    # [Vc] indices, [V] bool
-   [r["scatter_refreshed"] for r in info["records"][1:]]                # True at the iterations with a scatter stage
 
-``scatter_every=n`` runs the scatter stage at the outer iterations 0, n, 2n, ... and reuses the previous
-scatter-to-primary ratio in between; choose ``num_outer_iterations`` as n times the number of scatter steps you can
-afford. ``scatter_view_interpolation_order``: 3 cubic Catmull-Rom on 4 neighbors (default), 2 quadratic (3-point
+``mbir_iterations_per_outer_iteration=n`` runs n MBIR iterations on the corrected counts of every outer iteration
+before the next scatter correction. ``scatter_view_interpolation_order``: 3 cubic Catmull-Rom on 4 neighbors
+(default), 2 quadratic (3-point
 Lagrange), 1 linear, 0 nearest computed view; ``None`` leaves the skipped views uncorrected (diagnostics only); ignored
 at ``scatter_view_stride=1``. ``scatter_view_indices``, ``angular_neighbors``, ``interpolation_weights`` and
 ``interpolate_scatter`` of ``citrus.citrus`` expose the view subset and the interpolation.
@@ -208,7 +209,8 @@ Two settings of ``SolverConfig`` shape the library (:doc:`method`, "Uncollided f
   ``"equal_fluence"`` (equal source photon counts) or ``"log"`` (geometric spacing). ``group_edges_kev`` overrides
   the rule.
 * ``grouping_medium``: ``"auto"`` (default: measured on the object, water until then), a reference material's name
-  (``"aluminium"`` for an aluminium casting) or a mapping ``{"water": 0.9, "bone_cortical_icrp": 0.2}`` (g/cm^3) of reference
+  (``"aluminium"`` for an aluminium casting) or a mapping ``{"water": 0.9, "bone_cortical_icrp": 0.2}`` (g/cm^3) of
+  reference
   materials.
 * ``angular_table_grid``: ``"adaptive"`` (default; ``num_eta_table`` nodes placed by the curvature of the transfer) or
   ``"uniform"``.
@@ -248,7 +250,8 @@ of the catalogue (:doc:`conventions`, "Materials"), in any order; the library so
    from citrus.scatter_solver.cross_sections import material_index
    from citrus.utilities import attenuation_to_densities, wlab_phantom, wlab_solver
 
-   solver = wlab_solver(1.0, config=replace(SolverConfig(), materials=("air", "water", "bone_cortical_icrp")), device="cuda")
+   solver = wlab_solver(1.0, config=replace(SolverConfig(), materials=("air", "water", "bone_cortical_icrp")),
+                        device="cuda", spectrum=spectrum)
    rho = wlab_phantom(grid, materials=solver.materials, device="cuda")            # [3, R, C, S]
    material_index(solver.library, "water")                                       # 1
    attenuation_to_densities(solver.library, X)                                   # the density model of the loop

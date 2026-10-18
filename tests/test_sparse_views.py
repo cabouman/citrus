@@ -258,9 +258,9 @@ def test_config_defaults_and_validation():
         with pytest.raises(ValueError, match="scatter_view_interpolation_order"):  # validated at stride 1 too
             CitrusConfig(scatter_view_interpolation_order=order).validate()
     # scatter step every n outer iterations
-    assert config.scatter_every == 1
+    assert config.mbir_iterations_per_outer_iteration == 1
     for every in (1, 2, 7, np.int64(4)):
-        CitrusConfig(scatter_every=every).validate()
+        CitrusConfig(mbir_iterations_per_outer_iteration=every).validate()
     for every in (0, -1, 1.5, 2.0, True, "2", None):
-        with pytest.raises(ValueError, match="scatter_every"):
-            CitrusConfig(scatter_every=every).validate()
+        with pytest.raises(ValueError, match="mbir_iterations_per_outer_iteration"):
+            CitrusConfig(mbir_iterations_per_outer_iteration=every).validate()

@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.9.0 - 2026-10-17
+
+- **An outer iteration is one scatter correction followed by n MBIR iterations.** `CitrusConfig.scatter_every` is
+  replaced by `mbir_iterations_per_outer_iteration` (default 1), and `num_outer_iterations` counts scatter
+  corrections: `CitrusConfig(num_outer_iterations=10, mbir_iterations_per_outer_iteration=8)` runs the same sequence
+  as the former `num_outer_iterations=80, scatter_every=8` (the MBIR iterations keep their seeds and schedule
+  positions, counted over the whole loop). X_0 is the FDK initialization and outer iteration k = 1, ..., N gives X_k;
+  `records[k]` and `callback(k, X_k, record)` follow that count, a record holds `mbir_iterations` and the
+  `mbir_seconds` of all its MBIR iterations, and `scatter_refreshed` is gone (every outer iteration has a scatter
+  stage). `benchmarks/citrus_study.py` takes `--outer-iterations` (default 10) and `--mbir-iterations` (default 8)
+  instead of `--scatter-every`, and tags its outputs `_mbir<n>`.
+- The README and the docs describe the loop in these terms, and their examples pass the spectrum.
+
 ## v0.8.0 - 2026-10-17
 
 - **The source spectrum is required.** There is no default spectrum any more: `build_library`, `compute_library`,

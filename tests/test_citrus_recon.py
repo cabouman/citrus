@@ -179,27 +179,24 @@ def test_citrus_with_true_scatter_is_fixed_spr_mbir(tiny, monkeypatch):
     assert rel < 1e-4, rel  # MBIRTORCH's float32 atomics
 
 
-# ---- scatter step every n outer iterations ------------------------------------------------------------------
+# ---- several MBIR iterations per outer iteration ------------------------------------------------------------
 
 @cuda
-def test_scatter_every_reuses_the_correction(tiny):
-    """scatter_every=2 over 4 outer iterations: the scatter stage runs at k = 0 and 2 only (records 1 and 3), the
-    other records reuse the ratio (no accumulator entries, scatter_seconds ~ 0), the accumulators advance twice, and the
-    result is finite and corrected on every view. The scatter_every=2 run with 4 iterations must lie between the
-    2-iteration and the 4-iteration every-iteration runs in final error (it has the scatter steps of the former and
-    the MBIR iterations of the latter)."""
+def test_mbir_iterations_per_outer_iteration(tiny):
+    """Two outer iterations of two MBIR iterations each: every record has a scatter stage (accumulator entries), the
+    accumulators advance twice, and the result is finite and corrected on every view. In final error the run lies
+    between the runs of 2 and of 4 outer iterations with one MBIR iteration each (it has the scatter steps of the
+    former and the MBIR iterations of the latter)."""
     data, grid, geometry, solver, regularization = tiny
-    config = CitrusConfig(num_outer_iterations=4, scatter_every=2)
+    config = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration=2)
     X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
                            regularization=regularization)
     assert bool(torch.isfinite(X).all())
     records = info["records"][1:]
-    assert [r["scatter_refreshed"] for r in records] == [True, False, True, False]
-    assert all("accumulator_change_mean" in r for r in records[::2]) and not any("accumulator_change_mean" in r
-                                                                                 for r in records[1::2])
-    assert all(r["scatter_seconds"] < 0.5 * min(x["scatter_seconds"] for x in records[::2]) for r in records[1::2])
+    assert len(records) == 2 and all("accumulator_change_mean" in r for r in records)
+    assert [r["mbir_iterations"] for r in records] == [2, 2]
     assert float(info["spr"].min()) > 0
-    assert info["config"]["scatter_every"] == 2
+    assert info["config"]["mbir_iterations_per_outer_iteration"] == 2
     e_every2 = _rmse(X, data)
     X2, _ = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, CitrusConfig(num_outer_iterations=2),
                          regularization=regularization)
@@ -300,12 +297,13 @@ def test_sparse_views_interpolate_the_scatter_signal(tiny, monkeypatch):
 def test_resume_error_sinogram_matches_restart(tiny):
     """CitrusConfig.resume_error_sinogram: the loop keeps MBIRTORCH's error sinogram between outer iterations
     (shifted by each new corrected sinogram) and gives the reconstruction of the restarted MBIR (a fresh y_c - A X
-    every iteration) to float rounding, with a scatter stage every 2nd iteration (the reused correction); mbir_recon
-    too."""
+    every iteration) to float rounding, with two MBIR iterations per outer iteration (the second one continues the
+    first one's error sinogram unshifted); mbir_recon too."""
     data, grid, geometry, solver, regularization = tiny
     out = {}
     for resume in (True, False):
-        config = CitrusConfig(num_outer_iterations=4, scatter_every=2, resume_error_sinogram=resume)
+        config = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration=2,
+                              resume_error_sinogram=resume)
         out[resume], info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
                                          regularization=regularization)
         assert info["config"]["resume_error_sinogram"] is resume

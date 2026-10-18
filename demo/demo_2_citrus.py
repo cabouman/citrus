@@ -37,8 +37,8 @@ start_angle = 0.0                          # first view angle in degrees
 fan_angle = 2 * np.degrees(np.arctan(num_det_channels * pixel_pitch / 2 / source_detector_dist))
 end_angle = start_angle + 180.0 + fan_angle  # end of the angular range in degrees (excluded): a short scan
 I0 = 1.0e5                                 # flat-field counts per pixel
-num_outer_iterations = 80                  # CITRUS outer iterations (MBIR iterations)
-scatter_every = 8                          # scatter step at every 8th outer iteration
+num_outer_iterations = 10                  # CITRUS outer iterations: one scatter correction each, followed by
+mbir_iterations_per_outer_iteration = 8    # this many MBIR iterations on the corrected counts
 scatter_view_stride = 8                    # scatter step on every 8th view, the others interpolated in angle
 transport_cell_cm = 1.0                    # transport cell size in cm
 num_groups = 6                             # energy groups
@@ -74,7 +74,8 @@ Y, X_true = data["Y"], data["X_true"]  # counts [views, rows, channels], true at
 # The solver's library is built (and cached on disk) on first use, with energy groups fitted to the FDK volume.
 solver = ScatterSolver(None, config, geometry, detector=detector, grid_response=grid_response, device="cuda",
                        spectrum=spectrum)
-config_citrus = CitrusConfig(num_outer_iterations=num_outer_iterations, scatter_every=scatter_every,
+config_citrus = CitrusConfig(num_outer_iterations=num_outer_iterations,
+                             mbir_iterations_per_outer_iteration=mbir_iterations_per_outer_iteration,
                              scatter_view_stride=scatter_view_stride, verbose=True)
 X_citrus, info = citrus_recon(Y, I0, angles, grid, geometry, solver, config_citrus)
 X_uncorrected, _ = mbir_recon(Y, I0, angles, grid, geometry, config_citrus, regularization=info["regularization"],

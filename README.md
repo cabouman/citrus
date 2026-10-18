@@ -3,8 +3,9 @@
 **CITRUS** (Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter) reconstructs cone-beam CT
 volumes from scatter-contaminated projections by iterating model-based iterative reconstruction (MBIR, via
 [MBIRTORCH](https://github.com/cabouman/mbirtorch)) and a deterministic scatter solver for the linear Boltzmann
-transport equation (LBTE) **jointly**: after a chosen number of MBIR iterations, one source-iteration step of the
-scatter solver advances the scatter estimate from the current reconstruction. This replaces the usual sequential
+transport equation (LBTE) **jointly**: every outer iteration refreshes the scatter estimate with one source-iteration
+step of the scatter solver from the current reconstruction and runs a chosen number of MBIR iterations on the
+corrected data. This replaces the usual sequential
 pipeline (FDK, one scatter estimate from that volume, correction, then a reconstruction that never revisits the
 scatter), whose scatter estimate inherits the errors of the scatter-corrupted initial volume.
 
@@ -12,10 +13,10 @@ Full documentation: [purduecitrus.readthedocs.io](https://purduecitrus.readthedo
 
 ## How CITRUS works
 
-Each outer iteration k runs one warm-started MBIR iteration on the corrected counts `Y_c = Y / (1 + SPR)`. Every
-n-th outer iteration (`scatter_every`) first refreshes the correction: it converts the current reconstruction X_k
-into material densities, takes one scatter step per view and recomputes the scatter-to-primary ratio SPR; the
-iterations in between reuse the last correction.
+The loop starts from the FDK reconstruction X_0 of the uncorrected data. Outer iteration k = 1, ..., N converts
+X_{k-1} into material densities, takes one scatter step per view, corrects the measured counts with the estimated
+scatter-to-primary ratio, `Y_c = Y / (1 + SPR)`, and runs n warm-started MBIR iterations on the corrected data
+(`mbir_iterations_per_outer_iteration`), which give X_k.
 
 The scatter step is **age-ordered source iteration**. Per view the solver keeps an accumulator of the collided
 fluence, `Phi_{>1}`, and updates it with one transport sweep `G_k` (scattering plus transport through the densities of
@@ -100,10 +101,13 @@ In Python:
 
 ```python
 from citrus import CitrusConfig, citrus_recon
+from citrus.scatter_solver import load_spectrum_txt
 from citrus.utilities import wlab_solver
 
-solver = wlab_solver(delta_voxel, geometry=geometry)       # ScatterSolver with the cached cross-section library
-recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, CitrusConfig(num_outer_iterations=10))
+spectrum = load_spectrum_txt("spectrum.txt")               # the source spectrum, two columns: keV, photons per keV
+solver = wlab_solver(delta_voxel, geometry=geometry, spectrum=spectrum)   # ScatterSolver, library cached on disk
+recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver,
+                           CitrusConfig(num_outer_iterations=10, mbir_iterations_per_outer_iteration=8))
 ```
 
 Tests: `dev_scripts/run_tests.sh` or `python -m pytest -q` (GPU, Triton and MBIRTORCH tests, and those that need the
@@ -120,7 +124,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.8.0},
+  note = {Version 0.9.0},
   year = 2026
 }
 ```

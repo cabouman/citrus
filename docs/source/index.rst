@@ -8,9 +8,10 @@ Scatter is the largest source of shading, cupping and wrong CT numbers in cone-b
 the scatter once, from a first reconstruction that is itself corrupted by scatter, and never revisits it. CITRUS
 (Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter) instead interleaves model-based
 iterative reconstruction (MBIR) with steps of a deterministic solver of the linear Boltzmann transport equation
-(LBTE): after a chosen number of MBIR iterations, one scatter step advances the scatter estimate of every view by one
-transport sweep from the current reconstruction. The scatter estimate and the reconstruction converge together, for
-the cost of one transport sweep per view per scatter step.
+(LBTE): every outer iteration refreshes the scatter estimate of every view with one transport sweep from the current
+reconstruction, corrects the measured data with it and runs a chosen number of MBIR iterations on the result. The
+scatter estimate and the reconstruction converge together, for the cost of one transport sweep per view per outer
+iteration.
 
 A reconstruction in a few lines
 -------------------------------
@@ -18,11 +19,13 @@ A reconstruction in a few lines
 .. code-block:: python
 
    from citrus import CitrusConfig, citrus_recon
+   from citrus.scatter_solver import load_spectrum_txt
    from citrus.utilities import wlab_solver
 
-   solver = wlab_solver(delta_voxel, geometry=geometry)   # LBTE solver with the cached cross-section library
+   spectrum = load_spectrum_txt("spectrum.txt")           # the source spectrum, two columns: keV, photons per keV
+   solver = wlab_solver(delta_voxel, geometry=geometry, spectrum=spectrum)   # LBTE solver, library cached on disk
    recon, info = citrus_recon(counts, flat_field, angles, grid, geometry, solver,
-                              CitrusConfig(num_outer_iterations=80, scatter_every=8,
+                              CitrusConfig(num_outer_iterations=10, mbir_iterations_per_outer_iteration=8,
                                            scatter_view_stride=8))
 
 ``counts`` are the measured projections (primary plus scatter), ``grid`` and ``geometry`` describe the volume and the
@@ -73,9 +76,9 @@ How it works
    iteration's higher-order scatter, divides the measured data by one plus the scatter-to-primary ratio and runs one
    or more warm-started MBIR iterations on the result.
 
-Each scatter step, at outer iteration :math:`k`, turns the reconstruction :math:`X_k` into densities of the reference
-materials, resamples them onto the transport cells, and updates the per-view collided fluence :math:`\Phi_v` with one
-transport sweep
+Outer iteration :math:`k` turns the reconstruction :math:`X_{k-1}` (:math:`X_0` is the FDK initialization) into
+densities of the reference materials, resamples them onto the transport cells, and updates the per-view collided
+fluence :math:`\Phi_v` with one transport sweep
 :math:`G_k` applied to the newest first-collision term :math:`\phi_1` and to the previous accumulator:
 
 .. math::
