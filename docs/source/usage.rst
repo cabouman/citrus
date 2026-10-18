@@ -41,9 +41,9 @@ data sets are cached in ``demo/input/``.
 
 .. code-block:: bash
 
-   python benchmarks/citrus_study.py                      # 180 views over a short scan, 0.5 cm grid, 10 outer
-                                                          # iterations of 8 MBIR iterations, scatter step on every
-                                                          # 8th view (the setting of demo 2)
+   python benchmarks/citrus_study.py                      # 180 views over a short scan, 0.5 cm grid, adaptive
+                                                          # numbers of outer and MBIR iterations, scatter step on
+                                                          # every 8th view (the setting of demo 2)
    python benchmarks/citrus_study.py --end-view-angle 360 # the same over a full rotation
    python benchmarks/citrus_study.py --full               # 180 views over a full rotation, 0.5 cm grid, 20 outer
                                                           # iterations of 1 MBIR iteration, scatter step on every view

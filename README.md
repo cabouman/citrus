@@ -87,8 +87,8 @@ statistics), `benchmarks/citrus_study.py` takes the settings as flags and writes
 `demo/output/`:
 
 ```bash
-python benchmarks/citrus_study.py          # 180 views over a short scan, 0.5 cm grid, 80 outer iterations,
-                                           # scatter step on every 8th view at every 8th iteration
+python benchmarks/citrus_study.py          # 180 views over a short scan, 0.5 cm grid, adaptive numbers of outer
+                                           # and MBIR iterations, scatter step on every 8th view
 python benchmarks/citrus_study.py --full   # 180 views over a full rotation, 0.5 cm grid, 20 iterations,
                                            # scatter step on every view at every iteration
 python benchmarks/citrus_study.py --help   # every flag
