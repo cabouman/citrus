@@ -31,7 +31,7 @@ Age-ordered source iteration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 A converged scatter solve repeats transport sweeps, one per collision order, until the collided fluence has converged
-(source iteration, below). CITRUS spends a single sweep per view per outer iteration instead and carries the collided
+(source iteration, below). CITRUS spends a single sweep per view per scatter step instead and carries the collided
 fluence from one outer iteration to the next. Per view :math:`v` it keeps the accumulated collided moments
 :math:`\Phi_v = \sum_{n\ge1}\phi_v^{(n)}` and performs in outer iteration :math:`k` the step
 
@@ -261,7 +261,7 @@ Source iteration orders the collided fluence by collision number:
 
 where :math:`\mathcal L^{-1}` is one transport sweep and :math:`\mathcal S` the scattering-source operator. The
 standalone solver iterates until :math:`\|\phi^{(n)}\| / \|\phi_C\| <` ``source_iteration_tolerance`` (default
-:math:`10^{-3}`, scalar-flux cell means); the CITRUS loop takes one of these steps per outer iteration.
+:math:`10^{-3}`, scalar-flux cell means); the CITRUS loop takes one of these steps per scatter step.
 
 The first-collision source enters the sweep as linear-discontinuous moments on the transport cells, restricted from
 samples at the quadrature points of each cell (mean and the three slopes of the midpoint quadrature, exact for a source

@@ -630,7 +630,8 @@ class CitrusConfig:
     The options are described in docs/source/method.rst, "Options and secondary components".
 
     Attributes:
-        num_outer_iterations (int): number N of outer iterations, each one scatter step per view and one MBIR iteration.
+        num_outer_iterations (int): number N of outer iterations, one MBIR iteration each; the scatter stage runs at
+            every ``scatter_every``-th one.
             Defaults to 10.
         energy_kev (float or None): effective energy E_eff in keV of the density model; None uses the spectrum mean of
             the solver's library. Defaults to None.
@@ -1004,7 +1005,8 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
                 scatter_stage: Optional[ScatterStage], device: torch.device, *, regularization: Optional[dict],
                 init_recon: Optional[Tensor], model, callback, label: str,
                 after_initialization: Optional[Callable[[Tensor, dict], None]] = None) -> tuple[Tensor, dict]:
-    """MBIR loop of ``citrus_recon`` and ``mbir_recon``: per outer iteration a scatter stage and an MBIR iteration.
+    """MBIR loop of ``citrus_recon`` and ``mbir_recon``: an MBIR iteration per outer iteration, a scatter stage every
+    ``scatter_every``-th one.
 
     Args:
         Y (Tensor): [V, Rd, Cd] measured counts.
