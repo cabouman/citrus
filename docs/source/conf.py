@@ -6,8 +6,8 @@ import sys
 sys.path.insert(0, os.path.abspath("../.."))
 
 project = "citrus"
-author = "Jordan Houri and Charles A. Bouman"
-copyright = "2026, Jordan Houri and Charles A. Bouman"
+author = "Jordan Houri, Gregery T. Buzzard and Charles A. Bouman"
+copyright = "2026, Jordan Houri, Gregery T. Buzzard and Charles A. Bouman"
 
 
 def _version() -> str:

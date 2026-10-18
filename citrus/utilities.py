@@ -393,7 +393,8 @@ def effective_energy(library: MultigroupLibrary) -> float:
 def mass_attenuation_at(library: MultigroupLibrary, energy_kev: float) -> Tensor:
     """Total mass attenuation coefficients of the library's materials at one energy.
 
-    The coefficients are interpolated linearly in (log E, log mu) in ``library.fine_mu_t`` on the sorted fine energies.
+    The coefficients are interpolated linearly in (log E, log mu) in ``library.fine_mu_t`` on the sorted fine energies;
+    an energy that is a fine energy (the only one of a monoenergetic library) gives its tabulated coefficients.
 
     Args:
         library (MultigroupLibrary): the library.
@@ -413,6 +414,8 @@ def mass_attenuation_at(library: MultigroupLibrary, energy_kev: float) -> Tensor
     if not (float(E[0]) <= e <= float(E[-1])):
         raise ValueError(f"energy {e} keV outside the library's fine-energy range [{float(E[0])}, {float(E[-1])}]")
     i = int(torch.searchsorted(E, torch.tensor([e], dtype=torch.float64), right=True)[0]) - 1
+    if float(E[max(i, 0)]) == e:
+        return mu[:, max(i, 0)].clone()
     i = min(max(i, 0), E.numel() - 2)
     le0, le1 = torch.log(E[i]), torch.log(E[i + 1])
     t = (torch.log(torch.tensor(e, dtype=torch.float64)) - le0) / (le1 - le0)

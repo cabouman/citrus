@@ -123,9 +123,9 @@ Please cite the software when referencing this package.
 ```bibtex
 @misc{citrus,
   title = {citrus},
-  author = {Jordan Houri and Charles A. Bouman},
+  author = {Jordan Houri and Gregery T. Buzzard and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.10.0},
+  note = {Version 0.10.1},
   year = 2026
 }
 ```

@@ -115,6 +115,31 @@ def test_solver_with_a_line_runs(library_module):
     assert solver.library.fine_energy[solver.library.fine_weight > 0].tolist() == [80.0]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_attenuation_model_and_synthetic_data_of_a_line(library_module):
+    """The library of a line has one fine energy; the mass attenuation at the effective energy is its tabulated
+    value (no interpolation), so the attenuation volume, the primary and the synthetic counts are finite (the
+    first run of demo 2 with a monoenergetic source hit NaN here)."""
+    import numpy as np
+    from citrus.utilities import (WlabPhantom, effective_energy, mass_attenuation_at, synthesize_cone_beam_data,
+                                  wlab_geometry, wlab_grid)
+
+    spectrum = monoenergetic_spectrum(100.0)
+    config = replace(SMALL, materials=("air", "water", "bone_cortical_icrp"))
+    solver = ScatterSolver(None, config, wlab_geometry(), SiddonProjectors(), ideal_counting_response(), no_grid(),
+                           device="cuda", dtype=torch.float32, spectrum=spectrum)
+    solver.library_cache_dir = None
+    library = solver.library
+    assert library.fine_energy.numel() == 1 and effective_energy(library) == 100.0
+    assert torch.equal(mass_attenuation_at(library, 100.0), library.fine_mu_t[:, 0].to("cpu", torch.float64))
+    grid = wlab_grid(2.0)
+    data = synthesize_cone_beam_data(WlabPhantom(grid, solver.materials, device="cuda"), grid, wlab_geometry(),
+                                     np.array([0.0, 0.3]), solver, I0=1.0e5, noise=True)
+    for key in ("X_true", "P", "SPR", "Y"):
+        assert np.isfinite(np.asarray(data[key])).all(), key
+    assert np.asarray(data["Y"]).min() >= 0 and np.asarray(data["SPR"]).min() > 0
+
+
 def test_polychromatic_spectra_are_unchanged(library_module):
     """The 125 kVp spectrum is not a line: ``place_line`` returns the midpoints unchanged."""
     density = library_module._Spectrum(*SPECTRUM_125KVP)

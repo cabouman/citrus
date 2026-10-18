@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.10.1 - 2026-10-18
+
+- Fix: a monoenergetic library has one fine energy (the builder keeps the fine energies with source photons), and
+  `utilities.mass_attenuation_at` tried to interpolate between it and itself, giving NaN for the attenuation volume,
+  the primary and the synthetic counts (demo 2 with `monoenergetic_spectrum` failed in the Poisson draw). An energy
+  that is a fine energy now returns its tabulated coefficients.
+
 ## v0.10.0 - 2026-10-18
 
 - **Adaptive numbers of iterations by default.** `CitrusConfig.num_outer_iterations` and

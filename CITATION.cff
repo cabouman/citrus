@@ -5,10 +5,12 @@ type: software
 authors:
   - family-names: Houri
     given-names: Jordan
+  - family-names: Buzzard
+    given-names: Gregery T.
   - family-names: Bouman
     given-names: Charles A.
-version: 0.10.0
-date-released: 2026-10-17
+version: 0.10.1
+date-released: 2026-10-18
 url: "https://purduecitrus.readthedocs.io"
 repository-code: "https://github.com/cabouman/citrus"
 license: BSD-3-Clause
