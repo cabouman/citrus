@@ -21,7 +21,8 @@ from citrus.utilities import wlab_grid, wlab_phantom
 # Source spectrum: the path of a text file of two columns, photon energy in keV and relative photons per keV.
 # demo/spectra has a 125 kVp tube spectrum and a 6 MV linac spectrum (spectrum_6mv.txt).
 spectrum_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spectra", "spectrum_125kvp.txt")
-materials = ["air", "lung", "adipose", "water", "muscle", "soft_tissue", "bone"]  # reference materials
+materials = ["air", "lung_icrp", "adipose_icrp", "water", "muscle_icru44", "soft_tissue_icru44",
+             "bone_cortical_icrp"]  # reference materials of the density model
 num_det_rows, num_det_channels = 75, 100   # detector panel size in pixels
 pixel_pitch = 0.4                          # detector pixel pitch in cm
 source_detector_dist = 150.0               # source to detector distance in cm

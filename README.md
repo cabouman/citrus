@@ -119,7 +119,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.7.2},
+  note = {Version 0.8.0},
   year = 2026
 }
 ```

@@ -14,6 +14,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from conftest import SPECTRUM_125KVP
 from citrus.scatter_solver.config import SolverConfig
 from citrus.scatter_solver.cross_sections import material_pairs, material_pairs_if_compact, synthetic_library
 from citrus.scatter_solver.detector import csi_response, no_grid
@@ -359,7 +360,7 @@ def test_reproduces_pre_quadrature_solver_wlab():
         for trace in ("fine", "quadrature", "coarse"):
             config = replace(SolverConfig(), uncollided_trace_grid=trace, angular_table_grid="uniform",
                              group_edges_method="equal_fluence")
-            s = wlab_solver(dv, config=config, device="cuda")
+            s = wlab_solver(dv, config=config, device="cuda", spectrum=SPECTRUM_125KVP)
             assert s.quadrature_points(grid) == q
             _check_reference(s.solve_view(rho, grid, 0.3), case, 1e-5)
 
@@ -372,7 +373,7 @@ def test_quadrature_points_and_ratios_wlab():
     different rasterization of the phantom: the primary differs by 0.2 %)."""
     from citrus.utilities import wlab_solver
 
-    library = wlab_solver(0.5, device="cuda").library.to("cpu", torch.float64)
+    library = wlab_solver(0.5, device="cuda", spectrum=SPECTRUM_125KVP).library.to("cpu", torch.float64)
     g025 = wlab_grid(0.25)
     rho025 = wlab_phantom(g025, device="cuda")
     image = {}

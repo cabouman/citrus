@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from conftest import SPECTRUM_125KVP
 from citrus.scatter_solver.config import SolverConfig
 from citrus.scatter_solver.cross_sections import BONE, MATERIALS, NOMINAL_DENSITIES, WATER, MultigroupLibrary
 from citrus.scatter_solver import cross_section_library
@@ -44,7 +45,7 @@ def _group_avg(info: cross_section_library.BuildInfo, kind: str, material: str) 
 def built():
     # equal-fluence groups (the tests below check equal source fractions); the default adaptive eta table
     config = SolverConfig(num_groups=G, legendre_order=L, num_eta_table=1001, group_edges_method="equal_fluence")
-    return cross_section_library.compute_library(config, None, BACKEND, fine_bin_width_kev=0.5)
+    return cross_section_library.compute_library(config, SPECTRUM_125KVP, BACKEND, fine_bin_width_kev=0.5)
 
 
 
@@ -56,12 +57,13 @@ def built():
 @pytest.mark.parametrize(
     "material,energy,xcom,tolerance",
     [("water", 40.0, 0.2683, 2e-3), ("water", 60.0, 0.2059, 2e-3), ("water", 80.0, 0.1837, 2e-3),
-     ("water", 100.0, 0.1707, 2e-3), ("bone", 60.0, 0.3148, 0.03), ("bone", 100.0, 0.1855, 0.03)],
+     ("water", 100.0, 0.1707, 2e-3), ("bone_cortical_icrp", 60.0, 0.3148, 0.03),
+     ("bone_cortical_icrp", 100.0, 0.1855, 0.03)],
 )
 def test_mu_t_vs_xcom(material, energy, xcom, tolerance):
     config = SolverConfig(num_groups=1, group_edges_kev=(energy + 0.25, energy - 0.25), legendre_order=1,
                           num_eta_table=11)
-    library, _ = cross_section_library.compute_library(config, None, BACKEND)
+    library, _ = cross_section_library.compute_library(config, SPECTRUM_125KVP, BACKEND)
     m = library.materials.index(material)
     val = float(library.mu_t[m, 0])
     assert abs(val / xcom - 1.0) < tolerance, f"{material} {energy} keV: {val:.5f} vs XCOM {xcom}"
@@ -191,12 +193,12 @@ def test_composition():
     comp = cross_section_library.material_composition(BACKEND)
     assert set(comp["water"]) == {1, 8}
     assert abs(comp["water"][1] - 0.111898) < 1e-6  # H2O with XCOM's atomic weights (H 1.00794, O 15.9994)
-    assert abs(sum(comp["bone"].values()) - 1.0) < 1e-12
-    assert abs(comp["bone"][20] - 0.20993) < 1e-6
+    assert abs(sum(comp["bone_cortical_icrp"].values()) - 1.0) < 1e-12
+    assert abs(comp["bone_cortical_icrp"][20] - 0.20993) < 1e-6
 
 
 def test_spectrum_txt_roundtrip(tmp_path):
-    e, s = cross_section_library.default_spectrum_125kvp()
+    e, s = SPECTRUM_125KVP
     p = tmp_path / "spec.txt"
     np.savetxt(p, np.stack([e, s], axis=1), header="E_keV weight")
     e2, s2 = cross_section_library.load_spectrum_txt(str(p))
@@ -221,7 +223,8 @@ def test_zero_spectrum_group_falls_back_to_flat():
 
 def test_cache_roundtrip(tmp_path, monkeypatch):
     config = SolverConfig(num_groups=3, legendre_order=3, num_eta_table=51)
-    library1 = cross_section_library.build_library(config, None, cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
+    library1 = cross_section_library.build_library(config, SPECTRUM_125KVP,
+                                                   cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
                                                    gauss_legendre_nodes=8)
     files = list(tmp_path.glob("mglib_*.pt"))
     assert len(files) == 1
@@ -230,7 +233,8 @@ def test_cache_roundtrip(tmp_path, monkeypatch):
         raise AssertionError("cache miss: compute_library called again")
 
     monkeypatch.setattr(cross_section_library, "compute_library", boom)
-    library2 = cross_section_library.build_library(config, None, cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
+    library2 = cross_section_library.build_library(config, SPECTRUM_125KVP,
+                                                   cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
                                                    gauss_legendre_nodes=8)
     for k in library1.__dataclass_fields__:
         a, b = getattr(library1, k), getattr(library2, k)
@@ -240,7 +244,7 @@ def test_cache_roundtrip(tmp_path, monkeypatch):
             assert a == b
     # a different config is a different key
     monkeypatch.undo()
-    cross_section_library.build_library(SolverConfig(num_groups=3, legendre_order=2, num_eta_table=51), None,
+    cross_section_library.build_library(SolverConfig(num_groups=3, legendre_order=2, num_eta_table=51), SPECTRUM_125KVP,
                                         cache_dir=str(tmp_path), fine_bin_width_kev=2.0, gauss_legendre_nodes=8)
     assert len(list(tmp_path.glob("mglib_*.pt"))) == 2
     # a cache file without the fine-energy table (older format) is rebuilt, not returned
@@ -252,7 +256,8 @@ def test_cache_roundtrip(tmp_path, monkeypatch):
     with pytest.raises(KeyError):
         MultigroupLibrary.load(path)
     with pytest.warns(RuntimeWarning, match="rebuilding"):
-        library3 = cross_section_library.build_library(config, None, cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
+        library3 = cross_section_library.build_library(config, SPECTRUM_125KVP,
+                                                       cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
                                                        gauss_legendre_nodes=8)
     assert torch.equal(library3.fine_mu_t, library1.fine_mu_t) and torch.equal(library3.fine_group, library1.fine_group)
     assert torch.equal(MultigroupLibrary.load(path).fine_weight, library1.fine_weight)
@@ -292,7 +297,7 @@ def test_fine_table_polychromatic_transmission(built):
     from citrus.scatter_solver.cross_sections import group_transmission
 
     library, info = built
-    spectrum_energies, spectrum_weights = cross_section_library.default_spectrum_125kvp()
+    spectrum_energies, spectrum_weights = SPECTRUM_125KVP
     spectrum_density = cross_section_library._Spectrum(spectrum_energies, spectrum_weights)
     edges = np.arange(10.0, 125.0 + 1e-9, 0.1)
     p = spectrum_density.cumulative_integral(edges[1:]) - spectrum_density.cumulative_integral(edges[:-1])
@@ -323,7 +328,7 @@ def test_full_resolution_default_config():
     # scattered-fluence groups the 3 -> 5 transfer is a tiny backscatter sliver (the lowest edge, 39.9 keV, lies just
     # above the backscatter limit of the group's lower part), which no Legendre order of practical size reproduces
     config = SolverConfig(group_edges_method="equal_fluence")
-    library, info = cross_section_library.compute_library(config, None, BACKEND)
+    library, info = cross_section_library.compute_library(config, SPECTRUM_125KVP, BACKEND)
     assert library.mu_s_eta.shape == (7, 6, 6, 2001)
     for mi, mat in enumerate(library.materials):
         reference = _group_avg(info, "compton", mat) + _group_avg(info, "rayleigh", mat)

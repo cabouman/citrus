@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from conftest import SPECTRUM_125KVP
 from citrus.scatter_solver.geometry import ConeGeometry, Grid
 from citrus.scatter_solver.ray_tracing import SiddonProjectors
 from citrus.scatter_solver.source import SourceModel
@@ -439,6 +440,6 @@ def test_fc_moment_source_triton_real_library(monkeypatch):
     from citrus.scatter_solver.scatter_solver import build_solver_library
 
     _first_collision_kernel_or_skip()
-    library = build_solver_library(SolverConfig(num_groups=6, legendre_order=10))
+    library = build_solver_library(SolverConfig(num_groups=6, legendre_order=10), SPECTRUM_125KVP)
     tri, reference = _first_collision_moment_sources(library, monkeypatch)
     _assert_rel(tri, reference, 1e-5)

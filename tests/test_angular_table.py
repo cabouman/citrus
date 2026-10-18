@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 import torch
 
+from conftest import SPECTRUM_125KVP
 from citrus.scatter_solver.config import SolverConfig
 from citrus.scatter_solver.cross_sections import (ANGULAR_MAP_KNOTS, angular_table_nodes, angular_table_position,
                                                   material_table, synthetic_angular_map, synthetic_library,
@@ -78,7 +79,7 @@ def tables(library_module):
     backend = library_module.resolve_backend()
     out = {}
     for case, (path, groups, fine) in CASES.items():
-        spectrum = None if path is None else library_module.load_spectrum_txt(str(path))
+        spectrum = SPECTRUM_125KVP if path is None else library_module.load_spectrum_txt(str(path))
         config = SolverConfig(num_groups=groups, legendre_order=3, group_edges_method="equal_fluence")
         libraries = [library_module.compute_library(replace(config, angular_table_grid=grid), spectrum, backend,
                                                     fine_bin_width_kev=fine, materials=material_table(("water",)))[0]

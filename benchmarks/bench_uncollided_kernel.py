@@ -34,9 +34,13 @@ from citrus.scatter_solver.config import SolverConfig  # noqa: E402
 from citrus.scatter_solver.detector import csi_response, no_grid  # noqa: E402
 from citrus.utilities import wlab_setup  # noqa: E402
 from citrus.scatter_solver.ray_tracing import SiddonProjectors  # noqa: E402
+from citrus.scatter_solver.cross_section_library import load_spectrum_txt  # noqa: E402
 from citrus.scatter_solver.scatter_solver import build_solver_library  # noqa: E402
 from citrus.scatter_solver.source import SourceModel  # noqa: E402
 from citrus.scatter_solver.cross_sections import mu_t_volume  # noqa: E402
+
+SPECTRUM = load_spectrum_txt(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "demo", "spectra",
+                                          "spectrum_125kvp.txt"))  # the sample 125 kVp spectrum
 
 FIRST_COLLISION_BACKENDS = ("torch", "triton")
 ORIGINAL_FIRST_COLLISION = uncollided_module.first_collision_source_at_directions
@@ -102,7 +106,7 @@ class Bench:
     def __init__(self):
         """Load the cross-section library and the detector model."""
         self.device = torch.device("cuda")
-        self.library = build_solver_library(SolverConfig(num_groups=6, legendre_order=10))  # cached on disk
+        self.library = build_solver_library(SolverConfig(num_groups=6, legendre_order=10), SPECTRUM)  # cached on disk
         self.detector, self.grid_response = csi_response(0.06), no_grid()
         self.setups: dict[float, tuple] = {}
 

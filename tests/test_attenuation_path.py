@@ -13,6 +13,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from conftest import SPECTRUM_125KVP
 from citrus.citrus import (CitrusConfig, CitrusState, DensityModel, citrus_step, citrus_view_step,
                            primary_signals)
 from citrus.scatter_solver.config import SolverConfig
@@ -269,7 +270,7 @@ def test_primary_signals_mbirtorch_close_to_siddon_real_library():
 
     set_memory_cap(4400.0)
     geometry = full_field_wlab_geometry()
-    s = wlab_solver(0.5, geometry=geometry, device="cuda")
+    s = wlab_solver(0.5, geometry=geometry, device="cuda", spectrum=SPECTRUM_125KVP)
     angles = view_angles(36, geometry)
     X = densities_to_attenuation(s.library, wlab_phantom(GRID, device="cuda"))
     fx = s.material_fields_from_attenuation(X, GRID, DensityModel.from_library(s.library))

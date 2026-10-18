@@ -8,7 +8,7 @@ method.
 """
 
 from .config import SolverConfig
-from .cross_section_library import load_spectrum_txt
+from .cross_section_library import load_spectrum_txt, monoenergetic_spectrum
 from .cross_sections import MultigroupLibrary, synthetic_library
 from .detector import (csi_response, energy_weighted_response, focused_1d_grid, ideal_counting_response,
                        no_grid)
@@ -24,6 +24,7 @@ __all__ = [
     "synthetic_library",
     "build_solver_library",
     "load_spectrum_txt",
+    "monoenergetic_spectrum",
     "csi_response",
     "energy_weighted_response",
     "ideal_counting_response",

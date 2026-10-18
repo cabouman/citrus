@@ -17,6 +17,7 @@ import sys
 import time
 from collections import defaultdict
 from dataclasses import replace
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,9 +32,13 @@ from citrus.utilities import wlab_solver  # noqa: E402
 from citrus.scatter_solver import scatter_image as scatter_image_module  # noqa: E402
 from citrus.scatter_solver import scatter_solver as scatter_solver_module  # noqa: E402
 from citrus.scatter_solver.config import SolverConfig  # noqa: E402
+from citrus.scatter_solver.cross_section_library import load_spectrum_txt  # noqa: E402
 from citrus.scatter_solver.scatter_image import covering_polar_angle  # noqa: E402
 from citrus.utilities import (attenuation_to_densities, densities_to_attenuation,  # noqa: E402
                               full_field_wlab_geometry, set_memory_cap, wlab_geometry, wlab_grid, wlab_phantom)
+
+SPECTRUM = load_spectrum_txt(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "demo", "spectra",
+                                          "spectrum_125kvp.txt"))  # the sample 125 kVp spectrum
 
 DEVICE = torch.device("cuda")
 T: dict[str, float] = defaultdict(float)
@@ -129,7 +134,7 @@ def main() -> None:
     if args.uncollided_trace is not None:
         extra["uncollided_trace_grid"] = args.uncollided_trace
     config = replace(SolverConfig(), cone_num_polar=cone_polar, cone_num_azimuthal=cone_azimuthal, **extra)
-    solver = wlab_solver(args.delta_voxel, config=config, geometry=geometry, device=DEVICE)
+    solver = wlab_solver(args.delta_voxel, config=config, geometry=geometry, device=DEVICE, spectrum=SPECTRUM)
     library = solver.library
     rho_true = wlab_phantom(grid, device=DEVICE)
     X = densities_to_attenuation(library, rho_true)

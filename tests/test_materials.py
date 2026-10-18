@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import torch
 
+from conftest import SPECTRUM_125KVP
 from citrus.citrus import DensityModel
 from citrus.scatter_solver.config import SolverConfig
 from citrus.scatter_solver.cross_sections import (BONE, MATERIAL_TABLE, MATERIALS, NOMINAL_DENSITIES, WATER,
@@ -39,7 +40,8 @@ def _cap() -> None:
 def _two_material_table():
     from citrus.scatter_solver.cross_section_library import MATERIAL_FORMULAS
 
-    return [("water", 1.0, MATERIAL_FORMULAS["water"]), ("bone", 1.85, MATERIAL_FORMULAS["bone"])]
+    return [("water", 1.0, MATERIAL_FORMULAS["water"]),
+            ("bone_cortical_icrp", 1.85, MATERIAL_FORMULAS["bone_cortical_icrp"])]
 
 
 @pytest.fixture(scope="module")
@@ -48,8 +50,8 @@ def libraries():
     from citrus.scatter_solver.scatter_solver import build_solver_library
 
     try:
-        return (build_solver_library(SolverConfig(), materials=_two_material_table()),
-                build_solver_library(SolverConfig()))
+        return (build_solver_library(SolverConfig(), SPECTRUM_125KVP, materials=_two_material_table()),
+                build_solver_library(SolverConfig(), SPECTRUM_125KVP))
     except Exception as exc:  # no cached library and no photon data
         pytest.skip(f"real library unavailable: {exc}")
 
@@ -67,11 +69,12 @@ def random_pairs_rho(M: int, shape, seed: int = 0, dtype=torch.float64) -> torch
 # ---- material table and libraries --------------------------------------------------------------------------
 
 def test_material_table_and_synthetic_libraries():
-    assert MATERIALS == ("air", "lung", "adipose", "water", "muscle", "soft_tissue", "bone")
+    assert MATERIALS == ("air", "lung_icrp", "adipose_icrp", "water", "muscle_icru44", "soft_tissue_icru44",
+                         "bone_cortical_icrp")
     assert NOMINAL_DENSITIES == (0.0012, 0.26, 0.95, 1.0, 1.05, 1.06, 1.85) and (WATER, BONE) == (3, 6)
     assert tuple(n for n, _ in MATERIAL_TABLE) == MATERIALS
     library2 = synthetic_library()
-    assert library2.num_materials == 2 and library2.materials == ("water", "bone")
+    assert library2.num_materials == 2 and library2.materials == ("water", "bone_cortical_icrp")
     assert library2.nominal_density.tolist() == [1.0, 1.85]
     library7 = synthetic_library(num_materials=7, fine_spread=0.5)
     assert library7.num_materials == 7 and library7.materials == MATERIALS
@@ -106,12 +109,14 @@ def test_library_build_order_and_cache(tmp_path, monkeypatch):
     except Exception as exc:
         pytest.skip(f"photon data unavailable ({exc})")
     config = SolverConfig(num_groups=3, legendre_order=2, num_eta_table=51)
-    library = cross_section_library.build_library(config, None, cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
+    library = cross_section_library.build_library(config, SPECTRUM_125KVP,
+                                                  cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
                                                   gauss_legendre_nodes=8)
-    wb = cross_section_library.build_library(config, None, cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
+    wb = cross_section_library.build_library(config, SPECTRUM_125KVP, cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
                                              gauss_legendre_nodes=8, materials=_two_material_table())
     assert len(list(tmp_path.glob("mglib_*.pt"))) == 2  # two keys
-    assert library.materials == MATERIALS and library.num_materials == 7 and wb.materials == ("water", "bone")
+    assert library.materials == MATERIALS and library.num_materials == 7
+    assert wb.materials == ("water", "bone_cortical_icrp")
     assert library.nominal_density.tolist() == list(NOMINAL_DENSITIES)
     assert tuple(library.mu_s_eta.shape[:3]) == (7, 3, 3)
     assert tuple(library.fine_mu_t.shape) == (7, library.num_fine_energies)
@@ -120,7 +125,7 @@ def test_library_build_order_and_cache(tmp_path, monkeypatch):
         assert torch.allclose(a, b, rtol=1e-13, atol=1e-16), k
     assert torch.equal(wb.fine_weight, library.fine_weight) and torch.equal(wb.group_energy, library.group_energy)
     # the cache key depends on the table and on the build version (2-material keys of citrus 0.0.x differ)
-    spec = cross_section_library._spectrum_or_default(None)
+    spec = cross_section_library.spectrum_arrays(SPECTRUM_125KVP)
     k7 = cross_section_library._cache_key(config, spec, "xcom-xraylib", 2.0, 8)
     assert k7 != cross_section_library._cache_key(config, spec, "xcom-xraylib", 2.0, 8, _two_material_table())
     assert k7 != cross_section_library._cache_key(config, spec, "xrayphysics", 2.0, 8)  # the backend is in the key
@@ -132,7 +137,8 @@ def test_library_build_order_and_cache(tmp_path, monkeypatch):
         raise AssertionError("cache miss")
 
     monkeypatch.setattr(cross_section_library, "compute_library", boom)
-    library2 = cross_section_library.build_library(config, None, cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
+    library2 = cross_section_library.build_library(config, SPECTRUM_125KVP,
+                                                   cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
                                                    gauss_legendre_nodes=8)
     assert library2.materials == MATERIALS and torch.equal(library2.mu_s_eta, library.mu_s_eta)
     assert torch.equal(library2.nominal_density, library.nominal_density)
@@ -145,14 +151,15 @@ def test_library_build_order_and_cache(tmp_path, monkeypatch):
     with pytest.raises(KeyError):
         MultigroupLibrary.load(path)
     with pytest.warns(RuntimeWarning, match="rebuilding"):
-        library3 = cross_section_library.build_library(config, None, cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
+        library3 = cross_section_library.build_library(config, SPECTRUM_125KVP,
+                                                       cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
                                                        gauss_legendre_nodes=8)
     assert torch.equal(library3.nominal_density, library.nominal_density)
     # a table whose nominal attenuations cross is refused: soft tissue at 1.0 g/cm^3 crosses water (50-60 keV)
     bad = list(cross_section_library.default_material_table())
-    bad[5] = ("soft_tissue", 1.0, bad[5][2])
+    bad[5] = ("soft_tissue_icru44", 1.0, bad[5][2])
     with pytest.raises(ValueError, match="cross"):
-        cross_section_library.compute_library(config, None, cross_section_library.resolve_backend(),
+        cross_section_library.compute_library(config, SPECTRUM_125KVP, cross_section_library.resolve_backend(),
                                               fine_bin_width_kev=2.0, gauss_legendre_nodes=8,
                                               materials=bad)
 

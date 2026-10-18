@@ -41,9 +41,5 @@ version = { attr = "citrus.__version__" }
 [tool.setuptools.packages.find]
 include = ["citrus*"]
 
-[tool.setuptools.package-data]
-# the default 125 kVp spectrum (cross_section_library.default_spectrum_125kvp)
-"citrus.scatter_solver" = ["data/*.txt"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -16,18 +16,21 @@ production, and its totals are the values of NIST's attenuation tables. Elements
 with each elemental angular shape normalized numerically, so that the scattering of every material integrates to the
 XCOM cross section whatever the integral of the shape, and every material of the catalogue is built the same way.
 
-**Spectrum, groups and energy quadrature.** The default source is a W-anode 125 kV spectrum (11 degree take-off, 0.89
-mm Ti filter, 1 keV grid, shipped with the package and read by ``default_spectrum_125kvp``; CITRUS does not simulate
-tube spectra); any two-column spectrum can be loaded with ``load_spectrum_txt``. The repository's ``demo/spectra``
-holds two sample spectra, the 125 kVp one and the Mohan et al. (1985) 6 MV linac spectrum (1 keV nodes to 6 MeV, the
+**Spectrum, groups and energy quadrature.** The user supplies the source spectrum, (energies in keV, relative photon
+density per keV); there is no default, and CITRUS does not simulate tube spectra. A two-column text file is loaded with
+``load_spectrum_txt``; the repository's ``demo/spectra`` holds two samples, a W-anode 125 kV spectrum (11 degree
+take-off, 0.89 mm Ti filter, 1 keV grid) and the Mohan et al. (1985) 6 MV linac spectrum (1 keV nodes to 6 MeV, the
 spectrum of the 6 MV validation). Spectra are piecewise-linear densities integrated exactly, so characteristic lines
-are kept. The
+are kept. A spectrum of one node (``monoenergetic_spectrum(energy_kev)``, or a one-line file) is a monoenergetic
+line: all source photons sit in the fine bin that holds the line, which is evaluated at the line's energy, so the
+effective energy and the primary attenuation are exactly those of the line; the groups below it hold the scattered
+photons ("scattered_fluence" or "log" edges; "equal_fluence" needs a continuous spectrum). The
 group edges cut the estimated total fluence spectrum (source plus scattered photons) into equal areas. Each group is cut
 into bins of at most 0.5 keV, evaluated at the bin midpoints and weighted with the exact spectrum integral over the
 bin.
 
-The 125 kVp spectrum (``citrus/scatter_solver/data/spectrum_125kvp.txt``, the spectrum of the WLAB validation, 125
-nodes at 1 to 125 keV) was computed once with XrayPhysics, ``simulateSpectra`` filtered by
+The 125 kVp spectrum (``demo/spectra/spectrum_125kvp.txt``, the spectrum of the WLAB validation, 125 nodes at 1 to
+125 keV) was computed once with XrayPhysics, ``simulateSpectra`` filtered by
 ``filterResponse('Ti', 4.506, 0.089)``. The 6 MV spectrum (``demo/spectra/spectrum_6mv.txt``) is the EGSnrc
 ``mohan6`` histogram (24 bins of 0.25 MeV) written at 1 keV nodes, uniform inside each bin.
 

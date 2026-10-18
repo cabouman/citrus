@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from conftest import SPECTRUM_125KVP
 from citrus import citrus as citrus_module
 from citrus.citrus import (CitrusConfig, CitrusState, StateStore, citrus_recon, estimate_regularization,
                            mbir_recon)
@@ -73,7 +74,7 @@ def real_library():
     from citrus.scatter_solver.scatter_solver import build_solver_library
 
     try:
-        return build_solver_library(SolverConfig())
+        return build_solver_library(SolverConfig(), SPECTRUM_125KVP)
     except Exception as exc:  # no cached library and no photon data
         pytest.skip(f"real library unavailable: {exc}")
 

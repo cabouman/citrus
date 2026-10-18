@@ -31,11 +31,15 @@ from citrus.scatter_solver.detector import csi_response, no_grid  # noqa: E402
 from citrus.utilities import wlab_setup  # noqa: E402
 from citrus.scatter_solver.kernels import ray_tracing_kernels  # noqa: E402
 from citrus.scatter_solver.ray_tracing import SiddonProjectors  # noqa: E402
+from citrus.scatter_solver.cross_section_library import load_spectrum_txt  # noqa: E402
 from citrus.scatter_solver.scatter_solver import build_solver_library  # noqa: E402
 from citrus.scatter_solver.source import SourceModel  # noqa: E402
 from citrus.scatter_solver.uncollided import uncollided_fluence  # noqa: E402
 from citrus.scatter_solver.scatter_image import coarsen_mu_t, combined_scatter_image, panel_direction_set  # noqa: E402
 from citrus.scatter_solver.cross_sections import mu_t_volume  # noqa: E402
+
+SPECTRUM = load_spectrum_txt(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "demo", "spectra",
+                                          "spectrum_125kvp.txt"))  # the sample 125 kVp spectrum
 
 CAP_MIB = 5000
 FINE = 0.5
@@ -58,7 +62,7 @@ def library():
     Returns:
         MultigroupLibrary: the library.
     """
-    return build_solver_library(SolverConfig(num_groups=6, legendre_order=10))  # cached on disk (_cache/)
+    return build_solver_library(SolverConfig(num_groups=6, legendre_order=10), SPECTRUM)  # cached on disk (_cache/)
 
 
 def rel_rms(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:

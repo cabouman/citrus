@@ -51,7 +51,7 @@ DeviceLike = Union[torch.device, str, None]
 # libraries
 # =====================================================================================================
 
-def build_solver_library(config: SolverConfig, spectrum=None, cache_dir: Optional[str] = "default",
+def build_solver_library(config: SolverConfig, spectrum, cache_dir: Optional[str] = "default",
                          materials=None) -> MultigroupLibrary:
     """Build (or load from the cache) the multigroup cross-section library of a solver configuration.
 
@@ -59,8 +59,8 @@ def build_solver_library(config: SolverConfig, spectrum=None, cache_dir: Optiona
 
     Args:
         config (SolverConfig): the solver configuration.
-        spectrum (tuple, optional): (energies [K] in keV, photon density per keV [K]) of the source. Defaults to None,
-            the default 125 kVp spectrum.
+        spectrum (tuple): (energies [K] in keV, photon density per keV [K]) of the source; one node is a monoenergetic
+            line (``cross_section_library.monoenergetic_spectrum``).
         cache_dir (str, optional): cache directory; "default" is ``cross_section_library.default_cache_dir()`` and None
             disables the cache. Defaults to "default".
         materials (list, optional): (name, nominal density, formula) per material, overriding ``config.materials``.
@@ -308,8 +308,8 @@ class ScatterSolver:
             pixel). Defaults to None, the projector's own ``samples_per_pixel_axis`` or 1.
         direction_context_cache_size (int, optional): number of scatter-image direction contexts kept (least recently
             used dropped first); 0 disables the cache. Defaults to 8.
-        spectrum (tuple, optional): (energies [K] in keV, photon density per keV [K]) of a lazy library. Defaults to
-            None, the default 125 kVp spectrum.
+        spectrum (tuple, optional): (energies [K] in keV, photon density per keV [K]) of the source, required for a
+            lazy library (``library=None``). Defaults to None.
 
     Attributes:
         L (int): Legendre order of the collided transport (``config.legendre_order``).
@@ -338,6 +338,10 @@ class ScatterSolver:
         if detector is None or grid_response is None:
             raise TypeError("ScatterSolver needs a detector and a grid_response")
         config.validate()
+        if library is None and spectrum is None:
+            raise ValueError("a lazy ScatterSolver (library=None) needs the source spectrum: spectrum=(energies [K] in "
+                             "keV, photon density per keV [K]), e.g. load_spectrum_txt(path) or "
+                             "monoenergetic_spectrum(energy_kev)")
         self._config = config
         self.L = int(config.legendre_order)
         if device is not None:
@@ -419,11 +423,11 @@ class ScatterSolver:
         if self._library is not None:
             return tuple(self._library.materials)
         if self._materials is None:
-            from .cross_section_library import _spectrum_or_default, resolve_backend, sort_material_table
+            from .cross_section_library import resolve_backend, sort_material_table, spectrum_arrays
 
             backend = resolve_backend()
             table = sort_material_table(self._config, material_table(check_material_names(self._config.materials)),
-                                        _spectrum_or_default(self.spectrum), backend)
+                                        spectrum_arrays(self.spectrum), backend)
             self._materials = tuple(name for name, _, _ in table)
         return self._materials
 

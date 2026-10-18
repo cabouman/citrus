@@ -77,26 +77,24 @@ ELEMENT_DENSITIES: tuple[float, ...] = tuple(float(xraylib.ElementDensity(Z)) fo
 _COMPOUNDS: dict[str, tuple[float, str]] = {
     # name: (nominal density g/cm^3, composition); the first seven are the default reference materials `MATERIALS`
     "air": (0.0012, _AIR_DRY),
-    "lung": (0.26, _LUNG_ICRP),
-    "adipose": (0.95, _ADIPOSE_ICRP),
+    "lung_icrp": (0.26, _LUNG_ICRP),
+    "adipose_icrp": (0.95, _ADIPOSE_ICRP),
     "water": (1.0, "H2O"),
-    "muscle": (1.05, _MUSCLE_ICRU44),
-    "soft_tissue": (1.06, _SOFT_TISSUE_ICRU44),
-    "bone": (1.85, _BONE_CORTICAL_ICRP),
-    "trabecular_bone": (1.18, _SPONGIOSA_WOODARD_WHITE),
-    "brain": (1.04, _BRAIN_ICRU44),
-    "blood": (1.06, _BLOOD_ICRU44),
-    "cartilage": (1.10, _CARTILAGE_WOODARD_WHITE),
-    "skin": (1.09, _SKIN_ICRU44),
+    "muscle_icru44": (1.05, _MUSCLE_ICRU44),
+    "soft_tissue_icru44": (1.06, _SOFT_TISSUE_ICRU44),
+    "bone_cortical_icrp": (1.85, _BONE_CORTICAL_ICRP),
+    "trabecular_bone_icru46": (1.18, _SPONGIOSA_WOODARD_WHITE),
+    "brain_icru44": (1.04, _BRAIN_ICRU44),
+    "blood_icru44": (1.06, _BLOOD_ICRU44),
+    "cartilage_icru46": (1.10, _CARTILAGE_WOODARD_WHITE),
+    "skin_icru44": (1.09, _SKIN_ICRU44),
     "pmma": (1.18, _PMMA),
     "polyethylene": (0.94, _POLYETHYLENE),
     "carbon_fibre": (1.56, _CARBON_FIBRE_EPOXY),
-}
-# The compounds and mixtures of NIST's X-ray mass attenuation coefficient tables (Hubbell and Seltzer, NISTIR 5632,
-# Table 2: https://physics.nist.gov/PhysRefData/XrayMassCoef/tab2.html), with NIST's densities and mass fractions.
-# Seven of the 48 are already entries above with the same composition: water, muscle (Muscle, Skeletal ICRU-44),
-# soft_tissue (Tissue, Soft ICRU-44), brain, blood, pmma (NIST density 1.19) and polyethylene (NIST density 0.93).
-_NIST_COMPOUNDS: dict[str, tuple[float, str]] = {
+    # The compounds and mixtures of NIST's X-ray mass attenuation coefficient tables (Hubbell and Seltzer, NISTIR 5632,
+    # Table 2: https://physics.nist.gov/PhysRefData/XrayMassCoef/tab2.html), with NIST's densities and mass fractions.
+    # Seven of the 48 are already entries above with the same composition: water, muscle (Muscle, Skeletal ICRU-44),
+    # soft_tissue (Tissue, Soft ICRU-44), brain, blood, pmma (NIST density 1.19) and polyethylene (NIST density 0.93).
     # A-150 Tissue-Equivalent Plastic
     "a150_tissue_equivalent_plastic": (1.127, "0.101330*H + 0.775498*C + 0.035057*N + 0.052315*O + 0.017423*F + "
                                                "0.018377*Ca"),
@@ -194,25 +192,24 @@ _NIST_COMPOUNDS: dict[str, tuple[float, str]] = {
     # Tissue-Equivalent Gas, Propane Based
     "tissue_equivalent_gas_propane": (0.001826, "0.102676*H + 0.568937*C + 0.035022*N + 0.293365*O"),
 }
-# the compounds and tissues first (the hand-written entries, then NIST's), then every element by its English name
+# the compounds and tissues first, then every element by its English name
 MATERIAL_CATALOGUE: Mapping[str, tuple[float, str]] = MappingProxyType({
     **_COMPOUNDS,
-    **_NIST_COMPOUNDS,
     **{name: (density, symbol) for name, symbol, density in zip(ELEMENT_NAMES, ELEMENT_SYMBOLS, ELEMENT_DENSITIES)},
 })
-# the entries that are not single elements (the compounds, tissues and mixtures), and NIST's part of them
-NIST_COMPOUND_NAMES: tuple[str, ...] = tuple(_NIST_COMPOUNDS)
-COMPOUND_NAMES: tuple[str, ...] = tuple(_COMPOUNDS) + NIST_COMPOUND_NAMES
+# the entries that are not single elements (the compounds, tissues and mixtures)
+COMPOUND_NAMES: tuple[str, ...] = tuple(_COMPOUNDS)
 
 # The default reference materials, in library order = increasing attenuation at nominal density. Muscle is BELOW soft
 # tissue at
 # every energy (ICRU-44 muscle has the lower density and nearly the same composition: attenuation ratio 0.986-0.991
 # over 10-125 keV).
-MATERIALS: tuple[str, ...] = ("air", "lung", "adipose", "water", "muscle", "soft_tissue", "bone")
+MATERIALS: tuple[str, ...] = ("air", "lung_icrp", "adipose_icrp", "water", "muscle_icru44", "soft_tissue_icru44",
+                              "bone_cortical_icrp")
 MATERIAL_TABLE: tuple[tuple[str, float], ...] = tuple((n, MATERIAL_CATALOGUE[n][0]) for n in MATERIALS)
 NOMINAL_DENSITIES: tuple[float, ...] = tuple(float(d) for _, d in MATERIAL_TABLE)
 # rows of water and bone in the DEFAULT reference materials (3, 6); for any library use material_index(library, "water")
-WATER, BONE = MATERIALS.index("water"), MATERIALS.index("bone")
+WATER, BONE = MATERIALS.index("water"), MATERIALS.index("bone_cortical_icrp")
 ELECTRON_REST_KEV = 510.998950
 
 
@@ -232,7 +229,8 @@ def check_material_names(names: Sequence[str], minimum: int = 2) -> tuple[str, .
         ValueError: naming the problem (and the catalogue, for an unknown name).
     """
     if isinstance(names, str) or not isinstance(names, Sequence):
-        raise ValueError(f"materials must be a sequence of material names, e.g. ('air', 'water', 'bone'), got "
+        raise ValueError(f"materials must be a sequence of material names, e.g. ('air', 'water', "
+                         f"'bone_cortical_icrp'), got "
                          f"{names!r}")
     names = tuple(names)
     unknown = [n for n in names if not isinstance(n, str) or n not in MATERIAL_CATALOGUE]
@@ -329,23 +327,24 @@ class MultigroupLibrary:
     def __post_init__(self) -> None:
         """Fill in default material names and nominal densities and check the shapes.
 
-        Empty ``materials`` become ``MATERIALS`` for M = 7, ("water", "bone") for M = 2 and "m0", "m1", ... otherwise; a
+        Empty ``materials`` become ``MATERIALS`` for M = 7, ("water", "bone_cortical_icrp") for M = 2 and "m0", "m1",
+        ... otherwise; a
         missing ``nominal_density`` becomes ``NOMINAL_DENSITIES`` for the names ``MATERIALS``, (1.0, 1.85) for ("water",
-        "bone") and 1, 2, ..., M otherwise.
+        "bone_cortical_icrp") and 1, 2, ..., M otherwise.
 
         Raises:
             ValueError: if the names, ``nominal_density`` or ``eta_map`` do not match M.
         """
         M = int(self.mu_t.shape[0])
         if not self.materials:
-            self.materials = (MATERIALS if M == len(MATERIALS) else ("water", "bone") if M == 2
+            self.materials = (MATERIALS if M == len(MATERIALS) else ("water", "bone_cortical_icrp") if M == 2
                               else tuple(f"m{m}" for m in range(M)))
         self.materials = tuple(self.materials)
         if len(self.materials) != M:
             raise ValueError(f"{len(self.materials)} material names {self.materials} for {M} materials")
         if self.nominal_density is None:
             densities = (NOMINAL_DENSITIES if self.materials == MATERIALS
-                         else (1.0, 1.85) if self.materials == ("water", "bone")
+                         else (1.0, 1.85) if self.materials == ("water", "bone_cortical_icrp")
                          else tuple(float(m + 1) for m in range(M)))
             self.nominal_density = torch.tensor(densities, dtype=torch.float64, device=self.mu_t.device)
         if tuple(self.nominal_density.shape) != (M,):
@@ -807,7 +806,8 @@ def synthetic_library(num_groups: int = 4, legendre_order: int = 5, num_eta: int
         num_fine_per_group (int, optional): fine bins per group n. Defaults to 4.
         fine_spread (float, optional): relative spread of ``fine_mu_t`` within a group, from +spread at the lowest
             energy bin to -spread at the highest (0: constant; below 1 it models beam hardening). Defaults to 0.0.
-        num_materials (int, optional): M; 2 gives ("water", "bone"), 7 the default reference materials, any other M > 2
+        num_materials (int, optional): M; 2 gives ("water", "bone_cortical_icrp"), 7 the default reference materials,
+            any other M > 2
             blends of the two named "m0", "m1" and so on. Defaults to 2.
         angular_table_grid (str, optional): "uniform" (nodes equally spaced in eta) or "adaptive" (the nodes of
             ``synthetic_angular_map``). Defaults to "uniform".
@@ -854,14 +854,15 @@ def synthetic_library(num_groups: int = 4, legendre_order: int = 5, num_eta: int
             group_edges=edges, group_energy=energy, spectrum_fraction=fraction,
             mu_t=mu_t, mu_pe=mu_pe, mu_s_l=mu_s_l, eta_grid=eta, mu_s_eta=mu_s_eta,
             fine_energy=fine_energy, fine_mu_t=fine_mu_t, fine_weight=fine_weight, fine_group=fine_group,
-            materials=("water", "bone"), nominal_density=torch.tensor([1.0, 1.85], dtype=torch.float64),
+            materials=("water", "bone_cortical_icrp"), nominal_density=torch.tensor([1.0, 1.85], dtype=torch.float64),
             eta_map=eta_map,
         )
     if M < 2:
         raise ValueError("num_materials must be >= 2")
     if M == len(MATERIALS):
-        blend_coefficients = {"air": (0.90, 0.0), "lung": (0.95, 0.02), "adipose": (0.97, 0.0), "water": (1.0, 0.0),
-                              "muscle": (1.0, 0.02), "soft_tissue": (1.0, 0.04), "bone": (1.0, 1.0)}
+        blend_coefficients = {"air": (0.90, 0.0), "lung_icrp": (0.95, 0.02), "adipose_icrp": (0.97, 0.0),
+                              "water": (1.0, 0.0), "muscle_icru44": (1.0, 0.02), "soft_tissue_icru44": (1.0, 0.04),
+                              "bone_cortical_icrp": (1.0, 1.0)}
         row_blends = [blend_coefficients[n] for n in MATERIALS]
         names, nominal = MATERIALS, torch.tensor(NOMINAL_DENSITIES, dtype=torch.float64)
     else:

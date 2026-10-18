@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 import torch
 
+from conftest import SPECTRUM_125KVP
 from citrus.scatter_solver.config import SolverConfig
 from citrus.scatter_solver.cross_sections import material_table
 from citrus.scatter_solver.geometry import Grid
@@ -37,7 +38,7 @@ def library_module():
 
 @pytest.fixture(scope="module")
 def spectra(library_module):
-    return {"125kvp": (library_module.default_spectrum_125kvp(), 6),
+    return {"125kvp": (SPECTRUM_125KVP, 6),
             "6mv": (library_module.load_spectrum_txt(str(SPECTRUM_6MV)), 12)}
 
 
@@ -125,12 +126,13 @@ def test_grouping_medium(library_module, spectra):
                                                                    medium=(("water", 1.0),), fine_bin_width_kev=5.0)
     cumulative = np.concatenate([[0.0], np.cumsum(photons)])
     np.testing.assert_allclose(np.diff(np.interp(water[::-1], bin_edges, cumulative)), cumulative[-1] / 12, rtol=1e-9)
-    mixture = replace(config, grouping_medium={"water": 0.8, "bone": 0.4})
+    mixture = replace(config, grouping_medium={"water": 0.8, "bone_cortical_icrp": 0.4})
     mixture.validate()
-    assert mixture.grouping_medium == (("bone", 0.4), ("water", 0.8))
+    assert mixture.grouping_medium == (("bone_cortical_icrp", 0.4), ("water", 0.8))
     edges = library_module.make_group_edges(mixture, spectrum, fine_bin_width_kev=5.0)
     assert bool(np.all(np.diff(edges) < 0)) and not np.allclose(edges, water)
-    assert library_module.grouping_medium_densities(replace(config, grouping_medium={"water": 0.99312, "bone": 1e-7})) \
+    trace = replace(config, grouping_medium={"water": 0.99312, "bone_cortical_icrp": 1e-7})
+    assert library_module.grouping_medium_densities(trace) \
         == (("water", 0.993),)
     for bad, message in (("unobtainium", "unknown grouping_medium"), ("lead", "not among the reference materials"),
                          ({"water": 1.0, "titanium": 0.1}, "not among the reference materials"),
@@ -205,17 +207,19 @@ def test_grouping_estimates_on_the_wlab_phantom(library_module):
                                   wlab_solver)
 
     grid = wlab_grid(1.0)
-    solver = wlab_solver(1.0, device="cpu")
+    solver = wlab_solver(1.0, device="cpu", spectrum=SPECTRUM_125KVP)
     phantom = WlabPhantom(grid, solver.materials)
-    _, mass = library_module.mass_attenuation_preview(solver.config, solver.materials)
+    _, mass = library_module.mass_attenuation_preview(solver.config, solver.materials, solver.spectrum)
     X = sum(phantom.material(None, m) * float(mass[m]) for m in range(len(solver.materials)))
     medium = dict(grouping_medium_estimate(X, solver))
-    assert abs(medium["water"] - 22240 / 22400) < 1e-4 and abs(medium["bone"] - 160 / 22400 * 1.85) < 1e-4
-    assert sum(d for n, d in medium.items() if n not in ("water", "bone")) < 1e-5 and not solver.library_built
+    assert abs(medium["water"] - 22240 / 22400) < 1e-4 and abs(medium["bone_cortical_icrp"] - 160 / 22400 * 1.85) < 1e-4
+    assert sum(d for n, d in medium.items() if n not in ("water", "bone_cortical_icrp")) < 1e-5
+    assert not solver.library_built
     assert _set_grouping_object_size(solver, phantom, grid, None, "cpu") == 14.0
     true = dict(solver.config.grouping_medium)
-    assert set(true) == {"water", "bone"} and abs(true["water"] - 22240 / 22400) < 1e-9 and not solver.library_built
-    assert library_module.grouping_medium_densities(solver.config) == (("bone", 0.0132), ("water", 0.993))
+    assert set(true) == {"water", "bone_cortical_icrp"} and abs(true["water"] - 22240 / 22400) < 1e-9
+    assert not solver.library_built
+    assert library_module.grouping_medium_densities(solver.config) == (("bone_cortical_icrp", 0.0132), ("water", 0.993))
 
 
 @pytest.mark.parametrize("delta_voxel", [1.0, 0.5])
@@ -227,11 +231,11 @@ def test_object_size_of_the_wlab_phantom(library_module, delta_voxel):
     from citrus.utilities import WlabPhantom, air_water_threshold, object_size_cm, wlab_grid, wlab_solver
 
     grid = wlab_grid(delta_voxel)
-    solver = wlab_solver(delta_voxel, device="cpu")
+    solver = wlab_solver(delta_voxel, device="cpu", spectrum=SPECTRUM_125KVP)
     threshold = air_water_threshold(solver)
     assert not solver.library_built and 0.09 < threshold < 0.11  # (0.0002 + 0.2014) / 2 at about 63 keV
-    library = library_module.compute_library(SolverConfig(num_groups=3, legendre_order=2, num_eta_table=51), None,
-                                             fine_bin_width_kev=2.0, gauss_legendre_nodes=8)[0]
+    library = library_module.compute_library(SolverConfig(num_groups=3, legendre_order=2, num_eta_table=51),
+                                             SPECTRUM_125KVP, fine_bin_width_kev=2.0, gauss_legendre_nodes=8)[0]
     X = WlabPhantom(grid, library.materials).attenuation(library)
     assert object_size_cm(X, grid, solver) == 14.0
     assert object_size_cm(X, grid, library) == 14.0
@@ -255,7 +259,7 @@ def test_lazy_solver_config_and_build(monkeypatch):
 
     monkeypatch.setattr(scatter_solver_module, "build_solver_library", fake_build)
     solver = wlab_solver(2.0, config=SolverConfig(num_groups=4, legendre_order=3, num_polar=4, num_azimuthal=8),
-                         device="cpu")
+                         device="cpu", spectrum=SPECTRUM_125KVP)
     assert not solver.library_built and solver.num_groups == 4 and built == []
     solver.config = replace(solver.config, grouping_object_size_cm=12.0)
     assert solver.library.num_groups == 4 and solver.library_built and len(built) == 1
@@ -279,7 +283,7 @@ def test_citrus_recon_measures_the_object_and_builds_once(monkeypatch):
     from citrus.utilities import synthesize_wlab_dataset, wlab_geometry, wlab_solver
 
     try:
-        library = build_solver_library(SolverConfig())
+        library = build_solver_library(SolverConfig(), SPECTRUM_125KVP)
     except Exception as exc:  # no cached library and no photon data
         pytest.skip(f"real library unavailable: {exc}")
     geometry = replace(wlab_geometry(), num_det_rows=46, num_det_channels=38, delta_det_row=1.6, delta_det_channel=1.6)
@@ -295,7 +299,7 @@ def test_citrus_recon_measures_the_object_and_builds_once(monkeypatch):
     from citrus.utilities import wlab_grid
 
     grid = wlab_grid(2.0)
-    solver = wlab_solver(2.0, config=config, geometry=geometry, device="cuda")
+    solver = wlab_solver(2.0, config=config, geometry=geometry, device="cuda", spectrum=SPECTRUM_125KVP)
     X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver,
                            CitrusConfig(num_outer_iterations=2))
     size, medium = info["grouping_object_size_cm"], dict(info["grouping_medium"])

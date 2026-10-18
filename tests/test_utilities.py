@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from conftest import SPECTRUM_125KVP
 from citrus.scatter_solver.config import SolverConfig
 from citrus.scatter_solver.cross_sections import BONE, MATERIALS, WATER, synthetic_library
 from citrus.scatter_solver.geometry import ConeGeometry, Grid
@@ -35,7 +36,7 @@ def test_wlab_phantom_volumes_and_materials(delta):
     assert grid.extent == pytest.approx((30.0, 20.0, 40.0))
     rho = wlab_phantom(grid, dtype=torch.float64)
     assert rho.shape == (7, *grid.shape) and rho.dtype == torch.float64
-    assert (WATER, BONE) == (3, 6) and MATERIALS[WATER] == "water" and MATERIALS[BONE] == "bone"
+    assert (WATER, BONE) == (3, 6) and MATERIALS[WATER] == "water" and MATERIALS[BONE] == "bone_cortical_icrp"
     v = grid.voxel_volume
     w, b = rho[WATER], rho[BONE]
     others = [m for m in range(7) if m not in (WATER, BONE)]
@@ -101,7 +102,7 @@ def real_library():
     from citrus.scatter_solver.scatter_solver import build_solver_library
 
     try:
-        return build_solver_library(SolverConfig())
+        return build_solver_library(SolverConfig(), SPECTRUM_125KVP)
     except Exception as exc:  # no cached library and no photon data
         pytest.skip(f"real library unavailable: {exc}")
 
@@ -110,7 +111,7 @@ def real_library():
 
 def test_effective_energy_and_interpolation(real_library):
     E = effective_energy(real_library)
-    assert 62.5 < E < 63.5  # spectrum mean of the default 125 kVp spectrum
+    assert 62.5 < E < 63.5  # spectrum mean of the sample 125 kVp spectrum
     m = mass_attenuation_at(real_library, E)
     assert m.shape == (7,)
     assert 0.19 < float(m[WATER]) < 0.21 and 0.28 < float(m[BONE]) < 0.30  # water, cortical bone at ~63 keV (cm^2/g)
@@ -153,7 +154,7 @@ def test_density_round_trip(library_kind, request, device):
     air = (rho[WATER] == RHO_AIR)
     names = lambda mask: {MATERIALS[k] for k in range(7) if bool((rho2[k][mask] != 0).any())}  # noqa: E731
     if library_kind == "real":
-        assert names(lung) == {"lung", "adipose"} and names(air) == {"air", "lung"}
+        assert names(lung) == {"lung_icrp", "adipose_icrp"} and names(air) == {"air", "lung_icrp"}
     # negatives clamp to zero; X = mu_w is pure unit water; mu_w + 0.5 (mu_b - mu_soft) mixes soft tissue and bone
     mu = nominal_attenuation(library, E)
     Xn = torch.tensor([-0.1, 0.0, mw, 0.5 * (mu[5] + mu[6]), 2.0 * mb * 1.85], dtype=torch.float64, device=device)

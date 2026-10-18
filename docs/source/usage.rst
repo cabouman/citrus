@@ -17,7 +17,8 @@ downloads the NIST XCOM photon data and builds the library; both are cached), ra
 shows the primary signal, the scatter signal and the scatter fraction on the detector.
 
 ``demo_2_citrus.py`` defines every setting in a parameter block at the top: the spectrum file (two columns, energy in
-keV and relative photons per keV; the example is the package's 125 kVp spectrum), the reference materials, the
+keV and relative photons per keV; the example is the sample 125 kVp spectrum of ``demo/spectra``), the reference
+materials, the
 detector panel and the source distances, the voxel pitch of the WLAB phantom, the number of views and the angular
 range, the flat field, the CITRUS loop settings (outer iterations, ``scatter_every``, ``scatter_view_stride``) and the
 solver settings (transport cell size, energy groups, Legendre order). It synthesizes scatter-contaminated cone-beam
@@ -207,7 +208,7 @@ Two settings of ``SolverConfig`` shape the library (:doc:`method`, "Uncollided f
   ``"equal_fluence"`` (equal source photon counts) or ``"log"`` (geometric spacing). ``group_edges_kev`` overrides
   the rule.
 * ``grouping_medium``: ``"auto"`` (default: measured on the object, water until then), a reference material's name
-  (``"aluminium"`` for an aluminium casting) or a mapping ``{"water": 0.9, "bone": 0.2}`` (g/cm^3) of reference
+  (``"aluminium"`` for an aluminium casting) or a mapping ``{"water": 0.9, "bone_cortical_icrp": 0.2}`` (g/cm^3) of reference
   materials.
 * ``angular_table_grid``: ``"adaptive"`` (default; ``num_eta_table`` nodes placed by the curvature of the transfer) or
   ``"uniform"``.
@@ -247,7 +248,7 @@ of the catalogue (:doc:`conventions`, "Materials"), in any order; the library so
    from citrus.scatter_solver.cross_sections import material_index
    from citrus.utilities import attenuation_to_densities, wlab_phantom, wlab_solver
 
-   solver = wlab_solver(1.0, config=replace(SolverConfig(), materials=("air", "water", "bone")), device="cuda")
+   solver = wlab_solver(1.0, config=replace(SolverConfig(), materials=("air", "water", "bone_cortical_icrp")), device="cuda")
    rho = wlab_phantom(grid, materials=solver.materials, device="cuda")            # [3, R, C, S]
    material_index(solver.library, "water")                                       # 1
    attenuation_to_densities(solver.library, X)                                   # the density model of the loop

@@ -17,6 +17,7 @@ import dataclasses
 import sys
 import time
 from dataclasses import replace
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,8 +30,12 @@ from citrus import citrus as citrus_module  # noqa: E402
 from citrus.citrus import CitrusConfig, citrus_recon  # noqa: E402
 from citrus.recon.mbir_bridge import forward_project, make_cone_model  # noqa: E402
 from citrus.scatter_solver.config import SolverConfig  # noqa: E402
+from citrus.scatter_solver.cross_section_library import load_spectrum_txt  # noqa: E402
 from citrus.utilities import (densities_to_attenuation, full_field_wlab_geometry, set_memory_cap,  # noqa: E402
                               view_angles, wlab_geometry, wlab_grid, wlab_phantom, wlab_solver)
+
+SPECTRUM = load_spectrum_txt(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "demo", "spectra",
+                                          "spectrum_125kvp.txt"))  # the sample 125 kVp spectrum
 
 DEVICE = torch.device("cuda")
 MIB = 2.0 ** 20
@@ -54,7 +59,7 @@ def main() -> None:
     geometry = full_field_wlab_geometry() if args.panel == "full" else wlab_geometry()
     grid = wlab_grid(args.delta_voxel)
     solver = wlab_solver(args.delta_voxel, config=replace(SolverConfig(), transport_cell_cm=args.transport_cell_cm),
-                         geometry=geometry, device=DEVICE)
+                         geometry=geometry, device=DEVICE, spectrum=SPECTRUM)
     angles = view_angles(args.views, geometry)
     X_true = densities_to_attenuation(solver.library, wlab_phantom(grid, materials=solver.library.materials,
                                                                    device=DEVICE))

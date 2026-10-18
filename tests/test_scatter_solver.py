@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 
+from conftest import SPECTRUM_125KVP
 from citrus.scatter_solver.config import SolverConfig
 from citrus.scatter_solver.cross_sections import MultigroupLibrary, mu_t_volume, synthetic_library
 from citrus.scatter_solver.detector import csi_response, focused_1d_grid, no_grid
@@ -301,7 +302,7 @@ def test_real_library_wlab(rho):
     from citrus.scatter_solver.scatter_solver import build_solver_library
 
     config = replace(CONFIG, num_groups=6, source_iteration_tolerance=1e-3)
-    library = build_solver_library(config)
+    library = build_solver_library(config, SPECTRUM_125KVP)
     assert library.num_groups == 6
     r = make_solver(config, library=library).solve_view(rho, GRID, 0.0)
     iteration_result = r.source_iteration_result

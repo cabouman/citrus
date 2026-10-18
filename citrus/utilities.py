@@ -96,7 +96,8 @@ def wlab_phantom(grid: Grid, *, lung_center: tuple[float, float] = (-5.0, 0.0),
                  materials: Optional[Sequence[str]] = None, device=None, dtype=torch.float32) -> Tensor:
     """Rasterize the WLAB phantom on a grid by voxel-center membership (half-open intervals).
 
-    The "water" row holds the water prism with the lung and air inserts as water of reduced density, the "bone" row the
+    The "water" row holds the water prism with the lung and air inserts as water of reduced density, the
+    "bone_cortical_icrp" row the
     bone insert; every other row is zero.
 
     Args:
@@ -117,7 +118,7 @@ def wlab_phantom(grid: Grid, *, lung_center: tuple[float, float] = (-5.0, 0.0),
     """
     names = MATERIALS if materials is None else tuple(materials)
     water_row = _phantom_row(names, "water")
-    bone_row = _phantom_row(names, "bone")
+    bone_row = _phantom_row(names, "bone_cortical_icrp")
     size_x, size_y, size_z = WLAB_SIZE_XYZ
     extent_x, extent_y, extent_z = grid.extent
     lower = grid.lower_corner()
@@ -174,7 +175,7 @@ class WlabPhantom:
         """Store the materials as a tuple and check that water and bone are among them."""
         object.__setattr__(self, "materials", tuple(self.materials))
         _phantom_row(self.materials, "water")
-        _phantom_row(self.materials, "bone")
+        _phantom_row(self.materials, "bone_cortical_icrp")
 
     @property
     def num_materials(self) -> int:
@@ -213,7 +214,7 @@ class WlabPhantom:
         """
         rho = torch.zeros(*self.grid.shape, device=self.device, dtype=self.dtype)
         water_row = _phantom_row(self.materials, "water")
-        bone_row = _phantom_row(self.materials, "bone")
+        bone_row = _phantom_row(self.materials, "bone_cortical_icrp")
         if m not in (water_row, bone_row):
             return rho
         prism, lung, air, bone = self._masks()
@@ -243,7 +244,7 @@ class WlabPhantom:
             raise ValueError(f"the phantom's materials {self.materials} are not the library's {library.materials}")
         m_at = mass_attenuation_at(library, effective_energy(library) if energy_kev is None else float(energy_kev))
         X = torch.zeros(*self.grid.shape, device=self.device, dtype=self.dtype)
-        for m in (_phantom_row(self.materials, "water"), _phantom_row(self.materials, "bone")):
+        for m in (_phantom_row(self.materials, "water"), _phantom_row(self.materials, "bone_cortical_icrp")):
             X.add_(self.material(None, m), alpha=float(m_at[m]))
         return X
 
@@ -307,7 +308,8 @@ def _phantom_row(materials: Sequence[str], name: str) -> int:
     try:
         return material_index(materials, name)
     except ValueError:
-        raise ValueError(f"the WLAB phantom needs 'water' and 'bone' among the materials, got {tuple(materials)}; "
+        raise ValueError(f"the WLAB phantom needs 'water' and 'bone_cortical_icrp' among the materials, got "
+                         f"{tuple(materials)}; "
                          f"add them to SolverConfig.materials") from None
 
 
@@ -623,13 +625,15 @@ def wlab_solver(delta_voxel: float, *, config: Optional[SolverConfig] = None,
         device (torch.device, optional): device. Defaults to None, CUDA when available, else the CPU.
         cache_dir (str, optional): disk cache of a lazy library; "default" is ``$CITRUS_CACHE_DIR`` or
             ``~/.cache/citrus``, None no disk cache. Defaults to "default".
-        spectrum (tuple[np.ndarray, np.ndarray], optional): ([K] energies in keV, [K] photons per keV) of a lazy
-            library. Defaults to None, the default 125 kVp spectrum.
+        spectrum (tuple[np.ndarray, np.ndarray], optional): ([K] energies in keV, [K] photons per keV) of the source,
+            required for a lazy library. Defaults to None.
 
     Returns:
         ScatterSolver: the solver.
     """
     config = config if config is not None else SolverConfig()
+    if library is None and spectrum is None:
+        raise ValueError("wlab_solver without a library needs the source spectrum (spectrum=...)")
     device = (torch.device(device) if device is not None
               else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     solver = ScatterSolver(library, config, geometry if geometry is not None else full_field_wlab_geometry(),
@@ -1057,7 +1061,7 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
                             library: Optional[MultigroupLibrary] = None, device=None, start_view_angle: float = 0.0,
                             end_view_angle: Optional[float] = None,
                             progress: Optional[Callable[[int, float], None]] = None,
-                            geometry: Optional[ConeGeometry] = None) -> dict:
+                            geometry: Optional[ConeGeometry] = None, spectrum=None) -> dict:
     """Synthetic cone-beam data of the WLAB phantom (``synthesize_cone_beam_data``), optionally written to disk.
 
     The phantom is placed on ``wlab_grid(delta_voxel)`` in the water and bone rows of the library of ``wlab_solver``;
@@ -1082,6 +1086,8 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
         progress (Callable[[int, float], None], optional): called as ``progress(view_index, seconds)`` after every
             view. Defaults to None.
         geometry (ConeGeometry, optional): scan geometry. Defaults to None, ``full_field_wlab_geometry()``.
+        spectrum (tuple[np.ndarray, np.ndarray], optional): source spectrum, required without ``library``. Defaults
+            to None.
 
     Returns:
         dict: the data set, as returned by ``synthesize_cone_beam_data``.
@@ -1090,7 +1096,8 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
               else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     geometry = full_field_wlab_geometry() if geometry is None else geometry
     grid = wlab_grid(delta_voxel)
-    solver = wlab_solver(delta_voxel, config=config, library=library, geometry=geometry, device=device)
+    solver = wlab_solver(delta_voxel, config=config, library=library, geometry=geometry, device=device,
+                         spectrum=spectrum)
     phantom = WlabPhantom(grid, solver.materials, device=device, dtype=torch.float32)
     angles = view_angles(num_views, geometry, start_view_angle, end_view_angle)
     end = float(start_view_angle) + math.pi + fan_angle(geometry) if end_view_angle is None else float(end_view_angle)

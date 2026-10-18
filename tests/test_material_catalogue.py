@@ -16,11 +16,12 @@ import numpy as np
 import pytest
 import torch
 
+from conftest import SPECTRUM_125KVP
 from citrus.citrus import DensityModel
 from citrus.scatter_solver.config import SolverConfig
 from citrus.scatter_solver.cross_sections import (BONE, COMPOUND_NAMES, ELEMENT_DENSITIES, ELEMENT_NAMES,
                                                   ELEMENT_SYMBOLS, MATERIAL_CATALOGUE, MATERIAL_TABLE, MATERIALS,
-                                                  NIST_COMPOUND_NAMES, NOMINAL_DENSITIES, WATER, material_index,
+                                                  NOMINAL_DENSITIES, WATER, material_index,
                                                   material_table)
 from citrus.scatter_solver.detector import csi_response, no_grid
 from citrus.scatter_solver.geometry import Grid
@@ -28,11 +29,11 @@ from citrus.scatter_solver.ray_tracing import SiddonProjectors
 from citrus.scatter_solver.scatter_solver import ScatterSolver
 from citrus.utilities import (attenuation_to_densities, attenuation_to_density, densities_to_attenuation,
                               mass_attenuation_at, material_order, nominal_attenuation, set_memory_cap, wlab_geometry,
-                              wlab_grid, wlab_phantom, wlab_setup)
+                              wlab_grid, wlab_phantom, wlab_setup, wlab_solver)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-REDUCED = ("air", "water", "bone")
+REDUCED = ("air", "water", "bone_cortical_icrp")
 EXTENDED = MATERIALS + ("titanium",)
 # the small, fast library build of tests/test_materials.py
 SMALL = SolverConfig(num_groups=3, legendre_order=2, num_eta_table=51)
@@ -44,8 +45,8 @@ GRID = Grid((10, 16, 20), 2.0)  # the WLAB problem of tests/test_materials.py
 # cache keys of version 0.7.0 (default seven materials): SolverConfig() at 0.5 keV / 32 nodes, SMALL at 2 keV / 8
 # (version 0.6.0 added the angular table grid, the group rule, the grouping object size and the grouping medium to the
 # key; version 0.7.0 changed the build version and the backend, XCOM + xraylib)
-KEY_DEFAULT_V070 = "385b523384ebf80811d7"
-KEY_SMALL_V070 = "47dde6802807fb32dfb3"
+KEY_DEFAULT_V080 = "ce84c9793ffe2b097f66"  # the names of 0.8.0 are in the key
+KEY_SMALL_V080 = "6aa293182fc89d7c9054"
 # the library options of versions <= 0.5 (uniform eta table, equal-fluence groups)
 LEGACY_LIBRARY = dict(angular_table_grid="uniform", group_edges_method="equal_fluence")
 # Shape and float64 statistics of every tensor of the SMALL build with the legacy options (SMALL_BUILD, default seven
@@ -78,7 +79,7 @@ def library_module():
 def small_libraries(library_module):
     """{set name: small library} for the default seven, the reduced and the extended set (no cache)."""
     backend = library_module.resolve_backend()
-    return {name: library_module.compute_library(SMALL, None, backend, materials=material_table(names),
+    return {name: library_module.compute_library(SMALL, SPECTRUM_125KVP, backend, materials=material_table(names),
                                                  **SMALL_BUILD)[0]
             for name, names in (("default", MATERIALS), ("reduced", REDUCED), ("extended", EXTENDED))}
 
@@ -114,10 +115,12 @@ def _small_solver(library, dtype=torch.float32):
 
 def test_catalogue_and_default_set():
     assert tuple(MATERIAL_CATALOGUE)[:7] == MATERIALS
-    assert MATERIALS == ("air", "lung", "adipose", "water", "muscle", "soft_tissue", "bone")
-    assert set(MATERIAL_CATALOGUE) >= {"trabecular_bone", "brain", "blood", "cartilage", "skin", "pmma",
+    assert MATERIALS == ("air", "lung_icrp", "adipose_icrp", "water", "muscle_icru44", "soft_tissue_icru44",
+                         "bone_cortical_icrp")
+    assert set(MATERIAL_CATALOGUE) >= {"trabecular_bone_icru46", "brain_icru44", "blood_icru44", "cartilage_icru46",
+                                       "skin_icru44", "pmma",
                                        "polyethylene", "carbon_fibre", "aluminium", "titanium", "teflon"}
-    assert len(NIST_COMPOUND_NAMES) == 41 and set(NIST_COMPOUND_NAMES) <= set(COMPOUND_NAMES)
+    assert len(COMPOUND_NAMES) == 15 + 41  # the hand-written entries and NIST's Table 2 compounds
     assert MATERIAL_TABLE == tuple((n, MATERIAL_CATALOGUE[n][0]) for n in MATERIALS)
     assert NOMINAL_DENSITIES == (0.0012, 0.26, 0.95, 1.0, 1.05, 1.06, 1.85) and (WATER, BONE) == (3, 6)
     for name, (density, formula) in MATERIAL_CATALOGUE.items():
@@ -125,10 +128,12 @@ def test_catalogue_and_default_set():
     with pytest.raises(TypeError):
         MATERIAL_CATALOGUE["unobtainium"] = (1.0, "U")  # read-only
     assert SolverConfig().materials == MATERIALS
-    assert SolverConfig(materials=["bone", "water", "air"]).materials == ("bone", "water", "air")  # a tuple
+    shuffled = ("bone_cortical_icrp", "water", "air")
+    assert SolverConfig(materials=list(shuffled)).materials == shuffled  # a tuple
     assert material_table(REDUCED) == (("air", 0.0012, MATERIAL_CATALOGUE["air"][1]), ("water", 1.0, "H2O"),
-                                       ("bone", 1.85, MATERIAL_CATALOGUE["bone"][1]))
-    assert material_index(MATERIALS, "bone") == BONE and material_index(REDUCED, "bone") == 2
+                                       ("bone_cortical_icrp", 1.85, MATERIAL_CATALOGUE["bone_cortical_icrp"][1]))
+    assert material_index(MATERIALS, "bone_cortical_icrp") == BONE
+    assert material_index(REDUCED, "bone_cortical_icrp") == 2
 
 
 def test_material_names_are_checked():
@@ -138,16 +143,16 @@ def test_material_names_are_checked():
     with pytest.raises(ValueError, match="at least 2"):
         SolverConfig(materials=("water",)).validate()
     with pytest.raises(ValueError, match="duplicate"):
-        SolverConfig(materials=("water", "bone", "water")).validate()
+        SolverConfig(materials=("water", "bone_cortical_icrp", "water")).validate()
     with pytest.raises(ValueError, match="sequence of material names"):
         SolverConfig(materials="air,water,bone").validate()
     with pytest.raises(ValueError, match="unknown"):
         material_table(("water", "Water"))
     with pytest.raises(ValueError, match="not among the materials"):
-        material_index(REDUCED, "lung")
+        material_index(REDUCED, "lung_icrp")
     with pytest.raises(ValueError, match="at least 2"):  # the solver validates its configuration
-        ScatterSolver(None, replace(SMALL_SOLVER, materials=("bone",)), wlab_geometry(), SiddonProjectors(),
-                      csi_response(), no_grid())
+        ScatterSolver(None, replace(SMALL_SOLVER, materials=("bone_cortical_icrp",)), wlab_geometry(),
+                      SiddonProjectors(), csi_response(), no_grid(), spectrum=SPECTRUM_125KVP)
 
 
 def test_wlab_phantom_by_name():
@@ -155,14 +160,14 @@ def test_wlab_phantom_by_name():
     grid = wlab_grid(2.0)
     rho7 = wlab_phantom(grid, dtype=torch.float64)
     rho3 = wlab_phantom(grid, materials=REDUCED, dtype=torch.float64)
-    shuffled = ("bone", "titanium", "water", "lung")
+    shuffled = ("bone_cortical_icrp", "titanium", "water", "lung_icrp")
     rho4 = wlab_phantom(grid, materials=shuffled, dtype=torch.float64)
     assert rho3.shape == (3, *grid.shape) and rho4.shape == (4, *grid.shape)
     assert torch.equal(rho3[1], rho7[WATER]) and torch.equal(rho3[2], rho7[BONE]) and float(rho3[0].abs().max()) == 0
     assert torch.equal(rho4[2], rho7[WATER]) and torch.equal(rho4[0], rho7[BONE])
     assert torch.equal(wlab_setup(2.0, dtype=torch.float64, materials=REDUCED)[2], rho3)
-    for names in (("air", "lung", "water"), ("air", "bone"), ("titanium", "aluminium")):
-        with pytest.raises(ValueError, match="WLAB phantom needs 'water' and 'bone'"):
+    for names in (("air", "lung_icrp", "water"), ("air", "bone_cortical_icrp"), ("titanium", "aluminium")):
+        with pytest.raises(ValueError, match="WLAB phantom needs 'water' and 'bone_cortical_icrp'"):
             wlab_phantom(grid, materials=names)
 
 
@@ -191,8 +196,9 @@ def test_every_catalogue_entry_parses(library_module):
     assert ELEMENT_NAMES[-1] == "californium" and "einsteinium" not in MATERIAL_CATALOGUE
     # the compounds of the default set as NIST compounds of xraylib: cortical bone and adipose tissue exactly, lung
     # without the Ca, Fe, Zn traces
-    for name, nist, tolerance in (("bone", "Bone, Cortical (ICRP)", 1e-12), ("adipose", "Adipose Tissue (ICRP)", 1e-12),
-                                  ("lung", "Lung (ICRP)", 4e-4)):
+    for name, nist, tolerance in (("bone_cortical_icrp", "Bone, Cortical (ICRP)", 1e-12),
+                                  ("adipose_icrp", "Adipose Tissue (ICRP)", 1e-12),
+                                  ("lung_icrp", "Lung (ICRP)", 4e-4)):
         data = xraylib.GetCompoundDataNISTByName(nist)
         reference = dict(zip(data["Elements"], data["massFractions"]))
         ours = library_module.parse_formula(MATERIAL_CATALOGUE[name][1], backend.atomic_mass)
@@ -222,28 +228,34 @@ def test_nist_compounds_match_xraylib(library_module):
                   "c552_air_equivalent_plastic": "C-552 Air-Equivalent Plastic",
                   "plastic_scintillator": "Plastic Scintillator (Vinyltoluene based)",
                   "glass_borosilicate": "Glass, Pyrex", "air_sea_level": "Air, Dry (near sea level)"}
-    assert set(in_xraylib) <= set(NIST_COMPOUND_NAMES)
+    nist_names = COMPOUND_NAMES[15:]  # after the 15 hand-written entries
+    assert len(nist_names) == 41 and set(in_xraylib) <= set(nist_names)
     for name, nist in in_xraylib.items():
         data = xraylib.GetCompoundDataNISTByName(nist)
         reference = dict(zip(data["Elements"], data["massFractions"]))
         ours = library_module.parse_formula(MATERIAL_CATALOGUE[name][1], backend.atomic_mass)
         assert set(ours) == set(reference), name
         assert max(abs(ours[Z] - reference[Z]) for Z in ours) < 5e-5, name
-    for name in NIST_COMPOUND_NAMES:  # every NIST entry is written as mass fractions of elements, 6 digits each
+    for name in nist_names:  # every NIST entry is written as mass fractions of elements, 6 digits each
         assert all(len(term.split("*")[0].split(".")[1]) == 6 for term in MATERIAL_CATALOGUE[name][1].split(" + "))
 
 
 def test_demo_spectra(library_module):
-    """The two sample spectra of demo/spectra load with 1 keV nodes, to 125 keV and to 6000 keV; the 125 kVp copy is
-    the package's default spectrum."""
+    """The two sample spectra of demo/spectra load with 1 keV nodes, to 125 keV and to 6000 keV; there is no default
+    spectrum: a build, a lazy solver or the WLAB solver without one raises."""
     spectra = Path(__file__).parents[1] / "demo" / "spectra"
     for name, maximum in (("spectrum_125kvp.txt", 125.0), ("spectrum_6mv.txt", 6000.0)):
         energies, weights = library_module.load_spectrum_txt(str(spectra / name))
         assert energies[0] == 1.0 and energies[-1] == maximum
         assert np.all(np.diff(energies) == 1.0) and np.all(weights >= 0) and weights.max() > 0
-    e, s = library_module.default_spectrum_125kvp()
-    demo_e, demo_s = library_module.load_spectrum_txt(str(spectra / "spectrum_125kvp.txt"))
-    assert np.array_equal(e, demo_e) and np.array_equal(s, demo_s)
+        copy = library_module.load_spectrum_txt(str(Path(__file__).parent / "data" / name))  # the tests' copy
+        assert np.array_equal(copy[0], energies) and np.array_equal(copy[1], weights)
+    with pytest.raises(ValueError, match="a source spectrum is required"):
+        library_module.compute_library(SMALL, None, library_module.resolve_backend(), **SMALL_BUILD)
+    with pytest.raises(ValueError, match="needs the source spectrum"):
+        ScatterSolver(None, SMALL_SOLVER, wlab_geometry(), SiddonProjectors(), csi_response(), no_grid())
+    with pytest.raises(ValueError, match="needs the source spectrum"):
+        wlab_solver(1.0, device="cpu")
 
 
 # the compounds and a sample of the elements (every 10th atomic number, lead and tungsten): one build each
@@ -256,7 +268,7 @@ def test_every_catalogue_material_builds(name, library_module):
     coefficients, the nominal density, a composition whose mass fractions sum to 1 (lead and tungsten have their K
     edges at 88 and 69.5 keV, inside the 125 kVp spectrum)."""
     backend = library_module.resolve_backend()
-    library, info = library_module.compute_library(SMALL, None, backend, materials=material_table((name,)),
+    library, info = library_module.compute_library(SMALL, SPECTRUM_125KVP, backend, materials=material_table((name,)),
                                                    **SMALL_BUILD)
     assert library.materials == (name,) and library.nominal_density.tolist() == [MATERIAL_CATALOGUE[name][0]]
     assert tuple(library.mu_t.shape) == (1, 3) and tuple(library.mu_s_eta.shape[:3]) == (1, 3, 3)
@@ -267,19 +279,20 @@ def test_every_catalogue_material_builds(name, library_module):
 
 
 def test_default_set_keeps_the_cache_key_and_library(library_module, tmp_path, monkeypatch):
-    """The default reference materials give the cache keys of version 0.7.0 and the same library bit for bit, whether
+    """The default reference materials give the cache keys of version 0.8.0 and the same library bit for bit, whether
     the table is None, the default set by name or the same set in another order; the legacy options (uniform table,
     equal-fluence groups) reproduce the statistics of the library recorded with version 0.7.0 to float64 rounding."""
     backend = library_module.resolve_backend()
-    spectrum = library_module._spectrum_or_default(None)
+    spectrum = library_module.spectrum_arrays(SPECTRUM_125KVP)
     reverse = material_table(tuple(reversed(MATERIALS)))
     assert (library_module.sort_material_table(SMALL, reverse, spectrum, backend, fine_bin_width_kev=2.0)
             == material_table(MATERIALS) == library_module.default_material_table())
     key = library_module._cache_key
-    assert key(SolverConfig(), spectrum, backend.name, 0.5, 32) == KEY_DEFAULT_V070
-    assert key(SolverConfig(), spectrum, backend.name, 0.5, 32, material_table(MATERIALS)) == KEY_DEFAULT_V070
-    assert key(SMALL, spectrum, backend.name, 2.0, 8) == KEY_SMALL_V070
-    legacy, _ = library_module.compute_library(replace(SMALL, **LEGACY_LIBRARY), None, backend, **SMALL_BUILD)
+    assert key(SolverConfig(), spectrum, backend.name, 0.5, 32) == KEY_DEFAULT_V080
+    assert key(SolverConfig(), spectrum, backend.name, 0.5, 32, material_table(MATERIALS)) == KEY_DEFAULT_V080
+    assert key(SMALL, spectrum, backend.name, 2.0, 8) == KEY_SMALL_V080
+    legacy, _ = library_module.compute_library(replace(SMALL, **LEGACY_LIBRARY), SPECTRUM_125KVP,
+                                                       backend, **SMALL_BUILD)
     assert legacy.eta_map is None
     recorded = json.loads(SMALL_LEGACY_V070.read_text())
     tensors = {field: getattr(legacy, field) for field in legacy.__dataclass_fields__
@@ -290,14 +303,15 @@ def test_default_set_keeps_the_cache_key_and_library(library_module, tmp_path, m
         assert stats["shape"] == expected["shape"], field
         for name in ("sum", "sum_of_squares", "min", "max", "first", "last"):
             assert stats[name] == pytest.approx(expected[name], rel=1e-9, abs=1e-12), (field, name)
-    reference, _ = library_module.compute_library(SMALL, None, backend, **SMALL_BUILD)
-    by_name = library_module.build_library(SMALL, None, cache_dir=str(tmp_path), materials=reverse, **SMALL_BUILD)
-    assert [p.name for p in tmp_path.glob("mglib_*.pt")] == [f"mglib_{KEY_SMALL_V070}.pt"]
+    reference, _ = library_module.compute_library(SMALL, SPECTRUM_125KVP, backend, **SMALL_BUILD)
+    by_name = library_module.build_library(SMALL, SPECTRUM_125KVP,
+                                           cache_dir=str(tmp_path), materials=reverse, **SMALL_BUILD)
+    assert [p.name for p in tmp_path.glob("mglib_*.pt")] == [f"mglib_{KEY_SMALL_V080}.pt"]
     for field in reference.__dataclass_fields__:
         a, b = getattr(reference, field), getattr(by_name, field)
         assert torch.equal(a, b) if isinstance(a, torch.Tensor) else a == b, field
     assert reference.eta_map is not None and not torch.equal(reference.mu_s_eta, legacy.mu_s_eta)
-    # build_solver_library(config) builds config.materials: the default set is the same cache entry
+    # build_solver_library(config, SPECTRUM_125KVP) builds config.materials: the default set is the same cache entry
     from citrus.scatter_solver.scatter_solver import build_solver_library
 
     def cache_miss(*args, **keywords):
@@ -305,20 +319,22 @@ def test_default_set_keeps_the_cache_key_and_library(library_module, tmp_path, m
 
     with monkeypatch.context() as patch:
         patch.setattr(library_module, "compute_library", cache_miss)
-        assert library_module.build_library(SMALL, None, cache_dir=str(tmp_path), **SMALL_BUILD).materials == MATERIALS
-    if (Path(library_module.default_cache_dir()) / f"mglib_{KEY_DEFAULT_V070}.pt").is_file():
-        assert build_solver_library(SolverConfig()).materials == MATERIALS  # the cached default library
+        assert library_module.build_library(SMALL, SPECTRUM_125KVP,
+                                            cache_dir=str(tmp_path), **SMALL_BUILD).materials == MATERIALS
+    if (Path(library_module.default_cache_dir()) / f"mglib_{KEY_DEFAULT_V080}.pt").is_file():
+        assert build_solver_library(SolverConfig(), SPECTRUM_125KVP).materials == MATERIALS  # the cached library
 
 
 def test_each_set_has_its_own_cache_entry(library_module, small_libraries, tmp_path):
     """A set and any permutation of it share one cache entry, distinct from the default set's; the library comes out
     sorted by nominal attenuation; its water and bone rows equal the default library's to summation order."""
     build = library_module.build_library
-    a = build(SMALL, None, cache_dir=str(tmp_path), materials=material_table(("bone", "water", "air")), **SMALL_BUILD)
-    b = build(SMALL, None, cache_dir=str(tmp_path), materials=material_table(REDUCED), **SMALL_BUILD)
-    c = build(SMALL, None, cache_dir=str(tmp_path), **SMALL_BUILD)
+    a = build(SMALL, SPECTRUM_125KVP, cache_dir=str(tmp_path),
+              materials=material_table(("bone_cortical_icrp", "water", "air")), **SMALL_BUILD)
+    b = build(SMALL, SPECTRUM_125KVP, cache_dir=str(tmp_path), materials=material_table(REDUCED), **SMALL_BUILD)
+    c = build(SMALL, SPECTRUM_125KVP, cache_dir=str(tmp_path), **SMALL_BUILD)
     names = sorted(p.name for p in tmp_path.glob("mglib_*.pt"))
-    assert len(names) == 2 and f"mglib_{KEY_SMALL_V070}.pt" in names
+    assert len(names) == 2 and f"mglib_{KEY_SMALL_V080}.pt" in names
     assert a.materials == b.materials == REDUCED and c.materials == MATERIALS
     assert torch.equal(a.mu_s_eta, b.mu_s_eta)
     extended = small_libraries["extended"]
@@ -327,13 +343,14 @@ def test_each_set_has_its_own_cache_entry(library_module, small_libraries, tmp_p
     default = small_libraries["default"]
     for k in ("mu_t", "mu_pe", "mu_s_l", "mu_s_eta", "fine_mu_t"):
         for library in (a, extended):
-            rows = [material_index(library, "water"), material_index(library, "bone")]
+            rows = [material_index(library, "water"), material_index(library, "bone_cortical_icrp")]
             assert torch.allclose(getattr(library, k)[rows], getattr(default, k)[[WATER, BONE]], rtol=1e-13,
                                   atol=1e-16), k
     # a set whose members cross in attenuation is refused (skin crosses soft tissue and blood between 20 and 63 keV)
     with pytest.raises(ValueError, match="cross"):
-        library_module.compute_library(SMALL, None, library_module.resolve_backend(),
-                                       materials=material_table(("water", "soft_tissue", "blood", "skin")),
+        library_module.compute_library(SMALL, SPECTRUM_125KVP, library_module.resolve_backend(),
+                                       materials=material_table(("water", "soft_tissue_icru44", "blood_icru44",
+                                                                 "skin_icru44")),
                                        **SMALL_BUILD)
 
 
@@ -425,7 +442,7 @@ def test_synthesize_wlab_dataset_on_a_reduced_set(small_libraries):
     assert reduced["X_true"].shape == tuple(wlab_grid(2.0).shape) and reduced["meta"]["materials"] == list(REDUCED)
     np.testing.assert_allclose(reduced["X_true"], default["X_true"], rtol=1e-6)
     np.testing.assert_allclose(reduced["SPR"], default["SPR"], rtol=1e-4)
-    with pytest.raises(ValueError, match="WLAB phantom needs 'water' and 'bone'"):
+    with pytest.raises(ValueError, match="WLAB phantom needs 'water' and 'bone_cortical_icrp'"):
         synthesize_wlab_dataset(2, 2.0, noise=False, config=SMALL_SOLVER, geometry=wlab_geometry(), device="cuda",
                                 library=replace(small_libraries["reduced"], materials=("air", "water", "titanium")))
 
@@ -443,6 +460,7 @@ def test_regression_anchors_default_and_reduced_sets():
     case = json.loads(REFERENCE.read_text())["cases"]["wlab_1p0cm_f1"]
     grid = wlab_grid(1.0)
     for names in (MATERIALS, REDUCED):
-        s = wlab_solver(1.0, config=replace(SolverConfig(), materials=names, **LEGACY_LIBRARY), device="cuda")
+        s = wlab_solver(1.0, config=replace(SolverConfig(), materials=names, **LEGACY_LIBRARY), device="cuda",
+                        spectrum=SPECTRUM_125KVP)
         assert s.library.materials == names
         _check_reference(s.solve_view(wlab_phantom(grid, materials=names, device="cuda"), grid, 0.3), case, 1e-5)

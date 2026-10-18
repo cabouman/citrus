@@ -39,11 +39,15 @@ from citrus import CitrusConfig, citrus_recon, mbir_recon  # noqa: E402
 from citrus.citrus import estimate_regularization  # noqa: E402
 from citrus.recon.mbir_bridge import is_short_scan, make_cone_model, scan_range  # noqa: E402
 from citrus.scatter_solver.config import SolverConfig  # noqa: E402
+from citrus.scatter_solver.cross_section_library import load_spectrum_txt  # noqa: E402
 from citrus.scatter_solver.cross_sections import COMPOUND_NAMES, check_material_names  # noqa: E402
 from citrus.scatter_solver.geometry import ConeGeometry, Grid  # noqa: E402
 from citrus.utilities import (full_field_wlab_geometry, load_dataset,  # noqa: E402
                               nominal_attenuation, plot_history, plot_profiles, plot_slices, set_memory_cap,
                               synthesize_wlab_dataset, wlab_grid, wlab_solver)
+
+SPECTRUM = load_spectrum_txt(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "demo", "spectra",
+                                          "spectrum_125kvp.txt"))  # the sample 125 kVp spectrum
 
 # the data sets and the outputs live next to the demos: demo/input and demo/output
 DEMO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "demo")
@@ -187,7 +191,7 @@ def main() -> None:
         t0 = time.perf_counter()
         data = synthesize_wlab_dataset(args.views, args.delta_voxel, args.I0, not args.no_noise, args.seed, path,
                                        geometry=geometry, device=device, config=truth_config, start_view_angle=start,
-                                       end_view_angle=end)
+                                       end_view_angle=end, spectrum=SPECTRUM)
         print(f"data: synthesized {args.views} views in {time.perf_counter() - t0:.1f} s -> {path}.npz")
     geometry = ConeGeometry(**data["meta"]["geometry"])
     grid = wlab_grid(args.delta_voxel)
@@ -206,7 +210,7 @@ def main() -> None:
           f"{np.median(spr_true):.2f}, max {spr_true.max():.1f}")
 
     # ---- shared: solver, MBIRTORCH model, frozen regularization (scatter-free sinogram), metrics ---------------
-    solver = wlab_solver(args.delta_voxel, config=loop_config, geometry=geometry, device=device)
+    solver = wlab_solver(args.delta_voxel, config=loop_config, geometry=geometry, device=device, spectrum=SPECTRUM)
     print(f"truth solver: sweep {truth_polar}x{truth_azimuthal}, cone {cone_polar}x{cone_azimuthal}; "
           f"loop solver: sweep {loop_config.num_polar}x{loop_config.num_azimuthal}, "
           f"cone {loop_config.cone_num_polar}x{loop_config.cone_num_azimuthal}")

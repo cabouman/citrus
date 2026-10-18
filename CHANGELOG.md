@@ -1,12 +1,40 @@
 # Changelog
 
+## v0.8.0 - 2026-10-17
+
+- **The source spectrum is required.** There is no default spectrum any more: `build_library`, `compute_library`,
+  `build_solver_library`, `sort_material_table` and `transfer_at_eta` take it as their second positional argument, a
+  lazy `ScatterSolver` (`library=None`) and `wlab_solver` / `synthesize_wlab_dataset` without a library need
+  `spectrum=`, and `mass_attenuation_preview` needs it unless `energy_kev` is given; a missing spectrum raises a
+  `ValueError` that names `load_spectrum_txt` and `monoenergetic_spectrum`. `default_spectrum_125kvp` and the package
+  data file are gone (`cross_section_library._spectrum_or_default` is now `spectrum_arrays`); the sample spectra live
+  in `demo/spectra` only.
+- **Monoenergetic sources.** A spectrum of one node, `monoenergetic_spectrum(energy_kev)` or a one-line spectrum
+  file, is a line: the library puts all source photons in the fine bin that holds it and evaluates that bin at the
+  line's energy, so the effective energy and the primary attenuation are exactly those of the line; the group edges
+  come from the "scattered_fluence" (default) or "log" rule ("equal_fluence" raises for a line). `citrus.scatter_solver`
+  exports `monoenergetic_spectrum`.
+- **Tissue names carry their source.** `lung_icrp`, `adipose_icrp`, `bone_cortical_icrp` (ICRP compositions),
+  `muscle_icru44`, `soft_tissue_icru44`, `brain_icru44`, `blood_icru44`, `skin_icru44` (ICRU Report 44) and
+  `trabecular_bone_icru46`, `cartilage_icru46` (Woodard and White 1986 / ICRU Report 46) replace `lung`, `adipose`,
+  `bone`, `muscle`, `soft_tissue`, `brain`, `blood`, `skin`, `trabecular_bone` and `cartilage`, next to NIST's
+  `adipose_icru44`, `bone_cortical_icru44`, `lung_icru44`, ... The default reference materials are `("air",
+  "lung_icrp", "adipose_icrp", "water", "muscle_icru44", "soft_tissue_icru44", "bone_cortical_icrp")`; the WLAB phantom
+  needs `water` and `bone_cortical_icrp`. The library cache keys include the names, so cached libraries rebuild.
+- The conventions page lists the catalogue in one table of name, composition (or NIST source) and nominal density,
+  without the attenuation column.
+- The NIST compounds are part of the one `_COMPOUNDS` table (`NIST_COMPOUND_NAMES` of v0.7.2 is gone) and of
+  the one table of the conventions page.
+- Tests pass the sample 125 kVp spectrum of `demo/spectra` (`tests/conftest.py`); `tests/test_monoenergetic.py`
+  checks the line placement, the exact primary transmission and the group rules.
+
 ## v0.7.2 - 2026-10-17
 
 - **NIST compounds in the material catalogue.** The 48 compounds and mixtures of NIST's X-ray mass attenuation
   coefficient tables (Hubbell and Seltzer, Table 2) are catalogue entries with NIST's densities and mass fractions;
   seven of them were already entries with the same composition (`water`, `muscle`, `soft_tissue`, `brain`, `blood`,
   `pmma`, `polyethylene`), so 41 names are new, from `a150_tissue_equivalent_plastic` to
-  `tissue_equivalent_gas_propane` (`cross_sections.NIST_COMPOUND_NAMES`; the ICRU-44 tissues carry an `_icru44`
+  `tissue_equivalent_gas_propane` (the ICRU-44 tissues carry an `_icru44`
   suffix, `adipose_icru44`, `bone_cortical_icru44`, `lung_icru44`, ...). Every one builds a library on its own.
 - **`aluminium` and `titanium` are element entries** like the other 96 elements (they were duplicated among the
   compounds); aluminium's nominal density is now xraylib's 2.6989 g/cm^3 instead of 2.699.

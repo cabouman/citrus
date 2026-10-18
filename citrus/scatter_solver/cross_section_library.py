@@ -38,7 +38,7 @@ __all__ = [
     "build_library",
     "default_cache_dir",
     "compute_library",
-    "default_spectrum_125kvp",
+    "monoenergetic_spectrum",
     "load_spectrum_txt",
     "make_group_edges",
     "scattered_fluence_spectrum",
@@ -61,7 +61,7 @@ _BUILD_VERSION = "citrus-xsec-4"
 _TWO_PI = 2.0 * math.pi
 # catalogue materials whose transfer curves place the nodes of an adaptive angular table (`angular_map`): low-Z soft
 # tissue and calcium-bearing bone; the same for every library, so that the nodes do not depend on the material set
-ANGULAR_MAP_MATERIALS = ("water", "bone")
+ANGULAR_MAP_MATERIALS = ("water", "bone_cortical_icrp")
 
 # Compositions (formula strings of `parse_formula`: 'a*F1 + b*F2' with a, b mass fractions of the compounds F1, F2;
 # a bare formula is a stoichiometric compound) of every catalogue material, `cross_sections.MATERIAL_CATALOGUE`
@@ -103,7 +103,6 @@ _Q_BREAKPOINTS = np.array(
 )
 
 _SYMBOL_TO_Z = {s: i + 1 for i, s in enumerate(ELEMENT_SYMBOLS)}
-_DEFAULT_SPECTRUM_FILE = "spectrum_125kvp.txt"  # package data, citrus/scatter_solver/data
 
 
 # =============================================================================================
@@ -186,14 +185,15 @@ def _mean_energy(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], 
     edges = make_group_edges(config, spectrum, backend, fine_bin_width_kev=fine_bin_width_kev)
     E, _, bin_low, bin_high = fine_energy_grid(edges, fine_bin_width_kev)
     density = _Spectrum(*spectrum)
+    E = density.place_line(E, bin_low, bin_high)
     photons = density.cumulative_integral(bin_high) - density.cumulative_integral(bin_low)
     if not photons.sum() > 0:
         raise ValueError("spectrum has no photons inside the group structure")
     return float((photons * E).sum() / photons.sum())
 
 
-def sort_material_table(config: SolverConfig, materials: Optional[MaterialTable] = None,
-                        spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+def sort_material_table(config: SolverConfig, materials: Optional[MaterialTable],
+                        spectrum: tuple[np.ndarray, np.ndarray],
                         backend: XcomXraylibBackend | None = None, *,
                         fine_bin_width_kev: float = 0.5) -> tuple[tuple[str, float, str], ...]:
     """Sort a material table by nominal attenuation at the spectrum-mean energy of the build.
@@ -203,10 +203,10 @@ def sort_material_table(config: SolverConfig, materials: Optional[MaterialTable]
 
     Args:
         config (SolverConfig): solver configuration; sets the group structure and so the mean energy.
-        materials (Sequence or None, optional): (name, nominal density in g/cm^3, formula) per material. Defaults to
-            None, the seven default reference materials.
-        spectrum (tuple[np.ndarray, np.ndarray] or None, optional): (energies [K] in keV, photon density per keV [K]).
-            Defaults to None, the default 125 kVp spectrum.
+        materials (Sequence or None): (name, nominal density in g/cm^3, formula) per material; None, the seven
+            default reference materials.
+        spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]); one node is a
+            monoenergetic line.
         backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
         fine_bin_width_kev (float, optional): maximum fine bin width in keV. Defaults to 0.5.
 
@@ -215,8 +215,8 @@ def sort_material_table(config: SolverConfig, materials: Optional[MaterialTable]
     """
     table = _material_table(materials)
     backend = resolve_backend() if backend is None else backend
-    spectrum_arrays = _spectrum_or_default(spectrum)
-    energy = np.array([_mean_energy(config, spectrum_arrays, fine_bin_width_kev, backend)])
+    spectrum_pair = spectrum_arrays(spectrum)
+    energy = np.array([_mean_energy(config, spectrum_pair, fine_bin_width_kev, backend)])
     composition = material_composition(backend, table)
     attenuation = [density * sum(w * float(backend.sigma("total", Z, energy)[0]) for Z, w in composition[name].items())
                    for name, density, _ in table]
@@ -236,8 +236,8 @@ def mass_attenuation_preview(config: SolverConfig, names: Sequence[str],
     Args:
         config (SolverConfig): solver configuration; sets the group structure and so the mean energy.
         names (Sequence[str]): catalogue material names.
-        spectrum (tuple[np.ndarray, np.ndarray] or None, optional): (energies [K] in keV, photon density per keV [K]).
-            Defaults to None, the default 125 kVp spectrum.
+        spectrum (tuple[np.ndarray, np.ndarray] or None, optional): (energies [K] in keV, photon density per keV [K]);
+            required unless ``energy_kev`` is given. Defaults to None.
         backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
         energy_kev (float or None, optional): effective energy in keV. Defaults to None, the spectrum-mean energy.
         fine_bin_width_kev (float, optional): maximum fine bin width in keV. Defaults to 0.5.
@@ -246,8 +246,7 @@ def mass_attenuation_preview(config: SolverConfig, names: Sequence[str],
         (float, np.ndarray): the effective energy in keV and the total mass attenuation [len(names)] in cm^2/g there.
     """
     backend = resolve_backend() if backend is None else backend
-    spectrum_arrays = _spectrum_or_default(spectrum)
-    energy = (_mean_energy(config, spectrum_arrays, fine_bin_width_kev, backend) if energy_kev is None
+    energy = (_mean_energy(config, spectrum_arrays(spectrum), fine_bin_width_kev, backend) if energy_kev is None
               else float(energy_kev))
     table = material_table(tuple(names))
     composition = material_composition(backend, table)
@@ -311,48 +310,54 @@ def load_spectrum_txt(path: str) -> tuple[np.ndarray, np.ndarray]:
     return table[order, 0], table[order, 1]
 
 
-def default_spectrum_125kvp() -> tuple[np.ndarray, np.ndarray]:
-    """Load the default kV source spectrum: W anode, 125 kV, 11 degree take-off, 0.89 mm Ti filter.
+def monoenergetic_spectrum(energy_kev: float) -> tuple[np.ndarray, np.ndarray]:
+    """Return the spectrum of a monoenergetic source: one node, which the library treats as a line at that energy.
 
-    The spectrum is read from the package data file ``citrus/scatter_solver/data/spectrum_125kvp.txt``, 125 nodes at 1,
-    2, ..., 125 keV, and is piecewise linear between them (the same file as ``demo/spectra/spectrum_125kvp.txt``).
+    Args:
+        energy_kev (float): photon energy in keV.
 
     Returns:
-        (np.ndarray, np.ndarray): energies [125] in keV and relative photon density per keV [125], float64.
+        (np.ndarray, np.ndarray): energies [1] in keV and photon weight [1], float64.
     """
-    from importlib import resources
-
-    with resources.as_file(resources.files(__package__).joinpath("data", _DEFAULT_SPECTRUM_FILE)) as path:
-        return load_spectrum_txt(str(path))
+    if not float(energy_kev) > 0:
+        raise ValueError(f"the photon energy must be > 0 keV, got {energy_kev}")
+    return np.array([float(energy_kev)]), np.array([1.0])
 
 
 class _Spectrum:
-    """Piecewise-linear spectral density s(E), zero outside the samples, with exact integrals.
+    """Piecewise-linear spectral density s(E), zero outside the samples, with exact integrals; one sample is a line.
 
     Attributes:
         energies (np.ndarray): [K] sample energies in keV, ascending.
-        weights (np.ndarray): [K] density at the samples, negative values clipped to 0.
+        weights (np.ndarray): [K] density at the samples (the photon weight of a line), negative values clipped to 0.
         cumulative (np.ndarray): [K] integral of s from the first sample to each sample.
+        monoenergetic (bool): True for a single sample, a line at ``energies[0]`` carrying ``weights[0]`` photons.
     """
 
     def __init__(self, energies: np.ndarray, weights: np.ndarray) -> None:
         """Sort the samples and tabulate the cumulative integral.
 
         Args:
-            energies (np.ndarray): [K] sample energies in keV, K >= 2.
-            weights (np.ndarray): [K] spectral density at the samples.
+            energies (np.ndarray): [K] sample energies in keV, K >= 1.
+            weights (np.ndarray): [K] spectral density at the samples, or the photon weight of a single line.
         """
         energies = np.asarray(energies, dtype=np.float64).ravel()
         weights = np.asarray(weights, dtype=np.float64).ravel()
-        if energies.size != weights.size or energies.size < 2:
-            raise ValueError("spectrum needs >= 2 (energy, weight) samples")
+        if energies.size != weights.size or energies.size < 1:
+            raise ValueError("spectrum needs >= 1 (energy, weight) samples")
         o = np.argsort(energies)
         self.energies, self.weights = energies[o], np.clip(weights[o], 0.0, None)
+        self.monoenergetic = energies.size == 1
+        if self.monoenergetic:
+            if not self.weights[0] > 0:
+                raise ValueError("a monoenergetic spectrum needs a positive weight")
+            self.cumulative = np.array([0.0])
+            return
         seg = 0.5 * (self.weights[1:] + self.weights[:-1]) * np.diff(self.energies)
         self.cumulative = np.concatenate([[0.0], np.cumsum(seg)])
 
     def __call__(self, E: np.ndarray) -> np.ndarray:
-        """Evaluate the density by linear interpolation.
+        """Evaluate the density by linear interpolation (0 everywhere for a line, which has no density).
 
         Args:
             E (np.ndarray): energies in keV.
@@ -360,10 +365,12 @@ class _Spectrum:
         Returns:
             np.ndarray: s(E), same shape as ``E``, 0 outside the samples.
         """
+        if self.monoenergetic:
+            return np.zeros_like(np.asarray(E, dtype=np.float64))
         return np.interp(E, self.energies, self.weights, left=0.0, right=0.0)
 
     def cumulative_integral(self, E: np.ndarray) -> np.ndarray:
-        """Return the exact integral of s from minus infinity to E.
+        """Return the exact integral of s from minus infinity to E (a line counts from its energy on).
 
         Args:
             E (np.ndarray): upper limits in keV.
@@ -371,6 +378,8 @@ class _Spectrum:
         Returns:
             np.ndarray: the integrals, same shape as ``E``.
         """
+        if self.monoenergetic:
+            return np.where(np.asarray(E, dtype=np.float64) >= self.energies[0], self.weights[0], 0.0)
         E = np.clip(np.asarray(E, dtype=np.float64), self.energies[0], self.energies[-1])
         i = np.clip(np.searchsorted(self.energies, E, side="right") - 1, 0, self.energies.size - 2)
         x0, x1 = self.energies[i], self.energies[i + 1]
@@ -380,7 +389,7 @@ class _Spectrum:
         return self.cumulative[i] + y0 * t + 0.5 * slope * t * t
 
     def max_energy(self) -> float:
-        """Return the upper end of the support of s, the first zero sample after the last positive one.
+        """Return the upper end of the support of s: the first zero sample after the last positive one, or the line.
 
         Returns:
             float: energy in keV.
@@ -390,6 +399,25 @@ class _Spectrum:
             raise ValueError("spectrum is identically zero")
         j = int(pos[-1])
         return float(self.energies[min(j + 1, self.energies.size - 1)])
+
+    def place_line(self, E: np.ndarray, bin_low: np.ndarray, bin_high: np.ndarray) -> np.ndarray:
+        """Return the fine bin energies with the bin that holds a monoenergetic line evaluated at the line.
+
+        Args:
+            E (np.ndarray): [K] fine bin midpoints in keV.
+            bin_low (np.ndarray): [K] lower bin edges in keV.
+            bin_high (np.ndarray): [K] upper bin edges in keV.
+
+        Returns:
+            np.ndarray: [K] energies in keV, ``E`` itself unless the spectrum is a line.
+        """
+        if not self.monoenergetic:
+            return E
+        line = self.energies[0]
+        inside = (bin_low < line) & (line <= bin_high)
+        if not inside.any():
+            raise ValueError(f"the line at {line} keV lies outside the group structure")
+        return np.where(inside, line, E)
 
 
 def _equal_area_edges(grid: np.ndarray, cumulative: np.ndarray, G: int, energy_min: float,
@@ -454,6 +482,9 @@ def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarra
         raise ValueError(f"spectrum max energy {energy_max} <= energy_min_kev {energy_min}")
     method = config.group_edges_method
     if method == "equal_fluence":
+        if spectrum_density.monoenergetic:
+            raise ValueError('group_edges_method "equal_fluence" needs a continuous spectrum; a monoenergetic source '
+                             'uses "scattered_fluence" or "log" (or explicit group_edges_kev)')
         grid = np.linspace(energy_min, energy_max, 200001)
         cumulative = (spectrum_density.cumulative_integral(grid)
                       - spectrum_density.cumulative_integral(np.array([energy_min]))[0])
@@ -773,24 +804,26 @@ class BuildInfo:
     rayleigh_eta: np.ndarray | None = None
 
 
-def _spectrum_or_default(spectrum: tuple[np.ndarray, np.ndarray] | None) -> tuple[np.ndarray, np.ndarray]:
-    """Return a spectrum as flat float64 arrays, or the default 125 kVp spectrum for None.
+def spectrum_arrays(spectrum: tuple[np.ndarray, np.ndarray] | None) -> tuple[np.ndarray, np.ndarray]:
+    """Return a spectrum as flat float64 arrays; None raises, there is no default spectrum.
 
     Args:
-        spectrum (tuple[np.ndarray, np.ndarray] or None): (energies [K] in keV, photon density per keV [K]).
+        spectrum (tuple[np.ndarray, np.ndarray] or None): (energies [K] in keV, photon density per keV [K]); one node
+            is a monoenergetic line.
 
     Returns:
         (np.ndarray, np.ndarray): energies [K] in keV and photon densities per keV [K], float64.
     """
     if spectrum is None:
-        spectrum = default_spectrum_125kvp()
+        raise ValueError("a source spectrum is required: (energies [K] in keV, photon density per keV [K]); load a "
+                         "two-column file with load_spectrum_txt, or use monoenergetic_spectrum(energy_kev)")
     e, w = spectrum
     return np.asarray(e, dtype=np.float64).ravel(), np.asarray(w, dtype=np.float64).ravel()
 
 
 def compute_library(
     config: SolverConfig,
-    spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+    spectrum: tuple[np.ndarray, np.ndarray],
     backend: XcomXraylibBackend | None = None,
     *,
     fine_bin_width_kev: float = 0.5,
@@ -802,8 +835,8 @@ def compute_library(
     Args:
         config (SolverConfig): solver configuration; uses num_groups, group_edges_kev, group_edges_method,
             grouping_object_size_cm, grouping_medium, energy_min_kev, legendre_order, num_eta_table, angular_table_grid.
-        spectrum (tuple[np.ndarray, np.ndarray] or None, optional): (energies [K] in keV, photon density per keV [K]).
-            Defaults to None, the default 125 kVp spectrum.
+        spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]); one node is a
+            monoenergetic line.
         backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
         fine_bin_width_kev (float, optional): maximum fine energy bin width in keV. Defaults to 0.5.
         gauss_legendre_nodes (int, optional): Gauss-Legendre nodes per angular piece. Defaults to 32.
@@ -814,7 +847,7 @@ def compute_library(
         (MultigroupLibrary, BuildInfo): the library with float64 CPU tensors and the build diagnostics.
     """
     backend = resolve_backend() if backend is None else backend
-    spectrum_energies, spectrum_weights = _spectrum_or_default(spectrum)
+    spectrum_energies, spectrum_weights = spectrum_arrays(spectrum)
     spectrum_density = _Spectrum(spectrum_energies, spectrum_weights)
     edges = make_group_edges(config, (spectrum_energies, spectrum_weights), backend,
                              fine_bin_width_kev=fine_bin_width_kev)
@@ -828,6 +861,7 @@ def compute_library(
 
     # ---- energy quadrature ----------------------------------------------------------------
     E, fine_groups, bin_low, bin_high = fine_energy_grid(edges, fine_bin_width_kev)
+    E = spectrum_density.place_line(E, bin_low, bin_high)  # a monoenergetic line is evaluated at its energy
     K = E.size
     # exact spectrum photons per fine bin [K]
     photons_per_bin = spectrum_density.cumulative_integral(bin_high) - spectrum_density.cumulative_integral(bin_low)
@@ -1162,7 +1196,7 @@ def angular_map(q_nodes: np.ndarray, compton_shapes: np.ndarray, rayleigh_shapes
     return u
 
 
-def transfer_at_eta(config: SolverConfig, eta: np.ndarray, spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+def transfer_at_eta(config: SolverConfig, eta: np.ndarray, spectrum: tuple[np.ndarray, np.ndarray],
                     backend: Optional[XcomXraylibBackend] = None, *, fine_bin_width_kev: float = 0.5,
                     gauss_legendre_nodes: int = 32, materials: Optional[MaterialTable] = None) -> np.ndarray:
     """Return the exact per-steradian transfer at the cosines eta of the library that ``compute_library`` builds.
@@ -1172,8 +1206,8 @@ def transfer_at_eta(config: SolverConfig, eta: np.ndarray, spectrum: tuple[np.nd
     Args:
         config (SolverConfig): solver configuration, as for ``compute_library``.
         eta (np.ndarray): [n] cosines of the scattering angle.
-        spectrum (tuple[np.ndarray, np.ndarray] or None, optional): (energies [K] in keV, photon density per keV [K]).
-            Defaults to None, the default 125 kVp spectrum.
+        spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]); one node is a
+            monoenergetic line.
         backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
         fine_bin_width_kev (float, optional): maximum fine energy bin width in keV. Defaults to 0.5.
         gauss_legendre_nodes (int, optional): Gauss-Legendre nodes per angular piece. Defaults to 32.
@@ -1184,7 +1218,7 @@ def transfer_at_eta(config: SolverConfig, eta: np.ndarray, spectrum: tuple[np.nd
         np.ndarray: [M, G, G, n] transfer in cm^2/g/sr.
     """
     backend = resolve_backend() if backend is None else backend
-    spectrum_energies, spectrum_weights = _spectrum_or_default(spectrum)
+    spectrum_energies, spectrum_weights = spectrum_arrays(spectrum)
     spectrum_density = _Spectrum(spectrum_energies, spectrum_weights)
     edges = make_group_edges(config, (spectrum_energies, spectrum_weights), backend,
                              fine_bin_width_kev=fine_bin_width_kev)
@@ -1193,6 +1227,7 @@ def transfer_at_eta(config: SolverConfig, eta: np.ndarray, spectrum: tuple[np.nd
                                 fine_bin_width_kev=fine_bin_width_kev)
     names = tuple(n for n, _, _ in table)
     E, fine_groups, bin_low, bin_high = fine_energy_grid(edges, fine_bin_width_kev)
+    E = spectrum_density.place_line(E, bin_low, bin_high)
     photons_per_bin = spectrum_density.cumulative_integral(bin_high) - spectrum_density.cumulative_integral(bin_low)
     within_group_weight, _ = _within_group_weights(config, (spectrum_energies, spectrum_weights), backend, E,
                                                    fine_groups, bin_low, bin_high, photons_per_bin, G,
@@ -1258,7 +1293,7 @@ def _cache_key(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], ba
 
 def build_library(
     config: SolverConfig,
-    spectrum: tuple[np.ndarray, np.ndarray] | None = None,
+    spectrum: tuple[np.ndarray, np.ndarray],
     cache_dir: str | None = "default",
     *,
     fine_bin_width_kev: float = 0.5,
@@ -1273,8 +1308,8 @@ def build_library(
 
     Args:
         config (SolverConfig): solver configuration, as for ``compute_library``.
-        spectrum (tuple[np.ndarray, np.ndarray] or None, optional): (energies [K] in keV, photon density per keV [K]).
-            Defaults to None, the default 125 kVp spectrum.
+        spectrum (tuple[np.ndarray, np.ndarray]): (energies [K] in keV, photon density per keV [K]); one node is a
+            monoenergetic line.
         cache_dir (str or None, optional): cache folder; "default" for ``default_cache_dir()``, None for no cache.
             Defaults to "default".
         fine_bin_width_kev (float, optional): maximum fine energy bin width in keV. Defaults to 0.5.
@@ -1288,11 +1323,11 @@ def build_library(
     if cache_dir == "default":
         cache_dir = default_cache_dir()
     backend = resolve_backend()
-    spectrum_arrays = _spectrum_or_default(spectrum)
-    table = sort_material_table(config, materials, spectrum_arrays, backend, fine_bin_width_kev=fine_bin_width_kev)
+    spectrum_pair = spectrum_arrays(spectrum)
+    table = sort_material_table(config, materials, spectrum_pair, backend, fine_bin_width_kev=fine_bin_width_kev)
     path = None
     if cache_dir is not None:
-        key = _cache_key(config, spectrum_arrays, backend.name, fine_bin_width_kev, gauss_legendre_nodes, table)
+        key = _cache_key(config, spectrum_pair, backend.name, fine_bin_width_kev, gauss_legendre_nodes, table)
         path = os.path.join(cache_dir, f"mglib_{key}.pt")
         if os.path.isfile(path):
             try:
@@ -1303,7 +1338,7 @@ def build_library(
                 return library
             except (KeyError, TypeError, ValueError) as exc:
                 warnings.warn(f"rebuilding the library cache {path}: {exc}", RuntimeWarning)
-    library, _ = compute_library(config, spectrum_arrays, backend, fine_bin_width_kev=fine_bin_width_kev,
+    library, _ = compute_library(config, spectrum_pair, backend, fine_bin_width_kev=fine_bin_width_kev,
                                  gauss_legendre_nodes=gauss_legendre_nodes, materials=table)
     if path is not None:
         os.makedirs(cache_dir, exist_ok=True)  # type: ignore[arg-type]
