@@ -16,9 +16,9 @@ downloads the NIST XCOM photon data and builds the library; both are cached), ra
 40 cm water prism with lung, air and bone inserts) on a 1 cm grid, solves one view with the default configuration and
 shows the primary signal, the scatter signal and the scatter fraction on the detector.
 
-``demo_2_citrus.py`` defines every setting in a parameter block at the top: the spectrum file (two columns, energy in
-keV and relative photons per keV; the example is the sample 125 kVp spectrum of ``demo/spectra``), the reference
-materials, the
+``demo_2_citrus.py`` defines every setting in a parameter block at the top: the spectrum (loaded from a two-column
+file, energy in keV and relative photons per keV, the sample 125 kVp spectrum of ``demo/spectra``, or a monoenergetic
+line from ``monoenergetic_spectrum``), the reference materials, the
 detector panel and the source distances, the voxel pitch of the WLAB phantom, the number of views and the angular
 range, the flat field, the CITRUS loop settings (outer iterations, ``mbir_iterations_per_outer_iteration``,
 ``scatter_view_stride``) and the

@@ -21,10 +21,12 @@ from citrus.utilities import (WlabPhantom, load_dataset, plot_profiles, plot_sli
                               synthesize_cone_beam_data, wlab_grid)
 
 # ---- Parameters -----------------------------------------------------------------------------------------------
-# Source spectrum: the path of a text file of two columns, photon energy in keV and relative photons per keV ('#'
-# starts a comment).  demo/spectra has a 125 kVp tube spectrum and a 6 MV linac spectrum (spectrum_6mv.txt).
+# Source spectrum, (energies in keV, relative photons per keV), with a short name for the data file.  Load a text
+# file of two columns ('#' starts a comment; demo/spectra has a 125 kVp tube spectrum and a 6 MV linac spectrum,
+# spectrum_6mv.txt), or use a monoenergetic source (from citrus.scatter_solver import monoenergetic_spectrum):
+# spectrum, spectrum_name = monoenergetic_spectrum(100.0), "100kev".
 demo_dir = os.path.dirname(os.path.abspath(__file__))
-spectrum_file = os.path.join(demo_dir, "spectra", "spectrum_125kvp.txt")
+spectrum, spectrum_name = load_spectrum_txt(os.path.join(demo_dir, "spectra", "spectrum_125kvp.txt")), "125kvp"
 materials = ["air", "lung_icrp", "adipose_icrp", "water", "muscle_icru44", "soft_tissue_icru44",
              "bone_cortical_icrp"]  # reference materials of the density model
 num_det_rows, num_det_channels = 184, 150  # detector panel size in pixels
@@ -50,15 +52,13 @@ geometry = ConeGeometry(source_iso_dist=source_iso_dist, source_detector_dist=so
                         delta_det_row=pixel_pitch, delta_det_channel=pixel_pitch)
 grid = wlab_grid(delta_voxel)
 angles = np.radians(np.linspace(start_angle, end_angle, num_views, endpoint=False))
-spectrum = load_spectrum_txt(spectrum_file)
 config = SolverConfig(materials=tuple(materials), transport_cell_cm=transport_cell_cm, num_groups=num_groups,
                       legendre_order=legendre_order)
 detector, grid_response = ideal_counting_response(), no_grid()  # photon-counting detector, no anti-scatter grid
 
 # ---- Data: load them, or synthesize them once (about 2 minutes on a GPU) ---------------------------------------
 # The file name records the views, the voxel pitch, the angles and the spectrum: delete the file after changing others.
-name = (f"wlab_{num_views}v_{delta_voxel:g}cm_{start_angle:g}-{end_angle:.1f}deg_"
-        f"{os.path.splitext(os.path.basename(spectrum_file))[0]}").replace(".", "p")
+name = f"wlab_{num_views}v_{delta_voxel:g}cm_{start_angle:g}-{end_angle:.1f}deg_{spectrum_name}".replace(".", "p")
 path = os.path.join(demo_dir, "input", name)
 if os.path.exists(path + ".npz"):
     data = load_dataset(path)
