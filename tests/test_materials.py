@@ -50,7 +50,7 @@ def libraries():
     try:
         return (build_solver_library(SolverConfig(), materials=_two_material_table()),
                 build_solver_library(SolverConfig()))
-    except Exception as exc:  # no cached library and no XrayPhysics
+    except Exception as exc:  # no cached library and no photon data
         pytest.skip(f"real library unavailable: {exc}")
 
 
@@ -96,14 +96,15 @@ def test_material_table_and_synthetic_libraries():
 
 
 def test_library_build_order_and_cache(tmp_path, monkeypatch):
-    """The seven-material library from XrayPhysics (small config): names, nominal densities, shapes; its water and bone
-    rows equal those of a two-material (water, bone) table to summation order; distinct cache keys (the two-material
-    caches of citrus < 0.1.0 are never picked up), cache hit on rebuild, the order check refuses a crossing table."""
+    """The seven-material library from the photon data (small config): names, nominal densities, shapes; its water and
+    bone rows equal those of a two-material (water, bone) table to summation order; distinct cache keys (the
+    two-material caches of citrus < 0.1.0 are never picked up), cache hit on rebuild, the order check refuses a
+    crossing table."""
     cross_section_library = pytest.importorskip("citrus.scatter_solver.cross_section_library")
     try:
         cross_section_library.resolve_backend()
     except Exception as exc:
-        pytest.skip(f"XrayPhysics unavailable ({exc})")
+        pytest.skip(f"photon data unavailable ({exc})")
     config = SolverConfig(num_groups=3, legendre_order=2, num_eta_table=51)
     library = cross_section_library.build_library(config, None, cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
                                                   gauss_legendre_nodes=8)
@@ -119,11 +120,12 @@ def test_library_build_order_and_cache(tmp_path, monkeypatch):
         assert torch.allclose(a, b, rtol=1e-13, atol=1e-16), k
     assert torch.equal(wb.fine_weight, library.fine_weight) and torch.equal(wb.group_energy, library.group_energy)
     # the cache key depends on the table and on the build version (2-material keys of citrus 0.0.x differ)
-    spec = cross_section_library._spectrum_or_default(None, cross_section_library.resolve_backend())
-    k7 = cross_section_library._cache_key(config, spec, "xrayphysics", 2.0, 8)
-    assert k7 != cross_section_library._cache_key(config, spec, "xrayphysics", 2.0, 8, _two_material_table())
+    spec = cross_section_library._spectrum_or_default(None)
+    k7 = cross_section_library._cache_key(config, spec, "xcom-xraylib", 2.0, 8)
+    assert k7 != cross_section_library._cache_key(config, spec, "xcom-xraylib", 2.0, 8, _two_material_table())
+    assert k7 != cross_section_library._cache_key(config, spec, "xrayphysics", 2.0, 8)  # the backend is in the key
     monkeypatch.setattr(cross_section_library, "_BUILD_VERSION", "citrus-xsec-1")
-    assert cross_section_library._cache_key(config, spec, "xrayphysics", 2.0, 8) != k7
+    assert cross_section_library._cache_key(config, spec, "xcom-xraylib", 2.0, 8) != k7
     monkeypatch.undo()
 
     def boom(*a, **k):
@@ -163,7 +165,8 @@ def test_material_order_real_library(libraries):
     a = library.nominal_density[:, None] * library.fine_mu_t  # nominal attenuation at every fine energy (10-125 keV)
     assert bool((torch.diff(a, dim=0) > 0).all())
     mu = nominal_attenuation(library)  # at E_eff = 63.03 keV
-    np.testing.assert_allclose(mu.numpy(), [0.00022, 0.0520, 0.1846, 0.2013, 0.2102, 0.2122, 0.5366], atol=6e-5)
+    # XCOM + xraylib data (citrus >= 0.7.0)
+    np.testing.assert_allclose(mu.numpy(), [0.00022, 0.0520, 0.1847, 0.2014, 0.2102, 0.2123, 0.5365], atol=6e-5)
     assert float(mu[WATER]) == pytest.approx(float(mass_attenuation_at(wb, effective_energy(wb))[0]), rel=1e-12)
     # muscle (1.05) is below soft tissue (1.06) at every energy: ratio 0.986-0.991
     r = library.fine_mu_t[4] * 1.05 / (library.fine_mu_t[5] * 1.06)

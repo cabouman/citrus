@@ -22,7 +22,9 @@ Package layout
     ``geometry``                  ``Grid``, ``ConeGeometry`` (MBIRTORCH conventions)
     ``cross_sections``            the material catalogue, the multigroup library container, per-voxel coefficients,
                                   a synthetic test library
-    ``cross_section_library``     the library builder from XrayPhysics (EPDL97) data, cached on disk
+    ``photon_data``               the photon data: NIST XCOM cross sections (downloaded on first use), xraylib
+                                  angular distributions
+    ``cross_section_library``     the library builder from those data, cached on disk
     ``source``, ``detector``      point source with collimation; detector and anti-scatter-grid responses
     ``angular_quadrature``        direction sets, real spherical harmonics, the scattering-source operator
     ``linear_discontinuous_cell`` the linear-discontinuous cell equations and their closed-form solve
@@ -48,9 +50,9 @@ Scope of the solver
 -------------------
 
 * Photon energies from kV imaging to MV beams (default 10-125 keV in 6 groups whose edges follow the scattered
-  photons, any loaded spectrum); Compton scattering (no Doppler broadening) and Rayleigh scattering from EPDL97 via
-  XrayPhysics, with an angular table whose nodes follow the forward peaks; photoelectric absorption (and pair
-  production at MV) as local deposition.
+  photons, any loaded spectrum); Compton scattering (no Doppler broadening) and Rayleigh scattering with the cross
+  sections of NIST XCOM and the angular distributions of xraylib, with an angular table whose nodes follow the forward
+  peaks; photoelectric absorption (and pair production at MV) as local deposition.
 * Reference materials chosen from a catalogue of compounds, tissues and all elements (``SolverConfig.materials``,
   :doc:`conventions`, "Materials"); every voxel is a mixture of at most two of them, the two whose nominal
   attenuations bracket its attenuation.

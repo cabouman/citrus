@@ -10,7 +10,9 @@ Modules
                            resampling between grids
     cross_sections         material catalogue (MATERIAL_CATALOGUE), MultigroupLibrary container, per-voxel
                            coefficients, synthetic test library
-    cross_section_library  library builder from XrayPhysics (EPDL97) data, cached on disk
+    photon_data            photon interaction data: NIST XCOM cross sections (downloaded on first use) and xraylib
+                           angular shapes
+    cross_section_library  multigroup library builder from those data, cached on disk
     source, detector       point source with collimation; detector and anti-scatter-grid responses
     angular_quadrature     direction sets, real spherical harmonics, scattering-source operator
     linear_discontinuous_cell  linear-discontinuous cell equations and their closed-form solve

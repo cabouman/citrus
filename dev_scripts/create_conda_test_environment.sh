@@ -20,6 +20,8 @@ conda activate "$NAME"
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || return 1
 pip install -e ".[test]"
+# the NIST XCOM photon data: downloaded once into the citrus cache (or found through $CITRUS_XCOM_ARCHIVE)
+python -c "from citrus.scatter_solver.photon_data import resolve_backend; print(resolve_backend().reason)"
 cd dev_scripts || return 1
 
 echo

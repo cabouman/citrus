@@ -5,7 +5,7 @@ Usage:
                                                   [--out _cache/runs/bench_uncollided_kernel] [--skip-image]
                                                   [--repeats 15]
 
-Setting: WLAB phantom (utilities.wlab_setup), angle 0, real XrayPhysics library (G = 6, 2001-point eta table),
+Setting: WLAB phantom (utilities.wlab_setup), angle 0, real XCOM / xraylib library (G = 6, 2001-point eta table),
 CsI 0.6 mm response, no grid, float32, CUDA, caching-allocator cap 5000 MiB (Windows spills VRAM
 overflow into system RAM silently). phi_uncollided from the Siddon upstream operator.
 

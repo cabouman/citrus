@@ -296,7 +296,7 @@ def test_fc_sampling_float32_accumulation(rho, monkeypatch):
 # ---- real library (slow) ---------------------------------------------------------------------------------------
 
 @pytest.mark.skipif(os.environ.get("CITRUS_SLOW_TESTS") != "1", reason="set CITRUS_SLOW_TESTS=1 (builds the "
-                    "XrayPhysics library, cached in the library cache)")
+                    "library, cached in the library cache)")
 def test_real_library_wlab(rho):
     from citrus.scatter_solver.scatter_solver import build_solver_library
 

@@ -34,33 +34,33 @@ iteration.
 
 ## The scatter solver
 
-`citrus.scatter_solver` is a deterministic LBTE solver for kV photons: multigroup in energy (Compton and Rayleigh cross
-sections from EPDL97 via XrayPhysics), discrete ordinates in angle with real spherical harmonics, linear-discontinuous
-finite elements on a grid of transport cells swept in wavefront order, an analytic (exact-in-energy) uncollided fluence
-and first-collision source on a few quadrature points per cell, source iteration over collision order, and a
-collapsed-cone projection of the last-collided source onto the detector with a finite-cone footprint, detector and
-anti-scatter-grid responses. It runs in PyTorch with fused Triton kernels (ray tracing, first-collision source, sweep).
+`citrus.scatter_solver` is a deterministic LBTE solver for kV and MV photons: multigroup in energy (cross sections of
+NIST XCOM, Compton and Rayleigh angular distributions of xraylib), discrete ordinates in angle with real spherical
+harmonics, linear-discontinuous finite elements on a grid of transport cells swept in wavefront order, an analytic
+(exact-in-energy) uncollided fluence and first-collision source on a few quadrature points per cell, source iteration
+over collision order, and a collapsed-cone projection of the last-collided source onto the detector with a finite-cone
+footprint, detector and anti-scatter-grid responses. It runs in PyTorch with fused Triton kernels (ray tracing,
+first-collision source, sweep).
 
 ## Installation
 
 ```bash
 git clone git@github.com:cabouman/citrus.git
 cd citrus
-pip install .                  # numpy, scipy, torch, matplotlib, mbirtorch
-pip install ".[physics,gpu]"   # optional: XrayPhysics and Triton (see below)
+pip install .                  # numpy, scipy, torch, matplotlib, mbirtorch, xraylib
+pip install ".[gpu]"           # optional: Triton (see below)
 ```
 
-Install PyTorch first if you need a specific CUDA build.
+Install PyTorch first if you need a specific CUDA build. Every dependency installs from wheels; nothing is compiled.
 
-- **XrayPhysics** (`physics` extra) builds the multigroup cross-section library (once; it is cached in
-  `~/.cache/citrus` or `$CITRUS_CACHE_DIR`). It is a C++ library and needs a C++ toolchain and CMake: on Linux gcc or
-  clang, on Windows Visual Studio with the C++ build tools and CMake on `PATH`. With CMake 4 or newer set
-  `CMAKE_POLICY_VERSION_MINIMUM=3.5` in the environment before installing (XrayPhysics declares an older minimum
-  CMake version, which CMake 4 otherwise rejects), or use a CMake below 4. Without root access the toolchain can come
-  from conda: `conda create -n citrus -c conda-forge python=3.11 git cmake make c-compiler cxx-compiler`
-  (`dev_scripts/wsl_install_test.sh` runs the whole installation that way). **Without XrayPhysics the
-  cross-section library cannot be built**, so the demos and real reconstructions need it (or a cached library); the
-  test suite uses a synthetic library and skips the tests that need the real one.
+- **Photon data.** The multigroup cross-section library is built from the photon cross sections of NIST XCOM and the
+  Compton and Rayleigh angular distributions of [xraylib](https://github.com/tschoonj/xraylib) (installed with the
+  package). The XCOM tables are not shipped with CITRUS: on first use it downloads NIST's archive (173 kB, from
+  `https://physics.nist.gov/PhysRefData/Xcom/XCOM.tar.gz`, checked against a SHA-256) into `~/.cache/citrus/xcom` (or
+  `$CITRUS_CACHE_DIR/xcom`) and parses it once; built libraries are cached there too. On a machine without internet
+  access download that file elsewhere and set `CITRUS_XCOM_ARCHIVE` to its path (or to the folder it unpacks to).
+  Without the XCOM data the cross-section library cannot be built (a cached library still loads); the test suite uses
+  a synthetic library and skips the tests that need the real one.
 - **Triton** (`gpu` extra: `triton` on Linux, `triton-windows` on Windows) enables the fused kernels on CUDA. Without
   it, or on the CPU, the PyTorch reference paths are used automatically (`CITRUS_DISABLE_TRITON=1` forces them).
 
@@ -97,8 +97,8 @@ solver = wlab_solver(delta_voxel, geometry=geometry)       # ScatterSolver with 
 recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, CitrusConfig(num_outer_iterations=10))
 ```
 
-Tests: `dev_scripts/run_tests.sh` or `python -m pytest -q` (GPU, Triton, MBIRTORCH and XrayPhysics tests are skipped
-when unavailable).
+Tests: `dev_scripts/run_tests.sh` or `python -m pytest -q` (GPU, Triton and MBIRTORCH tests, and those that need the
+XCOM data, are skipped when unavailable).
 
 `CHANGELOG.md` lists the changes of every version, including the old -> new table of renamed settings.
 
@@ -111,10 +111,15 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.6.0},
+  note = {Version 0.7.0},
   year = 2026
 }
 ```
 
 GitHub's "Cite this repository" button on the repository page generates the
 citation from `CITATION.cff`.
+
+The photon data come from NIST XCOM (M.J. Berger, J.H. Hubbell, S.M. Seltzer, J. Chang, J.S. Coursey, R. Sukumar,
+D.S. Zucker and K. Olsen, *XCOM: Photon Cross Sections Database*, NIST Standard Reference Database 8,
+https://physics.nist.gov/xcom) and xraylib (T. Schoonjans et al., *The xraylib library for X-ray-matter interactions.
+Recent developments*, Spectrochimica Acta Part B 66, 776-784 (2011)); please cite them too.

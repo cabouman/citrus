@@ -3,3 +3,4 @@ scipy
 torch
 matplotlib
 mbirtorch>=0.0.2,<0.2
+xraylib>=4.1

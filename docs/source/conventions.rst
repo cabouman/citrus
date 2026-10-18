@@ -7,7 +7,8 @@ Units
 -----
 
 * Length: cm. Energy: keV. Attenuation: 1/cm. Mass coefficients: cm^2/g. Density: g/cm^3.
-* Angles: radians everywhere inside the package (degrees only at the XrayPhysics call boundary and in demo options).
+* Angles: radians everywhere inside the package (degrees only in demo options); scattering angles enter the cross
+  sections as :math:`\eta = \cos	heta`.
 * Source strength: 1 photon per steradian at the focal spot (spectrum fractions sum to 1).
 * Angular fluence: photons / (cm^2 sr) per source photon/sr. Scatter and primary images are reported both as photon
   fluence at the panel (photons/cm^2) and as detector signal (keV deposited per cm^2) after the detector / grid
@@ -104,21 +105,21 @@ spectrum mean of the default 125 kVp spectrum (63 keV). The first seven are the 
      - :math:`\rho^{nom}` (g/cm³)
      - :math:`\mu` at 63 keV (1/cm)
    * - ``air``
-     - XrayPhysics ``air``
+     - dry air: N₂, O₂, Ar, CO₂ (the volume percentages read as mass fractions)
      - 0.0012
      - 0.00022
    * - ``lung``
-     - XrayPhysics ``lung``
+     - ICRP lung (without the Ca, Fe, Zn traces)
      - 0.26
      - 0.0520
    * - ``adipose``
-     - XrayPhysics ``adipose_tissue``
+     - ICRP adipose tissue
      - 0.95
-     - 0.1846
+     - 0.1847
    * - ``water``
      - H₂O
      - 1.0
-     - 0.2013
+     - 0.2014
    * - ``muscle``
      - ICRU-44 skeletal muscle
      - 1.05
@@ -126,11 +127,11 @@ spectrum mean of the default 125 kVp spectrum (63 keV). The first seven are the 
    * - ``soft_tissue``
      - ICRU-44 soft tissue
      - 1.06
-     - 0.2122
+     - 0.2123
    * - ``bone``
-     - XrayPhysics ``bone_cortical`` (ICRP cortical bone)
+     - ICRP cortical bone
      - 1.85
-     - 0.5366
+     - 0.5365
    * - ``trabecular_bone``
      - spongiosa, Woodard and White (1986) / ICRU-46
      - 1.18
@@ -152,30 +153,31 @@ spectrum mean of the default 125 kVp spectrum (63 keV). The first seven are the 
      - 1.09
      - 0.2160
    * - ``pmma``
-     - XrayPhysics ``PMMA`` (C₅H₈O₂)
+     - PMMA (C₅H₈O₂)
      - 1.18
      - 0.2230
    * - ``polyethylene``
-     - XrayPhysics ``Polyethylene`` (C₂H₄)
+     - polyethylene (C₂H₄)
      - 0.94
      - 0.1826
    * - ``aluminium``
      - Al
      - 2.699
-     - 0.7034
+     - 0.7027
    * - ``titanium``
      - Ti
      - 4.54
-     - 3.0928
+     - 3.0919
    * - ``carbon_fibre``
      - carbon-fibre epoxy laminate (couch top): 60 % fibre volume, 0.692 C + 0.308 C₂₁H₂₄O₄ by mass
      - 1.56
      - 0.2756
 
-After these compounds the catalogue holds every element Z = 1..100 under its English (IUPAC) name, ``hydrogen`` to
-``fermium`` (for example ``lead``, 11.35 g/cm³, and ``tungsten``, 19.3 g/cm³; aluminium and titanium are the entries
-above), with the element as the composition and the standard-state density of XrayPhysics' element table (the NIST
-densities of Hubbell and Seltzer, NISTIR 5632; gases at 20 °C and 1 atm) as the nominal density.
+After these compounds the catalogue holds every element Z = 1..98 under its English (IUPAC) name, ``hydrogen`` to
+``californium`` (for example ``lead``, 11.35 g/cm³, and ``tungsten``, 19.3 g/cm³; aluminium and titanium are the
+entries above), with the element as the composition and xraylib's element density (the NIST densities of Hubbell and
+Seltzer, NISTIR 5632; gases at 20 °C and 1 atm) as the nominal density. xraylib has no scattering functions for
+Z = 99, 100.
 
 * Reference materials: the library is built for ``SolverConfig.materials`` (at least two catalogue names, any order),
   sorted by increasing attenuation at the nominal density (the order must hold at every library energy). Default: the

@@ -1,7 +1,7 @@
 """Multigroup cross-section library: container, per-voxel coefficients and a synthetic test library.
 
-The container is filled by `cross_section_library.build_library` from XrayPhysics (EPDL97) data;
-`synthetic_library` gives a fake but self-consistent library for tests that must not depend on XrayPhysics.
+The container is filled by `cross_section_library.build_library` from NIST XCOM and xraylib data (`photon_data`);
+`synthetic_library` gives a fake but self-consistent library for tests that must not depend on those data.
 
 Besides the group constants the library carries a FINE-ENERGY attenuation table (fine_energy,
 fine_mu_t, fine_weight, fine_group). Because mu_t(E; r) = sum_m rho_m(r) m_m(E) is linear in the
@@ -17,44 +17,50 @@ the uncollided fluence and the primary image (docs/source/design_notes.rst, "Cro
 Materials
 ---------
 `MATERIAL_CATALOGUE` maps a material name to (nominal density g/cm^3, composition) for every material the library
-builder knows. The composition is an XrayPhysics material string (`cross_section_library.parse_formula`): a chemical
+builder knows. The composition is a material string (`cross_section_library.parse_formula`): a chemical
 formula ('H2O', a stoichiometric compound) or 'a*F1 + b*F2 + ...' with a, b the mass fractions of the elements or
 compounds F1, F2 (normalized to sum 1). The NOMINAL density is the density of the material as it occurs in the body or
 in the scanner (the pure-material points of the density model). Nominal attenuation mu = rho^nom mu/rho at the
 spectrum-mean energy 63.03 keV of the default 125 kVp spectrum is listed for orientation:
 
     name             density  mu (1/cm)  composition source
-    air              0.0012   0.00022    XrayPhysics 'air' (dry air: N2, O2, Ar, CO2)
-    lung             0.26     0.0520     XrayPhysics 'lung' (density of the WLAB lung; XrayPhysics lists 0.25)
-    adipose          0.95     0.1846     XrayPhysics 'adipose_tissue' (ICRP adipose tissue; XrayPhysics lists 0.92)
-    water            1.0      0.2013     H2O
+    air              0.0012   0.00022    dry air: N2, O2, Ar, CO2 (the volume percentages read as mass fractions)
+    lung             0.26     0.0520     ICRP lung without the Ca, Fe, Zn traces (density of the WLAB lung)
+    adipose          0.95     0.1847     ICRP adipose tissue (NIST lists 0.92 g/cm^3)
+    water            1.0      0.2014     H2O
     muscle           1.05     0.2102     ICRU Report 44 (1989), skeletal muscle
-    soft_tissue      1.06     0.2122     ICRU Report 44 (1989), soft tissue
-    bone             1.85     0.5366     XrayPhysics 'bone_cortical' (ICRP cortical bone)
+    soft_tissue      1.06     0.2123     ICRU Report 44 (1989), soft tissue
+    bone             1.85     0.5365     ICRP cortical bone
     trabecular_bone  1.18     0.2697     Woodard and White (1986) Br J Radiol 59:1209, skeleton spongiosa (ICRU
                                          Report 46, 1992)
     brain            1.04     0.2092     ICRU Report 44 (1989), brain (grey / white matter)
     blood            1.06     0.2130     ICRU Report 44 (1989), whole blood
     cartilage        1.10     0.2234     Woodard and White (1986), cartilage (ICRU Report 46, 1992)
     skin             1.09     0.2160     ICRU Report 44 (1989), skin
-    pmma             1.18     0.2230     XrayPhysics 'PMMA' (C5H8O2, polymethyl methacrylate)
-    polyethylene     0.94     0.1826     XrayPhysics 'Polyethylene' (C2H4)
-    aluminium        2.699    0.7034     Al (NIST density)
-    titanium         4.54     3.0928     Ti (NIST density)
+    pmma             1.18     0.2230     C5H8O2, polymethyl methacrylate
+    polyethylene     0.94     0.1826     C2H4
+    aluminium        2.699    0.7027     Al (NIST density)
+    titanium         4.54     3.0919     Ti (NIST density)
     carbon_fibre     1.56     0.2756     carbon-fibre epoxy composite (treatment couch): 60 % fibre volume of carbon
                                          fibre (C, 1.8 g/cm^3) in bisphenol-A epoxy (C21H24O4, 1.2 g/cm^3), i.e.
                                          0.692 C + 0.308 C21H24O4 by mass at 1.56 g/cm^3 (a typical laminate, not a
                                          reference composition)
 
-(XrayPhysics' material list, xrayPhysics().get_material_library(), supplies air, lung, adipose, cortical bone, PMMA
-and polyethylene; it has no brain, blood, skin, cartilage or spongiosa, which come from the ICRU-44 and Woodard-White
-tables as cited, the ICRU-44 ones as tabulated by Hubbell and Seltzer, NISTIR 5632.)
+(The compositions of air, lung, adipose tissue, cortical bone, PMMA and polyethylene are the material strings of
+XrayPhysics, which CITRUS used up to version 0.6; they are kept because they define the WLAB validation materials.
+Cortical bone and adipose tissue have exactly the mass fractions of xraylib's NIST compounds 'Bone, Cortical (ICRP)'
+and 'Adipose Tissue (ICRP)'; lung is xraylib's 'Lung (ICRP)' without its Ca, Fe and Zn traces, every mass fraction
+within 4e-4; air reads the volume percentages of dry air as mass fractions, N 0.781, O 0.210, Ar 0.0093 by mass
+instead of the 0.755, 0.232, 0.0128 of xraylib's 'Air, Dry (near sea level)'. Brain, blood, skin, cartilage and
+spongiosa come from the ICRU-44 and Woodard-White tables as cited, the ICRU-44 ones as tabulated by Hubbell and
+Seltzer, NISTIR 5632.)
 
-Elements: after these compounds (`COMPOUND_NAMES`) the catalogue holds every element Z = 1..100 of EPDL97 under its
-English (IUPAC) name, 'hydrogen' ... 'fermium' (`ELEMENT_NAMES`, e.g. 'lead' 11.35 and 'tungsten' 19.3 g/cm^3), with
-the element symbol as the composition (`ELEMENT_SYMBOLS`) and the standard density of XrayPhysics' element table
-(`ELEMENT_DENSITIES`: NIST's standard-state densities, gases at 20 C and 1 atm); aluminium and titanium are the
-entries above.
+Elements: after these compounds (`COMPOUND_NAMES`) the catalogue holds every element Z = 1..98 under its English
+(IUPAC) name, 'hydrogen' ... 'californium' (`ELEMENT_NAMES`, e.g. 'lead' 11.35 and 'tungsten' 19.3 g/cm^3), with the
+element symbol as the composition (`ELEMENT_SYMBOLS`, xraylib's ``AtomicNumberToSymbol``) and xraylib's element density
+(`ELEMENT_DENSITIES`, ``xraylib.ElementDensity``: NIST's densities of Hubbell and Seltzer, NISTIR 5632, Table 1, gases
+at 20 C and 1 atm); aluminium and titanium are the entries above. Z = 99, 100 are left out: xraylib has no scattering
+functions for them.
 
 REFERENCE materials. The library is built for a chosen subset of the catalogue, the reference materials of the density
 model (`config.SolverConfig.materials`, at least two names; default the seven `MATERIALS`):
@@ -83,27 +89,28 @@ from types import MappingProxyType
 from typing import Mapping, Optional, Sequence, Union
 
 import torch
+import xraylib
 from torch import Tensor
 
 # ---- material catalogue (module docstring) ----------------------------------------------------------------------
-# XrayPhysics library strings (xrayPhysics().get_material_library(), verbatim; the air terms are mass fractions of the
-# compounds, as XrayPhysics' parser reads them)
-_AIR_XRAYPHYSICS = "78.084*N2 + 20.946*O2 + 0.9340*Ar + 0.0397*CO2"
-_LUNG_XRAYPHYSICS = (
+# the material strings of XrayPhysics (the materials of citrus <= 0.6, verbatim; the air terms are read as mass
+# fractions of the compounds, `cross_section_library.parse_formula`)
+_AIR_DRY = "78.084*N2 + 20.946*O2 + 0.9340*Ar + 0.0397*CO2"
+_LUNG_ICRP = (
     "0.10132562304283013*H + 0.10235810831090612*C + 0.028663471831760927*N + 0.75742799115584314*O + "
     "0.0018408652066471242*Na + 0.00073034326133282642*Mg + 0.00080037617680309744*P + 0.0022510579972587113*S + "
     "0.0026612507878702989*Cl + 0.0019409122287475113*K"
 )
-_ADIPOSE_XRAYPHYSICS = (
+_ADIPOSE_ICRP = (
     "0.119477*H + 0.637240*C + 0.007970*N + 0.232333*O + 0.000500*Na + 0.000020*Mg + 0.000160*P + 0.000730*S + "
     "0.001190*Cl + 0.000320*K + 0.000020*Ca + 0.000020*Fe + 0.000020*Zn"
 )
-_BONE_CORTICAL_XRAYPHYSICS = (
+_BONE_CORTICAL_ICRP = (
     "0.047234*H + 0.144330*C + 0.041990*N + 0.446096*O + 0.002200*Mg + 0.104970*P + "
     "0.003150*S + 0.209930*Ca + 0.000100*Zn"
 )
-_PMMA_XRAYPHYSICS = "C5O2H8"
-_POLYETHYLENE_XRAYPHYSICS = "C2H4"
+_PMMA = "C5O2H8"
+_POLYETHYLENE = "C2H4"
 # ICRU Report 44 (1989) mass fractions (as tabulated in NISTIR 5632, Hubbell and Seltzer)
 _MUSCLE_ICRU44 = "0.102*H + 0.143*C + 0.034*N + 0.710*O + 0.001*Na + 0.002*P + 0.003*S + 0.001*Cl + 0.004*K"
 _SOFT_TISSUE_ICRU44 = "0.102*H + 0.143*C + 0.034*N + 0.708*O + 0.002*Na + 0.003*P + 0.003*S + 0.002*Cl + 0.003*K"
@@ -122,15 +129,11 @@ _CARTILAGE_WOODARD_WHITE = "0.096*H + 0.099*C + 0.022*N + 0.744*O + 0.005*Na + 0
 # (mass fraction 0.6 x 1.8 / (0.6 x 1.8 + 0.4 x 1.2) = 0.692, density 1.56 g/cm^3)
 _CARBON_FIBRE_EPOXY = "0.692*C + 0.308*C21H24O4"
 
-# Elements Z = 1..100 (every element of EPDL97 / XrayPhysics): IUPAC symbols, English (IUPAC) names, and the standard
-# densities of XrayPhysics' element table (`xrayPhysics().massDensity(Z)`, g/cm^3, to 6 significant digits; NIST's
-# standard-state densities as in Hubbell and Seltzer, NISTIR 5632, Table 1: gases at 20 C and 1 atm; tests compare them
-# with XrayPhysics)
-ELEMENT_SYMBOLS: tuple[str, ...] = tuple((
-    "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb "
-    "Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au "
-    "Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm"
-).split())
+# Elements Z = 1..98 (those with xraylib scattering functions, `photon_data.SCATTERING_ELEMENTS`): xraylib's symbols,
+# English (IUPAC) names and xraylib's element densities (g/cm^3: NIST's densities of Hubbell and Seltzer, NISTIR 5632,
+# Table 1, gases at 20 C and 1 atm, for Z <= 92)
+NUM_ELEMENTS = 98
+ELEMENT_SYMBOLS: tuple[str, ...] = tuple(xraylib.AtomicNumberToSymbol(Z) for Z in range(1, NUM_ELEMENTS + 1))
 ELEMENT_NAMES: tuple[str, ...] = tuple((
     "hydrogen helium lithium beryllium boron carbon nitrogen oxygen fluorine neon sodium magnesium aluminium silicon "
     "phosphorus sulfur chlorine argon potassium calcium scandium titanium vanadium chromium manganese iron cobalt "
@@ -139,36 +142,26 @@ ELEMENT_NAMES: tuple[str, ...] = tuple((
     "xenon caesium barium lanthanum cerium praseodymium neodymium promethium samarium europium gadolinium terbium "
     "dysprosium holmium erbium thulium ytterbium lutetium hafnium tantalum tungsten rhenium osmium iridium platinum "
     "gold mercury thallium lead bismuth polonium astatine radon francium radium actinium thorium protactinium uranium "
-    "neptunium plutonium americium curium berkelium californium einsteinium fermium"
+    "neptunium plutonium americium curium berkelium californium"
 ).split())
-ELEMENT_DENSITIES: tuple[float, ...] = (
-    8.988e-05, 0.0001785, 0.534, 1.848, 2.37, 2.265, 0.0012506, 0.001429, 0.001696, 0.0008999, 0.971,
-    1.74, 2.6989, 2.33, 2.2, 2.07, 0.003214, 0.0017837, 0.862, 1.55, 2.989, 4.54, 6.11, 7.18, 7.44,
-    7.874, 8.9, 8.902, 8.96, 7.133, 5.904, 5.323, 5.73, 4.5, 0.00759, 0.003733, 1.532, 2.54, 4.469,
-    6.506, 8.57, 10.22, 11.5, 12.41, 12.41, 12.02, 10.5, 8.65, 7.31, 7.31, 6.691, 6.24, 4.93, 0.005887,
-    1.873, 3.5, 6.154, 6.657, 6.71, 6.9, 7.22, 7.46, 5.243, 7.9004, 8.229, 8.55, 8.795, 9.066, 9.321,
-    6.73, 9.849, 13.31, 16.654, 19.3, 21.02, 22.57, 22.42, 21.45, 19.32, 13.546, 11.72, 11.35, 9.747,
-    9.32, 9.0, 0.00973, 5.0, 5.0, 10.07, 11.72, 15.37, 18.95, 20.25, 19.84, 13.67, 13.51, 14.0, 14.0,
-    14.0, 14.0,
-)
+ELEMENT_DENSITIES: tuple[float, ...] = tuple(float(xraylib.ElementDensity(Z)) for Z in range(1, NUM_ELEMENTS + 1))
 
 _COMPOUNDS: dict[str, tuple[float, str]] = {
-    # name: (nominal density g/cm^3, XrayPhysics composition); the first seven are the default reference materials
-    # `MATERIALS`
-    "air": (0.0012, _AIR_XRAYPHYSICS),
-    "lung": (0.26, _LUNG_XRAYPHYSICS),
-    "adipose": (0.95, _ADIPOSE_XRAYPHYSICS),
+    # name: (nominal density g/cm^3, composition); the first seven are the default reference materials `MATERIALS`
+    "air": (0.0012, _AIR_DRY),
+    "lung": (0.26, _LUNG_ICRP),
+    "adipose": (0.95, _ADIPOSE_ICRP),
     "water": (1.0, "H2O"),
     "muscle": (1.05, _MUSCLE_ICRU44),
     "soft_tissue": (1.06, _SOFT_TISSUE_ICRU44),
-    "bone": (1.85, _BONE_CORTICAL_XRAYPHYSICS),
+    "bone": (1.85, _BONE_CORTICAL_ICRP),
     "trabecular_bone": (1.18, _SPONGIOSA_WOODARD_WHITE),
     "brain": (1.04, _BRAIN_ICRU44),
     "blood": (1.06, _BLOOD_ICRU44),
     "cartilage": (1.10, _CARTILAGE_WOODARD_WHITE),
     "skin": (1.09, _SKIN_ICRU44),
-    "pmma": (1.18, _PMMA_XRAYPHYSICS),
-    "polyethylene": (0.94, _POLYETHYLENE_XRAYPHYSICS),
+    "pmma": (1.18, _PMMA),
+    "polyethylene": (0.94, _POLYETHYLENE),
     "aluminium": (2.699, "Al"),
     "titanium": (4.54, "Ti"),
     "carbon_fibre": (1.56, _CARBON_FIBRE_EPOXY),

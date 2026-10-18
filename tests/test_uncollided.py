@@ -432,7 +432,7 @@ def test_fc_moment_source_triton_synthetic(monkeypatch):
 
 
 @pytest.mark.skipif(os.environ.get("CITRUS_SLOW_TESTS") != "1", reason="set CITRUS_SLOW_TESTS=1 (builds the "
-                    "XrayPhysics library, cached in the library cache)")
+                    "library, cached in the library cache)")
 def test_fc_moment_source_triton_real_library(monkeypatch):
     """As the synthetic test, with the real G = 6 library (2001-point eta table, Rayleigh forward peak)."""
     from citrus.scatter_solver.config import SolverConfig

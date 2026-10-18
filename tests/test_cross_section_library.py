@@ -1,7 +1,8 @@
 """Tests of the multigroup cross-section library builder (citrus/scatter_solver/cross_section_library.py).
 
-Skipped when XrayPhysics is not importable. The shared fixture uses the production energy grid (0.5 keV) and a
-1001-point eta table; the full-resolution default config build is gated behind CITRUS_SLOW_TESTS=1.
+Skipped when the photon data (NIST XCOM, xraylib; `photon_data`) are unavailable. The shared fixture uses the production
+energy grid (0.5 keV) and a 1001-point eta table; the full-resolution default config build is gated behind
+CITRUS_SLOW_TESTS=1.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from citrus.scatter_solver import cross_section_library
 try:
     BACKEND = cross_section_library.resolve_backend()
 except RuntimeError as exc:  # pragma: no cover - environment dependent
-    pytest.skip(f"XrayPhysics unavailable ({exc})", allow_module_level=True)
+    pytest.skip(f"photon data unavailable ({exc})", allow_module_level=True)
 
 G = 6
 L = 7
@@ -49,10 +50,13 @@ def built():
 
 # ---- (a) XCOM totals ------------------------------------------------------------------------------
 
+# NIST's tables (XCOM totals with coherent scattering, 4 digits): water (H 0.111894; the library's water has H
+# 0.111898 with XCOM's atomic weights and averages over 0.5 keV) to 2e-3; the bone values are those of ICRU-44
+# cortical bone (Ca 0.225), not of the catalogue's ICRP bone (Ca 0.210), hence the composition tolerance of 3 %
 @pytest.mark.parametrize(
     "material,energy,xcom,tolerance",
-    [("water", 40.0, 0.2683, 0.02), ("water", 60.0, 0.2059, 0.02), ("water", 80.0, 0.1837, 0.02),
-     ("water", 100.0, 0.1707, 0.02), ("bone", 60.0, 0.3148, 0.03), ("bone", 100.0, 0.1855, 0.03)],
+    [("water", 40.0, 0.2683, 2e-3), ("water", 60.0, 0.2059, 2e-3), ("water", 80.0, 0.1837, 2e-3),
+     ("water", 100.0, 0.1707, 2e-3), ("bone", 60.0, 0.3148, 0.03), ("bone", 100.0, 0.1855, 0.03)],
 )
 def test_mu_t_vs_xcom(material, energy, xcom, tolerance):
     config = SolverConfig(num_groups=1, group_edges_kev=(energy + 0.25, energy - 0.25), legendre_order=1,
@@ -80,11 +84,13 @@ def test_row_sums_conserve_scatter(built):
 
 
 def test_mu_t_is_sum_of_components(built):
+    """mu_t = photoelectric + Compton + Rayleigh (+ pair production, zero below 1.022 MeV): an identity of the XCOM
+    data."""
     library, info = built
     for mi, mat in enumerate(library.materials):
         comp = _group_avg(info, "photoelectric", mat) + _group_avg(info, "compton", mat) + _group_avg(info, "rayleigh",
                                                                                                       mat)
-        np.testing.assert_allclose(library.mu_t[mi].numpy(), comp, rtol=2e-3)
+        np.testing.assert_allclose(library.mu_t[mi].numpy(), comp, rtol=1e-12)
         np.testing.assert_allclose(library.mu_pe[mi].numpy(), _group_avg(info, "photoelectric", mat), rtol=1e-9)
 
 
@@ -184,13 +190,13 @@ def test_groups_and_spectrum(built):
 def test_composition():
     comp = cross_section_library.material_composition(BACKEND)
     assert set(comp["water"]) == {1, 8}
-    assert abs(comp["water"][1] - 0.1119) < 2e-4
+    assert abs(comp["water"][1] - 0.111898) < 1e-6  # H2O with XCOM's atomic weights (H 1.00794, O 15.9994)
     assert abs(sum(comp["bone"].values()) - 1.0) < 1e-12
     assert abs(comp["bone"][20] - 0.20993) < 1e-6
 
 
 def test_spectrum_txt_roundtrip(tmp_path):
-    e, s = cross_section_library.default_spectrum_125kvp(BACKEND)
+    e, s = cross_section_library.default_spectrum_125kvp()
     p = tmp_path / "spec.txt"
     np.savetxt(p, np.stack([e, s], axis=1), header="E_keV weight")
     e2, s2 = cross_section_library.load_spectrum_txt(str(p))
@@ -286,7 +292,7 @@ def test_fine_table_polychromatic_transmission(built):
     from citrus.scatter_solver.cross_sections import group_transmission
 
     library, info = built
-    spectrum_energies, spectrum_weights = cross_section_library.default_spectrum_125kvp(BACKEND)
+    spectrum_energies, spectrum_weights = cross_section_library.default_spectrum_125kvp()
     spectrum_density = cross_section_library._Spectrum(spectrum_energies, spectrum_weights)
     edges = np.arange(10.0, 125.0 + 1e-9, 0.1)
     p = spectrum_density.cumulative_integral(edges[1:]) - spectrum_density.cumulative_integral(edges[:-1])

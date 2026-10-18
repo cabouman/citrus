@@ -5,7 +5,9 @@ Fills a :class:`citrus.scatter_solver.cross_sections.MultigroupLibrary` for the 
 ``cross_sections.MATERIALS``: air, lung, adipose, water, muscle, soft tissue, cortical bone) from point-wise photon
 interaction data.
 
-Data: XrayPhysics (github.com/kylechampley/XrayPhysics, EPDL97 tables), loaded by ``resolve_backend()``.
+Data: the integrated cross sections and atomic weights of NIST XCOM (downloaded from NIST on first use and cached) and
+the angular shapes of xraylib, loaded by ``resolve_backend()`` (module ``photon_data``: sources, citations, XCOM's
+interpolation, the download, the cache and ``$CITRUS_XCOM_ARCHIVE`` for offline machines).
 
 Physics summary (all coefficients per unit density, cm^2/g):
   * Groups g = 0..G-1 from HIGHEST to LOWEST energy; ``group_edges`` [G+1] descending.
@@ -20,10 +22,14 @@ Physics summary (all coefficients per unit density, cm^2/g):
     every quantity is evaluated at the bin midpoint and weighted by the exact integral of w(E)
     over the bin (midpoint rule in E; the spectrum is integrated exactly as a piecewise-linear
     function, so characteristic lines are not lost).
-  * Element mixing is done here, NOT with the backend's compound scatter functions:
+  * Total attenuation mu_t = coherent + incoherent + photoelectric + pair production (nuclear and electron field),
+    XCOM's total with coherent scattering; mu_t - (Compton + Rayleigh) is absorption, so pair production is absorbed
+    locally (no annihilation photons).
+  * Element mixing is done here, NOT with compound data of a library:
         d mu_x/dOmega (E, eta) = sum_i w_i sigma_x(Z_i, E) pdf_x,i(E, eta),   x in {C, R}
-    with w_i mass fractions, sigma_x the elemental mass cross section and pdf_x,i the elemental
-    angular shape normalized numerically to 2 pi int pdf d eta = 1 (reference quadrature below).
+    with w_i mass fractions, sigma_x the elemental mass cross section (XCOM) and pdf_x,i the elemental
+    angular shape (xraylib) normalized numerically to 2 pi int pdf d eta = 1 (reference quadrature below), so the
+    group transfer integrates to the XCOM cross section whatever the integral of xraylib's shape.
   * Compton kinematics without Doppler broadening: E'(E, eta) = E / (1 + (E/m_e c^2)(1 - eta)).
     For each fine energy E the eta boundaries of every energy group are computed analytically,
     eta_edge = 1 - m_e c^2 (1/E_edge - 1/E), and the eta integral is done piecewise with
@@ -68,15 +74,19 @@ table by nominal attenuation at the spectrum-mean energy (``sort_material_table`
 unchanged) and asserts at every fine energy that the order holds (``check_material_order``: no two materials cross).
 The cache key holds the sorted table (names, nominal densities, formulas), so different sets never share a cache entry.
 The default seven:
-  * air     = XrayPhysics library string 'air' (78.084*N2 + 20.946*O2 + 0.9340*Ar + 0.0397*CO2, read as mass
-              fractions of the compounds exactly as XrayPhysics' parser does), 0.0012 g/cm^3.
-  * lung    = XrayPhysics 'lung', 0.26 g/cm^3 (the WLAB lung; XrayPhysics lists 0.25).
-  * adipose = XrayPhysics 'adipose_tissue', 0.95 g/cm^3 (XrayPhysics lists 0.92).
-  * water   = 'H2O' -> with XrayPhysics atomic masses (H 1.008, O 15.999): H 0.111907, O 0.888093; 1.0 g/cm^3.
+  * air     = '78.084*N2 + 20.946*O2 + 0.9340*Ar + 0.0397*CO2', 0.0012 g/cm^3: the volume percentages of dry air
+              read as mass fractions of the compounds (N 0.7808, O 0.2097, Ar 0.0093, C 0.0001 by mass; NIST's dry
+              air, xraylib's 'Air, Dry (near sea level)', has N 0.7553, O 0.2318, Ar 0.0128), kept as the air of the
+              WLAB validation.
+  * lung    = ICRP lung without its Ca, Fe and Zn traces (renormalized; every mass fraction within 4e-4 of xraylib's
+              'Lung (ICRP)'), 0.26 g/cm^3 (the WLAB lung).
+  * adipose = ICRP adipose tissue, the mass fractions of xraylib's 'Adipose Tissue (ICRP)', 0.95 g/cm^3 (NIST lists
+              0.92).
+  * water   = 'H2O' -> with XCOM's atomic weights (H 1.00794, O 15.9994): H 0.111898, O 0.888102; 1.0 g/cm^3.
   * muscle  = ICRU-44 skeletal muscle mass fractions, 1.05 g/cm^3.
   * soft_tissue = ICRU-44 soft tissue mass fractions, 1.06 g/cm^3. Muscle lies BELOW soft tissue at every energy
               of the library, hence the order.
-  * bone    = XrayPhysics library entry 'bone_cortical' (ICRP cortical bone, 1.85 g/cm^3), mass
+  * bone    = ICRP cortical bone, the mass fractions of xraylib's 'Bone, Cortical (ICRP)' (1.85 g/cm^3), mass
     fractions H 0.047234, C 0.144330, N 0.041990, O 0.446096, Mg 0.002200, P 0.104970,
     S 0.003150, Ca 0.209930, Zn 0.000100 (sum 1.000000). Note this is ICRP (not ICRU-44) cortical bone; its mu/rho
     differs slightly from ICRU-44.
@@ -100,10 +110,12 @@ import torch
 from .config import SolverConfig
 from .cross_sections import (ANGULAR_MAP_KNOTS, ELECTRON_REST_KEV, ELEMENT_SYMBOLS, MATERIAL_CATALOGUE, MATERIALS,
                              MultigroupLibrary, angular_table_nodes, material_table)
+from .photon_data import XcomXraylibBackend, default_cache_dir, resolve_backend
 
 __all__ = [
     "BuildInfo",
     "MATERIAL_FORMULAS",
+    "XcomXraylibBackend",
     "default_material_table",
     "sort_material_table",
     "mass_attenuation_preview",
@@ -128,18 +140,19 @@ __all__ = [
 ]
 
 # 2: the seven-material table; names, nominal densities and formulas in the key. 3 (citrus 0.6.0): the angular table
-# grid (adaptive tables with eta_map), the group edge rule and the grouping object size in the key
-_BUILD_VERSION = "citrus-xsec-3"
+# grid (adaptive tables with eta_map), the group edge rule and the grouping object size in the key. 4 (citrus 0.7.0):
+# the photon data of NIST XCOM and xraylib (backend "xcom-xraylib") instead of XrayPhysics
+_BUILD_VERSION = "citrus-xsec-4"
 _TWO_PI = 2.0 * math.pi
 # catalogue materials whose transfer curves place the nodes of an adaptive angular table (`angular_map`): low-Z soft
 # tissue and calcium-bearing bone; the same for every library, so that the nodes do not depend on the material set
 ANGULAR_MAP_MATERIALS = ("water", "bone")
 
-# Compositions (formula strings in XrayPhysics syntax: 'a*F1 + b*F2' with a, b mass fractions of the compounds F1, F2;
+# Compositions (formula strings of `parse_formula`: 'a*F1 + b*F2' with a, b mass fractions of the compounds F1, F2;
 # a bare formula is a stoichiometric compound) of every catalogue material, `cross_sections.MATERIAL_CATALOGUE`
 MATERIAL_FORMULAS: dict[str, str] = {name: formula for name, (_, formula) in MATERIAL_CATALOGUE.items()}
 
-MaterialTable = Sequence[tuple[str, float, str]]  # (name, nominal density g/cm^3, XrayPhysics formula) per material
+MaterialTable = Sequence[tuple[str, float, str]]  # (name, nominal density g/cm^3, formula) per material
 
 
 def default_material_table() -> tuple[tuple[str, float, str], ...]:
@@ -162,103 +175,9 @@ _Q_BREAKPOINTS = np.array(
     [0.0, 0.0025, 0.005, 0.01, 0.02, 0.035, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5,
      0.6, 0.7, 0.8, 0.9, 1.0]
 )
-_THETA_MIN_DEG = 1.0e-3  # XrayPhysics' coherent amplitude is wrong at exactly theta = 0 (x < 1e-6)
 
 _SYMBOL_TO_Z = {s: i + 1 for i, s in enumerate(ELEMENT_SYMBOLS)}
-
-
-# =============================================================================================
-# Data backend (XrayPhysics)
-# =============================================================================================
-
-class _XrayPhysicsBackend:
-    """Point-wise XrayPhysics data. Energies in keV, mass cross sections in cm^2/g.
-
-    ``sigma(kind, Z, E)`` with kind in {"total", "photoelectric", "compton", "rayleigh"}: E [K] -> [K].
-    ``pdf_raw(kind, Z, E, eta)`` with kind in {"compton", "rayleigh"}: E scalar, eta [N] -> [N]; an
-    unnormalized per-steradian angular shape (normalized by the caller).
-    ``library_pdf_normalization(kind, Z, E)``: XrayPhysics' own sphere normalization of ``pdf_raw``.
-    ``.name`` ("xrayphysics", part of the cache key) and ``.reason`` (where it was loaded from).
-    """
-
-    name = "xrayphysics"
-
-    def __init__(self) -> None:
-        import ctypes
-
-        from xrayphysics import xrayPhysics  # type: ignore
-
-        xray_physics = xrayPhysics()
-        shared_library = getattr(xray_physics, "libxrayphysics", None)
-        if shared_library is None:
-            raise ImportError("xrayphysics imported but libxrayphysics shared library did not load")
-        self._xray_physics = xray_physics
-        c_float = ctypes.c_float
-        self._cross_section_functions: dict[str, Callable] = {}
-        for kind, function_name in (("total", "sigma"), ("photoelectric", "sigmaPE"), ("compton", "sigmaCS"),
-                                    ("rayleigh", "sigmaRS")):
-            function = getattr(shared_library, function_name)
-            function.argtypes = [c_float, c_float]
-            function.restype = c_float
-            self._cross_section_functions[kind] = function
-        self._distribution_functions: dict[str, Callable] = {}
-        self._normalization_functions: dict[str, Callable] = {}
-        for kind, function_name in (("compton", "incoherentScatterDistribution"),
-                                    ("rayleigh", "coherentScatterDistribution")):
-            function = getattr(shared_library, function_name)
-            function.argtypes = [c_float, c_float, c_float]
-            function.restype = c_float
-            self._distribution_functions[kind] = function
-            normalization = getattr(shared_library, function_name + "_normalizationFactor")
-            normalization.argtypes = [c_float, c_float]
-            normalization.restype = c_float
-            self._normalization_functions[kind] = normalization
-        self._cross_section_scale = float(xray_physics.cross_section_scalar())
-        import xrayphysics as xray_physics_module  # type: ignore
-
-        self.reason = f"XrayPhysics (EPDL97) loaded from {os.path.dirname(xray_physics_module.__file__)}"
-
-    def atomic_mass(self, Z: int) -> float:
-        return float(self._xray_physics.atomicMass(Z))
-
-    def sigma(self, kind: str, Z: int, E: np.ndarray) -> np.ndarray:
-        function = self._cross_section_functions[kind]
-        Z_float = float(Z)
-        E = np.asarray(E, dtype=np.float64).ravel()
-        out = np.fromiter((function(Z_float, float(e)) for e in E), dtype=np.float64, count=E.size)
-        return out * self._cross_section_scale
-
-    def pdf_raw(self, kind: str, Z: int, E: float, eta: np.ndarray) -> np.ndarray:
-        function = self._distribution_functions[kind]
-        theta_deg = np.degrees(np.arccos(np.clip(np.asarray(eta, dtype=np.float64), -1.0, 1.0)))
-        theta_deg = np.maximum(theta_deg, _THETA_MIN_DEG)
-        Z_float, E_float = float(Z), float(E)
-        return np.fromiter((function(Z_float, E_float, float(t)) for t in theta_deg), dtype=np.float64,
-                           count=theta_deg.size)
-
-    def library_pdf_normalization(self, kind: str, Z: int, E: float) -> float | None:
-        return float(self._normalization_functions[kind](float(Z), float(E)))
-
-    def spectrum_125kvp(self) -> tuple[np.ndarray, np.ndarray]:
-        xray_physics = self._xray_physics
-        # 1 keV grid: XrayPhysics adds characteristic-line amplitudes into single samples, which is
-        # calibrated as counts per 1 keV bin; we interpret the result as a density per keV.
-        gammas = np.arange(1.0, 126.0, 1.0, dtype=np.float32)
-        energies, spectrum = xray_physics.simulateSpectra(125.0, takeOffAngle=11.0, Z=74, gammas=gammas)
-        filter_transmission = xray_physics.filterResponse("Ti", 4.506, 0.089, energies)
-        return (np.asarray(energies, dtype=np.float64),
-                np.asarray(spectrum, dtype=np.float64) * np.asarray(filter_transmission, dtype=np.float64))
-
-
-def resolve_backend() -> _XrayPhysicsBackend:
-    """Load the XrayPhysics data backend (``.name``, ``.reason``: where it was loaded from).
-
-    Raises RuntimeError if XrayPhysics or its shared library is unavailable.
-    """
-    try:
-        return _XrayPhysicsBackend()
-    except Exception as exc:  # ImportError, OSError from the DLL, ...
-        raise RuntimeError(f"XrayPhysics is unavailable: {type(exc).__name__}: {exc}") from exc
+_DEFAULT_SPECTRUM_FILE = "spectrum_125kvp.txt"  # package data, citrus/scatter_solver/data
 
 
 # =============================================================================================
@@ -266,11 +185,13 @@ def resolve_backend() -> _XrayPhysicsBackend:
 # =============================================================================================
 
 def parse_formula(formula: str, atomic_mass: Callable[[int], float]) -> dict[int, float]:
-    """Parse an XrayPhysics material string into element mass fractions {Z: w_Z} (sum 1).
+    """Parse a material string into element mass fractions {Z: w_Z} (sum 1).
 
     Accepts 'H2O' or mixtures 'a*F1 + b*F2 + ...' where a, b are (relative) mass fractions of
     the compounds; compound element counts are converted to mass fractions with ``atomic_mass``.
-    Mirrors XrayPhysics' ``xsec::parseMaterialText``.
+    A term's number is the mass fraction of its compound even when the compound is a molecule (so
+    '78.084*N2 + ...' weighs N2 by 78.084, not 78.084 molecules). atomic_mass: Z -> g/mol (the builder passes XCOM's
+    atomic weights, ``XcomXraylibBackend.atomic_mass``).
     """
     text = formula.replace(" ", "")
     terms = text.split("+")
@@ -300,7 +221,7 @@ def parse_formula(formula: str, atomic_mass: Callable[[int], float]) -> dict[int
     return {Z: w / total for Z, w in sorted(mass_fractions.items())}
 
 
-def material_composition(backend: _XrayPhysicsBackend,
+def material_composition(backend: XcomXraylibBackend,
                          materials: Optional[MaterialTable] = None) -> dict[str, dict[int, float]]:
     """Element mass fractions per material (table order; default the seven default reference materials), keyed by
     name."""
@@ -308,7 +229,7 @@ def material_composition(backend: _XrayPhysicsBackend,
 
 
 def _mean_energy(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], fine_bin_width_kev: float,
-                 backend: Optional["_XrayPhysicsBackend"] = None) -> float:
+                 backend: Optional[XcomXraylibBackend] = None) -> float:
     """Spectrum-mean photon energy (keV) over the group structure of ``config`` on the fine energy quadrature of the
     build: sum_e w_e E_e / sum_e w_e with w_e the exact spectrum integral over fine bin e, the effective energy of the
     library's density model (``citrus.utilities.effective_energy``, about 63 keV for the default 125 kVp spectrum).
@@ -324,17 +245,17 @@ def _mean_energy(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], 
 
 def sort_material_table(config: SolverConfig, materials: Optional[MaterialTable] = None,
                         spectrum: tuple[np.ndarray, np.ndarray] | None = None,
-                        backend: _XrayPhysicsBackend | None = None, *,
+                        backend: XcomXraylibBackend | None = None, *,
                         fine_bin_width_kev: float = 0.5) -> tuple[tuple[str, float, str], ...]:
     """The material table ((name, nominal density g/cm^3, formula) per material; None: the seven default reference
     materials)
     sorted by nominal attenuation rho^nom mu/rho(E_eff) at the spectrum-mean energy E_eff of the build
     (``_mean_energy``; elemental total mass attenuation of the backend mixed by mass fraction; a stable sort, so a
     table already in that order is returned as it is). Whether the order holds at every energy of the library is
-    checked by the build (``check_material_order``). Needs the backend (XrayPhysics)."""
+    checked by the build (``check_material_order``). Needs the backend (XCOM and xraylib)."""
     table = _material_table(materials)
     backend = resolve_backend() if backend is None else backend
-    spectrum_arrays = _spectrum_or_default(spectrum, backend)
+    spectrum_arrays = _spectrum_or_default(spectrum)
     energy = np.array([_mean_energy(config, spectrum_arrays, fine_bin_width_kev, backend)])
     composition = material_composition(backend, table)
     attenuation = [density * sum(w * float(backend.sigma("total", Z, energy)[0]) for Z, w in composition[name].items())
@@ -345,7 +266,7 @@ def sort_material_table(config: SolverConfig, materials: Optional[MaterialTable]
 
 def mass_attenuation_preview(config: SolverConfig, names: Sequence[str],
                              spectrum: tuple[np.ndarray, np.ndarray] | None = None,
-                             backend: _XrayPhysicsBackend | None = None, *, energy_kev: float | None = None,
+                             backend: XcomXraylibBackend | None = None, *, energy_kev: float | None = None,
                              fine_bin_width_kev: float = 0.5) -> tuple[float, np.ndarray]:
     """(E_eff keV, total mass attenuation [len(names)] cm^2/g at E_eff) of catalogue materials WITHOUT building the
     library: E_eff = energy_kev, or the spectrum-mean energy of the build of `config` (``_mean_energy``, the value
@@ -354,7 +275,7 @@ def mass_attenuation_preview(config: SolverConfig, names: Sequence[str],
     agree closely). For decisions taken before a lazy solver builds its library (``citrus.utilities.object_size_cm``).
     """
     backend = resolve_backend() if backend is None else backend
-    spectrum_arrays = _spectrum_or_default(spectrum, backend)
+    spectrum_arrays = _spectrum_or_default(spectrum)
     energy = (_mean_energy(config, spectrum_arrays, fine_bin_width_kev, backend) if energy_kev is None
               else float(energy_kev))
     table = material_table(tuple(names))
@@ -403,15 +324,20 @@ def load_spectrum_txt(path: str) -> tuple[np.ndarray, np.ndarray]:
     return table[order, 0], table[order, 1]
 
 
-def default_spectrum_125kvp(backend: _XrayPhysicsBackend | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """Default kV source: W anode, 125 kV, 11 deg take-off, 0.89 mm Ti filter.
+def default_spectrum_125kvp() -> tuple[np.ndarray, np.ndarray]:
+    """Default kV source: W anode, 125 kV, 11 deg take-off, 0.89 mm Ti filter (the spectrum of the WLAB validation).
 
-    XrayPhysics ``simulateSpectra`` x ``filterResponse('Ti', 4.506, 0.089)`` on a 1 keV grid (backend: a loaded
-    ``resolve_backend()`` object, None loads one).
-    Returns (energies_kev [K], weights [K]) with weights a photon density per keV (arbitrary scale).
+    Read from the package data file ``citrus/scatter_solver/data/spectrum_125kvp.txt`` (``load_spectrum_txt``): 125
+    nodes E = 1, 2, ..., 125 keV and the relative photon density per keV at each (simulated once with XrayPhysics'
+    ``simulateSpectra`` x ``filterResponse('Ti', 4.506, 0.089)``; CITRUS does not simulate tube spectra, any other
+    spectrum is loaded with ``load_spectrum_txt``).
+    Returns (energies_kev [125], weights [125]) float64, weights a photon density per keV (arbitrary scale),
+    piecewise-linear between the nodes.
     """
-    backend = resolve_backend() if backend is None else backend
-    return backend.spectrum_125kvp()
+    from importlib import resources
+
+    with resources.as_file(resources.files(__package__).joinpath("data", _DEFAULT_SPECTRUM_FILE)) as path:
+        return load_spectrum_txt(str(path))
 
 
 class _Spectrum:
@@ -470,7 +396,7 @@ _EDGES_MEMO: dict[str, np.ndarray] = {}
 
 
 def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray],
-                     backend: Optional["_XrayPhysicsBackend"] = None, *,
+                     backend: Optional[XcomXraylibBackend] = None, *,
                      fine_bin_width_kev: float = 0.5) -> np.ndarray:
     """Group edges [G+1] in keV, descending, spanning [energy_min_kev, kVp] (kVp = upper end of the spectrum support).
 
@@ -595,7 +521,7 @@ def grouping_medium_densities(config: SolverConfig) -> tuple[tuple[str, float], 
     return tuple(rounded)
 
 
-def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend: Optional["_XrayPhysicsBackend"] = None,
+def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend: Optional[XcomXraylibBackend] = None,
                                *, energy_min_kev: float = 10.0, object_size_cm: float = 20.0,
                                medium: Sequence[tuple[str, float]] = (("water", 1.0),),
                                fine_bin_width_kev: float = 0.5,
@@ -611,7 +537,7 @@ def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend:
         phi(E) = [S(E) + int_{E' > E} mu_C(E') p(E | E') phi(E') dE'] / (mu_t(E) - mu_R(E) + 1/L)
 
     with S the source spectrum, mu_C, mu_R, mu_t the Compton, Rayleigh and total attenuation of the medium (elemental
-    XrayPhysics cross sections mixed by the catalogue compositions and the densities),
+    XCOM cross sections mixed by the catalogue compositions and the densities),
     p(E | E') the energy distribution of a Compton photon scattered at E' (Klein-Nishina, normalized; Compton
     kinematics without binding), Rayleigh ignored (it does not change the energy, so it is neither a loss nor a gain
     here), photons below energy_min_kev absorbed. L -> 0 gives phi = S L (the source spectrum, "equal_fluence");
@@ -738,7 +664,7 @@ class BuildInfo:
     """Diagnostics of a library build (not cached; returned by ``compute_library``).
 
     Shapes: M materials, G groups, K fine energies.
-      backend, backend_reason       data backend ("xrayphysics") and where it was loaded from
+      backend, backend_reason       data backend ("xcom-xraylib") and where its data came from
       composition                   {material: {Z: mass fraction}}
       compton_below_cutoff [M, G]   group-weighted Compton scatter with E' < edges[-1] (absorbed)
       sigma_compton_group / sigma_rayleigh_group / sigma_photoelectric_group / sigma_total_group [M, G]
@@ -771,10 +697,10 @@ class BuildInfo:
     rayleigh_eta: np.ndarray | None = None
 
 
-def _spectrum_or_default(spectrum: tuple[np.ndarray, np.ndarray] | None,
-                         backend: _XrayPhysicsBackend) -> tuple[np.ndarray, np.ndarray]:
+def _spectrum_or_default(spectrum: tuple[np.ndarray, np.ndarray] | None) -> tuple[np.ndarray, np.ndarray]:
+    """(energies keV [K], weights [K]) float64 of `spectrum`, or of ``default_spectrum_125kvp()`` for None."""
     if spectrum is None:
-        spectrum = backend.spectrum_125kvp()
+        spectrum = default_spectrum_125kvp()
     e, w = spectrum
     return np.asarray(e, dtype=np.float64).ravel(), np.asarray(w, dtype=np.float64).ravel()
 
@@ -782,7 +708,7 @@ def _spectrum_or_default(spectrum: tuple[np.ndarray, np.ndarray] | None,
 def compute_library(
     config: SolverConfig,
     spectrum: tuple[np.ndarray, np.ndarray] | None = None,
-    backend: _XrayPhysicsBackend | None = None,
+    backend: XcomXraylibBackend | None = None,
     *,
     fine_bin_width_kev: float = 0.5,
     gauss_legendre_nodes: int = 32,
@@ -805,7 +731,7 @@ def compute_library(
       (MultigroupLibrary with float64 CPU tensors, BuildInfo).
     """
     backend = resolve_backend() if backend is None else backend
-    spectrum_energies, spectrum_weights = _spectrum_or_default(spectrum, backend)
+    spectrum_energies, spectrum_weights = _spectrum_or_default(spectrum)
     spectrum_density = _Spectrum(spectrum_energies, spectrum_weights)
     edges = make_group_edges(config, (spectrum_energies, spectrum_weights), backend,
                              fine_bin_width_kev=fine_bin_width_kev)
@@ -995,7 +921,7 @@ def compute_library(
     return library, info
 
 
-def _direct_transfer_table(eta: np.ndarray, backend: "_XrayPhysicsBackend", elements: Sequence[int], E: np.ndarray,
+def _direct_transfer_table(eta: np.ndarray, backend: XcomXraylibBackend, elements: Sequence[int], E: np.ndarray,
                            fine_groups: np.ndarray, bin_low: np.ndarray, bin_high: np.ndarray,
                            within_group_weight: np.ndarray, edges: np.ndarray, compton_scales: np.ndarray,
                            rayleigh_scales: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1126,14 +1052,14 @@ def angular_map(q_nodes: np.ndarray, compton_shapes: np.ndarray, rayleigh_shapes
 
 
 def transfer_at_eta(config: SolverConfig, eta: np.ndarray, spectrum: tuple[np.ndarray, np.ndarray] | None = None,
-                    backend: "_XrayPhysicsBackend | None" = None, *, fine_bin_width_kev: float = 0.5,
+                    backend: Optional[XcomXraylibBackend] = None, *, fine_bin_width_kev: float = 0.5,
                     gauss_legendre_nodes: int = 32, materials: Optional[MaterialTable] = None) -> np.ndarray:
     """The exact per-steradian transfer mu_s(eta) [M, G, G, n] (cm^2/g/sr; the quantity ``mu_s_eta`` tabulates,
     without interpolation) of the library ``compute_library`` builds with the same arguments, at the cos-angles
     eta [n]: for measuring the interpolation error of a table (tests, validation). Same cost per point as a table
     node of the build."""
     backend = resolve_backend() if backend is None else backend
-    spectrum_energies, spectrum_weights = _spectrum_or_default(spectrum, backend)
+    spectrum_energies, spectrum_weights = _spectrum_or_default(spectrum)
     spectrum_density = _Spectrum(spectrum_energies, spectrum_weights)
     edges = make_group_edges(config, (spectrum_energies, spectrum_weights), backend,
                              fine_bin_width_kev=fine_bin_width_kev)
@@ -1191,11 +1117,6 @@ def _cache_key(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarray], ba
     return h.hexdigest()[:20]
 
 
-def default_cache_dir() -> str:
-    """Directory of the library cache: $CITRUS_CACHE_DIR if set, else ~/.cache/citrus."""
-    return os.environ.get("CITRUS_CACHE_DIR") or os.path.join(os.path.expanduser("~"), ".cache", "citrus")
-
-
 def build_library(
     config: SolverConfig,
     spectrum: tuple[np.ndarray, np.ndarray] | None = None,
@@ -1226,7 +1147,7 @@ def build_library(
     if cache_dir == "default":
         cache_dir = default_cache_dir()
     backend = resolve_backend()
-    spectrum_arrays = _spectrum_or_default(spectrum, backend)
+    spectrum_arrays = _spectrum_or_default(spectrum)
     table = sort_material_table(config, materials, spectrum_arrays, backend, fine_bin_width_kev=fine_bin_width_kev)
     path = None
     if cache_dir is not None:

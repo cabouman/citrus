@@ -51,7 +51,10 @@ The LBTE source iteration solver, one module per stage.
     The material catalogue, the multigroup library container, per-voxel coefficients and a synthetic test library.
 
 :doc:`api/cross_section_library`
-    The multigroup library builder from XrayPhysics (EPDL97) data, cached on disk.
+    The multigroup library builder from the photon data, cached on disk.
+
+:doc:`api/photon_data`
+    The photon data: NIST XCOM cross sections (downloaded on first use) and xraylib angular distributions.
 
 :doc:`api/source`
     The point source: spectrum and collimation.
@@ -91,6 +94,7 @@ The LBTE source iteration solver, one module per stage.
    api/geometry
    api/cross_sections
    api/cross_section_library
+   api/photon_data
    api/source
    api/detector
    api/angular_quadrature

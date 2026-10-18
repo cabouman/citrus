@@ -6,3 +6,4 @@ sphinx_design
 numpy
 scipy
 matplotlib
+xraylib>=4.1

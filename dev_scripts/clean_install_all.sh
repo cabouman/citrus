@@ -12,5 +12,5 @@ pip install -e ".[test,docs]"
 cd dev_scripts || exit 1
 
 echo ""
-echo "*** citrus reinstalled. Optional extras: pip install -e \".[physics,gpu]\" (XrayPhysics, Triton) ***"
+echo "*** citrus reinstalled. Optional extra: pip install -e \".[gpu]\" (Triton) ***"
 echo ""

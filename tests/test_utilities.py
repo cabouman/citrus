@@ -102,7 +102,7 @@ def real_library():
 
     try:
         return build_solver_library(SolverConfig())
-    except Exception as exc:  # no cached library and no XrayPhysics
+    except Exception as exc:  # no cached library and no photon data
         pytest.skip(f"real library unavailable: {exc}")
 
 

@@ -19,13 +19,12 @@ dependencies = [
     "torch",
     "matplotlib",
     "mbirtorch>=0.0.2,<0.2",  # verified on 0.0.2 and 0.1.2 (recon first_iteration / init_recon semantics)
+    "xraylib>=4.1",  # angular shapes of Compton and Rayleigh scattering, atomic weights (verified on 4.2.1)
 ]
 
 [project.optional-dependencies]
 test = ["pytest"]
 docs = ["sphinx", "sphinx_book_theme", "sphinx-copybutton", "sphinxext-opengraph", "sphinx_design"]
-# XrayPhysics builds the cross-section library (C++ library: needs a C++ toolchain and CMake)
-physics = ["xrayphysics @ git+https://github.com/kylechampley/XrayPhysics"]
 # fused GPU kernels (optional: PyTorch paths are used without Triton)
 gpu = [
     "triton; sys_platform == 'linux'",
@@ -41,6 +40,10 @@ version = { attr = "citrus.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["citrus*"]
+
+[tool.setuptools.package-data]
+# the default 125 kVp spectrum (cross_section_library.default_spectrum_125kvp)
+"citrus.scatter_solver" = ["data/*.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

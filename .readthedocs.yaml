@@ -8,8 +8,8 @@ build:
   tools:
     python: "3.11"
 
-# The API pages mock torch, triton, mbirtorch and xrayphysics (docs/source/conf.py), so the package is put on the
-# path by conf.py and only the light requirements are installed.
+# The API pages mock torch, triton and mbirtorch (docs/source/conf.py), so the package is put on the path by conf.py
+# and only the light requirements are installed (xraylib among them: the material catalogue reads its element data).
 python:
    install:
    - requirements: docs/requirements.txt

@@ -7,9 +7,12 @@ Requirements
 * Python >= 3.11, PyTorch (CUDA build for GPU use), NumPy, SciPy, Matplotlib.
 * `MBIRTORCH <https://github.com/cabouman/mbirtorch>`_ for the reconstruction side (``citrus_recon``,
   ``mbir_recon``, the demos; installed as a dependency, verified with mbirtorch 0.1.2).
-* `XrayPhysics <https://github.com/kylechampley/XrayPhysics>`_ to build the cross-section library (once; the library
-  is cached on disk).
+* `xraylib <https://github.com/tschoonj/xraylib>`_ for the Compton and Rayleigh angular distributions and the atomic
+  weights (installed as a dependency from its wheels, verified with xraylib 4.2.1).
+* The NIST XCOM photon cross sections, downloaded on first use (below).
 * Optional: Triton (``triton`` on Linux, ``triton-windows`` on Windows) for the fused GPU kernels.
+
+Nothing is compiled: every dependency installs from wheels.
 
 Install the package
 -------------------
@@ -18,53 +21,41 @@ Install the package
 
    git clone https://github.com/cabouman/citrus.git
    cd citrus
-   pip install .                  # or: pip install -e .   (development); installs MBIRTORCH too
+   pip install .                  # or: pip install -e .   (development); installs MBIRTORCH and xraylib too
    pip install ".[test]"          # with pytest
-   pip install ".[physics,gpu]"   # XrayPhysics (needs a C++ toolchain and CMake) and Triton
+   pip install ".[gpu]"           # Triton
 
-The ``physics`` extra builds XrayPhysics from its git repository; the ``gpu`` extra installs ``triton`` on Linux and
-``triton-windows`` on Windows. Without XrayPhysics the cross-section library cannot be built (a cached library still
-works); the test suite then uses the synthetic library and skips the tests that need the real one.
+The ``gpu`` extra installs ``triton`` on Linux and ``triton-windows`` on Windows.
 ``dev_scripts/create_conda_test_environment.sh`` creates a conda environment ``citrus`` (Python 3.11) with the test
 extras; ``dev_scripts/check_cuda.sh`` reports what is available.
 
 PyTorch is best installed first, with the CUDA version of your driver (see pytorch.org).
 
-XrayPhysics
+Photon data
 -----------
 
-The multigroup library is built from the EPDL97 photon interaction data of XrayPhysics
-(``citrus.scatter_solver.cross_section_library.build_library``). XrayPhysics is a C++ library with Python bindings
-and is built from source:
+The multigroup library (``citrus.scatter_solver.cross_section_library.build_library``) is built from the integrated
+photon cross sections of NIST XCOM (coherent and incoherent scattering, photoelectric absorption, pair production) and
+the angular distributions of Compton and Rayleigh scattering of xraylib (module
+``citrus.scatter_solver.photon_data``). The XCOM tables are not part of the package. On first use CITRUS downloads
+NIST's offline distribution of XCOM, ``https://physics.nist.gov/PhysRefData/Xcom/XCOM.tar.gz`` (173 kB), into
+``$CITRUS_CACHE_DIR/xcom`` (default ``~/.cache/citrus/xcom``), checks its size and SHA-256, and parses the element
+tables once into ``xcom_elements.npz`` next to it; later runs read that file.
+
+On a machine without internet access, download the archive elsewhere and point the environment variable
+``CITRUS_XCOM_ARCHIVE`` to it, or to the folder it unpacks to:
 
 .. code-block:: bash
 
-   git clone --depth 1 https://github.com/kylechampley/XrayPhysics
-   cd XrayPhysics
-   pip install .
+   export CITRUS_XCOM_ARCHIVE=/path/to/XCOM.tar.gz      # Windows: set CITRUS_XCOM_ARCHIVE=C:\path	o\XCOM.tar.gz
 
-With CMake 4 or newer, set ``CMAKE_POLICY_VERSION_MINIMUM=3.5`` in the environment first (XrayPhysics declares a
-minimum CMake version that CMake 4 no longer accepts; the ``pip install`` then fails with "Exactly one .egg-info should
-have been produced"), or install a CMake below 4. The compiler, CMake and git can come from conda when there is no root
-access: ``conda create -n citrus -c conda-forge python=3.11 git cmake make c-compiler cxx-compiler``;
-``dev_scripts/wsl_install_test.sh`` runs the complete installation and the tests that way (tested on Ubuntu under WSL 2
-with a CUDA GPU).
-
-On Windows this needs Visual Studio (C++ build tools) and CMake on ``PATH``; the build can also be done explicitly:
-
-.. code-block:: bat
-
-   cmake -S . -B win_build -G "Visual Studio 17 2022" -A x64
-   cmake --build win_build --config Release
-   set PATH=C:\Program Files\CMake\bin;%PATH%
-   python -m pip install .
-
-``setup.py`` copies ``libxrayphysics`` (``.dll`` / ``.so``) into site-packages. Check with
-``python -c "from xrayphysics import xrayPhysics; xrayPhysics()"``.
+When neither the variable, the cache nor the network is available, building a library raises an error that names the
+URL and the variable. XCOM is a NIST Standard Reference Database; its use is subject to NIST's terms for Standard
+Reference Data, and publications should cite it (:doc:`citation`).
 
 The built library is cached in ``$CITRUS_CACHE_DIR`` (default ``~/.cache/citrus``), keyed by the configuration, the
-spectrum and the build parameters. Once cached, XrayPhysics is no longer needed for that configuration. Tests that need
-the real library are skipped when XrayPhysics is unavailable and nothing is cached.
+spectrum, the photon data and the build parameters. Tests that need the real library are skipped when the XCOM data
+are unavailable and nothing is cached.
 
 Triton
 ------
@@ -90,5 +81,5 @@ Tests
    python -m pytest -q
    CITRUS_SLOW_TESTS=1 python -m pytest -q     # also the slow tests (full-resolution library builds)
 
-CUDA-, Triton-, MBIRTORCH- and XrayPhysics-dependent tests are skipped when those are unavailable; the CPU / float64
-oracle tests always run.
+CUDA-, Triton- and MBIRTORCH-dependent tests, and those that need the XCOM data, are skipped when those are
+unavailable; the CPU / float64 oracle tests always run.

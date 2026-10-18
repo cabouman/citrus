@@ -30,7 +30,7 @@ from citrus.utilities import (attenuation_to_densities, attenuation_to_density, 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 SLOW = pytest.mark.skipif(os.environ.get("CITRUS_SLOW_TESTS") != "1",
-                          reason="set CITRUS_SLOW_TESTS=1 (real XrayPhysics library, cached)")
+                          reason="set CITRUS_SLOW_TESTS=1 (real library, cached)")
 CONFIG = SolverConfig(num_groups=4, legendre_order=3, num_polar=4, num_azimuthal=8, cone_num_polar=8,
                       cone_num_azimuthal=16, source_iteration_tolerance=1e-4, max_source_iterations=40,
                       direction_chunk=8)

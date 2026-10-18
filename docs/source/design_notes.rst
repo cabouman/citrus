@@ -6,15 +6,19 @@ The main implementation choices of CITRUS and the reason for each; :doc:`method`
 Cross sections
 --------------
 
-**Data and mixing.** The photon interaction data are EPDL97 via XrayPhysics: elemental total, photoelectric, Compton
-and Rayleigh cross sections and the incoherent / coherent angular distributions. Elements are mixed in
+**Data and mixing.** The integrated cross sections (coherent, incoherent, photoelectric, pair production) are NIST
+XCOM's, interpolated as XCOM's own program does it (log-log cubic splines, separate tables below the K edge, the value
+above an edge at the edge); the angular distributions are xraylib's (Klein-Nishina times the incoherent scattering
+function, Thomson times the squared form factor) (``photon_data``). Neither needs a compiled dependency: the XCOM
+tables are a 173 kB download from NIST, xraylib installs from wheels. XCOM covers 1 keV to 100 GeV including pair
+production, and its totals are the values of NIST's attenuation tables. Elements are mixed in
 ``cross_section_library``, :math:`d\mu_x/d\Omega(E,\eta) = \sum_i w_i \sigma_{x}(Z_i, E)\, \mathrm{pdf}_{x,i}(E, \eta)`,
-with each elemental angular shape normalized numerically, so that every material of the catalogue is built the same
-way. XrayPhysics' coherent amplitude is wrong at exactly :math:`\theta = 0`; angles are clamped at :math:`10^{-3}`
-degrees.
+with each elemental angular shape normalized numerically, so that the scattering of every material integrates to the
+XCOM cross section whatever the integral of the shape, and every material of the catalogue is built the same way.
 
 **Spectrum, groups and energy quadrature.** The default source is a W-anode 125 kV spectrum (11 degree take-off, 0.89
-mm Ti filter, 1 keV grid, ``default_spectrum_125kvp``); any two-column spectrum can be loaded with
+mm Ti filter, 1 keV grid, shipped with the package and read by ``default_spectrum_125kvp``; CITRUS does not simulate
+tube spectra); any two-column spectrum can be loaded with
 ``load_spectrum_txt``. Spectra are piecewise-linear densities integrated exactly, so characteristic lines are kept. The
 group edges cut the estimated total fluence spectrum (source plus scattered photons) into equal areas. Each group is cut
 into bins of at most 0.5 keV, evaluated at the bin midpoints and weighted with the exact spectrum integral over the
@@ -64,7 +68,7 @@ material's rows do not depend on the material set. The uniform table remains an 
 
 **Cache.** ``build_library`` caches the library as ``mglib_<hash>.pt`` in ``$CITRUS_CACHE_DIR`` (default
 ``~/.cache/citrus``); the key covers the configuration, the spectrum, the backend, the numerical parameters and the
-sorted material set, so XrayPhysics is needed only once per configuration.
+sorted material set, so the photon data are read only once per configuration.
 
 Angular quadratures
 -------------------

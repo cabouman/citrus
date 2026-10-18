@@ -1,5 +1,106 @@
 # Changelog
 
+## v0.7.0 - 2026-10-17
+
+Photon data from NIST XCOM and xraylib instead of XrayPhysics, so that CITRUS installs from wheels without compiling
+anything. **Breaking changes: the photon data change every library** (the cross sections, and with them the
+scattered-fluence group edges, the adaptive angular nodes and every primary and scatter result), the cache version is
+`citrus-xsec-4` with the backend name `"xcom-xraylib"` in the key (every cached library is rebuilt once),
+XrayPhysics and the `physics` extra are gone, xraylib is a required dependency, `default_spectrum_125kvp()` reads a
+data file and takes no backend (tube spectra are no longer simulated), and the element entries of the catalogue end at
+californium (Z = 98). The validation against the Monte Carlo at 125 kVp and 6 MV and the comparison of the new data
+with XrayPhysics and with Geant4 are in the validation folder (`validation/wlab/production_6mv_status.md`, "citrus
+0.7.0").
+
+### Photon data: NIST XCOM and xraylib
+
+- **New** module `citrus.scatter_solver.photon_data` with the backend `XcomXraylibBackend` (`resolve_backend()`,
+  re-exported by `cross_section_library` with `default_cache_dir`), the interface of the builder unchanged:
+  `sigma(kind, Z, E)`, `pdf_raw(kind, Z, E, eta)`, `library_pdf_normalization(kind, Z, E)`, `atomic_mass(Z)`.
+- **Integrated cross sections from NIST XCOM 3.1** (M.J. Berger et al., XCOM: Photon Cross Sections Database, NIST
+  Standard Reference Database 8): the element tables MDATX3.001 .. MDATX3.100 (1 keV .. 100 GeV, barns/atom), read
+  and interpolated as XCOM's Fortran program does it: natural cubic splines in (ln E, ln sigma) for coherent and
+  incoherent scattering over the grid without the points just below the edges; for photoelectric absorption the same
+  spline above the K edge and XCOM's own short tables of every interval between edges below it, interpolated linearly
+  in log-log, the value above an edge at the edge; pair production zero up to its thresholds (1.022007 / 2.044014 MeV)
+  and splined in ln(sigma / ((E - E_threshold) / E)^3) above; barns -> cm^2/g with XCOM's Avogadro factor and atomic
+  weights (ATWTS.DAT). `sigma` kinds: `"total"` (the sum of all five processes, as before with pair production
+  included), `"photoelectric"`, `"compton"` (incoherent), `"rayleigh"` (coherent) and, **new**, `"pair"` (nuclear plus
+  electron field). `XcomXraylibBackend.element(Z)` gives the parsed table (`XcomElement`).
+- **Angular shapes from xraylib** (T. Schoonjans et al., Spectrochimica Acta B 66, 776 (2011)): Compton = xraylib's
+  `DCS_KN` x `SF_Compt` (its `DCS_Compt`), Rayleigh = `DCS_Thoms` x `FF_Rayl`^2 (its `DCS_Rayl`), in cm^2/g/sr, from
+  q = sin(theta/2) without an angle clamp; below xraylib's smallest tabulated momentum transfer (1e-3 and 1e-7 per
+  angstrom) S is continued as x^2 and F held constant. The builder still normalizes every elemental shape to the XCOM
+  cross section of its process, so the scattering integrates to XCOM's whatever the integral of xraylib's shape.
+- `library_pdf_normalization` is the sphere integral of the shape on a fine quadrature (61 geometric pieces in q),
+  so `BuildInfo.pdf_normalization_max_relative_deviation` (the check of the builder's reference quadrature) is always
+  reported.
+- Atomic weights (formula -> mass fractions, and barns -> cm^2/g) from XCOM's table (ATWTS.DAT, NIST's standard
+  atomic weights): water is H 0.111898, O 0.888102 (with the weights of version 0.6: H 0.111907). xraylib's
+  `AtomicWeight` is not used (rounded, H 1.01 and O 16.0, and wrong for thulium, 167.27 instead of 168.934).
+- **Download on first use.** The XCOM data are not shipped: the first build fetches
+  `https://physics.nist.gov/PhysRefData/Xcom/XCOM.tar.gz` (172805 bytes, SHA-256 checked) into
+  `default_cache_dir()/xcom` (`$CITRUS_CACHE_DIR/xcom` or `~/.cache/citrus/xcom`), reads the element files from the
+  archive in memory and writes the parsed tables to `xcom_elements.npz` there. **New** environment variable
+  `CITRUS_XCOM_ARCHIVE`: the path of a downloaded XCOM.tar.gz or of the folder it unpacks to, for offline machines.
+  Without data, cache and network the build raises a RuntimeError naming the URL and the variable.
+  `photon_data.load_xcom_tables`, `read_xcom_source`, `parse_xcom_element`, `parse_xcom_atomic_weights`.
+- The library cache version is `citrus-xsec-4`; the backend name `"xcom-xraylib"` is part of the key.
+
+### Default spectrum
+
+`cross_section_library.default_spectrum_125kvp()` reads the package data file
+`citrus/scatter_solver/data/spectrum_125kvp.txt`: the 125 nodes the library used so far (W anode, 125 kV, 11 degree
+take-off, 0.89 mm Ti, simulated once with XrayPhysics), the same numbers as `validation/wlab/spectrum_125kvp.txt`.
+User spectra are loaded with `load_spectrum_txt` as before. The `backend` argument is removed.
+
+### Material catalogue
+
+- The compositions and nominal densities of the compounds are unchanged (they define the WLAB validation
+  materials). Checked against xraylib's NIST compounds: cortical bone and adipose tissue are 'Bone, Cortical (ICRP)'
+  and 'Adipose Tissue (ICRP)' exactly; lung is 'Lung (ICRP)' without the Ca, Fe and Zn traces (every mass fraction
+  within 4e-4); air reads the volume percentages of dry air as mass fractions (as before; not NIST's dry air).
+- The elements are Z = 1..98 (`hydrogen` ... `californium`): xraylib has no scattering functions for einsteinium and
+  fermium, which are removed. `ELEMENT_SYMBOLS` and `ELEMENT_DENSITIES` come from xraylib (`AtomicNumberToSymbol`,
+  `ElementDensity`: NIST's densities of Hubbell and Seltzer, gases at 20 C). The table embedded in version 0.6 (from
+  XrayPhysics) differed for 18 elements, mostly the gases (at 0 C there: hydrogen 8.988e-5 instead of 8.4e-5 g/cm^3,
+  nitrogen 1.2506e-3 instead of 1.165e-3, oxygen 1.429e-3 instead of 1.332e-3), carbon 2.265 instead of 2.0, sulfur
+  2.07 instead of 2.0, astatine, francium, californium; it is dropped. **New** `cross_sections.NUM_ELEMENTS` (98).
+
+### Removed
+
+- `cross_section_library._XrayPhysicsBackend`, its `spectrum_125kvp` (the tube-spectrum simulation) and the angle
+  clamp of XrayPhysics' Rayleigh amplitude; the `physics` extra of `pyproject.toml`.
+- The installation recipes for XrayPhysics (C++ toolchain, CMake, conda compilers) in the README, the documentation
+  and `dev_scripts/wsl_install_test.sh`; `dev_scripts/check_cuda.sh` reports xraylib, the XCOM data and the cache
+  instead, `create_conda_test_environment.sh` fetches the XCOM data.
+
+### Demo
+
+The cached data sets of `demo/demo_citrus.py` were made with the XrayPhysics library; regenerate them with
+`--regenerate` (the cache name is unchanged).
+
+### Tests and references
+
+**New** `tests/test_photon_data.py`: XCOM totals against NIST's tables (water from 10 keV to 10 MeV, lead around its
+K edge, to the tables' four digits), total = sum of the processes, the pair thresholds, the interpolation through the
+table points, the photoelectric jump at every edge, the spline against a line-by-line port of XCOM.f's SCOF / BSPOL,
+xraylib's DCS_Compt / DCS_Rayl reproduced by the shapes and their continuation below xraylib's tables, the fine
+normalization against the Klein-Nishina cross section, `$CITRUS_XCOM_ARCHIVE` with an archive and an unpacked folder
+without network access, the parsed cache, and the errors without data or with a wrong download.
+`tests/test_cross_section_library.py`: the water totals against NIST's tables to 2e-3 (were 2 %, the tolerance
+of EPDL97 against XCOM), mu_t = photoelectric + Compton + Rayleigh to 1e-12 (an identity of the XCOM data below the pair
+threshold; was 2e-3). `tests/test_material_catalogue.py`: the 98 elements with xraylib's symbols and densities, the
+default compounds against xraylib's NIST compounds, californium among the sampled builds.
+
+**The regression references now encode the XCOM + xraylib data**: the real-library WLAB cases of
+`tests/data/pre_quadrature_reference.json` were regenerated with this version (the synthetic cases are unchanged),
+`tests/test_material_catalogue.py` holds the cache keys of version 0.7.0 and the hash of the legacy-options build
+recorded with it (instead of the version 0.5.1 library, which encoded XrayPhysics data), and the nominal attenuations of
+`tests/test_materials.py`, the docstrings and the documentation are those of the new data. Against the Monte Carlo
+(Geant4 with Livermore, EPDL-based data) the primary is now slightly lower than with version 0.6.0, the difference of
+the XCOM and EPDL97 attenuation over the phantom's water, not a transport error (`validation/wlab`).
+
 ## v0.6.0 - 2026-10-17
 
 An adaptive angular transfer table and energy groups that follow the scattered photons, so that the solver is accurate

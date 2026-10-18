@@ -1,6 +1,7 @@
 """The material catalogue and the user-selected reference materials (version 0.5.0): every catalogue entry builds in the
 library; `SolverConfig.materials` selects the reference materials, the default set has one cache key and one library
-(the legacy options of version 0.6.0 reproduce the library of version 0.5.1 bit for bit); any set is sorted by
+(the legacy options reproduce a recorded build bit for bit; since version 0.7.0 it encodes the XCOM + xraylib data);
+any set is sorted by
 nominal attenuation and has its own cache entry; the density model, the WLAB phantom, the data generator and the
 solver work on a reduced set (air, water, bone) and on an extended one (the seven plus titanium); unknown names, a
 single reference material and a set without water or bone for the WLAB phantom raise."""
@@ -41,16 +42,17 @@ SMALL_BUILD = dict(fine_bin_width_kev=2.0, gauss_legendre_nodes=8)
 SMALL_SOLVER = replace(SMALL, num_polar=4, num_azimuthal=8, cone_num_polar=8, cone_num_azimuthal=16,
                        transport_cell_cm=4.0, source_iteration_tolerance=1e-4, max_source_iterations=40)
 GRID = Grid((10, 16, 20), 2.0)  # the WLAB problem of tests/test_materials.py
-# cache keys of version 0.6.0 (default seven materials): SolverConfig() at 0.5 keV / 32 nodes, SMALL at 2 keV / 8
-# (version 0.6.0 changed the build version and added the angular table grid, the group rule, the grouping object size
-# and the grouping medium to the key)
-KEY_DEFAULT_V060 = "5fada174f9a5ad6f6d10"
-KEY_SMALL_V060 = "4f0c551f679bcdf821c3"
+# cache keys of version 0.7.0 (default seven materials): SolverConfig() at 0.5 keV / 32 nodes, SMALL at 2 keV / 8
+# (version 0.6.0 added the angular table grid, the group rule, the grouping object size and the grouping medium to the
+# key; version 0.7.0 changed the build version and the backend, XCOM + xraylib)
+KEY_DEFAULT_V070 = "385b523384ebf80811d7"
+KEY_SMALL_V070 = "47dde6802807fb32dfb3"
 # the library options of versions <= 0.5 (uniform eta table, equal-fluence groups)
 LEGACY_LIBRARY = dict(angular_table_grid="uniform", group_edges_method="equal_fluence")
-# SHA-256 of the tensors of the SMALL build of version 0.5.1 (SMALL_BUILD, default seven materials; field name then the
-# float64 / int64 bytes, in field order): the legacy options reproduce it bit for bit
-SMALL_V051_SHA256 = "82733c2e779aa7a5667e7086b83f494685799dc010ad6aef2460778aac1f56a5"
+# SHA-256 of the tensors of the SMALL build with the legacy options (SMALL_BUILD, default seven materials; field name
+# then the float64 / int64 bytes, in field order), recorded with version 0.7.0 (XCOM + xraylib data; the hash of version
+# 0.5.1, which the legacy options reproduced up to version 0.6.0, encoded XrayPhysics data)
+SMALL_LEGACY_V070_SHA256 = "f888e15ef29e1f1225c57bee0ed444e0f616be5a9b662af55fe69ba615125ada"
 REFERENCE = Path(__file__).parent / "data" / "pre_quadrature_reference.json"
 
 
@@ -60,7 +62,7 @@ def library_module():
     try:
         cross_section_library.resolve_backend()
     except Exception as exc:
-        pytest.skip(f"XrayPhysics unavailable ({exc})")
+        pytest.skip(f"photon data unavailable ({exc})")
     return cross_section_library
 
 
@@ -158,13 +160,15 @@ def test_wlab_phantom_by_name():
 # ---- library builds -------------------------------------------------------------------------------------------
 
 def test_every_catalogue_entry_parses(library_module):
-    """Every catalogue entry (the compounds and the 100 elements) has a positive density and a composition that
-    parses to mass fractions summing to 1; the elements follow the compounds, one per atomic number 1..100 (aluminium
-    and titanium among the compounds), with XrayPhysics' standard densities."""
+    """Every catalogue entry (the compounds and the 98 elements) has a positive density and a composition that
+    parses to mass fractions summing to 1; the elements follow the compounds, one per atomic number 1..98 (aluminium
+    and titanium among the compounds), with xraylib's symbols and element densities (NIST's)."""
+    import xraylib
+
     backend = library_module.resolve_backend()
     names = tuple(MATERIAL_CATALOGUE)
     assert names[:len(COMPOUND_NAMES)] == COMPOUND_NAMES and len(set(names)) == len(names)
-    assert len(ELEMENT_NAMES) == len(ELEMENT_SYMBOLS) == len(ELEMENT_DENSITIES) == 100
+    assert len(ELEMENT_NAMES) == len(ELEMENT_SYMBOLS) == len(ELEMENT_DENSITIES) == 98
     assert set(ELEMENT_NAMES) <= set(names) and {"lead", "tungsten", "carbon"} <= set(names)
     for name, (density, formula) in MATERIAL_CATALOGUE.items():
         composition = library_module.parse_formula(formula, backend.atomic_mass)
@@ -172,12 +176,21 @@ def test_every_catalogue_entry_parses(library_module):
     for Z, (name, symbol, density) in enumerate(zip(ELEMENT_NAMES, ELEMENT_SYMBOLS, ELEMENT_DENSITIES), start=1):
         assert MATERIAL_CATALOGUE[name][1] == symbol
         assert library_module.parse_formula(symbol, backend.atomic_mass) == {Z: 1.0}
-        assert density == pytest.approx(backend._xray_physics.massDensity(Z), rel=1e-5), name
+        assert symbol == xraylib.AtomicNumberToSymbol(Z) and density == xraylib.ElementDensity(Z), name
     assert MATERIAL_CATALOGUE["lead"] == (11.35, "Pb") and MATERIAL_CATALOGUE["tungsten"] == (19.3, "W")
+    assert ELEMENT_NAMES[-1] == "californium" and "einsteinium" not in MATERIAL_CATALOGUE
+    # the compounds of the default set as NIST compounds of xraylib: cortical bone and adipose tissue exactly, lung
+    # without the Ca, Fe, Zn traces
+    for name, nist, tolerance in (("bone", "Bone, Cortical (ICRP)", 1e-12), ("adipose", "Adipose Tissue (ICRP)", 1e-12),
+                                  ("lung", "Lung (ICRP)", 4e-4)):
+        data = xraylib.GetCompoundDataNISTByName(nist)
+        reference = dict(zip(data["Elements"], data["massFractions"]))
+        ours = library_module.parse_formula(MATERIAL_CATALOGUE[name][1], backend.atomic_mass)
+        assert max(abs(ours.get(Z, 0.0) - reference.get(Z, 0.0)) for Z in set(ours) | set(reference)) < tolerance
 
 
 # the compounds and a sample of the elements (every 10th atomic number, lead and tungsten): one build each
-SAMPLE_ELEMENTS = tuple(ELEMENT_NAMES[Z - 1] for Z in range(10, 101, 10)) + ("lead", "tungsten")
+SAMPLE_ELEMENTS = tuple(ELEMENT_NAMES[Z - 1] for Z in range(10, 99, 10)) + ("californium", "lead", "tungsten")
 
 
 @pytest.mark.parametrize("name", list(COMPOUND_NAMES) + list(SAMPLE_ELEMENTS))
@@ -197,19 +210,20 @@ def test_every_catalogue_material_builds(name, library_module):
 
 
 def test_default_set_keeps_the_cache_key_and_library(library_module, tmp_path, monkeypatch):
-    """The default reference materials give the cache keys of version 0.6.0 and the same library bit for bit, whether
+    """The default reference materials give the cache keys of version 0.7.0 and the same library bit for bit, whether
     the table is None, the default set by name or the same set in another order (sorted by nominal attenuation before
-    the key and the build); the options of version 0.5 (uniform table, equal-fluence groups) reproduce the library of
-    version 0.5.1 bit for bit."""
+    the key and the build); the options of version 0.5 (uniform table, equal-fluence groups) reproduce the library
+    recorded with version 0.7.0 bit for bit (XCOM + xraylib data; up to version 0.6.0 they reproduced the XrayPhysics
+    library of version 0.5.1)."""
     backend = library_module.resolve_backend()
-    spectrum = library_module._spectrum_or_default(None, backend)
+    spectrum = library_module._spectrum_or_default(None)
     reverse = material_table(tuple(reversed(MATERIALS)))
     assert (library_module.sort_material_table(SMALL, reverse, spectrum, backend, fine_bin_width_kev=2.0)
             == material_table(MATERIALS) == library_module.default_material_table())
     key = library_module._cache_key
-    assert key(SolverConfig(), spectrum, backend.name, 0.5, 32) == KEY_DEFAULT_V060
-    assert key(SolverConfig(), spectrum, backend.name, 0.5, 32, material_table(MATERIALS)) == KEY_DEFAULT_V060
-    assert key(SMALL, spectrum, backend.name, 2.0, 8) == KEY_SMALL_V060
+    assert key(SolverConfig(), spectrum, backend.name, 0.5, 32) == KEY_DEFAULT_V070
+    assert key(SolverConfig(), spectrum, backend.name, 0.5, 32, material_table(MATERIALS)) == KEY_DEFAULT_V070
+    assert key(SMALL, spectrum, backend.name, 2.0, 8) == KEY_SMALL_V070
     legacy, _ = library_module.compute_library(replace(SMALL, **LEGACY_LIBRARY), None, backend, **SMALL_BUILD)
     digest = hashlib.sha256()
     for field in legacy.__dataclass_fields__:
@@ -217,10 +231,10 @@ def test_default_set_keeps_the_cache_key_and_library(library_module, tmp_path, m
         if isinstance(value, torch.Tensor):
             digest.update(field.encode())
             digest.update(value.contiguous().numpy().tobytes())
-    assert legacy.eta_map is None and digest.hexdigest() == SMALL_V051_SHA256
+    assert legacy.eta_map is None and digest.hexdigest() == SMALL_LEGACY_V070_SHA256
     reference, _ = library_module.compute_library(SMALL, None, backend, **SMALL_BUILD)
     by_name = library_module.build_library(SMALL, None, cache_dir=str(tmp_path), materials=reverse, **SMALL_BUILD)
-    assert [p.name for p in tmp_path.glob("mglib_*.pt")] == [f"mglib_{KEY_SMALL_V060}.pt"]
+    assert [p.name for p in tmp_path.glob("mglib_*.pt")] == [f"mglib_{KEY_SMALL_V070}.pt"]
     for field in reference.__dataclass_fields__:
         a, b = getattr(reference, field), getattr(by_name, field)
         assert torch.equal(a, b) if isinstance(a, torch.Tensor) else a == b, field
@@ -234,7 +248,7 @@ def test_default_set_keeps_the_cache_key_and_library(library_module, tmp_path, m
     with monkeypatch.context() as patch:
         patch.setattr(library_module, "compute_library", cache_miss)
         assert library_module.build_library(SMALL, None, cache_dir=str(tmp_path), **SMALL_BUILD).materials == MATERIALS
-    if (Path(library_module.default_cache_dir()) / f"mglib_{KEY_DEFAULT_V060}.pt").is_file():
+    if (Path(library_module.default_cache_dir()) / f"mglib_{KEY_DEFAULT_V070}.pt").is_file():
         assert build_solver_library(SolverConfig()).materials == MATERIALS  # the cached default library
 
 
@@ -246,7 +260,7 @@ def test_each_set_has_its_own_cache_entry(library_module, small_libraries, tmp_p
     b = build(SMALL, None, cache_dir=str(tmp_path), materials=material_table(REDUCED), **SMALL_BUILD)
     c = build(SMALL, None, cache_dir=str(tmp_path), **SMALL_BUILD)
     names = sorted(p.name for p in tmp_path.glob("mglib_*.pt"))
-    assert len(names) == 2 and f"mglib_{KEY_SMALL_V060}.pt" in names
+    assert len(names) == 2 and f"mglib_{KEY_SMALL_V070}.pt" in names
     assert a.materials == b.materials == REDUCED and c.materials == MATERIALS
     assert torch.equal(a.mu_s_eta, b.mu_s_eta)
     extended = small_libraries["extended"]
@@ -360,8 +374,9 @@ def test_synthesize_wlab_dataset_on_a_reduced_set(small_libraries):
 
 @cuda
 def test_regression_anchors_default_and_reduced_sets():
-    """The real library built through SolverConfig.materials reproduces the regression anchor of version 0.1.0 on WLAB
-    (tests/data/pre_quadrature_reference.json, 1 cm voxels in 1 cm cells) for the default seven (the library of
+    """The real library built through SolverConfig.materials reproduces the WLAB regression anchor
+    (tests/data/pre_quadrature_reference.json, 1 cm voxels in 1 cm cells; recorded with version 0.1.0, regenerated with
+    version 0.7.0 for the XCOM + xraylib data) for the default seven (the library of
     earlier versions: uniform eta table, equal-fluence groups) and for the reduced set air, water, bone (the WLAB
     phantom is water and bone only)."""
     from citrus.utilities import wlab_solver

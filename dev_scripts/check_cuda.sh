@@ -1,6 +1,7 @@
 #!/bin/bash
-# Reports the GPU driver, PyTorch / CUDA and Triton availability, and runs the per-device self-checks of the fused
-# Triton kernels of citrus (ray tracer, first-collision source, transport sweep) against their PyTorch paths.
+# Reports the GPU driver, PyTorch / CUDA and Triton availability, runs the per-device self-checks of the fused
+# Triton kernels of citrus (ray tracer, first-collision source, transport sweep) against their PyTorch paths, and
+# reports xraylib and the NIST XCOM data (the photon data of the cross-section library) and the cache.
 # Usage: ./check_cuda.sh   (exit code 0 if CUDA is usable, 1 otherwise)
 
 echo "=== GPU driver ==="
@@ -48,10 +49,24 @@ try:
     print(f"\nmbirtorch {mbirtorch.__version__}")
 except Exception as exc:  # noqa: BLE001
     print(f"\nmbirtorch not importable: {type(exc).__name__}: {exc}")
+print("\n=== photon data ===")
 try:
-    from citrus.scatter_solver.cross_section_library import resolve_backend
-    print("XrayPhysics:", resolve_backend().reason)
+    import xraylib
+    print(f"xraylib {xraylib.__version__}")
 except Exception as exc:  # noqa: BLE001
-    print(f"XrayPhysics unavailable: {exc}")
+    print(f"xraylib not importable: {type(exc).__name__}: {exc}")
+try:
+    import os
+
+    from citrus.scatter_solver import photon_data
+    print(f"cache: {photon_data.default_cache_dir()} (XCOM data in {photon_data.xcom_cache_dir()})")
+    variable = os.environ.get(photon_data.XCOM_ARCHIVE_ENVIRONMENT_VARIABLE)
+    print(f"{photon_data.XCOM_ARCHIVE_ENVIRONMENT_VARIABLE}: {variable or 'not set'}")
+    backend = photon_data.resolve_backend()  # downloads the XCOM archive on first use
+    print("XCOM:", backend.reason)
+    print("XCOM source SHA-256:", backend.xcom_sha256,
+          "(the expected archive)" if backend.xcom_sha256 == photon_data.XCOM_ARCHIVE_SHA256 else "")
+except Exception as exc:  # noqa: BLE001
+    print(f"photon data unavailable: {exc}")
 sys.exit(0 if cuda else 1)
 PYEOF

@@ -31,14 +31,14 @@ def library_module():
     try:
         cross_section_library.resolve_backend()
     except Exception as exc:
-        pytest.skip(f"XrayPhysics unavailable ({exc})")
+        pytest.skip(f"photon data unavailable ({exc})")
     return cross_section_library
 
 
 @pytest.fixture(scope="module")
 def spectra(library_module):
     backend = library_module.resolve_backend()
-    return {"125kvp": (library_module.default_spectrum_125kvp(backend), 6),
+    return {"125kvp": (library_module.default_spectrum_125kvp(), 6),
             "6mv": (library_module.load_spectrum_txt(str(SPECTRUM_6MV)), 12)}
 
 
@@ -230,7 +230,7 @@ def test_object_size_of_the_wlab_phantom(library_module, delta_voxel):
     grid = wlab_grid(delta_voxel)
     solver = wlab_solver(delta_voxel, device="cpu")
     threshold = air_water_threshold(solver)
-    assert not solver.library_built and 0.09 < threshold < 0.11  # (0.0002 + 0.2013) / 2 at about 63 keV
+    assert not solver.library_built and 0.09 < threshold < 0.11  # (0.0002 + 0.2014) / 2 at about 63 keV
     library = library_module.compute_library(SolverConfig(num_groups=3, legendre_order=2, num_eta_table=51), None,
                                              fine_bin_width_kev=2.0, gauss_legendre_nodes=8)[0]
     X = WlabPhantom(grid, library.materials).attenuation(library)
@@ -281,7 +281,7 @@ def test_citrus_recon_measures_the_object_and_builds_once(monkeypatch):
 
     try:
         library = build_solver_library(SolverConfig())
-    except Exception as exc:  # no cached library and no XrayPhysics
+    except Exception as exc:  # no cached library and no photon data
         pytest.skip(f"real library unavailable: {exc}")
     geometry = replace(wlab_geometry(), num_det_rows=46, num_det_channels=38, delta_det_row=1.6, delta_det_channel=1.6)
     config = SolverConfig(transport_cell_cm=2.0)

@@ -111,9 +111,10 @@ def build_solver_library(config: SolverConfig, spectrum=None, cache_dir: Optiona
     materials None (default): the reference materials of `config.materials` (at least two catalogue names,
     `SolverConfig.validate`) as the table `cross_sections.material_table(config.materials)`. An explicit table (name,
     nominal density, formula) per material overrides config.materials. The library's materials come out sorted by
-    nominal attenuation (`library.materials`). Needs XrayPhysics (also to sort the set and find the cache entry); built
+    nominal attenuation (`library.materials`). Needs the photon data (XCOM and xraylib, `photon_data`; also to sort the
+    set and find the cache entry); built
     once, then cached. float64 CPU tensors."""
-    from .cross_section_library import build_library  # lazy: XrayPhysics only needed here
+    from .cross_section_library import build_library  # lazy: the photon data are only needed here
 
     if materials is None:
         materials = material_table(check_material_names(config.materials))
@@ -418,7 +419,7 @@ class ScatterSolver:
     def materials(self) -> tuple[str, ...]:
         """Names of the library's materials in library order (`library.materials`). A lazy solver gives the order of
         config.materials after sorting by nominal attenuation (`cross_section_library.sort_material_table`, needs
-        XrayPhysics) without building the library."""
+        the photon data) without building the library."""
         if self._library is not None:
             return tuple(self._library.materials)
         if self._materials is None:
@@ -426,7 +427,7 @@ class ScatterSolver:
 
             backend = resolve_backend()
             table = sort_material_table(self._config, material_table(check_material_names(self._config.materials)),
-                                        _spectrum_or_default(self.spectrum, backend), backend)
+                                        _spectrum_or_default(self.spectrum), backend)
             self._materials = tuple(name for name, _, _ in table)
         return self._materials
 

@@ -93,7 +93,8 @@ with vacuum boundaries and a point source at the focal spot :math:`\mathbf r_0`,
 :math:`q = s(E)\,b(\boldsymbol\Omega)\,\delta(\mathbf r - \mathbf r_0)`, where :math:`s(E)` is the normalized spectrum
 and :math:`b` the collimation (1 for directions that hit the panel, else 0). Interactions: photoelectric absorption
 (local deposition), Compton scattering (Klein-Nishina kinematics with the incoherent scattering function, no Doppler
-broadening) and Rayleigh scattering (form factors), from EPDL97 via XrayPhysics. Every voxel is a mixture of the
+broadening) and Rayleigh scattering (form factors), and pair production (local deposition) at MV energies, with the
+cross sections of NIST XCOM and the angular distributions of xraylib. Every voxel is a mixture of the
 :math:`M` reference materials of the library with densities :math:`\rho_m`, so every coefficient is linear in the
 densities: :math:`\mu_x(\mathbf r, E) = \sum_m \rho_m(\mathbf r)\, m_{x,m}(E)` with the mass coefficients
 :math:`m_{x,m}` of the cross-section library.

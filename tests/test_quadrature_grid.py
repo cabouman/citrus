@@ -29,7 +29,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 F64 = torch.float64
 REFERENCE = Path(__file__).parent / "data" / "pre_quadrature_reference.json"
 SLOW = pytest.mark.skipif(os.environ.get("CITRUS_SLOW_TESTS") != "1",
-                          reason="set CITRUS_SLOW_TESTS=1 (real XrayPhysics library, cached)")
+                          reason="set CITRUS_SLOW_TESTS=1 (real library, cached)")
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 # the problem of tests/test_scatter_solver.py: 2 cm WLAB grid, 4 cm transport cells, q = 2 (Q is the 2 cm grid)
@@ -345,9 +345,10 @@ def test_reproduces_pre_quadrature_solver(device, dtype, tolerance):
 @cuda
 def test_reproduces_pre_quadrature_solver_wlab():
     """(a) The real library on WLAB, one view: 1 cm voxels in 1 cm cells (q = 1: everything on one grid) and 0.5 cm
-    voxels in 1 cm cells (q = 2) against version 0.1.0, with every trace grid (the WLAB phantom's boundaries lie on the
-    cell faces here, so the three traces agree to rounding). The library of version 0.1.0 has a uniform eta table and
-    equal-fluence groups (the defaults up to version 0.5)."""
+    voxels in 1 cm cells (q = 2) against the reference cases (solver of version 0.1.0; regenerated with version 0.7.0,
+    whose library holds the XCOM + xraylib data), with every trace grid (the WLAB phantom's boundaries lie on the cell
+    faces here, so the three traces agree to rounding). The library has a uniform eta table and equal-fluence groups
+    (the defaults up to version 0.5)."""
     from citrus.utilities import wlab_solver
 
     cases = json.loads(REFERENCE.read_text())["cases"]

@@ -12,7 +12,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     env:
-      # no GPU on the runners: CUDA, Triton, MBIRTORCH and XrayPhysics tests skip themselves
+      # no GPU on the runners: CUDA, Triton and MBIRTORCH tests skip themselves; the NIST XCOM data are downloaded
+      # on first use (the tests that need them skip themselves when the download fails)
       CITRUS_DISABLE_TRITON: "1"
     steps:
       - uses: actions/checkout@v4

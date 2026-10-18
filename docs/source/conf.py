@@ -36,7 +36,7 @@ for optional in ("sphinx_copybutton", "sphinxext.opengraph", "sphinx_design"):
         pass
 
 # the heavy runtime dependencies are not needed to render the API pages
-autodoc_mock_imports = ["torch", "triton", "mbirtorch", "xrayphysics"]
+autodoc_mock_imports = ["torch", "triton", "mbirtorch"]
 autodoc_member_order = "bysource"
 autodoc_typehints = "description"
 autodoc_default_options = {"members": True, "show-inheritance": True}

@@ -43,7 +43,7 @@ What CITRUS gives you
    .. grid-item-card:: A deterministic photon transport solver
 
       Multigroup in energy, discrete ordinates in angle, linear-discontinuous finite elements in space, Compton and
-      Rayleigh cross sections from EPDL97, first-collision source exact in energy, collapsed-cone projection to the
+      Rayleigh cross sections from NIST XCOM, first-collision source exact in energy, collapsed-cone projection to the
       detector with the anti-scatter grid and detector responses.
 
    .. grid-item-card:: Independent of the reconstruction grid
@@ -88,14 +88,15 @@ The projected scatter :math:`s_v` and the primary :math:`p_v` of the current vol
 polychromatic model and MBIR's monoenergetic one. :doc:`method` has the derivation and :doc:`design_notes` the
 reasons behind the main implementation choices.
 
-Built on MBIRTORCH and XrayPhysics
-----------------------------------
+Built on MBIRTORCH, NIST XCOM and xraylib
+-----------------------------------------
 
 The reconstruction side is `MBIRTORCH <https://github.com/cabouman/mbirtorch>`_: its cone-beam model provides the
 forward projections, the FDK initialization and the vectorized coordinate descent iterations, warm-started and resumed
-from their error sinogram between scatter updates. The photon interaction data come from
-`XrayPhysics <https://github.com/kylechampley/XrayPhysics>`_ (EPDL97), from which the multigroup cross-section
-library of the chosen reference materials is built once and cached.
+from their error sinogram between scatter updates. The photon cross sections come from
+`NIST XCOM <https://physics.nist.gov/xcom>`_ (downloaded on first use) and the Compton and Rayleigh angular
+distributions from `xraylib <https://github.com/tschoonj/xraylib>`_; from them the multigroup cross-section library of
+the chosen reference materials is built once and cached.
 
 Documentation
 -------------

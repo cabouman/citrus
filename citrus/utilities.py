@@ -34,7 +34,7 @@ For each voxel:
     X < 0 clamps to 0.
 
 At E_eff = 63.03 keV the nominal attenuations of the default reference materials are 0.00022 (air), 0.0520 (lung),
-0.1846 (adipose), 0.2013 (water), 0.2102 (muscle), 0.2122 (soft tissue), 0.5366 (bone) /cm (the other catalogue
+0.1847 (adipose), 0.2014 (water), 0.2102 (muscle), 0.2123 (soft tissue), 0.5365 (bone) /cm (the other catalogue
 materials: `cross_sections` module docstring). With the reference materials air, water, bone a voxel between water and
 bone becomes a water / bone mixture, one between air and water an air / water mixture (lung tissue is then water of
 reduced density mixed with air). The model is exact in attenuation at E_eff
@@ -54,7 +54,7 @@ composition. `object_mask(X, reference)` keeps the voxels above the attenuation 
 (`air_water_threshold`); `object_size_cm` is 4 V / S of that mask (V its volume, S the area of its exposed voxel faces;
 cavities count as outside), rounded to whole centimetres; `grouping_medium_estimate` averages the density model's
 densities over the mask. All three take a library or a solver; for a lazy solver whose library is not built yet the
-nominal attenuations come from XrayPhysics directly, so `citrus_recon` can use them on the FDK volume before it
+nominal attenuations come from the photon data directly, so `citrus_recon` can use them on the FDK volume before it
 builds the library.
 
 Synthetic cone-beam data
@@ -377,7 +377,7 @@ def nominal_densities(library: MultigroupLibrary) -> Tensor:
 
 def nominal_attenuation(library: MultigroupLibrary, energy_kev: Optional[float] = None) -> Tensor:
     """[M] attenuation (1/cm, float64 CPU) of each material at its nominal density at `energy_kev` (None: E_eff);
-    0.00022, 0.0520, 0.1846, 0.2013, 0.2102, 0.2122, 0.5366 /cm for the seven default reference materials at 63.03
+    0.00022, 0.0520, 0.1847, 0.2014, 0.2102, 0.2123, 0.5365 /cm for the seven default reference materials at 63.03
     keV."""
     e = effective_energy(library) if energy_kev is None else float(energy_kev)
     return nominal_densities(library) * mass_attenuation_at(library, e)
@@ -517,7 +517,8 @@ def wlab_solver(delta_voxel: float, *, config: Optional[SolverConfig] = None,
     will be used with), the full-field WLAB geometry (default), an ideal counting detector and no grid, float32.
     Library: `library` if given; else a LAZY solver whose library (the real one for the reference materials
     config.materials and `spectrum`, None the default 125 kVp spectrum) is built on first use (`ScatterSolver.library`;
-    cached in `cache_dir`, "default" is $CITRUS_CACHE_DIR or ~/.cache/citrus, None no disk cache; needs XrayPhysics),
+    cached in `cache_dir`, "default" is $CITRUS_CACHE_DIR or ~/.cache/citrus, None no disk cache; needs the photon
+    data, `photon_data`),
     so that citrus_recon / synthesize_cone_beam_data can still set config.grouping_object_size_cm before the build. The
     WLAB phantom for this solver is `wlab_phantom(grid, materials=solver.materials)` (water and bone must be among the
     reference materials)."""
@@ -541,7 +542,7 @@ def air_water_threshold(reference: Union[MultigroupLibrary, ScatterSolver],
     object mask of `object_size_cm`. reference: a library (E_eff = energy_kev or `effective_energy(library)`; its "air"
     and "water" rows when it has them, an absent air row counts as 0, an absent water row is computed from the
     catalogue) or a solver (its library when built; for a lazy solver whose library is not built yet, the catalogue's
-    air and water through XrayPhysics at the spectrum-mean energy of its config,
+    air and water from the photon data at the spectrum-mean energy of its config,
     `cross_section_library.mass_attenuation_preview`, so the library is not built)."""
     from .scatter_solver.cross_sections import MATERIAL_CATALOGUE
 

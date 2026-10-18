@@ -6,7 +6,7 @@
 
 Builds the multigroup library of the reference materials (``--materials``: comma-separated names of
 citrus.scatter_solver.cross_sections.MATERIAL_CATALOGUE, at least two, water and bone among them; default the seven
-air, lung, adipose, water, muscle, soft_tissue, bone) from XrayPhysics (cached in $CITRUS_CACHE_DIR or
+air, lung, adipose, water, muscle, soft_tissue, bone) from NIST XCOM and xraylib data (cached in $CITRUS_CACHE_DIR or
 ~/.cache/citrus; about 16 s on the first run for seven materials), rasterizes the WLAB phantom (30 x 20 x 40 cm water
 prism with lung, air and bone inserts, in the library's material basis: its water and bone rows; the result does not
 depend on the other reference materials), solves one view with the default solver

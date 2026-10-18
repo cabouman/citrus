@@ -5,7 +5,7 @@ Usage:
                                             [--out _cache/runs/bench_ray_tracing] [--parts equality,chunks,images,fine]
                                             [--torch-chunks 8] [--skip KEY,...] [--rerun]
 
-Setting: WLAB phantom (utilities.wlab_setup), angle 0, real XrayPhysics library (G = 6, the cached build at
+Setting: WLAB phantom (utilities.wlab_setup), angle 0, real XCOM / xraylib library (G = 6, the cached build at
 Legendre order 10), CsI 0.6 mm response, no grid, float32, CUDA, caching-allocator cap 5000 MiB. The
 solver traces the attenuation tau_down on the transport (coarse) grid and projects the emission at the quadrature
 points (scatter_image.combined_scatter_image). Here the quadrature points are the 0.5 cm grid and the coarse grid

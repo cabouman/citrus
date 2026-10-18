@@ -62,7 +62,7 @@ def library_module():
     try:
         cross_section_library.resolve_backend()
     except Exception as exc:
-        pytest.skip(f"XrayPhysics unavailable ({exc})")
+        pytest.skip(f"photon data unavailable ({exc})")
     return cross_section_library
 
 
