@@ -23,6 +23,10 @@ reconstruction :math:`X_0` of the uncorrected data, and every outer iteration :m
 4. divides the measured counts by :math:`1 + s_v / p_v` and runs one warm-started MBIR iteration on the corrected data,
    which gives :math:`X_{k+1}`.
 
+The scatter stage (steps 1 to 3) need not run at every outer iteration: with ``scatter_every`` :math:`n` it runs at
+:math:`k = 0, n, 2n, \dots` and the iterations in between reuse its correction, so :math:`n` MBIR iterations follow
+each scatter update ("Scatter step every n-th outer iteration", below).
+
 Age-ordered source iteration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

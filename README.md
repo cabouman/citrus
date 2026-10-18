@@ -3,8 +3,8 @@
 **CITRUS** (Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter) reconstructs cone-beam CT
 volumes from scatter-contaminated projections by iterating model-based iterative reconstruction (MBIR, via
 [MBIRTORCH](https://github.com/cabouman/mbirtorch)) and a deterministic scatter solver for the linear Boltzmann
-transport equation (LBTE) **jointly**: every MBIR iteration is paired with one source-iteration step of the scatter
-solver. This replaces the usual sequential pipeline (FDK, one scatter estimate from that volume, correction, then a
+transport equation (LBTE) **jointly**: after a chosen number of MBIR iterations, one source-iteration step of the
+scatter solver advances the scatter estimate from the current reconstruction. This replaces the usual sequential pipeline (FDK, one scatter estimate from that volume, correction, then a
 reconstruction that never revisits the scatter), whose scatter estimate inherits the errors of the scatter-corrupted
 initial volume.
 

@@ -6,10 +6,11 @@ inside the reconstruction loop.**
 
 Scatter is the largest source of shading, cupping and wrong CT numbers in cone-beam CT. The usual remedy estimates
 the scatter once, from a first reconstruction that is itself corrupted by scatter, and never revisits it. CITRUS
-(Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter) instead pairs every iteration of
-model-based iterative reconstruction (MBIR) with one step of a deterministic solver of the linear Boltzmann transport
-equation (LBTE). The scatter estimate and the reconstruction converge together, for the cost of one transport sweep
-per view per iteration.
+(Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter) instead interleaves model-based
+iterative reconstruction (MBIR) with steps of a deterministic solver of the linear Boltzmann transport equation
+(LBTE): after a chosen number of MBIR iterations, one scatter step advances the scatter estimate of every view by one
+transport sweep from the current reconstruction. The scatter estimate and the reconstruction converge together, for
+the cost of one transport sweep per view per scatter step.
 
 A reconstruction in a few lines
 -------------------------------
