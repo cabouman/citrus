@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.10.2 - 2026-10-18
+
+- Fix: MBIRTORCH's "cone angle is more than 45 degrees" warning appeared for tall panels of small pixels (736 rows
+  of 0.1 cm), because its constructor checks the cone with its default pixel pitch of 1 before CITRUS sets the real
+  pitch. The bridge now silences that first check and repeats it with the real panel, so a genuinely wide cone
+  still warns.
+- demo 2's data file name records the detector panel, so a panel change cannot load a stale data set.
+
 ## v0.10.1 - 2026-10-18
 
 - Fix: a monoenergetic library has one fine energy (the builder keeps the fine energies with source photons), and

@@ -225,3 +225,25 @@ def test_short_scan_fdk_parker_weights():
     assert w.sum(0).mean() * (ang[1] - ang[0]) == pytest.approx(lam, rel=1e-2)  # sum_beta w dbeta = pi (Lambda / pi)
     with pytest.warns(RuntimeWarning, match="shorter than a short scan"):
         assert short_scan_weights(geometry, np.linspace(0, np.pi, 50, endpoint=False)) is None
+
+
+def test_cone_angle_warning_uses_the_real_panel():
+    """A tall panel of small pixels (736 rows of 0.1 cm at 150 cm: a 13.8 degree half cone) builds without
+    MBIRTORCH's wide-cone warning, which its constructor raised with the default pitch of 1; a panel that really
+    spans more than 45 degrees still warns."""
+    import warnings
+
+    from citrus.scatter_solver.geometry import ConeGeometry, Grid
+
+    grid = Grid((8, 12, 16), 2.5)
+    angles = np.linspace(0.0, 3.5, 6)
+    narrow = ConeGeometry(source_iso_dist=100.0, source_detector_dist=150.0, num_det_rows=736, num_det_channels=60,
+                          delta_det_row=0.1, delta_det_channel=0.1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        make_cone_model(grid, narrow, angles, device=DEVICE)
+    wide = ConeGeometry(source_iso_dist=100.0, source_detector_dist=150.0, num_det_rows=80, num_det_channels=60,
+                        delta_det_row=4.0, delta_det_channel=0.1)
+    with pytest.warns(UserWarning, match="Cone angle is more than 45 degrees"):
+        make_cone_model(grid, wide, angles, device=DEVICE)
+

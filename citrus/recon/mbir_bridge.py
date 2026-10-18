@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from typing import Optional, Sequence, Union
 
+import warnings
+
 import numpy as np
 import torch
 from torch import Tensor
@@ -90,9 +92,13 @@ def make_cone_model(grid: Grid, geometry: ConeGeometry, angles: Union[Sequence[f
     if compile_mode is None:
         compile_mode = "auto" if device.type == "cuda" else "off"
     angle_array = _angles_array(angles)
-    model = mbirtorch.ConeBeamModel((len(angle_array), geometry.num_det_rows, geometry.num_det_channels), angle_array,
-                                    source_detector_dist=float(geometry.source_detector_dist),
-                                    source_iso_dist=float(geometry.source_iso_dist), compile_mode=compile_mode)
+    # the constructor checks the cone angle with its default pixel pitch of 1 (a tall panel of small pixels trips
+    # it); the check is repeated below with the real pitch
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Cone angle is more than 45 degrees")
+        model = mbirtorch.ConeBeamModel((len(angle_array), geometry.num_det_rows, geometry.num_det_channels),
+                                        angle_array, source_detector_dist=float(geometry.source_detector_dist),
+                                        source_iso_dist=float(geometry.source_iso_dist), compile_mode=compile_mode)
     model.set_params(no_warning=True,
                      delta_det_channel=float(geometry.delta_det_channel),
                      delta_det_row=float(geometry.delta_det_row),
@@ -104,6 +110,7 @@ def make_cone_model(grid: Grid, geometry: ConeGeometry, angles: Union[Sequence[f
                      recon_slice_offset=float(grid.recon_slice_offset), use_ror_mask=use_ror_mask, verbose=int(verbose))
     if params:
         model.set_params(**params)
+    model.verify_valid_params()  # the cone-angle check with the real panel
     model.configure_devices(devices=[str(device)])
     return model
 
