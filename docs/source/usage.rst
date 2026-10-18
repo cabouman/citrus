@@ -27,8 +27,8 @@ counts with ``synthesize_cone_beam_data`` (cached in ``demo/input/`` under a nam
 runs load them), builds the scatter solver from ``SolverConfig`` and the spectrum, reconstructs with ``citrus_recon``
 and, for comparison, with ``mbir_recon`` from the same FDK volume with the same regularization, prints the relative
 RMSE of both against the true attenuation and shows the central slices and central-row profiles. With the values in
-the file (180 views over a short scan, 0.5 cm voxels, 80 outer iterations with the scatter step on every 8th view at
-every 8th iteration) the first run synthesizes the data and takes a few minutes on a GPU.
+the file (180 views over a short scan, 0.5 cm voxels, adaptive numbers of outer and MBIR iterations, the scatter
+step on every 8th view) the first run synthesizes the data and takes a few minutes on a GPU.
 
 CITRUS studies
 --------------
@@ -54,8 +54,8 @@ data sets are cached in ``demo/input/``.
 Flags:
 
 * ``--views`` (default 180), ``--delta-voxel`` (default 0.5), ``--transport-cell-cm`` (default 1, any ratio to the
-  voxel pitch; used by the loop's and the truth's solver), ``--outer-iterations`` (default 10),
-  ``--mbir-iterations`` per outer iteration (default 8);
+  voxel pitch; used by the loop's and the truth's solver), ``--outer-iterations`` and ``--mbir-iterations`` per
+  outer iteration (a number each, or ``adaptive``, the default);
 * ``--start-view-angle`` / ``--end-view-angle`` (degrees; the default end is a short scan), ``--full`` (the full
   rotation configuration above);
 * ``--scatter-view-stride`` (default 8), ``--scatter-view-interpolation-order`` (``0``-``3`` or ``none``, default
@@ -102,7 +102,7 @@ CITRUS
    from citrus import CitrusConfig, citrus_recon, mbir_recon
    from citrus.utilities import wlab_solver
 
-   solver = wlab_solver(delta_voxel, geometry=geometry, device="cuda")          # or any ScatterSolver
+   solver = wlab_solver(delta_voxel, geometry=geometry, device="cuda", spectrum=spectrum)   # or any ScatterSolver
    recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, CitrusConfig(num_outer_iterations=10))
    baseline, _ = mbir_recon(Y, I0, angles, grid, geometry, CitrusConfig(num_outer_iterations=10),
                             regularization=info["regularization"])
@@ -141,8 +141,8 @@ The entries of ``info``:
 
 ``mbir_recon`` returns the same entries without those of the scatter solver.
 
-The scatter schedule (:doc:`method`, "Scatter step every n-th outer iteration" and "Scatter step on every m-th
-view"):
+The iteration counts and the view schedule (:doc:`method`, "MBIR iterations per outer iteration" and "Scatter step
+on every m-th view"):
 
 .. code-block:: python
 
