@@ -4,7 +4,7 @@ Usage and demos
 Demos
 -----
 
-Six quick-start scripts in ``demo/`` show how to write a Python script with the CITRUS API: every setting is a
+Seven quick-start scripts in ``demo/`` show how to write a Python script with the CITRUS API: every setting is a
 variable in a parameter block at the top, each step has a comment, and the figures are shown at the end. The
 reconstruction demos synthesize their data once and cache them in ``demo/input/`` under a file name built from the
 settings that change the data, so later runs load them.
@@ -17,6 +17,7 @@ settings that change the data, so later runs load them.
    python demo/demo_4_materials.py               # user-defined materials: iodine contrast and dental amalgam
    python demo/demo_5_parallel_monoenergetic.py  # a monoenergetic parallel beam (synchrotron CT)
    python demo/demo_6_callbacks.py               # convergence curves from the callbacks of citrus_recon
+   python demo/demo_7_scatter_schedules.py       # CITRUS against no correction, sequential, first-order, decoupled
 
 ``demo_1_scatter_solver.py`` builds the cross-section library of the default reference materials (on first use it
 downloads the NIST XCOM photon data and builds the library; both are cached), rasterizes the WLAB phantom (a 30 x 20 x
@@ -31,8 +32,9 @@ scatter step on every 8th view), prints the relative RMSE of the initial FDK vol
 shows the central slices and central-row profiles of the truth and of CITRUS.
 
 ``demo_3_helical_grid.py`` scans the WLAB prism with a helix (``helical_scan``) on a cylindrical panel
-(``ConeGeometry(use_curved_detector=True)``) behind a CT-style grid: tungsten septa parallel to the rotation axis
-(``anti_scatter_grid(..., septa_along="rows")``), each focused on the source. The pitch, the number of turns and the
+(``ConeGeometry(use_curved_detector=True)``) of energy-integrating CsI (``detector_response("cesium_iodide", ...)``)
+behind a CT-style grid: tungsten septa parallel to the rotation axis (``anti_scatter_grid(..., septa_along="rows")``),
+each focused on the source. The pitch, the number of turns and the
 panel height are chosen so that the helix covers the whole 40 cm height of the prism; the demo also shows a coronal
 slice.
 
@@ -50,6 +52,17 @@ panel as a parameter: the scatter that reaches the panel falls as the gap grows.
 relative RMSE of the volume against the truth and the sinogram residual ``record["sinogram_nrmse"]`` after every MBIR
 iteration, prints per outer iteration what its record holds (MBIR iterations taken, scatter change, accumulator
 change, timings) and plots the convergence curves.
+
+``demo_7_scatter_schedules.py`` reconstructs the data of demo 2 five times from the same FDK volume with the same frozen
+regularization, weights and partition seeds, and only the scatter estimate differs: no correction; sequential (one
+converged solve per view from the FDK volume, then frozen, the usual pipeline); first order only (the first-order
+scatter of the current volume every outer iteration); decoupled (a fresh converged solve per view every outer
+iteration); and CITRUS. The first four run the loop of ``citrus_recon`` written out with its public parts
+(``ScatterSolver.solve_view_from_fields``, the scatter operators of ``citrus.citrus``, ``primary_signals``,
+``interpolate_scatter`` and ``recon.mbir_bridge.mbir_iterations`` with the seeds of the loop), so the script is also an
+example of a custom scatter schedule. First order only, decoupled and CITRUS stop by the adaptive rules; no correction
+and sequential run the MBIR iterations of the CITRUS run. It shows the central slices with the relative RMSE and run
+time of each, and the relative RMSE after every MBIR iteration; the decoupled reconstruction takes the longest.
 
 On a GPU the first run of each reconstruction demo, with the synthesis of its data, takes a few minutes.
 

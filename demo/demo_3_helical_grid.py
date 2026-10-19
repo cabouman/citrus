@@ -1,9 +1,9 @@
 """Demo 3: a helical scan on a curved detector with an anti-scatter grid.
 
 Reconstruct a helical scan of the WLAB phantom (a 30 x 20 x 40 cm water prism with lung, air and bone inserts) by a
-clinical-CT-like scanner: a cylindrical panel centered on the source and a 1-D anti-scatter grid whose tungsten
-septa run parallel to the rotation axis, each focused on the source, as on a CT detector. The helix covers the whole
-height of the prism. The measured data are synthetic, made once and cached in demo/input.
+clinical-CT-like scanner: a cylindrical panel of CsI scintillator centered on the source and a 1-D anti-scatter grid
+whose tungsten septa run parallel to the rotation axis, each focused on the source, as on a CT detector. The helix
+covers the whole height of the prism. The measured data are synthetic, made once and cached in demo/input.
 
 For your own scanner, set the panel, the grid and the helix, and replace the synthetic data by your measured counts
 [views, detector rows, detector channels] with their view angles and table positions (``with_helical_z_shifts``).
@@ -16,7 +16,7 @@ import numpy as np
 
 from citrus import CitrusConfig, citrus_recon
 from citrus.scatter_solver import (ConeGeometry, ScatterSolver, SolverConfig, anti_scatter_grid,
-                                   ideal_counting_response, load_spectrum_txt)
+                                   detector_response, load_spectrum_txt)
 from citrus.utilities import (WlabPhantom, helical_scan, load_dataset, plot_profiles, plot_slices, save_dataset,
                               synthesize_cone_beam_data, view_angles, wlab_grid)
 
@@ -29,6 +29,7 @@ source_iso_dist = 60.0                     # source to rotation axis distance in
 source_detector_dist = 105.0               # source to detector distance in cm, the radius of the curved panel
 num_det_rows, num_det_channels = 80, 168   # panel size in pixels: 18.3 cm along z at the axis, a 37.7 cm field
 pixel_pitch = 0.4                          # pixel pitch in cm (channels: arc length on the cylinder)
+scintillator_thickness = 0.06              # CsI scintillator thickness in cm (energy integrating)
 septum_thickness, septum_height, septum_pitch = 0.01, 2.0, 0.1  # tungsten septa in cm, one per mm of arc
 delta_voxel = 0.5                          # voxel pitch in cm of the reconstruction grid (the 30 x 20 x 40 cm prism)
 num_turns = 3                              # turns of the helix
@@ -50,13 +51,17 @@ septa = anti_scatter_grid(geometry, septum_thickness, septum_height, septum_mate
                           pitch_cm=septum_pitch, septa_along="rows")
 grid = wlab_grid(delta_voxel)
 config = SolverConfig(materials=tuple(materials))
-# The data's and the reconstruction's solver: a photon-counting detector behind the grid, on the helical geometry.
-make_solver = lambda: ScatterSolver(None, config, geometry, detector=ideal_counting_response(),  # noqa: E731
-                                    grid_response=septa, device="cuda", spectrum=spectrum)
+# The detector: a CsI layer that records the energy its photons deposit, from the photon data of CsI, for every
+# energy and incidence angle.
+detector = detector_response("cesium_iodide", scintillator_thickness, mode="energy_integrating")
+# The data's and the reconstruction's solver: the CsI detector behind the grid, on the helical geometry.
+make_solver = lambda: ScatterSolver(None, config, geometry, detector=detector, grid_response=septa,  # noqa: E731
+                                    device="cuda", spectrum=spectrum)
 
 # ---- Data: loaded when a file of this name exists in demo/input, else synthesized once (a few minutes on a GPU) ---
 name = (f"wlab_helical_{num_turns}x{views_per_turn}v_{pitch_cm:g}cm_{delta_voxel:g}cm_{num_det_rows}x"
-        f"{num_det_channels}px{pixel_pitch:g}cm_curved_septa{septum_height:g}cm_125kvp").replace(".", "p")
+        f"{num_det_channels}px{pixel_pitch:g}cm_curved_septa{septum_height:g}cm_csi{scintillator_thickness:g}cm_125kvp"
+        ).replace(".", "p")
 path = os.path.join(demo_dir, "input", name)
 if os.path.exists(path + ".npz"):
     data = load_dataset(path)

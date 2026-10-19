@@ -92,6 +92,7 @@ python demo/demo_3_helical_grid.py            # a helical scan on a curved detec
 python demo/demo_4_materials.py               # user-defined materials: iodine contrast and a dental amalgam filling
 python demo/demo_5_parallel_monoenergetic.py  # a monoenergetic parallel beam (synchrotron CT), air gap option
 python demo/demo_6_callbacks.py               # convergence curves recorded with the callbacks of citrus_recon
+python demo/demo_7_scatter_schedules.py       # CITRUS against no correction, sequential, first-order, decoupled
 ```
 
 The demos are short scripts that show the API step by step, with every setting (spectrum, reference materials,
@@ -143,7 +144,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Gregery T. Buzzard and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.18.0},
+  note = {Version 0.18.1},
   year = 2026
 }
 ```

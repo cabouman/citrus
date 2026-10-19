@@ -32,7 +32,7 @@ A reconstruction in a few lines
 ``counts`` are the measured projections (primary plus scatter), ``grid`` and ``geometry`` describe the volume and the
 scanner (a cone beam with a flat or curved panel and circular or helical views, or a parallel beam) in MBIRTORCH's
 conventions, and the configuration runs the scatter step on every 8th view only, interpolating the others in angle.
-:doc:`usage` describes the six demos and the study script that compares CITRUS with MBIR without scatter correction.
+:doc:`usage` describes the seven demos and the study script that compares CITRUS with MBIR without scatter correction.
 
 What CITRUS gives you
 ---------------------
