@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.16.3 - 2026-10-19
+
+- **Demo names.** `demo_2_citrus.py` is now `demo_2_basic_cone.py`, `demo_3_helical.py` is `demo_3_helical_grid.py`
+  and `demo_5_parallel_beam.py` is `demo_5_parallel_monoenergetic.py`.
+
 ## v0.16.2 - 2026-10-19
 
 - **Demos.** Six demos: the scatter solver (1), a circular cone-beam scan of the WLAB phantom with the 6 MV spectrum

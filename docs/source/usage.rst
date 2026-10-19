@@ -11,26 +11,26 @@ settings that change the data, so later runs load them.
 
 .. code-block:: bash
 
-   python demo/demo_1_scatter_solver.py   # the scatter solver on one view of the WLAB phantom
-   python demo/demo_2_citrus.py           # CITRUS on a short circular cone-beam scan
-   python demo/demo_3_helical.py          # a helical scan on a curved detector with an anti-scatter grid
-   python demo/demo_4_materials.py        # user-defined materials: iodine contrast and dental amalgam
-   python demo/demo_5_parallel_beam.py    # a monoenergetic parallel beam (synchrotron CT)
-   python demo/demo_6_callbacks.py        # convergence curves from the callbacks of citrus_recon
+   python demo/demo_1_scatter_solver.py          # the scatter solver on one view of the WLAB phantom
+   python demo/demo_2_basic_cone.py              # CITRUS on a short circular cone-beam scan
+   python demo/demo_3_helical_grid.py            # a helical scan on a curved detector with an anti-scatter grid
+   python demo/demo_4_materials.py               # user-defined materials: iodine contrast and dental amalgam
+   python demo/demo_5_parallel_monoenergetic.py  # a monoenergetic parallel beam (synchrotron CT)
+   python demo/demo_6_callbacks.py               # convergence curves from the callbacks of citrus_recon
 
 ``demo_1_scatter_solver.py`` builds the cross-section library of the default reference materials (on first use it
 downloads the NIST XCOM photon data and builds the library; both are cached), rasterizes the WLAB phantom (a 30 x 20 x
 40 cm water prism with lung, air and bone inserts) on a 1 cm grid, solves one view with the default configuration and
 shows the primary signal, the scatter signal and the scatter fraction on the detector.
 
-``demo_2_citrus.py`` is the typical circular cone-beam scenario: a short scan of the WLAB phantom with the sample
+``demo_2_basic_cone.py`` is the typical circular cone-beam scenario: a short scan of the WLAB phantom with the sample
 125 kVp spectrum of ``demo/spectra`` (the 6 MV linac spectrum is a commented-out alternative, as is a focused lead
 anti-scatter grid, ``anti_scatter_grid``, used by the solvers of the data and of the reconstruction). It synthesizes
 the counts with ``synthesize_cone_beam_data``, reconstructs them with ``citrus_recon`` (adaptive iteration counts,
 scatter step on every 8th view), prints the relative RMSE of the initial FDK volume and of CITRUS against the truth and
 shows the central slices and central-row profiles of the truth and of CITRUS.
 
-``demo_3_helical.py`` scans the WLAB prism with a helix (``helical_scan``) on a cylindrical panel
+``demo_3_helical_grid.py`` scans the WLAB prism with a helix (``helical_scan``) on a cylindrical panel
 (``ConeGeometry(use_curved_detector=True)``) behind a CT-style grid: tungsten septa parallel to the rotation axis
 (``anti_scatter_grid(..., septa_along="rows")``), each focused on the source. The pitch, the number of turns and the
 panel height are chosen so that the helix covers the whole 40 cm height of the prism; the demo also shows a coronal
@@ -42,9 +42,9 @@ a vessel of contrast and an amalgam filling) as a density volume whose rows foll
 through the amalgam are starved of primary photons; the demo explains what to expect and compares the initial volume
 and CITRUS outside the filling.
 
-``demo_5_parallel_beam.py`` reconstructs a breast-sized phantom imaged by a monoenergetic parallel beam at 32 keV
-(``ParallelGeometry.from_grid``, ``monoenergetic_spectrum``), with the air gap between the rotation axis and the panel
-as a parameter: the scatter that reaches the panel falls as the gap grows.
+``demo_5_parallel_monoenergetic.py`` reconstructs a breast-sized phantom imaged by a monoenergetic parallel beam at
+32 keV (``ParallelGeometry.from_grid``, ``monoenergetic_spectrum``), with the air gap between the rotation axis and the
+panel as a parameter: the scatter that reaches the panel falls as the gap grows.
 
 ``demo_6_callbacks.py`` runs CITRUS on the data of demo 2 with ``callback`` and ``mbir_callback``: it records the
 relative RMSE of the volume against the truth and the sinogram residual ``record["sinogram_nrmse"]`` after every MBIR
