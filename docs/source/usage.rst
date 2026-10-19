@@ -137,9 +137,23 @@ The entries of ``info``:
   scatter is interpolated in angle);
 * ``grouping_object_size_cm``, ``grouping_medium`` (the object size and medium of the solver's energy groups, None
   when its group rule is not ``"scattered_fluence"``), ``grouping_applied`` (whether ``citrus_recon`` set them;
-  False for a prebuilt library) and ``library_seconds`` (time to build or load a lazy solver's library).
+  False for a prebuilt library) and ``library_seconds`` (time to build or load a lazy solver's library);
+* ``emission_profile``: the source's emission profile derived from an open-field image (None for a number).
 
 ``mbir_recon`` returns the same entries without those of the scatter solver.
+
+The flat field is a number or the measured open-field image, ``[rows, channels]`` for every view or ``[views, rows,
+channels]`` per view, in the same units as the counts (a bowtie or beam filter, the heel effect). An image normalizes
+the counts pixel by pixel and gives the solver's source the emission profile of the open field for the duration of the
+call (:doc:`method`, "Source emission profile and open field"); a per-pixel detector gain map, if known, separates the
+gain from the emission:
+
+.. code-block:: python
+
+   recon, info = citrus_recon(Y, open_field, angles, grid, geometry, solver, config)                  # all emission
+   recon, info = citrus_recon(Y, open_field, angles, grid, geometry, solver, config, detector_gain=gain)
+   info["emission_profile"]                     # [rows, channels], mean 1
+   baseline, _ = mbir_recon(Y, open_field, angles, grid, geometry, config)   # the same normalization, no correction
 
 The iteration counts and the view schedule (:doc:`method`, "MBIR iterations per outer iteration" and "Scatter step
 on every m-th view"):
@@ -353,6 +367,37 @@ the fine box and the first-order quantities on q\ :sup:`3` points per cell (``qu
 traced (:doc:`method`, "Options and secondary components"; :doc:`conventions`, "Grids"). ``ViewResult`` also carries
 the scalar and planar fluences per group, the source-iteration history, per-stage timings and peak memory.
 
+Detector, grid and source
+-------------------------
+
+The detector response, the anti-scatter grid and the source model are arguments of ``ScatterSolver`` (and of
+``utilities.wlab_solver``); :doc:`method`, "Detector and grid responses" and "Source emission profile and open field",
+describes the models.
+
+.. code-block:: python
+
+   from citrus.scatter_solver import (SourceModel, anti_scatter_grid, bowtie_emission_profile, detector_response,
+                                      emission_profile_from_open_field, tabulated_detector_response)
+
+   detector = detector_response("cesium_iodide", 0.06)                           # energy integrating, full deposition
+   detector = detector_response("gadolinium_oxysulfide", 0.02, deposition="local")   # thin screen, MV beams
+   detector = detector_response("cadmium_telluride", 0.2, mode="photon_counting")
+   detector = tabulated_detector_response(energies_kev, response)                # e.g. from a Monte Carlo run
+   septa = anti_scatter_grid(geometry, septum_thickness_cm=0.002, septum_height_cm=0.15)   # lead, one septum per
+   septa = anti_scatter_grid(geometry, 0.002, 0.15, septa_along="rows", septum_material="tungsten")  # pixel
+   source = SourceModel(emission_profile=bowtie_emission_profile(geometry, edge_weight=0.2))
+   source = SourceModel(emission_profile=emission_profile_from_open_field(open_field, solver, detector_gain=gain))
+   solver = ScatterSolver(library, config, geometry, detector=detector, grid_response=septa, source=source,
+                          device="cuda")
+
+``detector_response`` takes any catalogue material (:doc:`conventions`, "Materials") with its catalogue density or
+``density=``, ``mode`` "energy_integrating" (keV per photon) or "photon_counting", and ``deposition`` "full" or
+"local". ``anti_scatter_grid`` takes the septum material, thickness and height, ``focal_distance_cm`` (default: the
+source-detector distance), ``pitch_cm`` (default: the pixel pitch across the septa) and ``septa_along`` ("channels",
+the default, or "rows"). ``csi_response`` and ``focused_1d_grid`` remain the built-in CsI and lead models.
+``SourceModel(emission_profile=...)`` takes a ``[rows, channels]`` profile, or ``[views, rows, channels]`` with
+``emission_profile_angles``. ``citrus_recon`` sets the profile itself from an open-field image.
+
 Energy groups and the angular table
 -----------------------------------
 
@@ -429,9 +474,23 @@ geometry=..., start_view_angle=0.0, end_view_angle=None)`` is the WLAB wrapper u
 (``end_view_angle`` None: the short scan start + pi + fan angle; ``2 pi`` for a full rotation); ``save_dataset`` /
 ``load_dataset`` write and read ``.npz`` + ``.json``.
 
-The primary in the denominator of the synthetic scatter-to-primary ratio is the planar fluence summed over the
-groups (``citrus.citrus.primary_signals(..., quantity="planar_fluence")``), in photons/cm^2, rather than the
-detector signal.
+The scatter-to-primary ratio of the data is that of the solver's detector signals, through the detector response and
+behind the grid, as in the CITRUS loop (with the ideal counting detector and no grid of ``wlab_solver`` the signal is
+the planar fluence). The truth solver's source model sets the emission profile of the data and
+``detector_gain=`` a per-pixel gain map; ``synthesize_wlab_dataset`` passes ``detector=``, ``grid_response=``,
+``source=`` and ``detector_gain=`` on. The data's ``open_field`` is the flat field to give ``citrus_recon``: the
+number ``I0`` for a uniform source without a gain map, else the image ``I0 g f / mean(f)`` of the gain :math:`g` and
+the truth solver's open-field signal :math:`f` with its emission profile, and the primary counts are
+``P = open_field exp(-A X)``:
+
+.. code-block:: python
+
+   source = SourceModel(emission_profile=bowtie_emission_profile(geometry, 0.1))
+   septa = anti_scatter_grid(geometry, 0.002, 0.15)
+   data = synthesize_wlab_dataset(180, 0.5, source=source, detector_gain=gain, grid_response=septa,
+                                  geometry=geometry, spectrum=spectrum)
+   recon, info = citrus_recon(data["Y"], data["open_field"], data["angles"], grid, geometry, solver,
+                              detector_gain=gain)
 
 The solver's images are in photons/cm^2 per source photon/sr; its primary carries the inverse-square and obliquity
 factors of the point source and the polychromatic transmission. MBIRTORCH's model is the flat, monochromatic line

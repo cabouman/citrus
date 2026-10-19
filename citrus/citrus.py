@@ -1022,8 +1022,8 @@ def _sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: Grid, geometry: ConeGeometry, config: CitrusConfig,
-                scatter_stage: Optional[ScatterStage], device: torch.device, *, regularization: Optional[dict],
+def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: Grid, geometry: ConeGeometry,
+                config: CitrusConfig, scatter_stage: Optional[ScatterStage], device: torch.device, *, regularization: Optional[dict],
                 init_recon: Optional[Tensor], model, callback, label: str, mbir_callback=None,
                 schedule: Optional[Sequence[int]] = None,
                 after_initialization: Optional[Callable[[Tensor, dict], None]] = None) -> tuple[Tensor, dict]:

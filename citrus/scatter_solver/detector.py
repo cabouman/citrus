@@ -327,7 +327,7 @@ def material_cross_sections(material: str, energy_kev: ArrayLike, backend=None) 
     Args:
         material (str): catalogue material name (``cross_sections.MATERIAL_CATALOGUE``), e.g. "cesium_iodide".
         energy_kev (ArrayLike): [K] photon energies in keV.
-        backend (XcomXraylibBackend, optional): photon data. Defaults to None (``photon_data.resolve_backend()``).
+        backend (photon_data.XcomXraylibBackend, optional): photon data. Defaults to None (loaded on first use).
 
     Returns:
         dict[str, np.ndarray]: [K] mass cross sections in cm^2/g for "photoelectric", "compton", "rayleigh",
@@ -386,7 +386,7 @@ def detector_response(material: str = "cesium_iodide", thickness_cm: float = 0.0
             logarithmically spaced up to 20 MeV (pass the group energies to make the table exact at the groups).
             Defaults to None.
         thetas (ArrayLike, optional): table angles in rad; None uses 181 nodes from 0 to 89.5 degrees. Defaults to None.
-        backend (XcomXraylibBackend, optional): photon data. Defaults to None (loaded on first use).
+        backend (photon_data.XcomXraylibBackend, optional): photon data. Defaults to None (loaded on first use).
 
     Returns:
         DetectorResponse: the response, float64 tables on the CPU.
@@ -624,7 +624,7 @@ def anti_scatter_grid(geometry: Optional[ConeGeometry], septum_thickness_cm: flo
             logarithmically spaced up to 20 MeV. Defaults to None.
         theta1 (ArrayLike, optional): table angles theta1 in rad; None uses nodes dense up to twice the cut-off angle
             ``atan((p - t) / h)`` and coarser up to 89.5 degrees. Defaults to None.
-        backend (XcomXraylibBackend, optional): photon data. Defaults to None (loaded on first use).
+        backend (photon_data.XcomXraylibBackend, optional): photon data. Defaults to None (loaded on first use).
 
     Returns:
         GridResponse: the response, float64 tables on the CPU.
