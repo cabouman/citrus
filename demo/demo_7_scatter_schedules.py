@@ -21,8 +21,8 @@ sequential correction leaves shading; first-order scatter misses the multiple sc
 Decoupled and CITRUS reach nearly the same accuracy, CITRUS for one sweep per view per outer iteration instead of a
 converged solve (the run times in the titles, after the shared FDK volume; the uncollided fluence and the scatter
 image, which every schedule but the first two computes each time, cost as much as several sweeps). The convergence
-plot shows the relative RMSE against the truth after every MBIR iteration against the wall time of each
-reconstruction, both on log scales. The five reconstructions take several minutes on a GPU, the decoupled one the
+plot shows the relative RMSE against the truth after every MBIR iteration, with a dot at the volume each scatter
+solve starts from. The five reconstructions take several minutes on a GPU, the decoupled one the
 longest.
 """
 
@@ -85,21 +85,13 @@ relative_error = lambda X: float((X - X_true_gpu).norm() / X_true_gpu.norm())  #
 # ---- CITRUS; its run also sets the initial volume, the frozen regularization and the model every schedule shares ---
 solver = make_solver()
 loop = CitrusConfig(scatter_view_stride=scatter_view_stride)  # adaptive numbers of iterations
-history, clock = [], []                                       # (seconds since X_0, relative RMSE) after every MBIR
-
-
-def start_clock(k, X, record):                                 # called for X_0 (k = 0), after the FDK volume
-    if k == 0:
-        clock.append(time.perf_counter())
-
-
-def record_error(i, X, record):                                # called for X_0 (i = 0) and after every MBIR iteration
-    history.append((0.0 if i == 0 else time.perf_counter() - clock[0], relative_error(X)))
-
-
-X_citrus, info = citrus_recon(data["Y"], I0, angles, grid, geometry, solver, loop, callback=start_clock,
-                              mbir_callback=record_error)
-results = {"CITRUS": (X_citrus, sum(r["scatter_seconds"] for r in info["records"]), info["seconds"], history)}
+history = []                                                  # relative RMSE after MBIR iteration 0 (FDK), 1, ...
+X_citrus, info = citrus_recon(data["Y"], I0, angles, grid, geometry, solver, loop,
+                              mbir_callback=lambda i, X, record: history.append(relative_error(X)))
+blocks = [r["mbir_iterations"] for r in info["records"][1:]]  # MBIR iterations of each outer iteration
+solves = [int(n) for n in np.cumsum([0] + blocks[:-1])]       # MBIR iteration whose volume each scatter solve uses
+results = {"CITRUS": (X_citrus, sum(r["scatter_seconds"] for r in info["records"]), info["seconds"], history,
+                      solves)}
 
 # ---- The other schedules: the same loop with another scatter estimate ---------------------------------------------
 model, X_initial = info["model"], info["init_recon"]          # the model keeps the frozen regularization
@@ -135,10 +127,11 @@ def reconstruct(ratio_of_volume):
     """The outer loop of citrus_recon with the scatter-to-primary ratio ratio_of_volume(k, X) of outer iteration k,
     stopped by its adaptive rules (``loop``'s thresholds and maxima)."""
     X, i, scatter_seconds, start = X_initial.clone(), 0, 0.0, time.perf_counter()
-    history, previous_fit = [(0.0, relative_error(X))], None
+    history, solves, previous_fit = [relative_error(X)], [], None
     max_mbir = loop.max_mbir_iterations_per_outer_iteration
     for k in range(loop.max_outer_iterations):
         t0 = time.perf_counter()
+        solves.append(i)                                       # the scatter of outer iteration k uses X after i
         ratio = ratio_of_volume(k, X)
         torch.cuda.synchronize()
         scatter_seconds += time.perf_counter() - t0
@@ -148,7 +141,7 @@ def reconstruct(ratio_of_volume):
             np.random.seed([loop.base_seed, i])                # the partitions citrus_recon draws for iteration i
             X, _ = mbir_iterations(model, corrected, X, first_iteration=i, weights=Y / I0)
             i += 1
-            history.append((time.perf_counter() - start, relative_error(X)))
+            history.append(relative_error(X))
             fits.append(fit(X, corrected))                     # stop once the mean improvement per iteration of
             if j >= 2 and j < max_mbir:                        # the last two is too small
                 if 0.5 * (fits[-3] - fits[-1]) / fits[-3] < loop.mbir_stop_relative_improvement:
@@ -158,7 +151,7 @@ def reconstruct(ratio_of_volume):
             break
         previous_fit = fits[-1]
     torch.cuda.synchronize()
-    return X, scatter_seconds, time.perf_counter() - start, history
+    return X, scatter_seconds, time.perf_counter() - start, history, solves
 
 
 frozen = {}
@@ -171,13 +164,15 @@ schedules = {
 }
 for label, ratio_of_volume in schedules.items():
     results[label] = reconstruct(ratio_of_volume)
+results["no correction"] = results["no correction"][:4] + ([],)                     # no scatter solve
+results["sequential"] = results["sequential"][:4] + (results["sequential"][4][:1],)  # one, from the FDK volume
 
 # ---- Results: the relative RMSE against the truth and the central slices ----------------------------------------
 relative_rmse = lambda X: np.linalg.norm(X - X_true) / np.linalg.norm(X_true)  # noqa: E731
 order = ["no correction", "sequential", "first order only", "decoupled", "CITRUS"]
 panels = [("truth", X_true)]
 for label in order:
-    X, scatter_seconds, total_seconds, _ = results[label]   # the loop after the shared FDK volume
+    X, scatter_seconds, total_seconds, _, _ = results[label]   # the loop after the shared FDK volume
     X = X.cpu().numpy()
     print(f"{label:17s} relative RMSE {relative_rmse(X):.4f}, scatter {scatter_seconds:6.1f} s, "
           f"total {total_seconds:6.1f} s")
@@ -197,11 +192,12 @@ styles = {"no correction": ("#52514e", (0, (1, 2))), "sequential": ("#1baf7a", "
 fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
 for label in order:
     color, linestyle = styles[label]
-    seconds, errors = zip(*results[label][3][1:])              # from the first MBIR iteration on (log time axis)
-    ax.loglog(seconds, errors, color=color, linestyle=linestyle, linewidth=2, label=label,
-              drawstyle="steps-post")                      # the volume holds still while the scatter is computed
-ax.axhline(results["CITRUS"][3][0][1], color="0.6", linestyle="--", linewidth=1, label="FDK volume")
-ax.set(xlabel="wall time after the FDK volume (s)", ylabel="relative RMSE", title="Relative RMSE against the truth")
+    errors, solves = results[label][3], results[label][4]
+    ax.semilogy(errors, color=color, linestyle=linestyle, linewidth=2, label=label)
+    ax.semilogy(solves, [errors[i] for i in solves], linestyle="none", marker="o", markersize=4, color=color)
+ax.plot([], [], linestyle="none", marker="o", markersize=4, color="0.4", label="scatter solve")
+ax.set(xlabel="MBIR iteration (0 = FDK)", ylabel="relative RMSE", title="Relative RMSE against the truth",
+       xlim=(0, max(len(results[label][3]) - 1 for label in order)))
 ax.grid(True, which="major", alpha=0.3)
 ax.legend(frameon=False)
 plt.show()

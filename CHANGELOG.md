@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.18.3 - 2026-10-19
+
+- **Demo 7.** The convergence plot is against MBIR iterations again, with a dot on each curve at the volume each
+  scatter solve starts from.
+
 ## v0.18.2 - 2026-10-19
 
 - **Demo 7.** Every reconstruction, no correction and sequential included, stops by the adaptive rules of

@@ -61,8 +61,8 @@ iteration); and CITRUS. The first four run the loop of ``citrus_recon`` written 
 (``ScatterSolver.solve_view_from_fields``, the scatter operators of ``citrus.citrus``, ``primary_signals``,
 ``interpolate_scatter`` and ``recon.mbir_bridge.mbir_iterations`` with the seeds of the loop), so the script is also an
 example of a custom scatter schedule. Every reconstruction stops by the adaptive rules. It shows the central slices with
-the relative RMSE and run time of each, and the relative RMSE after every MBIR iteration against wall time; the
-decoupled reconstruction takes the longest.
+the relative RMSE and run time of each, and the relative RMSE after every MBIR iteration with the scatter solves marked;
+the decoupled reconstruction takes the longest.
 
 On a GPU the first run of each reconstruction demo, with the synthesis of its data, takes a few minutes.
 
