@@ -185,7 +185,7 @@ averaged onto 1 cm cells first, so the estimate depends neither on the voxel pit
 reconstruction, and it needs no threshold or mask: a lattice, a shell or a lung-like region count through their
 optical depth. For a convex homogeneous body it is close to the mean chord :math:`4V/S`. :math:`\bar\rho` is the
 density model's densities averaged over the voxels above the attenuation midway between air and water
-(``SolverConfig.grouping_medium = "auto"``; a catalogue name or a mapping of densities sets a known medium instead).
+(``SolverConfig.grouping_medium = "auto"``; a material name or a mapping of densities sets a known medium instead).
 The balance is only a grouping heuristic. Under this rule the energies within each group are weighted
 by :math:`\phi(E)` for the group constants too (the other rules weight them by the source spectrum): the photons a
 group transports are the source photons in the upper groups and the scattered ones in the lower groups, where the

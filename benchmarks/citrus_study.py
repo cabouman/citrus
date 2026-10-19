@@ -16,6 +16,7 @@ Usage::
         --mbir-iterations 1                            # a quick run
     python benchmarks/citrus_study.py --transport-cell-cm 0.5                  # 0.5 cm transport cells
     python benchmarks/citrus_study.py --materials air,water,bone_cortical_icrp             # three reference materials
+    python benchmarks/citrus_study.py --materials "air,water,iodine_solution:1.01:0.99*water+0.01*I,bone_cortical_icrp"
     python benchmarks/citrus_study.py --truth-sweep 16x32 --truth-cone 32x64   # truth finer than the loop's solver
 """
 
@@ -40,7 +41,7 @@ from citrus.citrus import estimate_regularization  # noqa: E402
 from citrus.recon.mbir_bridge import is_short_scan, make_cone_model, scan_range  # noqa: E402
 from citrus.scatter_solver.config import SolverConfig  # noqa: E402
 from citrus.scatter_solver.cross_section_library import load_spectrum_txt  # noqa: E402
-from citrus.scatter_solver.cross_sections import COMPOUND_NAMES, check_material_names  # noqa: E402
+from citrus.scatter_solver.cross_sections import COMPOUND_NAMES, Material, check_material_names  # noqa: E402
 from citrus.scatter_solver.geometry import ConeGeometry, Grid  # noqa: E402
 from citrus.utilities import (full_field_wlab_geometry, load_dataset,  # noqa: E402
                               nominal_attenuation, plot_history, plot_profiles, plot_slices, set_memory_cap,
@@ -66,6 +67,27 @@ def _counts(text: str, what: str) -> tuple[int, int]:
     except ValueError:
         raise SystemExit(f"{what} must be POLARxAZIMUTHAL, e.g. 16x32, got {text!r}")
     return p, a
+
+
+def _material_argument(text: str):
+    """One entry of --materials: a catalogue name, or a user material ``name:density:composition``.
+
+    Args:
+        text (str): the entry.
+
+    Returns:
+        str or Material: the catalogue name or the material.
+    """
+    parts = [part.strip() for part in text.split(":")]
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) != 3:
+        raise ValueError(f"a user material is name:density:composition, got {text!r}")
+    try:
+        density = float(parts[1])
+    except ValueError:
+        raise ValueError(f"the density of {text!r} must be a number in g/cm^3") from None
+    return Material(parts[0], density, parts[2])
 
 
 def main() -> None:
@@ -110,8 +132,9 @@ def main() -> None:
     parser.add_argument("--materials", default=",".join(SolverConfig().materials),
                         help="reference materials of the loop's density model, comma-separated names from the "
                              "catalogue "
-                             f"({', '.join(COMPOUND_NAMES)} and every element by its English name, e.g. lead); at "
-                             "least two (default: "
+                             f"({', '.join(COMPOUND_NAMES)} and every element by its English name, e.g. lead) or "
+                             "user materials name:density:composition (e.g. iodine_solution:1.01:0.99*water+0.01*I, "
+                             "density in g/cm^3); at least two (default: "
                              f"{','.join(SolverConfig().materials)})")
     parser.add_argument("--resume-error-sinogram", default=True, action=argparse.BooleanOptionalAction,
                         help="resume MBIR from its error sinogram between outer iterations (default) or restart it "
@@ -137,7 +160,8 @@ def main() -> None:
         if value != "adaptive" and value < 1:
             raise SystemExit(f"{flag} must be >= 1 or adaptive")
     try:
-        materials = check_material_names(tuple(name.strip() for name in args.materials.split(",") if name.strip()))
+        materials = check_material_names(tuple(_material_argument(entry) for entry in args.materials.split(",")
+                                               if entry.strip()))
     except ValueError as exc:
         raise SystemExit(f"--materials: {exc}")
     if not torch.cuda.is_available():

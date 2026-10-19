@@ -298,10 +298,28 @@ example ``aluminium``, 2.6989 g/cm³, ``titanium``, 4.54 g/cm³, ``lead``, 11.35
 with the element as the composition and xraylib's element density (the NIST densities of Hubbell and Seltzer,
 NISTIR 5632; gases at 20 °C and 1 atm) as the nominal density. xraylib has no scattering functions for Z = 99, 100.
 
-A composition is a material string (``cross_section_library.parse_formula``): a chemical formula (``H2O``, a
+A composition is a material string (``cross_sections.parse_formula``): a chemical formula (``H2O``, a
 stoichiometric compound) or a mixture ``a*F1 + b*F2 + ...`` with a, b the relative mass fractions of the elements or
 compounds F1, F2 (normalized to sum 1). A term's number is the mass fraction of its compound even when the compound
 is a molecule, so ``78.084*N2`` weighs N2 by 78.084; element counts are converted with the atomic weights of XCOM.
+A part that starts with a lowercase letter is a catalogue material by name and stands for its composition:
+``0.99*water + 0.01*I`` is water with 1 % iodine by mass.
+
+A material that is not in the catalogue is defined with ``cross_sections.Material(name, density, composition)``
+(``citrus.scatter_solver.Material``): its name, its nominal density in g/cm³ and its composition in the syntax above.
+It is accepted wherever a catalogue name is, and its library constants are built from the photon data exactly like
+those of a catalogue material. The definition is checked on construction: the composition must parse, its elements
+must have scattering data (Z = 1..98), the density must be positive, and a catalogue name is accepted only with that
+entry's own density and composition (such a copy is the catalogue entry). The library cache key holds every
+material's name, density and composition, so two definitions under one name never share a cached library.
+
+.. code-block:: python
+
+   from citrus.scatter_solver import Material
+
+   contrast = Material("iodine_solution", 1.01, "0.99*water + 0.01*I")   # a contrast agent in water
+   polymer = Material("peek", 1.32, "C19H12O3")                           # an industrial polymer
+   alloy = Material("ti6al4v", 4.43, "0.90*Ti + 0.06*Al + 0.04*V")        # an alloy, by mass
 
 The compositions of air, lung, adipose tissue, cortical bone, PMMA and polyethylene are those of the WLAB validation
 materials. Cortical bone and adipose tissue have exactly the mass fractions of xraylib's NIST compounds
@@ -314,9 +332,9 @@ Seltzer, NISTIR 5632; spongiosa and cartilage are from Woodard and White (1986),
 ICRU Report 46 (1992). Muscle lies below soft tissue at every library energy (lower density, nearly the same
 composition), hence its place in the default order.
 
-* Reference materials: the library is built for ``SolverConfig.materials`` (at least two catalogue names, any order),
-  sorted by increasing attenuation at the nominal density (the order must hold at every library energy). Default: the
-  seven ``cross_sections.MATERIALS``, in library order 0 air (0.0012 g/cm^3), 1 lung (0.26), 2 adipose (0.95), 3 water
+* Reference materials: the library is built for ``SolverConfig.materials`` (at least two catalogue names or
+  ``Material`` definitions with distinct names, any order), sorted by increasing attenuation at the nominal density
+  (the order must hold at every library energy). Default: the seven ``cross_sections.MATERIALS``, in library order 0 air (0.0012 g/cm^3), 1 lung (0.26), 2 adipose (0.95), 3 water
   (1.0), 4 skeletal muscle (1.05), 5 soft tissue (1.06), 6 cortical bone (ICRP composition, 1.85); ``WATER = 3`` and
   ``BONE = 6`` are the rows of the DEFAULT set; for any library look a row up by name,
   ``cross_sections.material_index(library, "water")`` (the WLAB phantom and the data generator do).

@@ -60,7 +60,8 @@ Flags:
   rotation configuration above);
 * ``--scatter-view-stride`` (default 8), ``--scatter-view-interpolation-order`` (``0``-``3`` or ``none``, default
   ``3``);
-* ``--materials`` (the reference materials of the loop's density model, comma-separated catalogue names, at least two;
+* ``--materials`` (the reference materials of the loop's density model, comma-separated catalogue names or user
+  materials ``name:density:composition``, at least two;
   default ``air,lung_icrp,adipose_icrp,water,muscle_icru44,soft_tissue_icru44,bone_cortical_icrp``);
 * ``--no-resume-error-sinogram`` (restart MBIR from the sinogram every outer iteration);
 * ``--I0`` (flat-field counts, default 1e5), ``--seed``, ``--no-noise``, ``--regenerate``, ``--truth-sweep``,
@@ -278,7 +279,7 @@ descriptions. The first setting of each group names the group.
      - size in cm of the object in the scattered-fluence rule (CITRUS measures it on the FDK volume)
    * - ``grouping_medium``
      - ``"auto"``
-     - medium of that rule: auto (the object's mean densities), a catalogue name or (name, density) pairs
+     - medium of that rule: auto (the object's mean densities), a reference material name or (name, density) pairs
    * - ``energy_min_kev``
      - ``10.0``
      - lowest group edge; photons scattered below it are absorbed
@@ -293,7 +294,8 @@ descriptions. The first setting of each group names the group.
      - placement of those nodes: adaptive (by the curvature of the transfer) or uniform
    * - ``materials`` (materials)
      - the seven defaults
-     - reference materials of the library and the density model (catalogue names, at least two)
+     - reference materials of the library and the density model (catalogue names or ``Material`` definitions, at
+       least two)
    * - ``num_polar`` (angle)
      - ``8``
      - Gauss-Legendre polar nodes of the sweep quadrature (at least L + 1)
@@ -364,7 +366,7 @@ Two settings of ``SolverConfig`` shape the library (:doc:`method`, "Uncollided f
   ``"equal_fluence"`` (equal source photon counts) or ``"log"`` (geometric spacing). ``group_edges_kev`` overrides
   the rule.
 * ``grouping_medium``: ``"auto"`` (default: measured on the object, water until then), a reference material's name
-  (``"aluminium"`` for an aluminium casting) or a mapping ``{"water": 0.9, "bone_cortical_icrp": 0.2}`` (g/cm^3) of
+  (``"aluminium"`` for an aluminium casting, or the name of a ``Material``) or a mapping ``{"water": 0.9, "bone_cortical_icrp": 0.2}`` (g/cm^3) of
   reference
   materials.
 * ``angular_table_grid``: ``"adaptive"`` (default; ``num_eta_table`` nodes placed by the curvature of the transfer) or
@@ -397,8 +399,9 @@ Reference materials
 -------------------
 
 ``SolverConfig.materials`` names the reference materials of the library and of the density model, at least two names
-of the catalogue (:doc:`conventions`, "Materials"), in any order; the library sorts them by nominal attenuation
-(``library.materials``) and refuses a set whose members cross in attenuation. Look density rows up by name:
+of the catalogue (:doc:`conventions`, "Materials") or user-defined materials, in any order; the library sorts them by
+nominal attenuation (``library.materials``) and refuses a set whose members cross in attenuation. Look density rows up
+by name:
 
 .. code-block:: python
 
@@ -414,6 +417,21 @@ of the catalogue (:doc:`conventions`, "Materials"), in any order; the library so
 
 The WLAB phantom (and ``synthesize_wlab_dataset``) needs water and bone among the reference materials;
 ``cross_sections.WATER`` / ``BONE`` are the rows of the default set only.
+
+A material that is not in the catalogue is defined with ``Material(name, density, composition)``, the nominal density
+in g/cm^3 and the composition a formula or mass fractions of formulas, elements and catalogue materials
+(:doc:`conventions`, "Materials"). It goes into ``SolverConfig.materials`` next to catalogue names, and everything
+else refers to it by its name: ``library.materials``, ``material_index``, ``grouping_medium`` and the density rows.
+
+.. code-block:: python
+
+   from citrus.scatter_solver import Material
+
+   contrast = Material("iodine_solution", 1.01, "0.99*water + 0.01*I")        # 1 % iodine by mass in water
+   config = replace(SolverConfig(), materials=("air", "water", contrast, "bone_cortical_icrp"))
+   solver = wlab_solver(1.0, config=config, device="cuda", spectrum=spectrum)
+   solver.materials                    # ('air', 'water', 'iodine_solution', 'bone_cortical_icrp')
+   material_index(solver.library, "iodine_solution")                             # 2
 
 Synthetic data
 --------------

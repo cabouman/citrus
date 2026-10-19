@@ -153,7 +153,7 @@ class SolverConfig:
                 names = tuple(name for name, _ in medium)
                 densities = [float(density) for _, density in medium]
             except (TypeError, ValueError):
-                raise ValueError(f"grouping_medium must be 'auto', a catalogue name or a mapping "
+                raise ValueError(f"grouping_medium must be 'auto', a material name or a mapping "
                                  f"{{reference material name: density}}, got {medium!r}") from None
             if any(not d >= 0 for d in densities) or not any(d > 0 for d in densities):
                 raise ValueError(f"grouping_medium densities must be >= 0 with at least one > 0, got {medium!r}")
