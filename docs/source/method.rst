@@ -657,8 +657,9 @@ image run through the pixel centers on it, the downstream optical depth ends on 
 ray's hit on it, and the incidence angle :math:`\theta_0`, the planar fluence and the detector and grid responses use
 the local normal of each pixel, which is horizontal and points to the axis. The scatter-image weights therefore depend
 on the direction and the channel, :math:`w_k \cos\theta_{0,kc}\, D_g(\theta_{0,kc})`, and a grid transmission that
-depends on the angles is evaluated per pixel for each chunk of directions; the grid's lamellae run along the arc and
-each column is focused along its own normal (at the focal spot for the default focal distance). The collapsed-cone
+depends on the angles is evaluated per pixel for each chunk of directions. Lamellae along the channels run along the
+arc and each column is focused along its own normal; lamellae along the rows (``septa_along="rows"``, the usual
+clinical grid) are focused along each pixel's normal. Both focus on the focal spot at the default focal distance. The collapsed-cone
 direction set keeps the axis of the normal at the panel center and covers the cylinder's edges, and the finite-cone
 footprint is computed on the plane tangent to the cylinder at the central ray (the arc length and the tangent-plane
 coordinate agree to first order in the fan angle).
