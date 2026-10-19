@@ -26,7 +26,8 @@ MBIRTORCH bridge
 The interface to the reconstruction package.
 
 :doc:`api/mbir_bridge`
-    The MBIRTORCH model of the solver's geometry, FDK with short-scan weights, warm-started MBIR iterations.
+    The MBIRTORCH model of the solver's geometry, FDK with short-scan weights or the filtered back projection of a
+    parallel beam, warm-started MBIR iterations.
 
 .. toctree::
    :hidden:
@@ -45,7 +46,8 @@ The LBTE source iteration solver, one module per stage.
     ``SolverConfig``: every discretization parameter of the solver.
 
 :doc:`api/geometry`
-    Transport and quadrature grids, the cone-beam geometry and the conservative resampling between grids.
+    Transport and quadrature grids, the cone-beam and parallel-beam geometries and the conservative resampling
+    between grids.
 
 :doc:`api/cross_sections`
     The material catalogue, the multigroup library container, per-voxel coefficients and a synthetic test library.
@@ -57,7 +59,7 @@ The LBTE source iteration solver, one module per stage.
     The photon data: NIST XCOM cross sections (downloaded on first use) and xraylib angular distributions.
 
 :doc:`api/source`
-    The point source: spectrum, emission profile and collimation.
+    The source: spectrum, emission profile and collimation of the focal spot or the parallel beam.
 
 :doc:`api/detector`
     Detector and anti-scatter-grid responses.

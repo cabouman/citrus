@@ -28,7 +28,8 @@ class Projectors(Protocol):
     """Protocol of the five ray-tracing operations of the scatter solver.
 
     Every operation works on one view angle in the recon frame, batched over a leading group axis G, with the volume
-    zero outside the box of its grid.
+    zero outside the box of its grid. For a ``ParallelGeometry`` the rays "from the focal spot" are the beam's rays,
+    which start upstream of the grid box (``ParallelGeometry.ray_starts``).
     """
 
     def upstream_cumulative(self, mu: Tensor, grid: Grid, geometry: ConeGeometry, angle: float) -> Tensor:
@@ -413,6 +414,8 @@ class SiddonProjectors:
         if self._use_triton(mu):
             return ray_tracing_kernels.upstream_cumulative(mu, grid, geometry, angle)
         centers = grid.center_coordinates(mu.device, mu.dtype).reshape(-1, 3)
+        if geometry.is_parallel:  # each ray starts upstream of the box on the beam's line through its end
+            return self.line_integrals(mu, geometry.ray_starts(centers, angle, grid), centers, grid).reshape(mu.shape)
         source_position = torch.tensor(geometry.source_position(angle), device=mu.device, dtype=mu.dtype)
         tau = self.line_integrals(mu, source_position.expand_as(centers), centers, grid)
         return tau.reshape(mu.shape)
@@ -432,6 +435,8 @@ class SiddonProjectors:
             Tensor: [G, N] optical depth from the focal spot to each point.
         """
         pts = points.to(device=mu.device, dtype=mu.dtype).reshape(-1, 3)
+        if geometry.is_parallel:
+            return self.line_integrals(mu, geometry.ray_starts(pts, angle, grid), pts, grid)
         source_position = torch.tensor(geometry.source_position(angle), device=mu.device, dtype=mu.dtype)
         return self.line_integrals(mu, source_position.expand_as(pts), pts, grid)
 
@@ -463,6 +468,11 @@ class SiddonProjectors:
         G = mu.shape[0]
         pixels = geometry.pixel_centers(angle, device, dtype)  # [Rd, Cd, 3]
         Rd, Cd = pixels.shape[:2]
+        if geometry.is_parallel:  # the beam's rays through the pixel (or sub-pixel) centers
+            n = samples_per_pixel_axis
+            ends = pixels.reshape(-1, 3) if n == 1 else geometry.subpixel_centers(angle, n, device, dtype).reshape(-1, 3)
+            tau = self.line_integrals(mu, geometry.ray_starts(ends, angle, grid), ends, grid).reshape(G, Rd, Cd, n * n)
+            return tau[..., 0] if n == 1 else -(torch.logsumexp(-tau, dim=-1) - math.log(n * n))
         source_position = torch.tensor(geometry.source_position(angle), device=device, dtype=dtype)
         if samples_per_pixel_axis == 1:
             ends = pixels.reshape(-1, 3)

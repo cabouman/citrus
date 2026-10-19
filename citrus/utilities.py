@@ -23,7 +23,7 @@ from .scatter_solver.config import SolverConfig
 from .scatter_solver.cross_sections import MATERIALS, MultigroupLibrary, material_index
 from .scatter_solver.detector import DetectorResponse, GridResponse, ideal_counting_response, no_grid
 from .scatter_solver.source import SourceModel
-from .scatter_solver.geometry import ConeGeometry, Grid
+from .scatter_solver.geometry import ConeGeometry, Grid, ParallelGeometry
 from .scatter_solver.scatter_solver import ScatterSolver
 
 __all__ = [
@@ -36,6 +36,7 @@ __all__ = [
     "wlab_grid",
     "wlab_geometry",
     "full_field_wlab_geometry",
+    "parallel_wlab_geometry",
     "wlab_setup",
     "effective_energy",
     "mass_attenuation_at",
@@ -355,6 +356,24 @@ def full_field_wlab_geometry() -> ConeGeometry:
         ConeGeometry: the scan geometry of the reconstructions.
     """
     return replace(wlab_geometry(), num_det_channels=150, num_det_rows=184)
+
+
+def parallel_wlab_geometry(delta_voxel: float, axis_detector_dist: float = 50.0) -> ParallelGeometry:
+    """Parallel-beam geometry of the WLAB prism on ``wlab_grid(delta_voxel)``, whose whole prism it sees at every view.
+
+    The detector rows are the slices of the grid (``ParallelGeometry.from_grid``) and the channels, of the voxel
+    pitch, span at least 38 cm, more than the 36.06 cm transaxial diagonal of the prism.
+
+    Args:
+        delta_voxel (float): voxel pitch in cm of the grid; it must divide every extent of the box.
+        axis_detector_dist (float, optional): distance from the rotation axis to the panel in cm. Defaults to 50.0, the
+            axis-detector distance of ``wlab_geometry``.
+
+    Returns:
+        ParallelGeometry: the scan geometry.
+    """
+    channels = int(math.ceil(38.0 / float(delta_voxel) - 1e-9))
+    return ParallelGeometry.from_grid(wlab_grid(delta_voxel), axis_detector_dist, channels, float(delta_voxel))
 
 
 def wlab_setup(delta_voxel: float = 1.0, device=None, dtype=torch.float32,
@@ -877,14 +896,17 @@ def object_size_cm(X: Tensor, grid: Grid, *, cell_cm: float = 1.0, num_rays: int
 def fan_angle(geometry: ConeGeometry) -> float:
     """In-plane fan angle ``2 atan(0.5 num_det_channels delta_det_channel / SDD)`` of the panel (offset ignored).
 
-    A curved panel has the fan angle ``num_det_channels delta_det_channel / SDD`` (its channels are arc lengths).
+    A curved panel has the fan angle ``num_det_channels delta_det_channel / SDD`` (its channels are arc lengths), and a
+    parallel beam the fan angle 0.
 
     Args:
-        geometry (ConeGeometry): scan geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
 
     Returns:
         float: fan angle in rad.
     """
+    if geometry.is_parallel:
+        return 0.0
     half = 0.5 * float(geometry.num_det_channels) * float(geometry.delta_det_channel)
     if geometry.use_curved_detector:
         return 2.0 * half / float(geometry.source_detector_dist)
@@ -900,7 +922,8 @@ def view_angles(num_views: int, geometry: Optional[ConeGeometry] = None, start_v
         geometry (ConeGeometry, optional): scan geometry, needed for the default end. Defaults to None.
         start_view_angle (float): first view angle in rad. Defaults to 0.0.
         end_view_angle (float, optional): end of the range in rad (excluded); ``start + 2 pi`` is a full rotation.
-            Defaults to None, the short scan end ``start + pi + fan_angle(geometry)``.
+            Defaults to None, the short scan end ``start + pi + fan_angle(geometry)`` (``start + pi`` for a parallel
+            beam).
 
     Returns:
         np.ndarray: [V] float64 view angles in rad (MBIRTORCH's angle convention).
@@ -951,7 +974,7 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
                               energy_kev: Optional[float] = None, device=None,
                               progress: Optional[Callable[[int, float], None]] = None,
                               detector_gain=None) -> dict:
-    """Cone-beam counts with scatter, ``Y = Poisson(F exp(-A X_true) (1 + SPR))``, for any density volume.
+    """Counts with scatter, ``Y = Poisson(F exp(-A X_true) (1 + SPR))``, of a cone-beam or parallel-beam scan.
 
     The primary is MBIRTORCH's projection of the true attenuation and SPR the solver's scatter-to-primary ratio of the
     detector signals of one fully converged solve per view; a lazy solver with the "scattered_fluence" group rule first
@@ -963,7 +986,7 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
         densities: true object on ``grid``: a density model with ``material(X, m)`` (e.g. ``WlabPhantom``) or a
             [M, R, C, S] volume in g/cm^3 of the solver library's materials.
         grid (Grid): reconstruction grid, the solver's fine grid.
-        geometry (ConeGeometry): scan geometry; it must be the solver's geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry; it must be the solver's geometry.
         angles (array-like): [V] view angles in rad.
         solver (ScatterSolver): solver that defines the scatter truth.
         I0 (float): flat-field counts per pixel. Defaults to 1.0e5.
@@ -983,7 +1006,7 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
         or [V, Rd, Cd] for a per-view emission profile), energy_kev, mass_attenuation [M] in cm^2/g, and meta (setup
         and statistics).
     """
-    from .recon.mbir_bridge import forward_project, make_cone_model, mbirtorch_version
+    from .recon.mbir_bridge import forward_project, make_model, mbirtorch_version
 
     from .citrus import primary_signals
     from .recon.mbir_bridge import ViewChunkProjector
@@ -1010,7 +1033,7 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
 
     # primary: MBIRTORCH forward projection (the reconstruction's own operator)
     t0 = time.perf_counter()
-    model = make_cone_model(grid, geometry, angles, device=device)
+    model = make_model(grid, geometry, angles, device=device)
     line_integrals = forward_project(model, X).to(device)
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -1076,7 +1099,9 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
 
     spr_array = to_numpy(SPR)
     meta = {
-        "description": "synthetic cone-beam data with scatter, citrus.utilities.synthesize_cone_beam_data",
+        "description": "synthetic cone-beam data with scatter, citrus.utilities.synthesize_cone_beam_data"
+                       if not geometry.is_parallel else
+                       "synthetic parallel-beam data with scatter, citrus.utilities.synthesize_cone_beam_data",
         "num_views": int(V), "I0": float(I0), "noise": bool(noise), "seed": int(seed), "energy_kev": energy_kev,
         "primary_projector": "mbirtorch", "data_format": 2,  # on-disk record of citrus >= 0.3.0 (format 2)
         "materials": list(library.materials), "nominal_density": [float(d) for d in library.nominal_density],
@@ -1184,7 +1209,7 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
                             geometry: Optional[ConeGeometry] = None, spectrum=None,
                             detector: Optional[DetectorResponse] = None, grid_response: Optional[GridResponse] = None,
                             source: Optional[SourceModel] = None, detector_gain=None) -> dict:
-    """Synthetic cone-beam data of the WLAB phantom (``synthesize_cone_beam_data``), optionally written to disk.
+    """Synthetic data of the WLAB phantom (``synthesize_cone_beam_data``), optionally written to disk.
 
     The phantom is placed on ``wlab_grid(delta_voxel)`` in the water and bone rows of the library of ``wlab_solver``;
     meta also records delta_voxel, start_view_angle, end_view_angle and short_scan.
@@ -1204,10 +1229,11 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
         device (torch.device, optional): device. Defaults to None, CUDA when available, else the CPU.
         start_view_angle (float): first view angle in rad. Defaults to 0.0.
         end_view_angle (float, optional): end of the angular range in rad (excluded). Defaults to None, the short scan
-            end ``start + pi + fan_angle(geometry)``.
+            end ``start + pi + fan_angle(geometry)`` (``start + pi`` for a parallel beam).
         progress (Callable[[int, float], None], optional): called as ``progress(view_index, seconds)`` after every
             view. Defaults to None.
-        geometry (ConeGeometry, optional): scan geometry. Defaults to None, ``full_field_wlab_geometry()``.
+        geometry (ConeGeometry or ParallelGeometry, optional): scan geometry, e.g.
+            ``parallel_wlab_geometry(delta_voxel)``. Defaults to None, ``full_field_wlab_geometry()``.
         spectrum (tuple[np.ndarray, np.ndarray], optional): source spectrum, required without ``library``. Defaults
             to None.
         detector (DetectorResponse, optional): detector response of the truth solver. Defaults to None (ideal

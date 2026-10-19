@@ -75,9 +75,11 @@ def primary_directions_to_voxels(grid: Grid, geometry: ConeGeometry, angle: floa
                                  dtype=torch.float32) -> Tensor:
     """Unit vectors ``Omega_UC(r) = (r - r0) / |r - r0|`` from the focal spot to each voxel center.
 
+    For a parallel beam every voxel has the beam direction.
+
     Args:
         grid (Grid): grid of the voxel centers.
-        geometry (ConeGeometry): scanner geometry.
+        geometry (ConeGeometry or ParallelGeometry): scanner geometry.
         angle (float): view angle in radians.
         device (torch.device | str, optional): device of the result. Defaults to None (CPU).
         dtype (torch.dtype, optional): dtype of the result. Defaults to torch.float32.
@@ -85,6 +87,9 @@ def primary_directions_to_voxels(grid: Grid, geometry: ConeGeometry, angle: floa
     Returns:
         Tensor: [rows, cols, slices, 3] unit directions in the reconstruction frame.
     """
+    if geometry.is_parallel:
+        beam = torch.tensor(geometry.beam_direction(angle), device=device, dtype=dtype)
+        return beam.expand(*grid.shape, 3).contiguous()
     r = grid.center_coordinates(device, dtype)
     r0 = torch.tensor(geometry.source_position(angle), device=device, dtype=dtype)
     d = r - r0
@@ -151,7 +156,9 @@ def uncollided_from_path_lengths(library: MultigroupLibrary, path_lengths: Tenso
                                  points: Grid, geometry: ConeGeometry, angle: float, source: SourceModel) -> Tensor:
     """Uncollided scalar fluence at the voxel centers of ``points`` from the upstream density line integrals.
 
-    Computes ``phi_UC,g(r) = b(Omega_UC(r)) / |r - r0|^2 sum_{E in g} w_E exp(-sum_m P_m(r) m_m(E))``.
+    Computes ``phi_UC,g(r) = b(Omega_UC(r)) / |r - r0|^2 sum_{E in g} w_E exp(-sum_m P_m(r) m_m(E))``; for a parallel
+    beam ``phi_UC,g(r) = b(r) sum_{E in g} w_E exp(-sum_m P_m(r) m_m(E))`` with the beam weight b of
+    ``SourceModel.beam_weight`` (unit incident fluence).
 
     Args:
         library (MultigroupLibrary): cross-section library with the fine-energy weights and mass attenuation.
@@ -169,6 +176,8 @@ def uncollided_from_path_lengths(library: MultigroupLibrary, path_lengths: Tenso
     device, dtype = path_lengths.device, path_lengths.dtype
     transmission = group_transmission(library, path_lengths, materials=materials)  # [G, R, C, S]
     r = points.center_coordinates(device, dtype)
+    if geometry.is_parallel:
+        return transmission.mul_(source.beam_weight(r, geometry, angle)[None])
     r0 = torch.tensor(geometry.source_position(angle), device=device, dtype=dtype)
     d = r - r0
     distance_squared = (d * d).sum(-1)  # [R, C, S]

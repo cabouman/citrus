@@ -1,6 +1,7 @@
-"""Bridge between the scatter solver's geometry (``Grid``, ``ConeGeometry``) and MBIRTORCH's ``ConeBeamModel``.
+"""Bridge between the solver's geometry (``Grid``, ``ConeGeometry``, ``ParallelGeometry``) and MBIRTORCH's models.
 
-It builds the MBIRTORCH model of a scan, projects and back-projects with it, runs FDK with short-scan (Parker) weights,
+It builds the MBIRTORCH model of a scan (``ConeBeamModel`` or ``ParallelBeamModel``), projects and back-projects with
+it, runs FDK with short-scan (Parker) weights or the filtered back projection of a parallel beam,
 runs warm-started and resumable MBIR iterations, and projects volumes onto chunks of views. MBIRTORCH is imported
 lazily, and the functions return torch tensors on the model device. The coupling is described in
 docs/source/design_notes.rst, "MBIRTORCH coupling", and the shared frames in docs/source/conventions.rst.
@@ -17,13 +18,16 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from ..scatter_solver.geometry import ConeGeometry, Grid
+from ..scatter_solver.geometry import ConeGeometry, Grid, ParallelGeometry
 
 __all__ = [
     "make_cone_model",
+    "make_parallel_model",
+    "make_model",
     "forward_project",
     "back_project",
     "fdk",
+    "direct_reconstruction",
     "scan_range",
     "is_short_scan",
     "short_scan_weights",
@@ -34,6 +38,7 @@ __all__ = [
 ]
 
 DeviceLike = Union[torch.device, str, None]
+ScanGeometry = Union[ConeGeometry, ParallelGeometry]
 
 
 def mbirtorch_version() -> str:
@@ -121,6 +126,86 @@ def make_cone_model(grid: Grid, geometry: ConeGeometry, angles: Union[Sequence[f
     model.verify_valid_params()  # the cone-angle check with the real panel
     model.configure_devices(devices=[str(device)])
     return model
+
+
+def make_parallel_model(grid: Grid, geometry: ParallelGeometry, angles: Union[Sequence[float], np.ndarray, Tensor], *,
+                        device: DeviceLike = None, use_ror_mask: bool = False, compile_mode: Optional[str] = None,
+                        verbose: int = 0, **params):
+    """MBIRTORCH ``ParallelBeamModel`` whose projections of a volume on ``grid`` land on the panel of ``geometry``.
+
+    MBIRTORCH gives detector row r the slice r of the volume, so the rows of ``geometry`` must be the slices of
+    ``grid`` (``ParallelGeometry.from_grid``): as many rows as slices, the row pitch ``delta_voxel``, row r at the z of
+    slice r and ``voxel_slice_aspect`` 1. The channel pitch and offset, the voxel size and the row aspect are copied.
+
+    Args:
+        grid (Grid): reconstruction grid of the volumes [R, C, S].
+        geometry (ParallelGeometry): parallel-beam geometry of the scan.
+        angles (Sequence[float], ndarray or Tensor): [V] view angles in rad.
+        device (torch.device or str, optional): the model's single device. Defaults to None (CUDA if available, else
+            CPU).
+        use_ror_mask (bool, optional): MBIRTORCH's region-of-reconstruction mask. Defaults to False.
+        compile_mode (str, optional): MBIRTORCH's ``compile_mode``. Defaults to None (``"auto"`` on CUDA, ``"off"`` on
+            CPU).
+        verbose (int, optional): MBIRTORCH's verbosity. Defaults to 0.
+        **params: passed to ``ParallelBeamModel.set_params`` (e.g. ``snr_db``, ``sharpness``, ``positivity_flag``).
+
+    Returns:
+        ParallelBeamModel: the MBIRTORCH model.
+
+    Raises:
+        ValueError: if the detector rows are not the slices of ``grid``.
+    """
+    import mbirtorch
+
+    pitch = float(grid.delta_voxel)
+    mismatches = []
+    if int(geometry.num_det_rows) != int(grid.num_slices):
+        mismatches.append(f"{geometry.num_det_rows} rows for {grid.num_slices} slices")
+    if float(grid.voxel_slice_aspect) != 1.0:
+        mismatches.append(f"voxel_slice_aspect {grid.voxel_slice_aspect} (must be 1)")
+    if abs(float(geometry.delta_det_row) - pitch) > 1e-9 * pitch:
+        mismatches.append(f"row pitch {geometry.delta_det_row} cm for slices of {pitch} cm")
+    if abs(float(geometry.det_row_offset) + float(grid.recon_slice_offset)) > 1e-9 * max(1.0, pitch):
+        mismatches.append(f"det_row_offset {geometry.det_row_offset} cm for recon_slice_offset "
+                          f"{grid.recon_slice_offset} cm (must be its negative)")
+    if mismatches:
+        raise ValueError("MBIRTORCH's parallel beam gives detector row r the slice r of the volume; the geometry does "
+                         "not match the grid (" + "; ".join(mismatches) + "): build it with ParallelGeometry.from_grid")
+    device = (torch.device(device) if device is not None
+              else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    if compile_mode is None:
+        compile_mode = "auto" if device.type == "cuda" else "off"
+    angle_array = _angles_array(angles)
+    model = mbirtorch.ParallelBeamModel((len(angle_array), geometry.num_det_rows, geometry.num_det_channels),
+                                        angle_array, compile_mode=compile_mode)
+    model.set_params(no_warning=True,
+                     delta_det_channel=float(geometry.delta_det_channel), delta_det_row=pitch,
+                     det_channel_offset=float(geometry.det_channel_offset),
+                     recon_shape=tuple(int(n) for n in grid.shape), delta_voxel=pitch,
+                     voxel_row_aspect=float(grid.voxel_row_aspect), use_ror_mask=use_ror_mask, verbose=int(verbose))
+    if params:
+        model.set_params(**params)
+    model.verify_valid_params()
+    model.configure_devices(devices=[str(device)])
+    return model
+
+
+def make_model(grid: Grid, geometry: ScanGeometry, angles: Union[Sequence[float], np.ndarray, Tensor], **kwargs):
+    """MBIRTORCH model of a scan: ``make_parallel_model`` for a ``ParallelGeometry``, else ``make_cone_model``.
+
+    Args:
+        grid (Grid): reconstruction grid of the volumes [R, C, S].
+        geometry (ConeGeometry or ParallelGeometry): geometry of the scan.
+        angles (Sequence[float], ndarray or Tensor): [V] view angles in rad.
+        **kwargs: keyword arguments of ``make_cone_model`` / ``make_parallel_model`` (``device``, ``compile_mode``,
+            model parameters, ...).
+
+    Returns:
+        ConeBeamModel or ParallelBeamModel: the MBIRTORCH model.
+    """
+    if geometry.is_parallel:
+        return make_parallel_model(grid, geometry, angles, **kwargs)
+    return make_cone_model(grid, geometry, angles, **kwargs)
 
 
 def forward_project(model, volume: Tensor) -> Tensor:
@@ -257,6 +342,30 @@ def fdk(model, sinogram: Tensor, filter_name: str = "ramp", *, geometry: Optiona
     return model.recon_fdk(sinogram, filter_name=filter_name, output_sharded=True)
 
 
+def direct_reconstruction(model, sinogram: Tensor, filter_name: str = "ramp", *,
+                          geometry: Optional[ScanGeometry] = None, angles=None) -> Tensor:
+    """Direct reconstruction of line integrals: FDK for a cone beam, filtered back projection for a parallel beam.
+
+    MBIRTORCH's filtered back projection assumes views evenly spaced over pi or 2 pi; other ranges give an approximate
+    volume, adequate as the start of MBIR.
+
+    Args:
+        model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model of the scan.
+        sinogram (Tensor): [V, Rd, Cd] line integrals.
+        filter_name (str, optional): MBIRTORCH's filter. Defaults to "ramp".
+        geometry (ConeGeometry or ParallelGeometry, optional): scan geometry; a cone-beam short scan gets
+            ``short_scan_weights`` with ``angles``. Defaults to None (the model decides).
+        angles (Sequence[float] or ndarray, optional): [V] view angles in rad. Defaults to None.
+
+    Returns:
+        Tensor: [R, C, S] volume in 1/cm on the model device.
+    """
+    parallel = geometry.is_parallel if geometry is not None else not hasattr(model, "recon_fdk")
+    if parallel:
+        return model.recon_fbp(sinogram, filter_name=filter_name, output_sharded=True)
+    return fdk(model, sinogram, filter_name, geometry=geometry, angles=angles)
+
+
 def mbir_iterations(model, sinogram: Tensor, init_recon: Union[Tensor, np.ndarray], first_iteration: int,
                     num_iterations: int = 1, weights: Optional[Tensor] = None,
                     stop_threshold_change_pct: float = 0.0, *, error_sinogram: Optional[Tensor] = None,
@@ -375,13 +484,13 @@ class ViewChunkProjector:
     """MBIRTORCH forward projections of volumes on ``grid`` onto chunks of consecutive views of a scan.
 
     The full view range uses ``model`` when it is given; any other range uses a sub-model over its angles
-    (``make_cone_model``), kept in a least-recently-used cache.
+    (``make_model``), kept in a least-recently-used cache.
 
     Args:
         grid (Grid): reconstruction grid.
-        geometry (ConeGeometry): cone-beam geometry of the scan.
+        geometry (ConeGeometry or ParallelGeometry): geometry of the scan.
         angles (Sequence[float], ndarray or Tensor): [V] view angles in rad.
-        model (ConeBeamModel, optional): the model over all angles. Defaults to None.
+        model (ConeBeamModel or ParallelBeamModel, optional): the model over all angles. Defaults to None.
         device (torch.device or str, optional): device of the sub-models. Defaults to None (CUDA if available).
         max_models (int, optional): number of sub-models kept. Defaults to 8.
     """
@@ -434,7 +543,7 @@ class ViewChunkProjector:
         key = (start, stop)
         model = self._models.get(key)
         if model is None:
-            model = make_cone_model(self.grid, self.geometry, self.angles[start:stop], device=self.device)
+            model = make_model(self.grid, self.geometry, self.angles[start:stop], device=self.device)
             self._models[key] = model
             while len(self._models) > self.max_models:
                 self._models.popitem(last=False)

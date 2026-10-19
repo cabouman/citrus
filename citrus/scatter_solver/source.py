@@ -1,8 +1,9 @@
-"""Point-source model of the solver: the spectrum, the emission profile and the collimation of the focal spot.
+"""Source model of the solver: the spectrum, the emission profile and the collimation of the focal spot or the beam.
 
 The focal spot emits one photon per steradian in total, split over the energy groups by the library's spectrum
 fractions, collimated to the panel and optionally weighted by an emission profile (a bowtie or beam filter, the heel
-effect) given per detector pixel.
+effect) given per detector pixel. A parallel beam carries a unit fluence over the panel's area, weighted by the same
+profile.
 """
 
 from __future__ import annotations
@@ -42,7 +43,9 @@ class SourceModel:
     The angular weight ``b(Omega)`` is 0 for directions whose ray from the focal spot misses the active panel area (edge
     to edge, outer half pixels included). Inside it is 1 without an emission profile, else the profile at the point
     where the ray hits the panel, interpolated bilinearly between the pixel centres and held constant from the outermost
-    pixel centres to the panel edge. The scale of the profile cancels in the scatter-to-primary ratio.
+    pixel centres to the panel edge. The scale of the profile cancels in the scatter-to-primary ratio. For a parallel
+    beam (``ParallelGeometry``) the source is a unit fluence of parallel rays over the panel's area, weighted by the
+    profile at the panel point of each ray (:meth:`beam_weight`).
 
     Attributes:
         emission_profile (Tensor, optional): [rows, channels] relative emission toward each pixel centre, the same for
@@ -140,6 +143,31 @@ class SourceModel:
                   & ((v + geometry.det_row_offset).abs() <= half_v))
         weight = (forward & inside).to(directions.dtype)
         profile = self.profile_at(angle, directions.device, directions.dtype)
+        if profile is None:
+            return weight
+        if tuple(profile.shape) != geometry.image_shape:
+            raise ValueError(f"emission_profile is {tuple(profile.shape)} per view, the panel {geometry.image_shape}")
+        return weight * panel_interpolate(profile, u, v, geometry)
+
+    def beam_weight(self, points: Tensor, geometry, angle: float) -> Tensor:
+        """Weight ``b(r)`` of a parallel beam at points.
+
+        It is the emission profile (1 by default) at the panel point of the beam's ray through each point, and 0
+        outside the beam's cross-section (the panel's area).
+
+        Args:
+            points (Tensor): [..., 3] points in the recon frame in cm.
+            geometry (ParallelGeometry): parallel-beam geometry.
+            angle (float): view angle in rad.
+
+        Returns:
+            Tensor: [...] weights, on the device and in the dtype of ``points``.
+        """
+        u, v = geometry.panel_uv_of_points(points, angle)
+        half_u, half_v = geometry.panel_half_extent()
+        weight = (((u + geometry.det_channel_offset).abs() <= half_u)
+                  & ((v + geometry.det_row_offset).abs() <= half_v)).to(points.dtype)
+        profile = self.profile_at(angle, points.device, points.dtype)
         if profile is None:
             return weight
         if tuple(profile.shape) != geometry.image_shape:

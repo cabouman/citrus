@@ -17,7 +17,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .recon.mbir_bridge import ViewChunkProjector, fdk, forward_project, make_cone_model, mbir_iterations
+from .recon.mbir_bridge import (ViewChunkProjector, direct_reconstruction, forward_project, make_model,
+                                mbir_iterations)
 from .scatter_solver.angular_quadrature import Quadrature
 from .scatter_solver.cross_sections import MultigroupLibrary
 from .scatter_solver.geometry import ConeGeometry, Grid
@@ -1049,13 +1050,14 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
             (``_flat_field``).
         angles (ndarray): [V] view angles in rad.
         grid (Grid): reconstruction grid.
-        geometry (ConeGeometry): cone-beam geometry of the scan.
+        geometry (ConeGeometry or ParallelGeometry): geometry of the scan.
         config (CitrusConfig): loop settings.
         scatter_stage (callable or None): ``scatter_stage(k, X, record)`` returns the scatter-to-primary ratio
             [V, Rd, Cd] of the volume X at the start of outer iteration k + 1 (k = 0, 1, ...); None for no correction.
         device (torch.device): device of the loop.
         regularization (dict or None): frozen regularization; None estimates it on the first corrected sinogram.
-        init_recon (Tensor or None): [R, C, S] initial volume in 1/cm; None uses FDK of the uncorrected data.
+        init_recon (Tensor or None): [R, C, S] initial volume in 1/cm; None uses the direct reconstruction (FDK, or
+            the filtered back projection of a parallel beam) of the uncorrected data.
         model (ConeBeamModel or None): prebuilt MBIRTORCH model; None builds it.
         callback (callable or None): ``callback(k, X_k, record)`` for the initial volume (k = 0) and after every
             outer iteration k = 1, ..., N.
@@ -1076,10 +1078,11 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
     weights = Y / I0
     measured_line_integrals = -torch.log(Y.clamp_min(config.min_counts) / I0)
     if model is None:
-        model = make_cone_model(grid, geometry, angles, device=device)
+        model = make_model(grid, geometry, angles, device=device)
     t0 = time.perf_counter()
     if init_recon is None:
-        X = fdk(model, measured_line_integrals, geometry=geometry, angles=angles)  # Parker-weighted for a short scan
+        # FDK (Parker-weighted for a short scan), or the filtered back projection of a parallel beam
+        X = direct_reconstruction(model, measured_line_integrals, geometry=geometry, angles=angles)
     else:
         X = torch.as_tensor(init_recon, dtype=torch.float32, device=device).clone()
     _sync(device)
@@ -1345,14 +1348,15 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
             unchanged), or the open field [Rd, Cd] for every view or [V, Rd, Cd] per view.
         angles (Sequence[float] or ndarray): [V] view angles in rad.
         grid (Grid): reconstruction grid (MBIRTORCH conventions), also the fine grid of the solver.
-        geometry (ConeGeometry): cone-beam geometry of the scan.
+        geometry (ConeGeometry or ParallelGeometry): geometry of the scan.
         solver (ScatterSolver): scatter solver of the scanner; its device is used for everything.
         config (CitrusConfig, optional): loop settings. Defaults to None (``CitrusConfig()``).
         regularization (dict, optional): frozen ``sigma_y``, ``sigma_x`` and ``sigma_prox``. Defaults to None
             (estimated once on the first corrected sinogram).
-        init_recon (Tensor, optional): [R, C, S] initial volume in 1/cm. Defaults to None (FDK of the uncorrected data).
-        model (ConeBeamModel, optional): prebuilt MBIRTORCH model (``recon.mbir_bridge.make_cone_model``). Defaults to
-            None.
+        init_recon (Tensor, optional): [R, C, S] initial volume in 1/cm. Defaults to None (FDK of the uncorrected data,
+            or the filtered back projection of a parallel beam).
+        model (ConeBeamModel or ParallelBeamModel, optional): prebuilt MBIRTORCH model
+            (``recon.mbir_bridge.make_model``). Defaults to None.
         callback (callable, optional): ``callback(k, X_k, record)``, called for the initial volume (k = 0, the FDK)
             and after every outer iteration k = 1, ..., N. Defaults to None.
         mbir_callback (callable, optional): ``mbir_callback(i, X, record)``, called for the initial volume (i = 0)
@@ -1382,7 +1386,7 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
     library_seconds: list[float] = [0.0]
     transport_grid = solver.transport_grid(grid)
     if model is None:
-        model = make_cone_model(grid, geometry, angle_array, device=device)
+        model = make_model(grid, geometry, angle_array, device=device)
     projector = ViewChunkProjector(grid, geometry, angle_array, model=model, device=device)
     full_shape = (solver.num_groups, (solver.L + 1) ** 2, 4) + tuple(transport_grid.shape)
     computed = scatter_view_indices(V, config.scatter_view_stride)
@@ -1494,13 +1498,14 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Tens
             view or [V, Rd, Cd] per view.
         angles (Sequence[float] or ndarray): [V] view angles in rad.
         grid (Grid): reconstruction grid.
-        geometry (ConeGeometry): cone-beam geometry of the scan.
+        geometry (ConeGeometry or ParallelGeometry): geometry of the scan.
         config (CitrusConfig, optional): loop settings. Defaults to None (``CitrusConfig()``).
         spr (Tensor or ndarray, optional): [V, Rd, Cd] fixed scatter-to-primary ratio, applied as ``Y / (1 + spr)``.
             Defaults to None (no correction).
         regularization (dict, optional): frozen ``sigma_y``, ``sigma_x`` and ``sigma_prox``. Defaults to None
             (estimated once on the first sinogram).
-        init_recon (Tensor, optional): [R, C, S] initial volume in 1/cm. Defaults to None (FDK).
+        init_recon (Tensor, optional): [R, C, S] initial volume in 1/cm. Defaults to None (FDK, or the filtered back
+            projection of a parallel beam).
         model (ConeBeamModel, optional): prebuilt MBIRTORCH model. Defaults to None.
         device (torch.device or str, optional): device of the loop. Defaults to None (the device of a tensor sinogram,
             else CUDA if available).

@@ -2,7 +2,7 @@
 
 ``_ray_kernel`` traces one ray per lane in registers and accumulates all groups at once; its ``MODE`` selects the
 segment end points (given segments, oblique lines through the pixel centers, focal spot to voxel centers, focal spot
-to pixel centers). ``_downstream_shared_kernel`` computes the downstream optical depth with one crossing sequence
+to pixel centers) and ``PARALLEL`` replaces the focal spot by the upstream start of a parallel beam's ray. ``_downstream_shared_kernel`` computes the downstream optical depth with one crossing sequence
 shared by all rays of a direction. The public wrappers mirror the ``SiddonProjectors`` operations on float32 CUDA
 tensors, and ``kernels_usable`` checks them against the PyTorch path once per device.
 """
@@ -95,7 +95,7 @@ def use_kernels(t: Tensor, backend: str) -> bool:
 def _self_check(device: torch.device) -> tuple[bool, str]:
     """Compare every kernel operation with the PyTorch Siddon path on a tiny random problem.
 
-    The pixel operations run on a flat panel and on a curved panel with a helical z shift.
+    The pixel operations run on a flat panel, on a curved panel with a helical z shift and on a parallel beam.
 
     Args:
         device (torch.device): the CUDA device to check.
@@ -103,7 +103,7 @@ def _self_check(device: torch.device) -> tuple[bool, str]:
     Returns:
         (bool, str): whether the largest relative deviation is within ``SELF_CHECK_REL_TOL``, and a message.
     """
-    from ..geometry import ConeGeometry, Grid
+    from ..geometry import ConeGeometry, Grid, ParallelGeometry
     from ..ray_tracing import SiddonProjectors, line_integrals
 
     grid = Grid(shape=(5, 7, 6), delta_voxel=1.0, voxel_row_aspect=1.25, voxel_slice_aspect=0.8,
@@ -127,9 +127,12 @@ def _self_check(device: torch.device) -> tuple[bool, str]:
     curved = ConeGeometry(source_iso_dist=6.0, source_detector_dist=9.0, num_det_rows=9, num_det_channels=11,
                           delta_det_row=1.1, delta_det_channel=1.3, det_channel_offset=0.4, use_curved_detector=True,
                           helical_view_angles=(0.0, 1.0), helical_z_shifts=(-0.5, 1.5))
+    # a parallel beam whose panel cuts the grid box
+    parallel = ParallelGeometry(axis_detector_dist=2.5, num_det_rows=9, num_det_channels=11, delta_det_row=0.9,
+                                delta_det_channel=1.1, det_row_offset=-0.3, det_channel_offset=0.4)
     pairs = [(line_integrals(field, a, b, grid, volume_index=volume_index),
               line_integrals_triton(field, a, b, grid, volume_index=volume_index))]
-    for g in (geometry, curved):
+    for g in (geometry, curved, parallel):
         pairs += [
             (reference.upstream_cumulative(mu, grid, g, angle), upstream_cumulative(mu, grid, g, angle)),
             (reference.primary_project(mu, grid, g, angle), primary_project(mu, grid, g, angle)),
@@ -328,8 +331,9 @@ if triton is not None:
                     lox, loy, loz, hix, hiy, hiz, ddx, ddy, ddz, zoff,
                     qx, qy, qz, ux_, uy_, uz_, vx_, vy_, vz_,
                     rmid, cmid, drow, dch, rowoff, choff, bcx, bcy, bcz, half, nx_, ny_, nz_, rad,
+                    wx, wy, wz, wdist,
                     MODE: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, HAS_VOLUME_INDEX: tl.constexpr,
-                    CURVED: tl.constexpr, BLOCK: tl.constexpr):
+                    CURVED: tl.constexpr, PARALLEL: tl.constexpr, BLOCK: tl.constexpr):
         """Trace one block of rays (program_id 0) of direction or volume index k (program_id 1) into ``out``.
 
         Writes ``out[(k G + g) M + m]``, with m the segment (MODE 0), the pixel ``r * Cd + c`` (MODE 1, 3) or the
@@ -390,11 +394,17 @@ if triton is not None:
             ny_: y component of the panel normal ``n_hat`` (CURVED).
             nz_: z component of the panel normal ``n_hat`` (CURVED).
             rad: radius of the curved panel, the source-detector distance, in cm (CURVED).
+            wx: x component of the beam direction (PARALLEL).
+            wy: y component of the beam direction (PARALLEL).
+            wz: z component of the beam direction (PARALLEL).
+            wdist: distance from the rotation axis of the plane where the beam's rays start, in cm (PARALLEL).
             MODE (constexpr): end points: 0 given segments, 1 oblique pixel lines, 2 upstream, 3 primary.
             G (constexpr): number of energy groups.
             GP (constexpr): next power of two >= G.
             HAS_VOLUME_INDEX (constexpr): read ``volume_index_ptr`` (MODE 0).
             CURVED (constexpr): the pixels lie on the cylinder of a curved panel (MODE 1, 3).
+            PARALLEL (constexpr): a parallel beam: the rays of MODE 2 and 3 start at ``p - (p . w + wdist) w`` for
+                the end point p (``ParallelGeometry.ray_starts``) instead of the focal spot.
             BLOCK (constexpr): rays per program.
         """
         k = tl.program_id(1)
@@ -451,6 +461,14 @@ if triton is not None:
                 p1x = px + (tc + h) * ox
                 p1y = py + (tc + h) * oy
                 p1z = pz + (tc + h) * oz
+            elif PARALLEL:
+                along = px * wx + py * wy + pz * wz + wdist  # the beam's ray through the pixel center
+                p0x = px - along * wx
+                p0y = py - along * wy
+                p0z = pz - along * wz
+                p1x = px
+                p1y = py
+                p1z = pz
             else:
                 p0x = tl.zeros([BLOCK], dtype=tl.float32) + bcx  # the focal spot (box-center slots)
                 p0y = tl.zeros([BLOCK], dtype=tl.float32) + bcy
@@ -466,9 +484,15 @@ if triton is not None:
             cx = ddx * (c.to(tl.float32) - (NX - 1) * 0.5)
             cy = ddy * (r.to(tl.float32) - (NY - 1) * 0.5)
             cz = ddz * (s.to(tl.float32) - (NZ - 1) * 0.5) + zoff
-            p0x = tl.zeros([BLOCK], dtype=tl.float32) + qx
-            p0y = tl.zeros([BLOCK], dtype=tl.float32) + qy
-            p0z = tl.zeros([BLOCK], dtype=tl.float32) + qz
+            if PARALLEL:
+                along = cx * wx + cy * wy + cz * wz + wdist  # the beam's ray through the voxel center
+                p0x = cx - along * wx
+                p0y = cy - along * wy
+                p0z = cz - along * wz
+            else:
+                p0x = tl.zeros([BLOCK], dtype=tl.float32) + qx
+                p0y = tl.zeros([BLOCK], dtype=tl.float32) + qy
+                p0z = tl.zeros([BLOCK], dtype=tl.float32) + qz
             p1x = cx
             p1y = cy
             p1z = cz
@@ -674,8 +698,8 @@ def _launch_ray(volume: Tensor, out: Tensor, num_rays: int, num_major: int, mode
         directions (Tensor, optional): [K, 3] float32 contiguous directions (MODE 1). Defaults to None.
         volume_stride (int, optional): element stride between volumes. Defaults to 0.
         geometry_scalars (dict, optional): mode-specific scalars with keys "q", "u", "v", "Rd", "Cd", "pixel",
-            "box_center", "half", "n", "radius" and "curved"; missing keys are zero (1 for "Rd", "Cd", False for
-            "curved"). Defaults to None.
+            "box_center", "half", "n", "radius", "curved", "beam", "upstream_distance" and "parallel"; missing keys
+            are zero (1 for "Rd", "Cd", False for "curved" and "parallel"). Defaults to None.
     """
     geometry_scalars = geometry_scalars or {}
     sG, sR, sC, sS = (int(x) for x in volume.stride()[-4:])
@@ -700,9 +724,12 @@ def _launch_ray(volume: Tensor, out: Tensor, num_rays: int, num_major: int, mode
             *(float(x) for x in q), *(float(x) for x in u_axis), *(float(x) for x in v_axis),
             *(float(x) for x in pixel_parameters), *(float(x) for x in box_center),
             float(geometry_scalars.get("half", 0.0)), *(float(x) for x in geometry_scalars.get("n", (0.0, 0.0, 0.0))),
-            float(geometry_scalars.get("radius", 0.0)))
+            float(geometry_scalars.get("radius", 0.0)),
+            *(float(x) for x in geometry_scalars.get("beam", (0.0, 0.0, 0.0))),
+            float(geometry_scalars.get("upstream_distance", 0.0)))
     constexprs = dict(MODE=int(mode), G=int(G), GP=_next_pow2(G), HAS_VOLUME_INDEX=volume_index is not None,
-                      CURVED=bool(geometry_scalars.get("curved", False)), BLOCK=BLOCK_RAYS)
+                      CURVED=bool(geometry_scalars.get("curved", False)),
+                      PARALLEL=bool(geometry_scalars.get("parallel", False)), BLOCK=BLOCK_RAYS)
     triton_utilities.launch(_ray_kernel, (triton.cdiv(max(num_rays, 1), BLOCK_RAYS), int(num_major), 1), args,
                             constexprs, NUM_WARPS)
 
@@ -799,8 +826,26 @@ def upstream_cumulative(mu: Tensor, grid, geometry, angle: float) -> Tensor:
     G = mu.shape[0]
     V = grid.num_voxels
     out = torch.empty(G, *grid.shape, device=mu.device, dtype=torch.float32)
-    _launch_ray(mu, out, V, 1, MODE_UPSTREAM, G, grid, geometry_scalars=dict(q=geometry.source_position(angle)))
+    if geometry.is_parallel:
+        geometry_scalars = _beam_scalars(geometry, angle, grid)
+    else:
+        geometry_scalars = dict(q=geometry.source_position(angle))
+    _launch_ray(mu, out, V, 1, MODE_UPSTREAM, G, grid, geometry_scalars=geometry_scalars)
     return out
+
+
+def _beam_scalars(geometry, angle: float, grid) -> dict:
+    """Collect the scalars of ``ParallelGeometry.ray_starts`` for ``_launch_ray``.
+
+    Args:
+        geometry (ParallelGeometry): the parallel-beam geometry.
+        angle (float): view angle in radians.
+        grid (Grid): the grid the rays are traced through.
+
+    Returns:
+        dict: "parallel" True, "beam" the beam direction and "upstream_distance" the distance of the start plane in cm.
+    """
+    return dict(parallel=True, beam=geometry.beam_direction(angle), upstream_distance=geometry.upstream_distance(grid))
 
 
 def primary_project(mu: Tensor, grid, geometry, angle: float, samples_per_pixel_axis: int = 1) -> Tensor:
@@ -823,6 +868,16 @@ def primary_project(mu: Tensor, grid, geometry, angle: float, samples_per_pixel_
     device, dtype = mu.device, mu.dtype
     G = mu.shape[0]
     Rd, Cd = geometry.num_det_rows, geometry.num_det_channels
+    if geometry.is_parallel:
+        if samples_per_pixel_axis == 1:
+            out = torch.empty(G, Rd, Cd, device=device, dtype=dtype)
+            geometry_scalars = dict(_pixel_geometry_scalars(geometry, angle), **_beam_scalars(geometry, angle, grid))
+            _launch_ray(mu, out, Rd * Cd, 1, MODE_PRIMARY, G, grid, geometry_scalars=geometry_scalars)
+            return out
+        ends = geometry.subpixel_centers(angle, samples_per_pixel_axis, device, dtype).reshape(-1, 3)
+        tau = line_integrals_triton(mu, geometry.ray_starts(ends, angle, grid), ends, grid)
+        tau = tau.reshape(G, Rd, Cd, samples_per_pixel_axis ** 2)
+        return -(torch.logsumexp(-tau, dim=-1) - math.log(samples_per_pixel_axis * samples_per_pixel_axis))
     source_position = geometry.source_position(angle)
     if samples_per_pixel_axis == 1:
         out = torch.empty(G, Rd, Cd, device=device, dtype=dtype)
@@ -899,11 +954,12 @@ def downstream_cumulative(mu: Tensor, grid, geometry, angle: float, omegas: Tens
     sG, sR, sC, sS = (int(x) for x in mu.stride())
     dx, dy, dz = (float(d) for d in grid.deltas)
     curved = bool(geometry.use_curved_detector)
-    source_position = geometry.source_position(angle)
+    # the focal spot and the radius of a curved panel (unused by a flat panel, which a parallel beam has)
+    source_position = geometry.source_position(angle) if curved else (0.0, 0.0, 0.0)
+    radius = float(geometry.source_detector_dist) if curved else 0.0
     args = (mu, directions, toward, out, int(V), sG, sR, sC, sS, int(grid.num_cols), int(grid.num_rows),
             int(grid.num_slices), dx, dy, dz, float(grid.recon_slice_offset), *(float(x) for x in panel_center),
-            *(float(x) for x in n_hat), float(diag), float(source_position[0]), float(source_position[1]),
-            float(geometry.source_detector_dist))
+            *(float(x) for x in n_hat), float(diag), float(source_position[0]), float(source_position[1]), radius)
     triton_utilities.launch(_downstream_shared_kernel, (triton.cdiv(V, BLOCK_DOWN), K, 1), args,
                             dict(G=int(G), GP=_next_pow2(G), CURVED=curved, BLOCK=BLOCK_DOWN), NUM_WARPS)
     return out

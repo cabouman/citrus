@@ -467,7 +467,8 @@ class GridResponse:
         theta2_rad (Tensor): [T2] ascending angles >= 0 in rad in the u-source plane, from the panel normal.
         transmission (Tensor): [E, T1, T2] transmitted fraction of the photons incident on the grid.
         focal_distance_cm (float, optional): distance of the focal line from the panel in cm, which defines the
-            focusing direction; None uses the source-detector distance (focused at the focal spot). Defaults to None.
+            focusing direction (``math.inf``: unfocused); None uses ``default_focal_distance`` of the geometry (the
+            source-detector distance, or unfocused for a parallel beam). Defaults to None.
         name (str): label of the response. Defaults to "grid".
         septa_along (str): direction of the septa (lamellae) on the panel, "channels" (along u, repeating along the
             rows) or "rows" (along v, repeating along the channels); it sets the axes of :func:`grid_angles`.
@@ -614,8 +615,9 @@ def anti_scatter_grid(geometry: Optional[ConeGeometry], septum_thickness_cm: flo
         septum_thickness_cm (float): septum thickness t in cm.
         septum_height_cm (float): septum height h in cm (along the panel normal).
         septum_material (str, optional): catalogue material name of the septa. Defaults to "lead".
-        focal_distance_cm (float, optional): distance of the focal line from the panel in cm. Defaults to None (the
-            source-detector distance: focused at the focal spot).
+        focal_distance_cm (float, optional): distance of the focal line from the panel in cm, ``math.inf`` for an
+            unfocused grid. Defaults to None (``default_focal_distance``: the source-detector distance of a cone beam,
+            focused at the focal spot; unfocused for a parallel beam).
         pitch_cm (float, optional): septum pitch p in cm. Defaults to None (the detector pixel pitch across the septa).
         septa_along (str, optional): "channels" (septa along u, repeating along the rows) or "rows" (septa along v,
             parallel to the rotation axis, repeating along the channels). Defaults to "channels".
@@ -638,7 +640,7 @@ def anti_scatter_grid(geometry: Optional[ConeGeometry], septum_thickness_cm: flo
             raise ValueError("pass the geometry, or both pitch_cm and focal_distance_cm")
     p = float(pitch_cm if pitch_cm is not None else
               (geometry.delta_det_row if septa_along == "channels" else geometry.delta_det_channel))
-    f = float(focal_distance_cm if focal_distance_cm is not None else geometry.source_detector_dist)
+    f = float(focal_distance_cm if focal_distance_cm is not None else default_focal_distance(geometry))
     t, h = float(septum_thickness_cm), float(septum_height_cm)
     if not (0.0 <= t < p) or h < 0:
         raise ValueError(f"need 0 <= septum thickness < pitch ({p:g} cm) and height >= 0")
@@ -659,6 +661,21 @@ def anti_scatter_grid(geometry: Optional[ConeGeometry], septum_thickness_cm: flo
 
 
 # ---- angles -------------------------------------------------------------------------------------------
+
+def default_focal_distance(geometry) -> float:
+    """Focal distance of a grid built for a geometry.
+
+    It is the source-detector distance of a cone beam (a grid focused at the focal spot) and infinite for a parallel
+    beam (an unfocused grid, septa parallel to the panel normal).
+
+    Args:
+        geometry (ConeGeometry or ParallelGeometry): the scan geometry.
+
+    Returns:
+        float: the focal distance in cm, ``math.inf`` for a parallel beam.
+    """
+    return math.inf if geometry.is_parallel else float(geometry.source_detector_dist)
+
 
 def detector_angle(omega: Tensor, geometry: ConeGeometry, angle: float,
                    pixel_positions: Optional[Tensor] = None) -> Tensor:
@@ -701,8 +718,9 @@ def grid_angles(omega: Tensor, pixel_positions: Tensor, geometry: ConeGeometry, 
             cm in the recon frame.
         geometry (ConeGeometry): the scan geometry.
         angle (float): view angle in rad.
-        focal_distance (float, optional): distance of the focal line from the panel in cm; None uses
-            ``geometry.source_detector_dist`` (focused at the focal spot). Defaults to None.
+        focal_distance (float, optional): distance of the focal line from the panel in cm, ``math.inf`` for an
+            unfocused grid; None uses ``default_focal_distance(geometry)`` (focused at the focal spot of a cone beam,
+            unfocused for a parallel beam). Defaults to None.
         septa_along (str, optional): "channels" (lamellae along u) or "rows" (lamellae along v). Defaults to
             "channels".
 
@@ -715,7 +733,10 @@ def grid_angles(omega: Tensor, pixel_positions: Tensor, geometry: ConeGeometry, 
     if septa_along not in ("channels", "rows"):
         raise ValueError(f"septa_along must be one of {SEPTA_DIRECTIONS}, got {septa_along!r}")
     u_hat, v_hat, n_hat = (torch.tensor(a, device=device, dtype=dtype) for a in geometry.panel_axes(angle))
-    focal_distance = geometry.source_detector_dist if focal_distance is None else float(focal_distance)
+    if focal_distance is None:
+        focal_distance = default_focal_distance(geometry)
+    focal_distance = float(focal_distance)
+    unfocused = math.isinf(focal_distance)  # the septa are parallel to the panel normal
     panel_center = torch.tensor(geometry.panel_center(angle), device=device, dtype=dtype)
     if omega.dim() == 2 and pixel_positions.dim() == 3:
         a = -omega[:, None, None, :]  # [K, 1, 1, 3]
@@ -725,19 +746,24 @@ def grid_angles(omega: Tensor, pixel_positions: Tensor, geometry: ConeGeometry, 
         pixels = pixel_positions
     if geometry.use_curved_detector:  # the axes of the cylinder at each pixel
         u_hat, v_hat, n_hat = geometry.local_panel_axes(pixels, angle)
-        if septa_along == "channels":  # focal line at the central row of each column
+        if unfocused:
+            focus = None
+        elif septa_along == "channels":  # focal line at the central row of each column
             focus = pixels - ((pixels - panel_center) * v_hat).sum(-1, keepdim=True) * v_hat + focal_distance * n_hat
         else:  # focal line along each pixel's own normal
             focus = pixels + focal_distance * n_hat
     else:
-        focus = panel_center + focal_distance * n_hat
+        focus = None if unfocused else panel_center + focal_distance * n_hat
     if septa_along == "rows":  # the septa repeat along u: theta1 in the u-normal plane
         u_hat, v_hat = v_hat, u_hat
-    f = focus - pixels
     a_normal = (a * n_hat).sum(-1)
     theta_a = torch.atan2((a * v_hat).sum(-1), a_normal)
-    theta_f = torch.atan2((f * v_hat).sum(-1), (f * n_hat).sum(-1))
-    theta1 = theta_a - theta_f
+    if focus is None:  # an unfocused grid: theta1 from the panel normal (broadcast over the pixels)
+        theta1 = theta_a + torch.zeros_like(pixels[..., 0])
+    else:
+        f = focus - pixels
+        theta_f = torch.atan2((f * v_hat).sum(-1), (f * n_hat).sum(-1))
+        theta1 = theta_a - theta_f
     theta2 = torch.atan2((a * u_hat).sum(-1), a_normal)
     theta1, theta2 = torch.broadcast_tensors(theta1, theta2)
     return theta1, theta2
