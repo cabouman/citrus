@@ -6,10 +6,11 @@ cylinder with a bone insert, a vessel of contrast and a small amalgam filling), 
 of it with scatter and reconstruct it with CITRUS. The data are made once and cached in demo/input.
 
 What to expect: the amalgam stops nearly every photon of the rays through it, so their counts are almost all scatter
-and noise (photon starvation). In the initial FDK volume the filling throws dark streaks across the slice (the scatter
-counts look like transmitted primary). CITRUS removes the scatter of those rays as of every other, which clears most
-of the scatter streaks, but the counts left after the correction are too few to measure the filling's attenuation:
-it stays underestimated and some noise streaks remain. The RMSE is therefore computed outside the filling.
+and noise (photon starvation), and the rays that graze it disagree with MBIR's linear model. In the initial FDK volume
+the filling throws dark streaks across the slice. CITRUS removes the scatter, and its metal mask
+(``metal_attenuation_threshold``) gives zero weight to every ray through a voxel above the threshold, which clears the
+streaks around the filling. The filling itself is then left to the regularization, so its attenuation is not measured
+and comes out far too low; the RMSE is therefore computed outside it. Set the threshold to None to see the streaks.
 """
 
 import os
@@ -49,6 +50,7 @@ source_detector_dist, source_iso_dist = 150.0, 100.0  # source to detector and t
 num_views = 180                            # number of views over a short scan
 I0 = 1.0e6                                 # flat-field counts per pixel
 scatter_view_stride = 8                    # scatter step on every 8th view, the others interpolated in angle
+metal_attenuation_threshold = 2.0          # 1/cm: voxels above are metal (cortical bone is about 0.5 1/cm here)
 
 # ---- Scanner and solver: the solver lists the reference materials in library order (by attenuation) ---------------
 geometry = ConeGeometry(source_iso_dist=source_iso_dist, source_detector_dist=source_detector_dist,
@@ -90,7 +92,8 @@ print(f"Scatter-to-primary ratio of the data: median {np.median(data['SPR']):.2f
 
 # ---- CITRUS -------------------------------------------------------------------------------------------------------
 X_citrus, info = citrus_recon(Y, I0, angles, grid, geometry, solver,
-                              CitrusConfig(scatter_view_stride=scatter_view_stride, verbose=True))
+                              CitrusConfig(scatter_view_stride=scatter_view_stride, verbose=True,
+                                           metal_attenuation_threshold=metal_attenuation_threshold))
 
 # ---- Results: the RMSE outside the filling, the images on a scale that saturates it -------------------------------
 X_citrus, X_initial = X_citrus.cpu().numpy(), info["init_recon"].cpu().numpy()

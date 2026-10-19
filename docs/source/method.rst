@@ -68,7 +68,7 @@ Scatter-to-primary correction
 The correction is multiplicative: :math:`Y_c = Y\,p/(p+s) = Y/(1 + \mathrm{SPR})` with :math:`\mathrm{SPR} = s/p` per
 pixel, both signals from the solver at the current densities. It is independent of the flat field and of the mismatch
 between the solver's polychromatic primary and MBIR's monoenergetic model, and it only rescales the noise of :math:`Y`,
-so the weights :math:`W = Y/I_0` of the measured counts are the exact weights of :math:`y_c = -\log(Y_c/I_0)`
+so the weights :math:`W = Y/I_0` of the measured counts are the inverse variances of :math:`y_c = -\log(Y_c/I_0)`
 (elementwise for an open-field image).
 
 Warm-started MBIR
@@ -583,6 +583,22 @@ The rule is a stopping criterion rather than a speed-up (an MBIR iteration is mu
 the iterations it saves buy little time): it ends the MBIR iterations when the fit has saturated and, with the outer
 rule, the reconstruction when a further scatter correction no longer changes the fit.
 
+Metal
+~~~~~
+
+A measurement whose ray crosses metal fits MBIR's linear model poorly even when it has plenty of counts: the line
+integral changes steeply across the pixel (the exponential edge-gradient effect), the spectrum hardens, and through a
+thick piece no primary photon gets through, so the corrected data of the ray rest on the solver's scatter estimate.
+MBIR spreads such errors along the rays as streaks. With ``CitrusConfig.metal_attenuation_threshold`` (in 1/cm) every
+outer iteration marks the voxels of the current volume above the threshold, forward projects them and gives zero
+weight to every measurement whose ray crosses one; the residual of the adaptive rules is computed over the other
+measurements, and ``records[k]["metal_measurement_fraction"]`` holds the share left out. The scatter solver still sees the whole
+volume. The mask works on attenuation, so it applies to any material, including user-defined ones; the threshold must
+lie above every material of the object that is not metal (the nominal attenuations of the catalogue at the effective
+energy are in :doc:`conventions`, "Materials"). The metal itself is then reconstructed from the regularization and the
+rays that miss it, so its attenuation is not measured; the option is for the tissue around it. The default ``None``
+turns the mask off.
+
 Scatter step on every m-th view
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -659,8 +675,8 @@ the local normal of each pixel, which is horizontal and points to the axis. The 
 on the direction and the channel, :math:`w_k \cos\theta_{0,kc}\, D_g(\theta_{0,kc})`, and a grid transmission that
 depends on the angles is evaluated per pixel for each chunk of directions. Lamellae along the channels run along the
 arc and each column is focused along its own normal; lamellae along the rows (``septa_along="rows"``, the usual
-clinical grid) are focused along each pixel's normal. Both focus on the focal spot at the default focal distance. The collapsed-cone
-direction set keeps the axis of the normal at the panel center and covers the cylinder's edges, and the finite-cone
+clinical grid) are focused along each pixel's normal. Both focus on the focal spot at the default focal distance.
+The collapsed-cone direction set keeps the axis of the normal at the panel center and covers the cylinder's edges, and the finite-cone
 footprint is computed on the plane tangent to the cylinder at the central ray (the arc length and the tangent-plane
 coordinate agree to first order in the fan angle).
 

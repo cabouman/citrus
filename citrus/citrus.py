@@ -664,6 +664,10 @@ class CitrusConfig:
             it. Defaults to True.
         grouping_object_size (str or float): object size in cm of the solver's ``"scattered_fluence"`` energy groups;
             ``"auto"`` measures it on the initial reconstruction. Defaults to "auto".
+        metal_attenuation_threshold (float or None): attenuation in 1/cm above which a voxel of the current volume
+            counts as metal; the measurements whose rays cross a metal voxel get zero weight in the MBIR iterations
+            of the outer iteration and are left out of its fit (``sinogram_nrmse``). None turns the metal mask off.
+            Defaults to None.
     """
 
     num_outer_iterations: Union[int, Literal["adaptive"]] = "adaptive"
@@ -683,6 +687,7 @@ class CitrusConfig:
     primary_views_per_chunk: Optional[int] = None
     resume_error_sinogram: bool = True
     grouping_object_size: Union[Literal["auto"], float] = "auto"
+    metal_attenuation_threshold: Optional[float] = None
 
     def validate(self) -> None:
         """Check the settings.
@@ -718,6 +723,11 @@ class CitrusConfig:
         if not (size == "auto" or (isinstance(size, (int, float, np.floating, np.integer))
                                    and not isinstance(size, bool) and float(size) > 0)):
             raise ValueError(f"grouping_object_size must be 'auto' or a positive number (cm), got {size!r}")
+        threshold = self.metal_attenuation_threshold
+        if threshold is not None and (isinstance(threshold, bool)
+                                      or not isinstance(threshold, (int, float, np.floating, np.integer))
+                                      or not float(threshold) > 0):
+            raise ValueError(f"metal_attenuation_threshold must be None or a positive number (1/cm), got {threshold!r}")
 
 
 # =====================================================================================================
@@ -1075,7 +1085,7 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
         (Tensor, dict): reconstruction [R, C, S] in 1/cm and the info dict.
     """
     config.validate()
-    weights = Y / I0
+    weights_of_counts = Y / I0
     measured_line_integrals = -torch.log(Y.clamp_min(config.min_counts) / I0)
     if model is None:
         model = make_model(grid, geometry, angles, device=device)
@@ -1126,6 +1136,7 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
             spr = scatter_stage(k, X, record)
         corrected_counts = Y if spr is None else Y / (1.0 + spr)
         corrected_line_integrals = -torch.log(corrected_counts.clamp_min(config.min_counts) / I0)
+        weights, fit_mask = _metal_mask(model, X, weights_of_counts, config, record)
         if regularization is None:  # estimated once on the first sinogram MBIR inverts, then frozen
             regularization = estimate_regularization(model, corrected_line_integrals, weights)
         block = max_iterations if schedule is None else int(schedule[k])
@@ -1136,8 +1147,8 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
             error_sinogram, negative_projection = negative_projection.add_(corrected_line_integrals), None
         residual: Optional[float] = None
         if track_residual:
-            residual = (float(error_sinogram.norm() / corrected_line_integrals.norm()) if error_sinogram is not None
-                        else _sinogram_nrmse(model, X, corrected_line_integrals))
+            residual = (_relative_norm(error_sinogram, corrected_line_integrals, fit_mask) if error_sinogram is not None
+                        else _sinogram_nrmse(model, X, corrected_line_integrals, fit_mask))
             record["sinogram_nrmse_start"] = residual
         if mbir_callback is not None and k == 0:  # the initial volume against the first corrected sinogram
             mbir_callback(0, X, {"outer_iteration": 0, "mbir_iteration": 0, "sinogram_nrmse": residual})
@@ -1153,11 +1164,11 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
                                                    error_sinogram=error_sinogram, return_checkpoint=True)
                 error_sinogram = checkpoint["error_sinogram"]  # y_c - A X of the new X
                 del checkpoint
-                residual = (float(error_sinogram.norm() / corrected_line_integrals.norm()) if track_residual
+                residual = (_relative_norm(error_sinogram, corrected_line_integrals, fit_mask) if track_residual
                             else None)
             else:
                 X, _ = mbir_iterations(model, corrected_line_integrals, X, first_iteration=iteration, weights=weights)
-                residual = _sinogram_nrmse(model, X, corrected_line_integrals) if track_residual else None
+                residual = _sinogram_nrmse(model, X, corrected_line_integrals, fit_mask) if track_residual else None
             iteration += 1
             j += 1
             residuals.append(residual)
@@ -1209,18 +1220,64 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
     return X, info
 
 
-def _sinogram_nrmse(model, X: Tensor, line_integrals: Tensor) -> float:
+def _sinogram_nrmse(model, X: Tensor, line_integrals: Tensor, mask: Optional[Tensor] = None) -> float:
     """Relative RMSE of the forward projection of a volume against a sinogram, ``|A X - y| / |y|``.
 
     Args:
         model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model.
         X (Tensor): [R, C, S] volume in 1/cm.
         line_integrals (Tensor): [V, Rd, Cd] sinogram y.
+        mask (Tensor or None, optional): [V, Rd, Cd] measurements to include; None includes all. Defaults to None.
 
     Returns:
         float: the relative RMSE.
     """
-    return float((forward_project(model, X) - line_integrals).norm() / line_integrals.norm())
+    return _relative_norm(forward_project(model, X) - line_integrals, line_integrals, mask)
+
+
+def _relative_norm(error: Tensor, reference: Tensor, mask: Optional[Tensor] = None) -> float:
+    """Norm of an error sinogram relative to that of a reference sinogram, over the masked measurements.
+
+    Args:
+        error (Tensor): [V, Rd, Cd] error sinogram.
+        reference (Tensor): [V, Rd, Cd] reference sinogram.
+        mask (Tensor or None, optional): [V, Rd, Cd] measurements to include; None includes all. Defaults to None.
+
+    Returns:
+        float: ``|error| / |reference|`` over the mask.
+    """
+    if mask is None:
+        return float(error.norm() / reference.norm())
+    return float(error[mask].norm() / reference[mask].norm())
+
+
+def _metal_mask(model, X: Tensor, weights: Tensor, config: CitrusConfig,
+                record: dict) -> tuple[Tensor, Optional[Tensor]]:
+    """MBIR weights of an outer iteration with the measurements through metal set to 0, and the measurements kept.
+
+    With ``metal_attenuation_threshold`` the voxels of X above the threshold are metal; the measurements whose rays
+    cross a metal voxel (forward projection of the metal voxels above 0) get weight 0 and are left out of the fit.
+
+    Args:
+        model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model.
+        X (Tensor): [R, C, S] current volume in 1/cm.
+        weights (Tensor): [V, Rd, Cd] weights of the measured counts, ``Y / I0``.
+        config (CitrusConfig): loop settings.
+        record (dict): record of the outer iteration; gets ``metal_measurement_fraction`` with a threshold.
+
+    Returns:
+        (Tensor, Tensor or None): weights [V, Rd, Cd] and the boolean mask [V, Rd, Cd] of the measurements kept in
+            the fit (None for all).
+    """
+    if config.metal_attenuation_threshold is None:
+        return weights, None
+    metal = (X > float(config.metal_attenuation_threshold)).to(torch.float32)
+    if not bool(metal.any()):
+        record["metal_measurement_fraction"] = 0.0
+        return weights, None
+    kept = forward_project(model, metal) <= 0.0
+    record["metal_measurement_fraction"] = 1.0 - float(kept.float().mean())
+    return torch.where(kept, weights, torch.zeros_like(weights)), kept
 
 
 def _counts_and_angles(sinogram_counts, angles, device) -> tuple[Tensor, np.ndarray]:

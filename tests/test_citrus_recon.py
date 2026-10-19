@@ -455,3 +455,64 @@ def test_residual_without_resume_matches(tiny):
                                regularization=regularization, mbir_callback=lambda i, X, r: None)
         out[resume] = [(r["sinogram_nrmse_start"], r["sinogram_nrmse"]) for r in info["records"][1:]]
     assert np.allclose(out[True], out[False], rtol=1e-4)
+
+
+# ---- weights: scatter as noise, metal mask -------------------------------------------------------------------
+
+def test_metal_threshold_is_validated():
+    assert CitrusConfig().metal_attenuation_threshold is None
+    CitrusConfig(metal_attenuation_threshold=2).validate()
+    CitrusConfig(metal_attenuation_threshold=np.float32(1.5)).validate()
+    for bad in (0, -1.0, True, "2"):
+        with pytest.raises(ValueError, match="metal_attenuation_threshold"):
+            CitrusConfig(metal_attenuation_threshold=bad).validate()
+
+
+def test_relative_norm_over_a_mask():
+    error = torch.tensor([3.0, 100.0])
+    reference = torch.tensor([4.0, 1.0])
+    assert citrus_module._relative_norm(error, reference, torch.tensor([True, False])) == pytest.approx(0.75)
+    assert citrus_module._relative_norm(error, reference) == pytest.approx(float(error.norm() / reference.norm()))
+
+
+@cuda
+def test_metal_mask_zeroes_the_rays_through_metal(tiny):
+    """The measurements whose rays cross a voxel above the threshold get weight 0 and leave the fit; a volume without
+    such a voxel keeps its weights."""
+    from citrus.recon.mbir_bridge import forward_project, make_cone_model
+
+    data, grid, geometry, solver, regularization = tiny
+    model = make_cone_model(grid, geometry, data["angles"], device=DEVICE)
+    W = torch.as_tensor(data["Y"], device=DEVICE) / 1.0e5
+    X = torch.full(grid.shape, 0.2, device=DEVICE)
+    config = CitrusConfig(metal_attenuation_threshold=5.0)
+    record: dict = {}
+    weights, kept = citrus_module._metal_mask(model, X, W, config, record)
+    assert kept is None and record["metal_measurement_fraction"] == 0.0 and torch.equal(weights, W)
+    unmasked, none = citrus_module._metal_mask(model, X, W, CitrusConfig(), {})
+    assert unmasked is W and none is None
+    X[4, 7, 10] = 40.0
+    weights, kept = citrus_module._metal_mask(model, X, W, config, record)
+    through = forward_project(model, (X > 5.0).float()) > 0
+    assert torch.equal(kept, ~through) and bool(through.any())
+    assert float(weights[through].abs().max()) == 0.0 and torch.equal(weights[kept], W[kept])
+    assert 0.0 < record["metal_measurement_fraction"] < 0.2
+
+
+@cuda
+@pytest.mark.parametrize("resume", [True, False])
+def test_citrus_recon_with_a_metal_threshold(tiny, resume):
+    """With a threshold below the bone of the phantom, the bone's rays leave the fit: every outer iteration records
+    the fraction it masked (none while the bone is below the threshold), and the residual over the other rays falls
+    within each outer iteration."""
+    data, grid, geometry, solver, regularization = tiny
+    config = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration=2, resume_error_sinogram=resume,
+                          metal_attenuation_threshold=0.3)
+    X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
+                           regularization=regularization,
+                           mbir_callback=lambda i, X, record: None)  # the residual is tracked without resume too
+    records = info["records"][1:]
+    assert bool(torch.isfinite(X).all())
+    fractions = [r["metal_measurement_fraction"] for r in records]  # the FDK's bone may stay below the threshold
+    assert all(0.0 <= f < 0.5 for f in fractions) and fractions[-1] > 0.0, fractions
+    assert all(0 < r["sinogram_nrmse"] < r["sinogram_nrmse_start"] < 1 for r in records)

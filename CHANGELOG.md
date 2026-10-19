@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.17.0 - 2026-10-19
+
+- **Metal mask.** `CitrusConfig.metal_attenuation_threshold` (1/cm, default None): every outer iteration marks the
+  voxels of the current volume above the threshold as metal and gives zero weight to the measurements whose rays
+  cross one, so that the starved and inconsistent rays through metal do not streak the tissue around it; the residual
+  of the adaptive rules is computed over the other measurements, and the records hold
+  `metal_measurement_fraction`. The mask works on attenuation, so it applies to any material, including user-defined
+  ones. The metal's own attenuation is left to the regularization. Demo 4 uses it on its amalgam filling.
+
 ## v0.16.3 - 2026-10-19
 
 - **Demo names.** `demo_2_citrus.py` is now `demo_2_basic_cone.py`, `demo_3_helical.py` is `demo_3_helical_grid.py`

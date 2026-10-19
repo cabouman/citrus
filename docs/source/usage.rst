@@ -39,8 +39,8 @@ slice.
 ``demo_4_materials.py`` defines an iodine contrast agent and a dental amalgam with ``Material``, puts them in
 ``SolverConfig.materials`` next to catalogue names and builds a small head phantom (a water cylinder with a bone rod,
 a vessel of contrast and an amalgam filling) as a density volume whose rows follow ``solver.materials``. The rays
-through the amalgam are starved of primary photons; the demo explains what to expect and compares the initial volume
-and CITRUS outside the filling.
+through the amalgam are starved of primary photons; the metal mask (``metal_attenuation_threshold``) leaves them out
+of the MBIR iterations, and the demo compares the initial volume and CITRUS outside the filling.
 
 ``demo_5_parallel_monoenergetic.py`` reconstructs a breast-sized phantom imaged by a monoenergetic parallel beam at
 32 keV (``ParallelGeometry.from_grid``, ``monoenergetic_spectrum``), with the air gap between the rotation axis and the
@@ -154,7 +154,8 @@ The entries of ``info``:
   against the corrected sinogram before and after its MBIR iterations, with the resumed error sinogram),
   ``scatter_seconds``, ``mbir_seconds`` (of all its MBIR iterations), ``total_seconds``,
   ``scatter_change_relative`` (from outer iteration 2 on: mean absolute change of the scatter-count estimate over its
-  mean absolute value) and, on CUDA, ``gpu_peak_allocated_mib``; a record with a scatter stage also holds
+  mean absolute value), ``metal_measurement_fraction`` (with ``metal_attenuation_threshold``: the share of
+  measurements left out) and, on CUDA, ``gpu_peak_allocated_mib``; a record with a scatter stage also holds
   ``negative_fraction`` (voxels clamped by the density model), ``accumulator_change_mean`` /
   ``accumulator_change_max`` (relative accumulator change over the computed views), ``transfer_seconds``,
   ``primary_seconds`` and, at ``scatter_view_stride > 1``, ``interpolation_seconds`` (the last two are part of
@@ -324,6 +325,9 @@ descriptions. The first setting of each group names the group.
    * - ``energy_kev``
      - ``None``
      - effective energy of the density model; None for the spectrum mean of the library
+   * - ``metal_attenuation_threshold``
+     - ``None``
+     - attenuation in 1/cm above which a voxel is metal; the measurements whose rays cross metal get zero weight
    * - ``grouping_object_size``
      - ``"auto"``
      - object size in cm of the solver's scattered-fluence groups; auto measures the initial volume (escape
