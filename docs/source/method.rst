@@ -515,7 +515,10 @@ The solver needs the densities of the library's reference materials, chosen from
 ``SolverConfig.materials`` (at least two; by default air, lung, adipose, water, muscle, soft tissue and cortical bone;
 the catalogue with compositions, nominal densities :math:`\rho_m^{nom}` and nominal attenuations
 :math:`\mu_m = \rho_m^{nom}\, m_m(E_{eff})` is in :doc:`conventions`, "Materials"). The library sorts them by nominal
-attenuation and refuses a set whose attenuations cross somewhere in 10-125 keV. Each voxel gets the two consecutive
+attenuation at the effective energy and refuses only neighbours whose nominal attenuations there are nearly equal
+(closer than 0.1 %, ``cross_section_library.MINIMUM_ATTENUATION_GAP``), which the model could not tell apart; materials
+may cross in attenuation at other energies of the spectrum, since the model works at one energy. Each voxel gets the two
+consecutive
 reference materials whose nominal attenuations bracket :math:`X`:
 
 .. math::

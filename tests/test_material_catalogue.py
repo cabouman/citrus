@@ -346,12 +346,11 @@ def test_each_set_has_its_own_cache_entry(library_module, small_libraries, tmp_p
             rows = [material_index(library, "water"), material_index(library, "bone_cortical_icrp")]
             assert torch.allclose(getattr(library, k)[rows], getattr(default, k)[[WATER, BONE]], rtol=1e-13,
                                   atol=1e-16), k
-    # a set whose members cross in attenuation is refused (skin crosses soft tissue and blood between 20 and 63 keV)
-    with pytest.raises(ValueError, match="cross"):
-        library_module.compute_library(SMALL, SPECTRUM_125KVP, library_module.resolve_backend(),
-                                       materials=material_table(("water", "soft_tissue_icru44", "blood_icru44",
-                                                                 "skin_icru44")),
-                                       **SMALL_BUILD)
+    # members that cross away from E_eff are accepted (skin crosses soft tissue and blood between 20 and 63 keV)
+    library_module.compute_library(SMALL, SPECTRUM_125KVP, library_module.resolve_backend(),
+                                   materials=material_table(("water", "soft_tissue_icru44", "blood_icru44",
+                                                             "skin_icru44")),
+                                   **SMALL_BUILD)
 
 
 # ---- density model on a reduced set ----------------------------------------------------------------------------

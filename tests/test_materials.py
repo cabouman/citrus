@@ -82,9 +82,6 @@ def test_material_table_and_synthetic_libraries():
     # water and bone rows are exactly the two-material library's, the table is in attenuation order
     for k in ("mu_t", "mu_pe", "mu_s_l", "mu_s_eta"):
         assert torch.equal(getattr(library7, k)[[WATER, BONE]], getattr(library2, k)), k
-    from citrus.scatter_solver.cross_section_library import check_material_order
-
-    check_material_order(library7.fine_mu_t.numpy(), library7.nominal_density.numpy(), library7.materials)
     assert material_order(library7) == list(range(7))
     library5 = synthetic_library(num_materials=5)
     assert library5.materials == ("m0", "m1", "m2", "m3", "m4") and library5.nominal_density.tolist() == [1, 2, 3, 4, 5]
@@ -155,13 +152,17 @@ def test_library_build_order_and_cache(tmp_path, monkeypatch):
                                                        cache_dir=str(tmp_path), fine_bin_width_kev=2.0,
                                                        gauss_legendre_nodes=8)
     assert torch.equal(library3.nominal_density, library.nominal_density)
-    # a table whose nominal attenuations cross is refused: soft tissue at 1.0 g/cm^3 crosses water (50-60 keV)
-    bad = list(cross_section_library.default_material_table())
-    bad[5] = ("soft_tissue_icru44", 1.0, bad[5][2])
-    with pytest.raises(ValueError, match="cross"):
+    # soft tissue at 1.0 g/cm^3 crosses water near 43 keV but is 0.6 % below it at E_eff: accepted
+    crossing = list(cross_section_library.default_material_table())
+    crossing[5] = ("soft_tissue_icru44", 1.0, crossing[5][2])
+    cross_section_library.compute_library(config, SPECTRUM_125KVP, cross_section_library.resolve_backend(),
+                                          fine_bin_width_kev=2.0, gauss_legendre_nodes=8, materials=crossing)
+    # a material with water's composition at 1.0005 g/cm^3 is 0.05 % from water at every energy: refused
+    coincident = list(cross_section_library.default_material_table()) + [("water_copy", 1.0005, "H2O")]
+    with pytest.raises(ValueError, match="nearly the same nominal attenuation"):
         cross_section_library.compute_library(config, SPECTRUM_125KVP, cross_section_library.resolve_backend(),
                                               fine_bin_width_kev=2.0, gauss_legendre_nodes=8,
-                                              materials=bad)
+                                              materials=coincident)
 
 
 def test_material_order_real_library(libraries):
@@ -178,12 +179,21 @@ def test_material_order_real_library(libraries):
     # muscle (1.05) is below soft tissue (1.06) at every energy: ratio 0.986-0.991
     r = library.fine_mu_t[4] * 1.05 / (library.fine_mu_t[5] * 1.06)
     assert 0.98 < float(r.min()) and float(r.max()) < 0.995
-    with pytest.raises(ValueError, match="cross"):
-        check_material_order(library.fine_mu_t[[3, 5]].numpy(), np.array([1.0, 1.0]), ["water", "soft_tissue_1.0"])
+    # one energy decides: distinct values pass in any order, near-coincident ones are refused
+    check_material_order(np.array([0.5365, 0.2014, 0.0002]), ["bone", "water", "air"])
+    with pytest.raises(ValueError, match="nearly the same nominal attenuation"):
+        check_material_order(np.array([0.2014, 0.20145]), ["water", "water_copy"])
+    # soft tissue at 1.0 g/cm^3 is above water below about 43 keV: bracketed below water at E_eff, above it at 30 keV
     nd = library.nominal_density.clone()
     nd[5] = 1.0
-    with pytest.raises(ValueError, match="cross"):
-        material_order(replace(library, nominal_density=nd))
+    crossing = replace(library, nominal_density=nd)
+    order = material_order(crossing)
+    assert order.index(5) < order.index(WATER)
+    low = material_order(crossing, 30.0)
+    assert low.index(5) > low.index(WATER)
+    X = torch.full((4,), 0.5 * float(nominal_attenuation(crossing)[WATER] + nominal_attenuation(crossing)[4]))
+    rho = attenuation_to_densities(crossing, X)
+    assert bool((rho[[WATER, 4]] > 0).all()) and float(rho[5].abs().max()) == 0.0
 
 
 # ---- pair representation and the first-collision source

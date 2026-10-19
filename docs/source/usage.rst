@@ -429,7 +429,8 @@ Two settings of ``SolverConfig`` shape the library (:doc:`method`, "Uncollided f
   ``"equal_fluence"`` (equal source photon counts) or ``"log"`` (geometric spacing). ``group_edges_kev`` overrides
   the rule.
 * ``grouping_medium``: ``"auto"`` (default: measured on the object, water until then), a reference material's name
-  (``"aluminium"`` for an aluminium casting, or the name of a ``Material``) or a mapping ``{"water": 0.9, "bone_cortical_icrp": 0.2}`` (g/cm^3) of
+  (``"aluminium"`` for an aluminium casting, or the name of a ``Material``) or a mapping ``{"water": 0.9,
+  "bone_cortical_icrp": 0.2}`` (g/cm^3) of
   reference
   materials.
 * ``angular_table_grid``: ``"adaptive"`` (default; ``num_eta_table`` nodes placed by the curvature of the transfer) or
@@ -463,7 +464,8 @@ Reference materials
 
 ``SolverConfig.materials`` names the reference materials of the library and of the density model, at least two names
 of the catalogue (:doc:`conventions`, "Materials") or user-defined materials, in any order; the library sorts them by
-nominal attenuation (``library.materials``) and refuses a set whose members cross in attenuation. Look density rows up
+nominal attenuation at the effective energy (``library.materials``) and refuses only members that are nearly
+equal there. Look density rows up
 by name:
 
 .. code-block:: python

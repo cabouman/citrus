@@ -355,7 +355,9 @@ composition), hence its place in the default order.
 
 * Reference materials: the library is built for ``SolverConfig.materials`` (at least two catalogue names or
   ``Material`` definitions with distinct names, any order), sorted by increasing attenuation at the nominal density
-  (the order must hold at every library energy). Default: the seven ``cross_sections.MATERIALS``, in library order 0 air (0.0012 g/cm^3), 1 lung (0.26), 2 adipose (0.95), 3 water
+  at the effective energy (neighbours must differ there by at least 0.1 %; they may cross at other
+  energies). Default: the seven ``cross_sections.MATERIALS``, in library order 0 air (0.0012 g/cm^3), 1 lung (0.26), 2
+  adipose (0.95), 3 water
   (1.0), 4 skeletal muscle (1.05), 5 soft tissue (1.06), 6 cortical bone (ICRP composition, 1.85); ``WATER = 3`` and
   ``BONE = 6`` are the rows of the DEFAULT set; for any library look a row up by name,
   ``cross_sections.material_index(library, "water")`` (the WLAB phantom and the data generator do).

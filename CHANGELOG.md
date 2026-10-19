@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.15.0 - 2026-10-19
+
+- **Reference materials may cross in attenuation away from the effective energy.** The density model brackets a
+  voxel at one energy, so the library now only requires the reference materials to be distinct there: neighbours in
+  order of nominal attenuation at the effective energy must differ by at least 0.1 %
+  (`cross_section_library.MINIMUM_ATTENUATION_GAP`), and the former requirement of the same order at every energy
+  of the spectrum is gone. `utilities.material_order(library, energy_kev=None)` sorts at the energy the density
+  model uses, so `CitrusConfig.energy_kev` brackets correctly too. A strong contrast agent that crosses bone below
+  its K edge (for example 10 % iodine in water) is now accepted. `check_material_order` takes the attenuations at one
+  energy.
+
 ## v0.14.0 - 2026-10-19
 
 - **Curved detectors.** `ConeGeometry(use_curved_detector=True)` places the panel on MBIRTORCH's cylinder of radius

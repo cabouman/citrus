@@ -221,26 +221,36 @@ def mass_attenuation_preview(config: SolverConfig, names: Sequence[str],
     return energy, mass
 
 
-def check_material_order(fine_mu_t: np.ndarray, nominal_density: np.ndarray, names=None) -> None:
-    """Check that the nominal attenuations increase strictly with the material index at every fine energy.
+MINIMUM_ATTENUATION_GAP = 1e-3  # smallest relative gap between neighbouring reference materials at E_eff
 
-    This is the fixed bracketing order of the density model (``citrus.utilities.attenuation_to_densities``).
+
+def check_material_order(attenuation: np.ndarray, names=None, minimum_gap: float = MINIMUM_ATTENUATION_GAP) -> None:
+    """Check that the nominal attenuations at one energy are distinct enough for the density model to bracket them.
+
+    Neighbours in increasing order must differ by at least ``minimum_gap`` relative to the larger; crossings at other
+    energies are allowed (the density model works at one energy).
 
     Args:
-        fine_mu_t (np.ndarray): [M, E] total mass attenuation in cm^2/g at the fine energies.
-        nominal_density (np.ndarray): [M] nominal densities in g/cm^3.
+        attenuation (np.ndarray): [M] nominal attenuations in 1/cm at the evaluation energy, in any order.
         names (Sequence[str] or None, optional): material names for the error message. Defaults to None (indices).
+        minimum_gap (float, optional): smallest relative gap. Defaults to ``MINIMUM_ATTENUATION_GAP``.
 
     Raises:
-        ValueError: if two consecutive materials cross at some energy.
+        ValueError: if two materials have nearly the same nominal attenuation.
     """
-    attenuation = np.asarray(nominal_density, dtype=np.float64)[:, None] * np.asarray(fine_mu_t, dtype=np.float64)
-    bad = np.nonzero(~(np.diff(attenuation, axis=0) > 0).all(axis=1))[0]
+    attenuation = np.asarray(attenuation, dtype=np.float64).reshape(-1)
+    order = np.argsort(attenuation, kind="stable")
+    sorted_attenuation = attenuation[order]
+    gaps = np.diff(sorted_attenuation) / np.maximum(sorted_attenuation[1:], np.finfo(np.float64).tiny)
+    bad = np.nonzero(~(gaps >= float(minimum_gap)))[0]
     if bad.size:
         i = int(bad[0])
-        material_names = list(names) if names is not None else [str(k) for k in range(attenuation.shape[0])]
-        raise ValueError(f"materials {material_names[i]!r} and {material_names[i + 1]!r} cross in attenuation at "
-                         f"nominal density inside the library's energy range; reorder the material table")
+        material_names = list(names) if names is not None else [str(k) for k in range(attenuation.size)]
+        first, second = material_names[int(order[i])], material_names[int(order[i + 1])]
+        raise ValueError(f"materials {first!r} and {second!r} have nearly the same nominal attenuation at the "
+                         f"effective energy ({sorted_attenuation[i]:.6g} and {sorted_attenuation[i + 1]:.6g} 1/cm, "
+                         f"less than {float(minimum_gap):.1%} apart), so the density model cannot tell them apart; "
+                         f"drop one or change a nominal density")
 
 
 # =============================================================================================
@@ -1002,8 +1012,11 @@ def compute_library(
     fine_weights = photons_per_bin / photons_per_bin.sum()
     keep = fine_weights > 0
     nominal = np.array([d for _, d, _ in table], dtype=np.float64)
-    if M > 1:
-        check_material_order(material_sigma["total"][:, keep], nominal, names)
+    if M > 1:  # the density model brackets at the effective energy: the materials must be distinct there
+        effective = float((fine_weights[keep] * E[keep]).sum() / fine_weights[keep].sum())
+        at_effective = np.array([sum(w * float(backend.sigma("total", Z, np.array([effective]))[0])
+                                     for Z, w in composition[name].items()) for name in names])
+        check_material_order(nominal * at_effective, names)
     library = MultigroupLibrary(
         group_edges=to_tensor(edges),
         group_energy=to_tensor(group_energy),

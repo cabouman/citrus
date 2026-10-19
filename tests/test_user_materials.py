@@ -201,7 +201,8 @@ def test_copy_of_catalogue_material_builds_the_same_constants(library_module):
 
 def test_iodine_solution_builds_and_orders(library_module, iodine_library):
     """1 % iodine in water sorts between soft tissue and bone among the defaults; its constants are the mass-fraction
-    mix of the water and iodine constants; the preview attenuation agrees; 10 % iodine crosses bone and is refused."""
+    mix of the water and iodine constants; the preview attenuation agrees; 10 % iodine crosses bone below the iodine
+    K edge but is far above it at E_eff, so it is accepted and sorted above bone."""
     backend = library_module.resolve_backend()
     extended = _build(library_module, MATERIALS + (IODINE,))
     assert extended.materials == MATERIALS[:6] + ("iodine_solution", "bone_cortical_icrp")
@@ -219,9 +220,11 @@ def test_iodine_solution_builds_and_orders(library_module, iodine_library):
                                                            SPECTRUM_125KVP, backend, fine_bin_width_kev=2.0)
     assert mass[0] == pytest.approx(0.99 * mass[1] + 0.01 * mass[2], rel=1e-12)
     assert library_module.mass_attenuation_preview(SMALL, (IODINE,), energy_kev=energy)[1][0] == mass[0]
-    with pytest.raises(ValueError, match="cross"):
-        _build(library_module, ("water", Material("iodine_10_percent", 1.05, "0.9*water + 0.1*I"),
-                                "bone_cortical_icrp"))
+    strong = _build(library_module, ("water", Material("iodine_10_percent", 1.05, "0.9*water + 0.1*I"),
+                                         "bone_cortical_icrp"))
+    assert strong.materials == ("water", "bone_cortical_icrp", "iodine_10_percent")
+    attenuation = strong.nominal_density[:, None] * strong.fine_mu_t
+    assert bool((attenuation[2] < attenuation[1]).any())  # it does cross bone at some energy of the spectrum
 
 
 def test_user_material_as_grouping_medium(library_module):

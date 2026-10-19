@@ -451,25 +451,29 @@ def nominal_attenuation(library: MultigroupLibrary, energy_kev: Optional[float] 
     return nominal_densities(library) * mass_attenuation_at(library, e)
 
 
-def material_order(library: MultigroupLibrary) -> list[int]:
-    """Bracketing order of the density model: the material indices sorted by nominal attenuation at E_eff.
+def material_order(library: MultigroupLibrary, energy_kev: Optional[float] = None) -> list[int]:
+    """Bracketing order of the density model: the material indices sorted by nominal attenuation at one energy.
 
-    For a library built by ``cross_section_library.build_library`` this is the library order ``[0, 1, ..., M-1]``.
+    At E_eff this is the library order ``[0, 1, ..., M-1]`` of a library built by
+    ``cross_section_library.build_library``; materials may cross in attenuation at other energies.
 
     Args:
         library (MultigroupLibrary): the library.
+        energy_kev (float, optional): energy in keV. Defaults to None, the effective energy E_eff.
 
     Returns:
         list[int]: [M] material indices in increasing nominal attenuation.
 
     Raises:
-        ValueError: if the order is not the same at every fine energy of the library.
+        ValueError: if two materials have nearly the same nominal attenuation at that energy
+            (``cross_section_library.check_material_order``).
     """
-    order = torch.argsort(nominal_attenuation(library)).tolist()
-    a = (nominal_densities(library)[:, None] * library.fine_mu_t.detach().to("cpu", torch.float64))[order]
-    if a.shape[0] > 1 and not bool((torch.diff(a, dim=0) > 0).all()):
-        raise ValueError("the materials' nominal attenuations cross inside the library's energy range")
-    return order
+    from .scatter_solver.cross_section_library import check_material_order
+
+    attenuation = nominal_attenuation(library, energy_kev)
+    if attenuation.numel() > 1:
+        check_material_order(attenuation.numpy(), library.materials)
+    return torch.argsort(attenuation).tolist()
 
 
 def _mass_attenuation_coefficients(library: MultigroupLibrary, energy_kev: Optional[float], like: Tensor) -> Tensor:
@@ -525,7 +529,7 @@ def attenuation_to_densities(library: MultigroupLibrary, X: Tensor, energy_kev: 
         Tensor: [M, ...] densities in g/cm^3 (at most two nonzero per voxel), on the device and in the dtype of ``X``.
     """
     M = library.num_materials
-    order = material_order(library)
+    order = material_order(library, energy_kev)
     num_dims = X.dim()
     mass_attenuation = _mass_attenuation_coefficients(library, energy_kev, X).reshape((M,) + (1,) * num_dims)
     slot_order = torch.as_tensor(order, device=X.device, dtype=torch.long)
@@ -578,7 +582,7 @@ def attenuation_to_density(library: MultigroupLibrary, X: Tensor, material: int,
     material_index = int(material)
     if not 0 <= material_index < M:
         raise ValueError(f"material {material} outside the library's {M} materials {tuple(library.materials)}")
-    order = material_order(library)
+    order = material_order(library, energy_kev)
     slot = order.index(material_index)
     slot_order = torch.as_tensor(order, device=X.device, dtype=torch.long)
     # [M] mass attenuations in bracketing order
