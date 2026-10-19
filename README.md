@@ -6,15 +6,16 @@ scatter-contaminated projections by iterating model-based iterative reconstructi
 [MBIRTORCH](https://github.com/cabouman/mbirtorch)) and a deterministic scatter solver for the linear Boltzmann
 transport equation (LBTE) **jointly**: every outer iteration refreshes the scatter estimate with one source-iteration
 step of the scatter solver from the current reconstruction and runs MBIR iterations on the corrected data (as many as
-the fit of the corrected data keeps improving, by default). This replaces the usual sequential
-pipeline (FDK, one scatter estimate from that volume, correction, then a reconstruction that never revisits the
-scatter), whose scatter estimate inherits the errors of the scatter-corrupted initial volume.
+the fit of the corrected data keeps improving, by default). This replaces the usual sequential pipeline (a direct
+reconstruction such as FDK, one scatter estimate from that volume, correction, then a reconstruction that never
+revisits the scatter), whose scatter estimate inherits the errors of the scatter-corrupted initial volume.
 
 Full documentation: [purduecitrus.readthedocs.io](https://purduecitrus.readthedocs.io).
 
 ## How CITRUS works
 
-The loop starts from the FDK reconstruction X_0 of the uncorrected data. Outer iteration k = 1, ..., N converts
+The loop starts from the direct reconstruction X_0 of the uncorrected data (FDK, or the filtered back projection of a
+parallel beam). Outer iteration k = 1, ..., N converts
 X_{k-1} into material densities, takes one scatter step per view, corrects the measured counts with the estimated
 scatter-to-primary ratio, `Y_c = Y / (1 + SPR)`, and runs warm-started MBIR iterations on the corrected data,
 which give X_k. By default both counts are adaptive: the MBIR iterations stop once the fit of the corrected sinogram
@@ -30,8 +31,9 @@ Phi_{>1}^{(k)} = G_k phi_1^{(k)} + G_k Phi_{>1}^{(k-1)}
              = G_k phi_1^{(k)} + G_k G_{k-1} phi_1^{(k-1)} + G_k G_{k-1} G_{k-2} phi_1^{(k-2)} + ...
 ```
 
-where `phi_1^{(k)}` is the first-collision source of reconstruction k (from its uncollided fluence). Expanded, the second-order scatter comes from the
-newest reconstruction, the third order from the previous one, and so on: the dominant low-order scatter is always
+where `phi_1^{(k)}` is the first-collision source of reconstruction k (from its uncollided fluence). Expanded, the
+second-order scatter comes from the newest reconstruction, the third order from the previous one, and so on: the
+dominant low-order scatter is always
 refreshed from the freshest reconstruction, while stale information is relegated to the weaker and smoother
 higher orders. With fixed densities the recursion *is* source iteration and converges to the fully converged scatter
 estimate, so the scatter and the reconstruction converge together for the cost of one sweep per view per outer
@@ -50,7 +52,9 @@ first-collision source, sweep).
 The user supplies the source spectrum (a two-column file, or one node for a monoenergetic source) and chooses the
 reference materials of the density model from a catalogue of compounds, tissues and every element, or defines their
 own. The scan is a cone beam with a flat or curved panel and circular or helical views, or a parallel beam; the source
-may carry an emission profile measured from the open field (a bowtie filter, the heel effect).
+may carry an emission profile measured from the open field (a bowtie filter, the heel effect), the detector response
+and an anti-scatter grid (septa along one or both panel directions) are built from material data, and the rays through
+metal can be left out of MBIR with a metal mask.
 
 ## Installation
 
@@ -94,22 +98,24 @@ The demos are short scripts that show the API step by step, with every setting (
 panel, voxel pitch, views, loop and solver settings) a variable at the top. The first run of demo 1 downloads the
 photon data and builds the cross-section library (both cached); the reconstruction demos synthesize their data once
 and cache it in `demo/input/` (a few minutes on a GPU for the first run).
-For studies (other sparse-view and sparse-iteration scatter schedules, a finer ground truth, the RMSE history and run
+For studies (other iteration counts and sparse-view scatter schedules, a finer ground truth, the RMSE history and run
 statistics), `benchmarks/citrus_study.py` takes the settings as flags and writes figures and a summary JSON to
 `demo/output/`:
 
 ```bash
 python benchmarks/citrus_study.py          # 180 views over a short scan, 0.5 cm grid, adaptive numbers of outer
                                            # and MBIR iterations, scatter step on every 8th view
-python benchmarks/citrus_study.py --full   # 180 views over a full rotation, 0.5 cm grid, 20 iterations,
-                                           # scatter step on every view at every iteration
+python benchmarks/citrus_study.py --full   # 180 views over a full rotation, 0.5 cm grid, 20 outer iterations
+                                           # of 1 MBIR iteration, scatter step on every view
 python benchmarks/citrus_study.py --help   # every flag
 ```
 
-The views are evenly spaced over `[start, end)`; the default end is a short scan, start + 180 degrees + the in-plane
-fan angle of the detector (`utilities.view_angles`, `utilities.fan_angle`). MBIRTORCH's FDK, which initializes the
-loop, counts every view equally, so CITRUS applies redundancy weights before it over any range that is not whole
-rotations: short scans and overscans, also for the parallel beam (`recon.mbir_bridge.redundancy_weights`).
+The views are evenly spaced over `[start, end)`; the default end of a cone beam is a short scan, start + 180 degrees +
+the in-plane fan angle of the detector (`utilities.view_angles`, `utilities.fan_angle`), and of a parallel beam start +
+180 degrees. MBIRTORCH 0.1.2's FDK and filtered back projection, which initialize the loop, count every view equally,
+so over any range that is not whole rotations (short scans and overscans) CITRUS applies redundancy weights before them
+(`recon.mbir_bridge.redundancy_weights`), or leaves them to an MBIRTORCH that applies them itself; a helical scan
+keeps MBIRTORCH's FDK.
 
 In Python:
 

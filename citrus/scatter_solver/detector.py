@@ -1,7 +1,8 @@
 """Detector and anti-scatter-grid responses as lookup tables, and the angles at which they are evaluated.
 
 :class:`DetectorResponse` tabulates D(E, theta0), the energy deposited per incident photon, and :class:`GridResponse`
-tabulates G(E, theta1, theta2), the transmitted fraction of a 1-D anti-scatter grid; tables from a Monte Carlo
+tabulates G(E, theta1, theta2), the transmitted fraction of one set of anti-scatter-grid septa (a crossed grid
+holds a second set, ``GridResponse.crossed``); tables from a Monte Carlo
 simulation can replace the analytic builders. :func:`detector_response` and :func:`anti_scatter_grid` build them for
 any material of the catalogue from the photon data, :func:`csi_response` and :func:`focused_1d_grid` from coarse
 built-in tables, and :func:`tabulated_detector_response` from a user table. :func:`detector_angle` and

@@ -2,8 +2,8 @@
 
 The module holds the WLAB phantom (a water prism with lung, air and bone inserts) with its grid and scan geometries,
 the interpolating attenuation <-> density model between the library's reference materials, the object size and mean
-composition that set the energy groups, view angles, synthetic cone-beam data with scatter, a GPU memory cap and small
-plotting helpers.
+composition that set the energy groups, view angles and helical scans, synthetic cone-beam and parallel-beam data with
+scatter, a GPU memory cap and small plotting helpers.
 """
 
 from __future__ import annotations

@@ -6,13 +6,12 @@ reconstruction loop.**
 
 Scatter is a major source of shading, cupping and wrong CT numbers whenever the beam irradiates a large volume of the
 object at once, as in cone-beam CT on flat or curved panels, circular or helical, and in parallel-beam CT with a wide
-beam and a short air gap. The usual remedy estimates
-the scatter once, from a first reconstruction that is itself corrupted by scatter, and never revisits it. CITRUS
-(Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter) instead interleaves model-based
-iterative reconstruction (MBIR) with steps of a deterministic solver of the linear Boltzmann transport equation
-(LBTE): every outer iteration refreshes the scatter estimate of every view with one transport sweep from the current
-reconstruction, corrects the measured data with it and runs MBIR iterations on the result (by default as many as
-the fit of the corrected data keeps improving). The
+beam and a short air gap. The usual remedy estimates the scatter once, from a first reconstruction that is itself
+corrupted by scatter, and never revisits it. CITRUS (Coupled Iterative Tomographic reconstruction and
+Recursively-Updated Scatter) instead interleaves model-based iterative reconstruction (MBIR) with steps of a
+deterministic solver of the linear Boltzmann transport equation (LBTE): every outer iteration refreshes the scatter
+estimate of every view with one transport sweep from the current reconstruction, corrects the measured data with it
+and runs MBIR iterations on the result (by default as many as the fit of the corrected data keeps improving). The
 scatter estimate and the reconstruction converge together, for the cost of one transport sweep per view per outer
 iteration.
 
@@ -64,6 +63,18 @@ What CITRUS gives you
       for the CPU and float64. The scatter step can run on every m-th view only, each outer iteration can run several
       MBIR iterations on one correction, and the per-view state is stored compactly.
 
+   .. grid-item-card:: Cone and parallel beams
+
+      Cone beams on flat or curved panels with circular or helical views, and parallel beams, in MBIRTORCH's
+      conventions; the user's spectrum (kV, MV or one line), an emission profile from the measured open field, and
+      detector responses and anti-scatter grids (septa along one or both directions) built from material data.
+
+   .. grid-item-card:: Any materials, metal included
+
+      Reference materials from a catalogue of tissues, compounds and every element, or defined by a formula. A metal
+      mask leaves the rays through metal out of MBIR, so that starved and inconsistent rays do not streak the tissue
+      around it.
+
 How it works
 ------------
 
@@ -79,7 +90,8 @@ How it works
    iteration's higher-order scatter, divides the measured data by one plus the scatter-to-primary ratio and runs one
    or more warm-started MBIR iterations on the result.
 
-Outer iteration :math:`k` turns the reconstruction :math:`X_{k-1}` (:math:`X_0` is the FDK initialization) into
+Outer iteration :math:`k` turns the reconstruction :math:`X_{k-1}` (:math:`X_0` is the direct reconstruction: FDK, or
+the filtered back projection of a parallel beam) into
 densities of the reference materials, resamples them onto the transport cells, and updates the per-view collided
 fluence :math:`\Phi_v` with one transport sweep
 :math:`G_k` applied to the newest first-collision term :math:`\phi_1` and to the previous accumulator:

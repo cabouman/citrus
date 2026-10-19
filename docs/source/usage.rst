@@ -56,11 +56,11 @@ On a GPU the first run of each reconstruction demo, with the synthesis of its da
 CITRUS studies
 --------------
 
-``benchmarks/citrus_study.py`` compares CITRUS with MBIR without scatter correction, with every setting as a flag and writes figures (central
-slices, central-row profiles, relative RMSE per outer iteration, estimated vs true scatter-to-primary ratio of view 0),
-a summary JSON (the settings, the reference materials, the object size and medium of the energy groups, the RMSE
-history, the run times and the peak allocated GPU memory) and optionally the CITRUS volume to ``demo/output/``. The
-data sets are cached in ``demo/input/``.
+``benchmarks/citrus_study.py`` compares CITRUS with MBIR without scatter correction, with every setting as a flag, and
+writes figures (central slices, central-row profiles, relative RMSE per outer iteration, estimated vs true
+scatter-to-primary ratio of view 0), a summary JSON (the settings, the reference materials, the object size and medium
+of the energy groups, the RMSE history, the run times and the peak allocated GPU memory) and optionally the CITRUS
+volume to ``demo/output/``. The data sets are cached in ``demo/input/``.
 
 .. code-block:: bash
 
@@ -113,9 +113,9 @@ The default end is a short scan, start + 180 degrees + the in-plane fan angle of
 ``2 atan(0.5 num_det_channels delta_det_channel / SDD)`` (``utilities.fan_angle``; on a curved panel
 ``num_det_channels delta_det_channel / SDD``); ``--end-view-angle 360`` (with the default start 0) is a full
 rotation. Over a range that is not whole rotations ``citrus_recon`` / ``mbir_recon`` apply redundancy weights
-before MBIRTORCH's FDK or filtered back projection (``recon.mbir_bridge.redundancy_weights``), and the sparse-view
-interpolation runs
-along the arc. A parallel beam has no fan angle: its default range is 180 degrees.
+before MBIRTORCH's FDK or filtered back projection (``recon.mbir_bridge.redundancy_weights``; an MBIRTORCH that
+applies them itself does so), except for a helical scan, and the sparse-view interpolation runs along the arc. A
+parallel beam has no fan angle: its default range is 180 degrees.
 
 Ground truth: the scatter of every view is computed by the scatter solver from the TRUE densities with a fully
 converged source iteration, stored as the scatter-to-primary ratio and applied to MBIRTORCH's primary counts, then
@@ -144,8 +144,7 @@ and the frozen regularization. A ``callback(k, X_k, record)`` can track the iter
 ``mbir_callback(i, X, record)`` per MBIR iteration, i = 0 for the FDK initialization, with
 ``record["sinogram_nrmse"]`` the relative RMSE of the forward projection of X against the corrected sinogram of its
 outer iteration, a convergence measure without ground truth (demo 6 plots it next to the error against the truth; the
-study script computes the RMSE
-against the truth with it).
+study script records the error against the truth with it).
 
 The entries of ``info``:
 
@@ -219,7 +218,8 @@ Other settings of ``CitrusConfig``: ``resume_error_sinogram`` (default ``True``:
 between outer iterations instead of recomputing it with a forward projection; the same reconstruction to float
 rounding), ``primary_views_per_chunk`` (views per chunk of the primary projections; default: one sinogram of path
 lengths), ``gpu_state_budget_mib`` and ``pinned_memory_limit_gib`` (where the per-view accumulators are stored),
-``energy_kev``, ``min_counts``, ``base_seed``, ``verbose``.
+``energy_kev``, ``min_counts``, ``base_seed``, ``verbose``, and ``metal_attenuation_threshold`` (the metal mask,
+:doc:`method`, "Metal").
 
 A curved (cylindrical) panel and helical views are part of the geometry, so the same calls reconstruct them
 (:doc:`method`, "Curved panels and helical scans"; :doc:`conventions`, "Frames"):
@@ -366,7 +366,7 @@ descriptions. The first setting of each group names the group.
      - explicit descending group edges in keV (num_groups + 1 values) instead of the rule
    * - ``grouping_object_size_cm``
      - ``20.0``
-     - size in cm of the object in the scattered-fluence rule (CITRUS measures it on the FDK volume)
+     - size in cm of the object in the scattered-fluence rule (CITRUS measures it on the initial volume)
    * - ``grouping_medium``
      - ``"auto"``
      - medium of that rule: auto (the object's mean densities), a reference material name or (name, density) pairs
@@ -512,7 +512,7 @@ Two settings of ``SolverConfig`` shape the library (:doc:`method`, "Uncollided f
 ``wlab_solver`` (and ``ScatterSolver(None, config, ..., spectrum=spectrum)``) returns a solver whose library is built
 on first use, so
 ``citrus_recon`` can first measure the object: with ``CitrusConfig.grouping_object_size = "auto"`` (default) it sets
-``grouping_object_size_cm`` to the size measured from the escape probability of the FDK volume
+``grouping_object_size_cm`` to the size measured from the escape probability of the initial volume
 (``citrus.utilities.object_size_cm``) and, for
 ``grouping_medium = "auto"``, the medium to the object's mean densities (``grouping_medium_estimate``) before the
 first scatter stage builds the library (cached per size and medium); ``info["grouping_object_size_cm"]`` and

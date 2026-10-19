@@ -9,7 +9,8 @@ CITRUS
 The reconstruction loop and its utilities.
 
 :doc:`api/citrus`
-    The CITRUS loop, the per-view scatter step and its operators, the density model and the state storage.
+    The CITRUS loop, the per-view scatter step and its operators, the density model, the metal mask and fill and
+    the state storage.
 
 :doc:`api/utilities`
     The WLAB phantom and geometries, the density model, the object size and medium of the energy groups, view

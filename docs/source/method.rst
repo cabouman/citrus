@@ -25,7 +25,8 @@ beam), and outer iteration :math:`k = 1, \dots, N`
 2. advances the collided fluence of every view by one transport sweep and projects its scatter signal :math:`s_v`;
 3. computes the primary signal :math:`p_v` of every view from :math:`\rho_k`;
 4. divides the measured counts by :math:`1 + s_v / p_v` and runs :math:`n` warm-started MBIR iterations on the
-   corrected data (``mbir_iterations_per_outer_iteration``), which give :math:`X_k`.
+   corrected data (``mbir_iterations_per_outer_iteration``), which give :math:`X_k`; with the metal mask the
+   measurements through metal get zero weight ("Metal", below).
 
 Steps 1 to 3 are the scatter stage, step 4 the MBIR stage; :math:`n` sets how many MBIR iterations follow each scatter
 correction and :math:`N` how many outer iterations run; by default both are adaptive ("MBIR iterations per outer
@@ -375,11 +376,10 @@ signal above (keV/cm^2, or photons/cm^2 for a counting detector); and ``signal``
 per source photon per steradian.
 
 **Grid angles.** A set of grid lamellae is one-dimensional: in the default direction they run along :math:`u`
-(channels), repeat along
-:math:`v` (rows) and are focused on the line parallel to :math:`u` at the focal distance from the panel along the
-panel normal :math:`\hat n` (by default the source-detector distance, a grid focused at the focal spot; infinite, an
-unfocused grid, for a parallel beam). With
-:math:`\mathbf a = -\boldsymbol\Omega` and :math:`\mathbf f` the vector from the pixel to the focal line,
+(channels), repeat along :math:`v` (rows) and are focused on the line parallel to :math:`u` at the focal distance from
+the panel along the panel normal :math:`\hat n` (by default the source-detector distance, a grid focused at the focal
+spot; infinite, an unfocused grid, for a parallel beam). With :math:`\mathbf a = -\boldsymbol\Omega` and :math:`\mathbf
+f` the vector from the pixel to the focal line,
 
 .. math::
 
@@ -449,7 +449,8 @@ Source emission profile and open field
 The source of a cone beam is an isotropic point source at the focal spot, that of a parallel beam a uniform beam over
 the panel's area; a bowtie or beam filter, the heel effect or any other non-uniform
 emission enters as the angular weight :math:`b(\boldsymbol\Omega)` of the source (``SourceModel.emission_profile``),
-given per detector pixel: :math:`b` is the profile at the point where the ray from the focal spot hits the panel,
+given per detector pixel: :math:`b` is the profile at the point where the ray from the focal spot (for a parallel
+beam, the ray along the beam) hits the panel,
 interpolated bilinearly between the pixel centres, constant from the outermost pixel centres to the panel edge, and
 0 off the panel. The same :math:`b` weights the uncollided fluence, and with it the first-collision source and every
 collision order of the scatter, and the solver's primary, so the scatter-to-primary ratio accounts for the parts of
@@ -499,7 +500,8 @@ direction sets, and the ``direction_context_cache_size`` most recently used dire
 The primary
 -----------
 
-The primary signal uses the same detector rule with the per-pixel direction from the focal spot and the exact-in-energy
+The primary signal uses the same detector rule with the per-pixel direction from the focal spot (along the beam for
+a parallel beam) and the exact-in-energy
 transmission of the density line integrals, averaged over the pixel after the energy sum. It is computed in two steps,
 the per-material line integrals :math:`P_m = \int \rho_m\,dl` (a projector) and the transmission with the responses
 (``scatter_image.primary_from_path_lengths``), so any projector can feed it:
@@ -647,16 +649,16 @@ are not corrected.
 Short scans and redundancy weights
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The views are evenly spaced over :math:`[\beta_s, \beta_e)`; the synthetic data default to a short scan,
-:math:`\beta_e = \beta_s + \pi + 2\gamma_m` with :math:`2\gamma_m = 2\arctan(N_c \Delta_c / (2\,\mathrm{SDD}))` the
-in-plane fan angle of the panel. MBIRTORCH's FDK and filtered back projection weight every view by
-:math:`\pi / V`, which counts every line equally only over a whole number of rotations. Over any other range of
-:math:`\Lambda` the line integrals are weighted with :math:`(\Lambda/\pi)\, w(\beta, \gamma)` before the direct
-reconstruction (``recon.mbir_bridge.redundancy_weights``), so that the measurements of every in-plane line sum to one;
-the weights are those of cabouman/mbirtorch pull request 30, and an MBIRTORCH whose ``recon_fdk`` applies them itself
-is left to do so. Below a full rotation they are the Parker weights in the overscan form of Wesarg et al.; above it
-they ramp over the excess beyond the whole rotations at both ends of the range. A parallel beam is the case
-:math:`\gamma = 0`. MBIR itself needs no weighting.
+The views are evenly spaced over :math:`[\beta_s, \beta_e)`; the synthetic data default to a short scan, :math:`\beta_e
+= \beta_s + \pi + 2\gamma_m` with :math:`2\gamma_m = 2\arctan(N_c \Delta_c / (2\,\mathrm{SDD}))` the in-plane fan angle
+of the panel. MBIRTORCH's FDK and filtered back projection weight every view by :math:`\pi / V`, which counts every line
+equally only over a whole number of rotations. Over any other range of :math:`\Lambda` the line integrals are weighted
+with :math:`(\Lambda/\pi)\, w(\beta, \gamma)` before the direct reconstruction
+(``recon.mbir_bridge.redundancy_weights``), so that the measurements of every in-plane line sum to one; the weights are
+those of cabouman/mbirtorch pull request 30, and an MBIRTORCH whose ``recon_fdk`` or ``recon_fbp`` applies them itself
+is left to do so. Below a full rotation they are the Parker weights in the overscan form of Wesarg et al.; above it they
+ramp over the excess beyond the whole rotations at both ends of the range. A parallel beam is the case :math:`\gamma =
+0`. MBIR itself needs no weighting.
 
 With the view position :math:`\beta = (i + 1/2)\,\Lambda / V` along the arc, the overscan
 :math:`\delta = (\Lambda - \pi)/2` and the in-plane fan angle :math:`\gamma = -\arctan(u / \mathrm{SDD})` of channel
@@ -693,24 +695,24 @@ the local normal of each pixel, which is horizontal and points to the axis. The 
 on the direction and the channel, :math:`w_k \cos\theta_{0,kc}\, D_g(\theta_{0,kc})`, and a grid transmission that
 depends on the angles is evaluated per pixel for each chunk of directions. Lamellae along the channels run along the arc
 and each column is focused along its own normal; lamellae along the rows (``septa_along="rows"``, the usual clinical
-grid) are focused along each pixel's normal. Both focus on the focal spot at the default focal distance. The
+grid) are focused along each pixel's normal; a crossed grid has both. Both focus on the focal spot at the default
+focal distance. The
 collapsed-cone direction set keeps the axis of the normal at the panel center and covers the cylinder's edges, and the
 finite-cone footprint is computed on the plane tangent to the cylinder at the central ray (the arc length and the
 tangent-plane coordinate agree to first order in the fan angle).
 
-**Helical scan.** Every view carries a z shift of the source and the panel (a table of unwrapped view angles and
-shifts in the geometry), used by the scatter solver for each view, by MBIRTORCH and by the synthetic data. The
-reconstruction grid must hold the whole object that the helix illuminates (the projectors take the volume as zero
-outside it); the transport grid covers the reconstruction grid as for a circular scan, and each view's solve covers
-the whole grid (the collimation leaves the slabs outside the view's field dark). No redundancy weights are applied:
-the per-row helical weights of the MBIRTORCH pull request give a worse starting volume near the ends of the helix,
-where few views see a slice. The initial volume is MBIRTORCH's FDK, which for a helical scan scales every slice by the
-inverse fraction of
-the views that see it: an approximate reconstruction, adequate as the start of MBIR, which is exact for the helical
-geometry. With ``scatter_view_stride`` :math:`m > 1` the skipped views are interpolated along the helix, in the
+**Helical scan.** Every view carries a z shift of the source and the panel (a table of unwrapped view angles and shifts
+in the geometry), used by the scatter solver for each view, by MBIRTORCH and by the synthetic data. The reconstruction
+grid must hold the whole object that the helix illuminates (the projectors take the volume as zero outside it); the
+transport grid covers the reconstruction grid as for a circular scan, and each view's solve covers the whole grid (the
+collimation leaves the slabs outside the view's field dark). No redundancy weights are applied: per-row helical weights,
+tried in the MBIRTORCH pull request and removed there, gave a worse starting volume near the ends of the helix, where
+few views see a slice. The initial volume is MBIRTORCH's FDK, which for a helical scan scales every slice by the inverse
+fraction of the views that see it: an approximate reconstruction, adequate as the start of MBIR, which is exact for the
+helical geometry. With ``scatter_view_stride`` :math:`m > 1` the skipped views are interpolated along the helix, in the
 unwrapped angle between consecutive computed views, never between views a turn apart at another z; two computed
-neighbours differ in z by :math:`m` times the table feed per view, so the stride should keep that well below the
-height of the panel at the isocenter.
+neighbours differ in z by :math:`m` times the table feed per view, so the stride should keep that well below the height
+of the panel at the isocenter.
 
 Parallel beams
 ~~~~~~~~~~~~~~

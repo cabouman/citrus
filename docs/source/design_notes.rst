@@ -45,7 +45,7 @@ solution is not needed for a grouping: a slowing-down balance in energy alone, w
 cheap and places the edges where the photons are. Escape matters as much as absorption in an object of patient size,
 so the balance has a leakage term set by the object's escape probability, and its medium is the object's mean
 composition;
-the CITRUS loop measures both on the FDK volume and builds the library only after that (a lazy library in
+the CITRUS loop measures both on the initial volume and builds the library only after that (a lazy library in
 ``ScatterSolver``), once per run and cached per size and medium. A known medium (an industrial part of one material)
 can be named instead. The same estimate weights the energies within each group: a group constant is an average over
 the photons the group carries, and in the lowest groups at MV these are scattered photons near the top of the group,
@@ -354,7 +354,8 @@ random subsets differ from those of one continuous ``recon`` run.
 that is not whole rotations ``mbir_bridge.fdk`` and ``direct_reconstruction`` multiply the line integrals by
 (Lambda / pi) w(beta, gamma) (``redundancy_weights``, a port of the weights of cabouman/mbirtorch pull request 30,
 with gamma = -atan(u / SDD) in MBIRTORCH's frame, 0 for a parallel beam). When the installed MBIRTORCH's ``recon_fdk``
-takes ``redundancy_weighting``, CITRUS leaves the cone-beam weighting to it and asks it to skip the helical weights.
+or ``recon_fbp`` takes ``redundancy_weighting``, CITRUS leaves the weighting to it; a helical scan gets none, since
+per-row helical weights gave a worse start near the ends of the helix than MBIRTORCH's coverage-scaled FDK.
 
 **Primary of the loop.** The loop's primary uses MBIRTORCH's projector, the reconstruction's own operator: it averages
 the line integral over the pixel like a detector pixel does, and the synthetic data define their scatter through the
@@ -370,6 +371,22 @@ The error sinogram must match the initial volume; it is trusted, not checked, an
 initial volume in place, so the loop passes a copy of the volume. The engine path draws the same partitions and
 partition sequence as ``recon`` for the same random state and uses the same regularization, so a resumed call
 equals the plain one up to the float rounding of the carried error sinogram.
+
+Metal
+-----
+
+**Selected by attenuation.** Metal is the voxels of the current volume above an attenuation threshold, not the
+voxels of named materials: a user can define any material that contains metal, and the attenuation at the effective
+energy decides how badly a ray disagrees with the linear model, so a megavoltage beam, which passes through metal,
+needs no mask. A threshold on the primary counts would catch only the starved core of a thick piece; the rays that
+streak the tissue graze the metal with plenty of counts.
+
+**Left out, then filled.** The rays through metal get zero weight rather than a smaller one: their data are
+inconsistent, not merely noisy. Without data the masked metal fades under the regularization, which tightens the
+mask onto the metal's core but would hand the scatter solver a fading absorber. Blur spreads the attenuation of the
+metal but keeps its sum, so the fill gives the tightened set the first metal estimate rescaled to that sum. Scatter
+weights that discount high-scatter measurements, a polynomial beam-hardening fit (MBIRTORCH's
+``recon_plastic_metal``) and frozen values that also define the set were tried and gave worse reconstructions.
 
 Memory
 ------

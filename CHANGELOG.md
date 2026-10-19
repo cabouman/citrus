@@ -7,6 +7,11 @@
   pitch across it), transmitting the product of the two 1-D transmissions at their own grid angles
   (`GridResponse.crossed`, `GridResponse.transmission_at`, which the scatter image and the primary now use). Such a
   grid takes the per-pixel path of the scatter image on every panel.
+- **Docs.** The README and every Read the Docs page were checked again against the code: CITRUS is presented as a
+  reconstruction of cone-beam and parallel-beam CT rather than of cone-beam CT only, the direct reconstruction that
+  starts the loop is FDK or the filtered back projection, the redundancy weights are left to an MBIRTORCH that applies
+  them and none are applied to helical scans, and the metal mask and crossed grids appear where the features are
+  listed; the design notes give the reasons for the metal mask.
 
 ## v0.17.1 - 2026-10-19
 

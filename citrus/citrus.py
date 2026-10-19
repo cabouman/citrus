@@ -3,7 +3,8 @@
 Every outer iteration advances the collided fluence of every view by one transport sweep, divides the measured counts
 by one plus the scatter-to-primary ratio of the current densities and runs warm-started MBIR iterations on the
 corrected data. The module holds the loop (``citrus_recon``, ``mbir_recon``), the per-view scatter step and its
-operators, the density model, the compact per-view state storage and the angular interpolation of sparse-view scatter.
+operators, the density model, the metal mask and fill, the compact per-view state storage and the angular
+interpolation of sparse-view scatter.
 The method is described in docs/source/method.rst, "The CITRUS loop" and "Options and secondary components".
 """
 

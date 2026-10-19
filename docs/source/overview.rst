@@ -10,8 +10,8 @@ Package layout
     :func:`~citrus.citrus.citrus_step` (one scatter step of one view; ``citrus_view_step`` from prebuilt fields) and its
     operators ``uncollided_operator``, ``first_collision_operator``, ``multiple_collision_operator``,
     ``accumulator_update_operator``, ``project_scatter``; the primaries of all views (``primary_signals``, MBIRTORCH
-    projections of the material maps); the density model (one material map at a time) and the compact per-view
-    state storage.
+    projections of the material maps); the density model (one material map at a time), the metal mask and fill
+    (``metal_fill``) and the compact per-view state storage.
 
 ``citrus.scatter_solver``
     The LBTE source iteration solver. :class:`~citrus.scatter_solver.scatter_solver.ScatterSolver` assembles the
@@ -40,8 +40,9 @@ Package layout
 
 ``citrus.recon``
     ``mbir_bridge``: the MBIRTORCH ``ConeBeamModel`` or ``ParallelBeamModel`` matching the solver's geometry, FDK or
-    the filtered back projection of a parallel beam (with redundancy weights for a short scan or an overscan), the
-    warm-started and resumable MBIR iterations, projections onto chunks of views.
+    the filtered back projection of a parallel beam (with redundancy weights over a range that is not whole
+    rotations, left to MBIRTORCH when it applies them, none for a helical scan), the warm-started and resumable MBIR
+    iterations, projections onto chunks of views.
 
 ``citrus.utilities``
     The WLAB phantom with its grid and its cone-beam and parallel-beam geometries, the interpolating attenuation <->
@@ -62,7 +63,8 @@ Scope of the solver
   two whose nominal attenuations bracket its attenuation at the effective energy.
 * A point source collimated to a flat or curved panel, with circular or helical views, or a parallel beam; an
   optional emission profile of the source (from the measured open field); detector and anti-scatter-grid responses
-  as lookup tables, built from the photon data for any catalogue material or given as a table.
+  (grid septa along the channels, the rows or both) as lookup tables, built from the photon data for any catalogue
+  material or given as a table.
 * Float32 on CUDA (production; fused Triton kernels) and float64 / CPU (reference and tests).
 
 Repository
@@ -86,5 +88,5 @@ Repository
 ``benchmarks/``
     Benchmarks of the sweep, the first-collision source kernel and the ray tracer, a per-stage profile of the CITRUS
     step, the GPU memory of the loop (``bench_citrus_memory.py``), fixed against adaptive numbers of MBIR iterations
-    (``adaptive_mbir_study.py``), and ``citrus_study.py``, the CITRUS study script with every setting as a flag
-    (:doc:`usage`).
+    (``adaptive_mbir_study.py``), demo 2's data at another voxel pitch (``make_demo_data.py``), and
+    ``citrus_study.py``, the CITRUS study script with every setting as a flag (:doc:`usage`).
