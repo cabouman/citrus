@@ -98,7 +98,7 @@
 ## v0.18.1 - 2026-10-19
 
 - **Demos.** `demo_7_scatter_schedules.py` compares CITRUS with no correction, the sequential pipeline (one converged
-  solve from the FDK volume), first-order scatter only and a fresh converged solve every outer iteration, from the
+  solve from the FDK volume), first-order scatter only and a fresh fully converged solve every outer iteration, from the
   same initial volume with the same regularization and partition seeds, with the loop written out from the public
   functions of `citrus.citrus`; it plots the central slices and the relative RMSE after every MBIR iteration.
   `demo_3_helical_grid.py` uses an energy-integrating CsI detector from the photon data.

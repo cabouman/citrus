@@ -5,9 +5,9 @@ reconstruction starts from the same FDK volume and runs MBIR with the same froze
 measured counts and seeded partitions; only the scatter estimate that corrects the counts differs:
 
 * no correction;
-* sequential: one converged scatter solve per view from the FDK volume, then frozen (the usual pipeline);
+* sequential: one converged scatter solve per view from the FDK volume, then frozen (the legacy approach);
 * first order only: every outer iteration, the first-order scatter of the current volume (no multiple scatter);
-* decoupled: every outer iteration, a fresh converged solve per view from the current volume;
+* decoupled: every outer iteration, a fresh fully converged solve per view from the current volume;
 * CITRUS: every outer iteration, one transport sweep per view, the collided fluence carried over (citrus_recon).
 
 The first four run the loop of citrus_recon written out with the functions it is made of (the solver's converged

@@ -56,8 +56,8 @@ change, timings) and plots the convergence curves.
 
 ``demo_7_scatter_schedules.py`` reconstructs the data of demo 2 five times from the same FDK volume with the same frozen
 regularization, weights and partition seeds, and only the scatter estimate differs: no correction; sequential (one
-converged solve per view from the FDK volume, then frozen, the usual pipeline); first order only (the first-order
-scatter of the current volume every outer iteration); decoupled (a fresh converged solve per view every outer
+converged solve per view from the FDK volume, then frozen, the legacy approach); first order only (the first-order
+scatter of the current volume every outer iteration); decoupled (a fresh fully converged solve per view every outer
 iteration); and CITRUS. The first four run the loop of ``citrus_recon`` written out with its public parts
 (``ScatterSolver.solve_view_from_fields``, the scatter operators of ``citrus.citrus``, ``primary_signals``,
 ``interpolate_scatter`` and ``recon.mbir_bridge.mbir_iterations`` with the seeds of the loop), so the script is also an
