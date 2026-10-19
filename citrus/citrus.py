@@ -950,10 +950,13 @@ def interpolate_scatter(computed_scatter: Tensor, angles: Union[Sequence[float],
                         computed: Union[Sequence[int], np.ndarray],
                         order: Literal[0, 1, 2, 3] | None = 3,
                         previous: Optional[Tensor] = None, weights: Optional[Tensor] = None, *,
-                        helical: bool = False) -> Tensor:
+                        helical: bool = False, geometry=None) -> Tensor:
     """Scatter of every view from the scatter of the computed views, interpolated in angle per pixel.
 
-    The computed views keep their values exactly; a skipped view v gets ``max(0, sum_j w_vj s_j)``.
+    The computed views keep their values exactly; a skipped view v gets ``max(0, sum_j w_vj s_j)``. With the
+    ``geometry`` of a helical scan each neighbour's image is first shifted along the rows by the z shift between the
+    two views, ``s_j(r + (z_v - z_j) / delta_det_row)`` (edge rows held): the scattering object moves by that much
+    relative to the panel, unmagnified since its photons do not come from the focal spot.
 
     Args:
         computed_scatter (Tensor): [Vc, ...] per-view images of the computed views (any units).
@@ -965,6 +968,8 @@ def interpolate_scatter(computed_scatter: Tensor, angles: Union[Sequence[float],
         weights (Tensor, optional): [V, Vc] precomputed ``interpolation_weights(angles, computed, order)``.
             Defaults to None (computed here).
         helical (bool, optional): the views of a helical scan (``interpolation_weights``). Defaults to False.
+        geometry (ConeGeometry or ParallelGeometry, optional): the scan geometry, whose z shifts align the
+            neighbours of a helical scan ([V, rows, channels] images). Defaults to None, no alignment.
 
     Returns:
         Tensor: [V, ...] scatter of every view.
@@ -998,8 +1003,44 @@ def interpolate_scatter(computed_scatter: Tensor, angles: Union[Sequence[float],
         raise ValueError(f"weights must be [{V}, {Vc}], got {tuple(weights.shape)}")
     out = (weights.to(computed_scatter.device, computed_scatter.dtype)
            @ computed_scatter.reshape(Vc, -1)).reshape((V,) + tuple(computed_scatter.shape[1:]))
+    if geometry is not None and geometry.is_helical and computed_scatter.dim() == 3 and computed_scatter.shape[1] > 1:
+        rows = geometry.z_shifts(angle_array) / float(geometry.delta_det_row)  # z of every view in detector rows
+        skipped = np.setdiff1d(np.arange(V), computed_index)
+        out[torch.as_tensor(skipped, device=out.device)] = _row_aligned_sum(
+            computed_scatter, weights.detach().cpu().numpy()[skipped], rows[skipped][:, None] - rows[computed_index])
     out.clamp_min_(0.0)
     out[computed_index_tensor] = computed_scatter  # exact (and unclamped) on the computed views
+    return out
+
+
+def _row_aligned_sum(images: Tensor, weights: np.ndarray, shifts: np.ndarray, views_per_batch: int = 32) -> Tensor:
+    """Weighted sums of images each sampled along its rows at ``r + shift`` (linear, edge rows held).
+
+    Args:
+        images (Tensor): [Vc, Rd, Cd] images.
+        weights (ndarray): [n, Vc] weights of each output.
+        shifts (ndarray): [n, Vc] row shift of each image for each output.
+        views_per_batch (int, optional): outputs formed at once. Defaults to 32.
+
+    Returns:
+        Tensor: [n, Rd, Cd] ``sum_j weights[i, j] images[j](r + shifts[i, j])``.
+    """
+    device, dtype = images.device, images.dtype
+    Rd = int(images.shape[1])
+    k = max(1, int((weights != 0).sum(axis=1).max(initial=0)))
+    order = np.argsort(weights == 0, axis=1, kind="stable")[:, :k]  # the nonzero weights first
+    rows = torch.arange(Rd, device=device, dtype=torch.float64)
+    out = torch.empty((weights.shape[0],) + tuple(images.shape[1:]), device=device, dtype=dtype)
+    for start in range(0, weights.shape[0], views_per_batch):
+        stop = min(start + views_per_batch, weights.shape[0])
+        index = torch.as_tensor(order[start:stop], device=device)  # [b, k]
+        w = torch.as_tensor(np.take_along_axis(weights[start:stop], order[start:stop], 1), device=device, dtype=dtype)
+        shift = torch.as_tensor(np.take_along_axis(shifts[start:stop], order[start:stop], 1), device=device)
+        position = (rows + shift[..., None]).clamp(0.0, Rd - 1.0)  # [b, k, Rd]
+        lower = position.floor().long().clamp(max=Rd - 2)
+        fraction = (position - lower).to(dtype)[..., None]
+        sampled = ((1.0 - fraction) * images[index[..., None], lower] + fraction * images[index[..., None], lower + 1])
+        out[start:stop] = (w[..., None, None] * sampled).sum(dim=1)
     return out
 
 
@@ -1571,7 +1612,7 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
             t0 = time.perf_counter()
             # the scatter SIGNAL is interpolated in angle; the primary of every view is computed (primary_signals)
             scatter = interpolate_scatter(computed_scatter, angle_array, computed, interpolation_order,
-                                          previous=last_scatter[0], weights=weights)
+                                          previous=last_scatter[0], weights=weights, geometry=geometry)
             _sync(device)
             record["interpolation_seconds"] = time.perf_counter() - t0
         if sparse and interpolation_order is None:

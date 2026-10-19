@@ -710,9 +710,12 @@ tried in the MBIRTORCH pull request and removed there, gave a worse starting vol
 few views see a slice. The initial volume is MBIRTORCH's FDK, which for a helical scan scales every slice by the inverse
 fraction of the views that see it: an approximate reconstruction, adequate as the start of MBIR, which is exact for the
 helical geometry. With ``scatter_view_stride`` :math:`m > 1` the skipped views are interpolated along the helix, in the
-unwrapped angle between consecutive computed views, never between views a turn apart at another z; two computed
-neighbours differ in z by :math:`m` times the table feed per view, so the stride should keep that well below the height
-of the panel at the isocenter.
+unwrapped angle between consecutive computed views, never between views a turn apart at another z. Two computed
+neighbours differ in z by :math:`m` times the table feed per view, so each neighbour's image is first shifted along the
+rows by the z shift between it and the interpolated view, :math:`s_j(r + (z_v - z_j)/\Delta_{row})`. The shift is not
+magnified: the scatter comes from the object, which moves by :math:`z_v - z_j` relative to the panel, not from the focal
+spot, while the irradiated slab, and with it the scatter's envelope, stays fixed on the panel. The stride should still
+keep the z step well below the height of the panel at the isocenter.
 
 Parallel beams
 ~~~~~~~~~~~~~~

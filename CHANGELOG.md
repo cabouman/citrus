@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.22.0 - 2026-10-19
+
+- **Helical scatter interpolation.** On a helical scan the scatter of a skipped view is interpolated from its computed
+  neighbours after shifting each along the rows by the z shift between the two views (`interpolate_scatter(...,
+  geometry=)`, used by `citrus_recon`). The shift is not magnified: the scattering object moves by that much relative
+  to the panel, while the irradiated slab and the scatter's envelope stay fixed on it. The gain is largest for objects
+  whose z extent is short compared with the beam.
+
 ## v0.21.1 - 2026-10-19
 
 - **Signal-only converged solve.** `ScatterSolver.solve_view`, `solve_view_from_fields` and `solve_views` take

@@ -264,3 +264,37 @@ def test_config_defaults_and_validation():
     for every in (0, -1, 1.5, 2.0, True, "2", None):
         with pytest.raises(ValueError, match="mbir_iterations_per_outer_iteration"):
             CitrusConfig(mbir_iterations_per_outer_iteration=every).validate()
+
+
+@pytest.mark.parametrize("order", [1, 3])
+def test_helical_interpolation_follows_the_object_along_the_rows(order):
+    """On a helical scan each neighbour is shifted along the rows by the z shift between the views before weighting:
+    an image that moves with the object, s_v(r) = f(r + z_v / delta_det_row), is reproduced on the skipped views
+    (exactly for f linear away from the edges), which unaligned interpolation misses; without the geometry the
+    interpolation is unchanged."""
+    from citrus.scatter_solver.geometry import ConeGeometry
+    from citrus.utilities import helical_scan
+
+    V, stride, Rd, Cd = 64, 4, 40, 3
+    angles = np.arange(V) * TWO_PI * 2 / V  # two turns
+    geometry = helical_scan(ConeGeometry(60.0, 105.0, Rd, Cd, 0.4, 0.4), angles, pitch_cm=6.0)
+    rows = geometry.z_shifts(angles) / geometry.delta_det_row
+    r = np.arange(Rd, dtype=np.float64)
+
+    def image(v, f):
+        return torch.as_tensor(np.repeat(f(r + rows[v])[:, None], Cd, axis=1))
+
+    computed = scatter_view_indices(V, stride)
+    skipped = np.setdiff1d(np.arange(V), computed)
+    interior = slice(8, Rd - 8)  # the shifts stay within 4.5 rows
+    for f, tolerance in ((lambda x: 2.0 + 0.05 * x, 1e-12), (lambda x: 1.0 + np.exp(-((x - 20.0) / 6.0) ** 2), 1e-2)):
+        truth = torch.stack([image(v, f) for v in range(V)])
+        aligned = interpolate_scatter(truth[computed], angles, computed, order, helical=True, geometry=geometry)
+        plain = interpolate_scatter(truth[computed], angles, computed, order, helical=True)
+        aligned_error = float((aligned[skipped][:, interior] - truth[skipped][:, interior]).abs().max())
+        plain_error = float((plain[skipped][:, interior] - truth[skipped][:, interior]).abs().max())
+        assert aligned_error < tolerance < plain_error
+        assert torch.equal(aligned[computed], truth[computed])
+    circular = ConeGeometry(60.0, 105.0, Rd, Cd, 0.4, 0.4)  # no z shifts: the plain interpolation
+    assert torch.equal(interpolate_scatter(truth[computed], angles, computed, order, helical=True, geometry=circular),
+                       plain)
