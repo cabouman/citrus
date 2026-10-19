@@ -72,7 +72,7 @@ Repository
 
 ``demo/``
     Seven quick-start scripts (:doc:`usage`, "Demos"): ``demo_1_scatter_solver.py`` (the scatter solver on one view
-    of the WLAB phantom), ``demo_2_basic_cone.py`` (CITRUS on a circular cone-beam scan), ``demo_3_helical_grid.py``
+    of the WLAB phantom), ``demo_2_basic_cone.py`` (CITRUS on a circular cone-beam scan), ``demo_3_helical_cone.py``
     (a helical scan on a curved CsI detector with an anti-scatter grid), ``demo_4_materials.py`` (user-defined
     materials), ``demo_5_parallel_monoenergetic.py`` (a monoenergetic parallel beam), ``demo_6_callbacks.py``
     (convergence curves from the callbacks) and ``demo_7_scatter_schedules.py`` (CITRUS against other ways of

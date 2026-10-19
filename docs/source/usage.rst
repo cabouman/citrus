@@ -13,7 +13,7 @@ settings that change the data, so later runs load them.
 
    python demo/demo_1_scatter_solver.py          # the scatter solver on one view of the WLAB phantom
    python demo/demo_2_basic_cone.py              # CITRUS on a short circular cone-beam scan
-   python demo/demo_3_helical_grid.py            # a helical scan on a curved detector with an anti-scatter grid
+   python demo/demo_3_helical_cone.py            # a helical scan on a curved detector with an anti-scatter grid
    python demo/demo_4_materials.py               # user-defined materials: iodine contrast and dental amalgam
    python demo/demo_5_parallel_monoenergetic.py  # a monoenergetic parallel beam (synchrotron CT)
    python demo/demo_6_callbacks.py               # convergence curves from the callbacks of citrus_recon
@@ -31,7 +31,7 @@ the counts with ``synthesize_cone_beam_data``, reconstructs them with ``citrus_r
 scatter step on every 8th view), prints the relative RMSE of the initial FDK volume and of CITRUS against the truth and
 shows the central slices and central-row profiles of the truth and of CITRUS.
 
-``demo_3_helical_grid.py`` scans the WLAB prism with a helix (``helical_scan``) on a cylindrical panel
+``demo_3_helical_cone.py`` scans the WLAB prism with a helix (``helical_scan``) on a cylindrical panel
 (``ConeGeometry(use_curved_detector=True)``) of energy-integrating CsI (``detector_response("cesium_iodide", ...)``)
 behind a CT-style grid: tungsten septa parallel to the rotation axis (``anti_scatter_grid(..., septa_along="rows")``),
 each focused on the source. The pitch, the number of turns and the
@@ -60,9 +60,9 @@ scatter of the current volume every outer iteration); decoupled (a fresh converg
 iteration); and CITRUS. The first four run the loop of ``citrus_recon`` written out with its public parts
 (``ScatterSolver.solve_view_from_fields``, the scatter operators of ``citrus.citrus``, ``primary_signals``,
 ``interpolate_scatter`` and ``recon.mbir_bridge.mbir_iterations`` with the seeds of the loop), so the script is also an
-example of a custom scatter schedule. First order only, decoupled and CITRUS stop by the adaptive rules; no correction
-and sequential run the MBIR iterations of the CITRUS run. It shows the central slices with the relative RMSE and run
-time of each, and the relative RMSE after every MBIR iteration; the decoupled reconstruction takes the longest.
+example of a custom scatter schedule. Every reconstruction stops by the adaptive rules. It shows the central slices with
+the relative RMSE and run time of each, and the relative RMSE after every MBIR iteration against wall time; the
+decoupled reconstruction takes the longest.
 
 On a GPU the first run of each reconstruction demo, with the synthesis of its data, takes a few minutes.
 

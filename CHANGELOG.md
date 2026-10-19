@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.18.2 - 2026-10-19
+
+- **Demo 7.** Every reconstruction, no correction and sequential included, stops by the adaptive rules of
+  `citrus_recon`, and the convergence plot shows the relative RMSE against wall time.
+- **Demo name.** `demo_3_helical_grid.py` is now `demo_3_helical_cone.py`.
+
 ## v0.18.1 - 2026-10-19
 
 - **Demos.** `demo_7_scatter_schedules.py` compares CITRUS with no correction, the sequential pipeline (one converged

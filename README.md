@@ -88,7 +88,7 @@ step, the GPU memory of the loop, fixed against adaptive numbers of MBIR iterati
 ```bash
 python demo/demo_1_scatter_solver.py          # the scatter solver on one view of the WLAB phantom
 python demo/demo_2_basic_cone.py              # a short circular cone-beam scan, 125 kVp (6 MV and a grid as options)
-python demo/demo_3_helical_grid.py            # a helical scan on a curved detector behind a CT-style anti-scatter grid
+python demo/demo_3_helical_cone.py            # a helical scan on a curved detector behind a CT-style anti-scatter grid
 python demo/demo_4_materials.py               # user-defined materials: iodine contrast and a dental amalgam filling
 python demo/demo_5_parallel_monoenergetic.py  # a monoenergetic parallel beam (synchrotron CT), air gap option
 python demo/demo_6_callbacks.py               # convergence curves recorded with the callbacks of citrus_recon
@@ -144,7 +144,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Gregery T. Buzzard and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.18.1},
+  note = {Version 0.18.2},
   year = 2026
 }
 ```
