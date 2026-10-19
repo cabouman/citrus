@@ -363,10 +363,9 @@ class DirectionSetContext:
         if pixels is None:
             pixels = self._cache["pixels64"] = self.geometry.pixel_centers(self.angle, self.device, torch.float64)
         omega = self.omega[start:stop].to(torch.float64)
-        theta1, theta2 = grid_angles(omega, pixels, self.geometry, self.angle, self.grid_response.focal_distance_cm,
-                                     self.grid_response.septa_along)
         energy = self.group_energy.to(torch.float64)
-        return self.grid_response.at(energy, theta1, theta2).permute(1, 0, 2, 3).to(self.dtype)
+        return self.grid_response.transmission_at(energy, omega, pixels, self.geometry, self.angle).permute(
+            1, 0, 2, 3).to(self.dtype)
 
     def finalize(self, accumulator: Tensor) -> dict[str, Tensor]:
         """Image dict from an accumulator.
@@ -466,7 +465,7 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
                          else torch.zeros(G, 0, device=device, dtype=float64))
     # grid response: the grid angles of one probe direction over the full panel decide separability
     separable = False
-    if factorize:
+    if factorize and grid_response.crossed is None:  # septa along the rows vary along the channels
         probe = torch.tensor(n_hat, device=device, dtype=float64)[None].neg()
         if K:
             probe = torch.cat([probe, omega64[:1]])
@@ -486,14 +485,13 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
     block = max(1, (1 << 22) // max(1, G * Rd * Cg))
     for start in range(0, K, block):
         stop = min(start + block, K)
-        th1, th2 = grid_angles(omega64[start:stop], pixel_columns, geometry, angle, focal_distance,
-                               grid_response.septa_along)  # [b, Rd, Cg]
-        grid_block = grid_response.at(energy64, th1, th2).permute(1, 0, 2, 3)  # [b, G, Rd, Cg]
+        grid_block = grid_response.transmission_at(energy64, omega64[start:stop], pixel_columns, geometry,
+                                                   angle).permute(1, 0, 2, 3)  # [b, G, Rd, Cg]
         if grid_weight is not None:
             grid_weight[start:stop] = grid_block
         signal_weight[start:stop] = ((weight64[start:stop] * c[start:stop])[:, None, None, None]
                                      * detector_weight[start:stop, :, None, None] * grid_block)
-        del th1, th2, grid_block
+        del grid_block
     accumulation_weight = None
     if separable:
         accumulation_weight = torch.empty(G, Rd, 3, K, device=device, dtype=dtype)
@@ -552,8 +550,7 @@ def _curved_panel_context(quadrature: Quadrature, geometry: ConeGeometry, angle:
     detector_channel = detector.at(energy64, torch.arccos(cos_channel))  # [G, K, Cd]
     planar = weight64[:, None] * cos_channel  # [K, Cd]
     signal = planar[None] * detector_channel  # [G, K, Cd]
-    table = grid_response.transmission
-    grid_per_pixel = not bool((table == table[:, :1, :1]).all())  # the transmission depends on the angles
+    grid_per_pixel = grid_response.depends_on_angles
     if not grid_per_pixel:
         zero = torch.zeros(1, device=device, dtype=torch.float64)
         signal = signal * grid_response.at(energy64, zero, zero)[:, :, None]  # [G, 1, 1]
@@ -1187,9 +1184,7 @@ def primary_from_path_lengths(library: MultigroupLibrary, path: Tensor, material
     theta0 = detector_angle(omega_p, geometry, angle, pixels)  # [Rd, Cd]
     planar = fluence * torch.cos(theta0)
     detector_response = detector.at(group_energy, theta0)  # [G, Rd, Cd]
-    theta1, theta2 = grid_angles(omega_p, pixels, geometry, angle, grid_response.focal_distance_cm,
-                                 grid_response.septa_along)  # [Rd, Cd]
-    grid_transmission = grid_response.at(group_energy, theta1, theta2)
+    grid_transmission = grid_response.transmission_at(group_energy, omega_p, pixels, geometry, angle)  # [G, Rd, Cd]
     signal_per_group = planar * grid_transmission * detector_response
     return {"fluence": fluence, "planar_fluence": planar, "signal_per_group": signal_per_group,
             "signal": signal_per_group.sum(0)}

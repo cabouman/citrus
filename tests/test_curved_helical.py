@@ -344,10 +344,11 @@ def test_curved_panel_primary_passes_a_focused_grid(septa_along):
     assert float(theta1.abs().min()) > 0.01
 
 
-@pytest.mark.parametrize("septa_along", ["channels", "rows"])
+@pytest.mark.parametrize("septa_along", ["channels", "rows", "both"])
 def test_curved_panel_with_anti_scatter_grid(septa_along):
-    """A scatter solve on a curved panel behind a lead grid from its septa (pitch = pixel pitch): finite, and the
-    grid lowers the scatter-to-primary ratio well below that of the same panel without a grid."""
+    """A scatter solve on a curved panel behind a lead grid from its septa (pitch = pixel pitch, septa along the
+    channels, the rows or both): finite, and the grid lowers the scatter-to-primary ratio well below that of the same
+    panel without a grid."""
     from citrus.scatter_solver.config import SolverConfig
     from citrus.scatter_solver.detector import anti_scatter_grid
     from citrus.scatter_solver.photon_data import resolve_backend

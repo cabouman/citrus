@@ -374,7 +374,8 @@ Every image, primary and scatter, holds four arrays per view: ``fluence``, the s
 signal above (keV/cm^2, or photons/cm^2 for a counting detector); and ``signal``, its sum over the groups. All are
 per source photon per steradian.
 
-**Grid angles.** The anti-scatter grid is one-dimensional: its lamellae run along :math:`u` (channels), repeat along
+**Grid angles.** A set of grid lamellae is one-dimensional: in the default direction they run along :math:`u`
+(channels), repeat along
 :math:`v` (rows) and are focused on the line parallel to :math:`u` at the focal distance from the panel along the
 panel normal :math:`\hat n` (by default the source-detector distance, a grid focused at the focal spot; infinite, an
 unfocused grid, for a parallel beam). With
@@ -392,7 +393,9 @@ A primary ray of a grid focused at the focal spot has :math:`\theta_1 = 0` exact
 :math:`\theta_2 = -\arctan(u / \text{SDD})`. A grid whose lamellae run along the rows (``septa_along="rows"``, parallel
 to the rotation axis of a circular scan) swaps the roles of :math:`\hat u` and :math:`\hat v`: it is focused on the line
 parallel to :math:`\hat v` and :math:`\theta_1` lies in the plane of :math:`\hat u` and :math:`\hat n`. Its response
-varies along the channels, so the scatter image then stores the grid weights per pixel rather than per row.
+varies along the channels, so the scatter image then stores the grid weights per pixel rather than per row. A crossed
+or 2-D grid (``septa_along="both"``, as the 2-D collimators of CT detectors) has both sets, each with its own grid
+angles; its transmission is the product of the two (``GridResponse.crossed``, ``GridResponse.transmission_at``).
 
 **Detector models.** A detector layer of thickness :math:`t`, density :math:`\rho` and total mass attenuation
 :math:`\mu(E)` (``detector_response``: any catalogue material, with the cross sections of the photon data) stops a
@@ -428,7 +431,9 @@ period, so it is exact for a pixel that spans whole periods. ``anti_scatter_grid
 any catalogue material (attenuation from the photon data), thickness, height, focal distance, direction and pitch, by
 default the pixel pitch across the septa, one septum per pixel, so that every pixel sees the same septum shadow. The
 grid transmission enters the primary and the scatter signals alike, so the scatter-to-primary ratio of the solver is
-that of the detector behind the grid, in the CITRUS loop and in the synthetic data.
+that of the detector behind the grid, in the CITRUS loop and in the synthetic data. For a crossed grid the product of
+the two 1-D transmissions is exact for opaque septa, since the shadows along :math:`u` and :math:`v` do not interact,
+and counts the septum material twice where the walls of a 2-D grid cross, a correction of order :math:`(t/p)^2`.
 
 **Attenuation of the built-in models.** The mass attenuation of CsI and lead in ``csi_response`` and
 ``focused_1d_grid`` are coarse tables of NIST XCOM total

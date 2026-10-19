@@ -464,6 +464,7 @@ describes the models.
    detector = tabulated_detector_response(energies_kev, response)                # e.g. from a Monte Carlo run
    septa = anti_scatter_grid(geometry, septum_thickness_cm=0.002, septum_height_cm=0.15)   # lead, one septum per
    septa = anti_scatter_grid(geometry, 0.002, 0.15, septa_along="rows", septum_material="tungsten")  # pixel
+   septa = anti_scatter_grid(geometry, 0.01, 2.0, septa_along="both", septum_material="tungsten")  # 2-D collimator
    source = SourceModel(emission_profile=bowtie_emission_profile(geometry, edge_weight=0.2))
    source = SourceModel(emission_profile=emission_profile_from_open_field(open_field, solver, detector_gain=gain))
    solver = ScatterSolver(library, config, geometry, detector=detector, grid_response=septa, source=source,
@@ -473,7 +474,8 @@ describes the models.
 ``density=``, ``mode`` "energy_integrating" (keV per photon) or "photon_counting", and ``deposition`` "full" or
 "local". ``anti_scatter_grid`` takes the septum material, thickness and height, ``focal_distance_cm`` (default: the
 source-detector distance of a cone beam, infinite, an unfocused grid, for a parallel beam), ``pitch_cm`` (default:
-the pixel pitch across the septa) and ``septa_along`` ("channels", the default, or "rows"). ``csi_response`` and
+the pixel pitch across the septa) and ``septa_along`` ("channels", the default, "rows", or "both" for a crossed or
+2-D grid, whose transmission is the product of the two directions). ``csi_response`` and
 ``focused_1d_grid`` remain the built-in CsI and lead models. ``SourceModel(emission_profile=...)`` takes a
 ``[rows, channels]`` profile, or ``[views, rows, channels]`` with ``emission_profile_angles``. ``citrus_recon`` sets
 the profile itself from an open-field image.

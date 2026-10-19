@@ -473,6 +473,8 @@ class GridResponse:
         septa_along (str): direction of the septa (lamellae) on the panel, "channels" (along u, repeating along the
             rows) or "rows" (along v, repeating along the channels); it sets the axes of :func:`grid_angles`.
             Defaults to "channels".
+        crossed (GridResponse, optional): a second set of septa in the other direction (a crossed or 2-D grid); the
+            transmission is the product of the two (:meth:`transmission_at`). Defaults to None.
     """
 
     energy_kev: Tensor
@@ -482,14 +484,49 @@ class GridResponse:
     focal_distance_cm: Optional[float] = None
     name: str = "grid"
     septa_along: str = "channels"
+    crossed: Optional["GridResponse"] = None
 
     def __post_init__(self) -> None:
-        """Check that ``transmission`` is [E, T1, T2] and the septa direction."""
+        """Check that ``transmission`` is [E, T1, T2], the septa direction and the crossed septa."""
         shape = (self.energy_kev.numel(), self.theta1_rad.numel(), self.theta2_rad.numel())
         if tuple(self.transmission.shape) != shape:
             raise ValueError(f"transmission must be [E, T1, T2] = {list(shape)}, got {tuple(self.transmission.shape)}")
         if self.septa_along not in SEPTA_DIRECTIONS:
             raise ValueError(f"septa_along must be one of {SEPTA_DIRECTIONS}, got {self.septa_along!r}")
+        if self.crossed is not None and (self.crossed.septa_along == self.septa_along
+                                         or self.crossed.crossed is not None):
+            raise ValueError("the crossed septa must run in the other direction and have no crossed septa of their own")
+
+    @property
+    def depends_on_angles(self) -> bool:
+        """True unless the transmission is the same for every angle (as for ``no_grid``)."""
+        table = self.transmission
+        return self.crossed is not None or not bool((table == table[:, :1, :1]).all())
+
+    def transmission_at(self, group_energy: Tensor, omega: Tensor, pixel_positions: Tensor, geometry,
+                        angle: float) -> Tensor:
+        """Transmission of photons arriving at pixels, from their grid angles (:func:`grid_angles`).
+
+        With crossed septa the two sets act one after the other: the transmission is the product of the two tables,
+        each at the grid angles of its own septa direction.
+
+        Args:
+            group_energy (Tensor): [G] energies in keV.
+            omega (Tensor): [K, 3] or [..., 3] unit photon directions in the recon frame.
+            pixel_positions (Tensor): [rows, channels, 3], or [..., 3] broadcastable with ``omega``, in cm.
+            geometry (ConeGeometry or ParallelGeometry): the scan geometry.
+            angle (float): view angle in rad.
+
+        Returns:
+            Tensor: [G, ...] transmission, as :meth:`at` for the grid angles.
+        """
+        theta1, theta2 = grid_angles(omega, pixel_positions, geometry, angle, self.focal_distance_cm,
+                                     self.septa_along)
+        transmission = self.at(group_energy, theta1, theta2)
+        if self.crossed is not None:
+            transmission = transmission * self.crossed.transmission_at(group_energy, omega, pixel_positions,
+                                                                       geometry, angle)
+        return transmission
 
     def at(self, group_energy: Tensor, theta1: Tensor, theta2: Tensor) -> Tensor:
         """Interpolate the table trilinearly at group energies and grid angles.
@@ -604,10 +641,12 @@ def anti_scatter_grid(geometry: Optional[ConeGeometry], septum_thickness_cm: flo
                       pitch_cm: Optional[float] = None, septa_along: str = "channels",
                       density: Optional[float] = None, energies: Optional[ArrayLike] = None,
                       theta1: Optional[ArrayLike] = None, backend=None) -> GridResponse:
-    """Build a 1-D anti-scatter grid from its septa, with the septum attenuation from the photon data.
+    """Build an anti-scatter grid from its septa, with the septum attenuation from the photon data.
 
     The transmission is the geometric septum-shadow model of :func:`focused_1d_grid` with the septum material's
-    attenuation; with the default pitch, one septum per pixel, every pixel sees the same septum shadow.
+    attenuation; with the default pitch, one septum per pixel, every pixel sees the same septum shadow. Septa in both
+    directions (a crossed or 2-D grid) transmit the product of the two 1-D transmissions, which is exact for opaque
+    septa (the shadows along u and v do not interact) and counts the septum material twice where the walls cross.
 
     Args:
         geometry (ConeGeometry or ParallelGeometry, optional): the panel; needed for the default pitch and focal
@@ -618,9 +657,11 @@ def anti_scatter_grid(geometry: Optional[ConeGeometry], septum_thickness_cm: flo
         focal_distance_cm (float, optional): distance of the focal line from the panel in cm, ``math.inf`` for an
             unfocused grid. Defaults to None (``default_focal_distance``: the source-detector distance of a cone beam,
             focused at the focal spot; unfocused for a parallel beam).
-        pitch_cm (float, optional): septum pitch p in cm. Defaults to None (the detector pixel pitch across the septa).
-        septa_along (str, optional): "channels" (septa along u, repeating along the rows) or "rows" (septa along v,
-            parallel to the rotation axis, repeating along the channels). Defaults to "channels".
+        pitch_cm (float, optional): septum pitch p in cm, of both directions for ``"both"``. Defaults to None (the
+            detector pixel pitch across the septa).
+        septa_along (str, optional): "channels" (septa along u, repeating along the rows), "rows" (septa along v,
+            parallel to the rotation axis, repeating along the channels) or "both" (septa along u and v, as in the
+            2-D collimators of CT detectors). Defaults to "channels".
         density (float, optional): septum density in g/cm^3. Defaults to None (the catalogue density).
         energies (ArrayLike, optional): table energies in keV; None uses 10 to 150 keV every 0.5 keV, then 160 nodes
             logarithmically spaced up to 20 MeV. Defaults to None.
@@ -633,8 +674,17 @@ def anti_scatter_grid(geometry: Optional[ConeGeometry], septum_thickness_cm: flo
     """
     from .cross_sections import MATERIAL_CATALOGUE
 
+    if septa_along == "both":
+        options = dict(septum_material=septum_material, focal_distance_cm=focal_distance_cm, pitch_cm=pitch_cm,
+                       density=density, energies=energies, theta1=theta1, backend=backend)
+        along_channels = anti_scatter_grid(geometry, septum_thickness_cm, septum_height_cm, septa_along="channels",
+                                           **options)
+        along_rows = anti_scatter_grid(geometry, septum_thickness_cm, septum_height_cm, septa_along="rows", **options)
+        name = along_channels.name.replace("focused 1D grid", "focused crossed grid").replace(
+            "septa along the channels", "septa along the channels and the rows")
+        return replace(along_channels, crossed=along_rows, name=name)
     if septa_along not in SEPTA_DIRECTIONS:
-        raise ValueError(f"septa_along must be one of {SEPTA_DIRECTIONS}, got {septa_along!r}")
+        raise ValueError(f"septa_along must be one of {SEPTA_DIRECTIONS + ('both',)}, got {septa_along!r}")
     if pitch_cm is None or focal_distance_cm is None:
         if geometry is None:
             raise ValueError("pass the geometry, or both pitch_cm and focal_distance_cm")

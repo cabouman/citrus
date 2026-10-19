@@ -232,14 +232,14 @@ outer iteration) run without host synchronization.
 
 The detector response depends on a direction only through :math:`\theta_0` and is stored as ``[K, G]``; the grid
 response of a flat panel with a 1-D grid is stored as ``[K, G, Rd]``, and the three accumulation weights (fluence,
-planar fluence, signal) as one ``[G Rd, 3, K]`` matrix, a factor ``Cd / 3`` smaller than per-pixel tables.
-Separability is checked numerically on probe directions when the context is built; a panel that fails it (a grid
-whose septa run along the rows) falls back to per-pixel weights, and a curved panel has its own context, whose
-weights depend on the direction and the channel. The responses are evaluated in float64 and stored in the image
-dtype. The panel-facing directions are selected in the image dtype, so a direction grazing the panel plane is kept or
-dropped exactly as the projectors see it, and they are stored as one contiguous tensor, so the projectors copy them
-to the host once per context. The context does not depend on the voxel grid; the tables that do (sub-cell offsets,
-footprint heights) and the spherical harmonics per order are cached in it on first use.
+planar fluence, signal) as one ``[G Rd, 3, K]`` matrix, a factor ``Cd / 3`` smaller than per-pixel tables. Separability
+is checked numerically on probe directions when the context is built; a panel that fails it (a grid whose septa run
+along the rows, or along both directions) falls back to per-pixel weights, and a curved panel has its own context, whose
+weights depend on the direction and the channel. The responses are evaluated in float64 and stored in the image dtype.
+The panel-facing directions are selected in the image dtype, so a direction grazing the panel plane is kept or dropped
+exactly as the projectors see it, and they are stored as one contiguous tensor, so the projectors copy them to the host
+once per context. The context does not depend on the voxel grid; the tables that do (sub-cell offsets, footprint
+heights) and the spherical harmonics per order are cached in it on first use.
 
 **Direction set and footprint.** The cone product set is limited to the smallest cone about the panel normal that
 contains every direction from the transport-grid box to the panel. Per-pixel scatter of a finite direction set carries

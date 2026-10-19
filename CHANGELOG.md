@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.18.0 - 2026-10-19
+
+- **Crossed grids.** `anti_scatter_grid(..., septa_along="both")` builds a crossed or 2-D grid (as the 2-D
+  collimators of CT detectors): septa along the channels and along the rows, each with its pitch (default: the pixel
+  pitch across it), transmitting the product of the two 1-D transmissions at their own grid angles
+  (`GridResponse.crossed`, `GridResponse.transmission_at`, which the scatter image and the primary now use). Such a
+  grid takes the per-pixel path of the scatter image on every panel.
+
 ## v0.17.1 - 2026-10-19
 
 - **Metal fill.** With `metal_attenuation_threshold`, the metal voxels of the volume the scatter solver sees and of

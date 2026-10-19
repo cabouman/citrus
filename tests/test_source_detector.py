@@ -356,3 +356,54 @@ def test_ideal_responses_keep_the_planar_fluence():
     image = primary_from_path_lengths(library, path, None, geometry, 0.3, SourceModel(), ideal_counting_response(),
                                       no_grid())
     assert torch.equal(image["signal"], image["planar_fluence"].sum(0))
+
+
+def test_crossed_grid_is_the_product_of_its_septa(photon_data):
+    """Septa along both directions transmit the product of the grids along the channels and along the rows, each at
+    its own grid angles and pitch; on the primary ray of a focused grid that is the product of the open fractions."""
+    geometry = ConeGeometry(100.0, 150.0, 5, 7, 0.3, 0.4)
+    both = anti_scatter_grid(geometry, 0.02, 2.0, septa_along="both", backend=photon_data)
+    channels = anti_scatter_grid(geometry, 0.02, 2.0, backend=photon_data)
+    rows = anti_scatter_grid(geometry, 0.02, 2.0, septa_along="rows", backend=photon_data)
+    assert both.crossed is not None and both.crossed.septa_along == "rows" and "crossed" in both.name
+    assert both.depends_on_angles and not no_grid().depends_on_angles
+    angle = 0.8
+    pixels = geometry.pixel_centers(angle, dtype=F64)
+    directions = torch.randn(9, 3, generator=torch.Generator().manual_seed(3), dtype=F64)
+    directions = directions / directions.norm(dim=-1, keepdim=True)
+    expected = (channels.transmission_at(E_G, directions, pixels, geometry, angle)
+                * rows.transmission_at(E_G, directions, pixels, geometry, angle))
+    torch.testing.assert_close(both.transmission_at(E_G, directions, pixels, geometry, angle), expected)
+    primary = geometry.primary_directions(angle, dtype=F64)
+    on_axis = both.transmission_at(E_G, primary, pixels, geometry, angle)  # [G, Rd, Cd]
+    zero = torch.zeros((), dtype=F64)
+    open_product = channels.at(E_G, zero, zero) * rows.at(E_G, zero, zero)
+    torch.testing.assert_close(on_axis, open_product[:, None, None].expand_as(on_axis), rtol=1e-6, atol=1e-9)
+    with pytest.raises(ValueError, match="septa_along"):
+        anti_scatter_grid(geometry, 0.02, 2.0, septa_along="diagonal", backend=photon_data)
+    with pytest.raises(ValueError, match="other direction"):
+        replace(channels, crossed=channels)
+
+
+def test_crossed_grid_rejects_more_scatter_on_a_flat_panel(photon_data):
+    """On a flat panel a crossed grid lowers the scatter-to-primary ratio below that of either set of its septa."""
+    from citrus.utilities import wlab_phantom
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    grid = Grid((10, 16, 20), 2.0)
+    config = SolverConfig(num_groups=3, legendre_order=2, num_polar=4, num_azimuthal=8, cone_num_polar=6,
+                          cone_num_azimuthal=12, transport_cell_cm=4.0, max_source_iterations=6)
+    library = synthetic_library(3, 3, num_materials=7)
+    geometry = ConeGeometry(100.0, 150.0, num_det_rows=24, num_det_channels=32, delta_det_row=1.5,
+                            delta_det_channel=1.5)
+    rho = wlab_phantom(grid, device=device, dtype=torch.float32)
+    ratios = {}
+    for septa_along in ("channels", "rows", "both"):
+        septa = anti_scatter_grid(geometry, 0.05, 6.0, septa_along=septa_along, backend=photon_data)
+        solver = ScatterSolver(library, config, geometry, SiddonProjectors(), csi_response(), septa, device=device,
+                               dtype=torch.float32)
+        result = solver.solve_view(rho, grid, 0.5)
+        scatter, primary = result.scatter["signal"], result.primary["signal"]
+        assert bool(torch.isfinite(scatter).all()) and float(scatter.min()) >= 0 and float(primary.min()) > 0
+        ratios[septa_along] = float(scatter.sum() / primary.sum())
+    assert ratios["both"] < 0.8 * min(ratios["channels"], ratios["rows"]), ratios
