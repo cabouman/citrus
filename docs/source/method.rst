@@ -526,7 +526,7 @@ every view). The signal is interpolated rather than the ratio because the scatte
 while the ratio carries the object's shadow edges. ``scatter_view_interpolation_order`` selects the weights: 3
 (default) Catmull-Rom on the four nearest computed views, 2 three-point Lagrange, 1 linear, 0 nearest computed view;
 ``None`` (diagnostics) leaves the skipped views uncorrected. The weights are circular in angle for a
-full rotation and run along the arc for a short scan.
+full rotation, run along the arc for a short scan and along the unwrapped angles for a helical scan.
 
 With :math:`j_0, j_1` the computed views bracketing a skipped view and :math:`t \in [0, 1)` its fractional position
 between them, order 0 takes the nearer of the two (:math:`t = 1/2` goes to :math:`j_0`), order 1 the weights
@@ -568,7 +568,39 @@ With the view position :math:`\beta = (i + 1/2)\,\Lambda / V` along the arc, the
 
 The weights need :math:`\delta \ge \gamma_m`, i.e. a range of at least :math:`\pi` plus the fan angle; a shorter
 range gets no weights and a warning (the data are incomplete). They act per channel, the in-plane Parker weighting,
-approximate off the central plane like FDK itself.
+approximate off the central plane like FDK itself. On a curved panel the fan angle of a channel is :math:`u /
+\mathrm{SDD}`.
+
+Curved panels and helical scans
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Both follow MBIRTORCH's ``ConeBeamModel`` (``use_curved_detector``, ``helical_z_shifts``), whose projector is the
+primary of the CITRUS loop, so the solver places the source and the pixels exactly where MBIRTORCH projects
+(:doc:`conventions`, "Frames").
+
+**Curved panel.** The pixels lie on the cylinder of radius SDD about the vertical axis through the source, and
+everything the solver does at the panel follows the cylinder: the primary rays and the oblique lines of the scatter
+image run through the pixel centers on it, the downstream optical depth ends on it, the source collimation tests the
+ray's hit on it, and the incidence angle :math:`\theta_0`, the planar fluence and the detector and grid responses use
+the local normal of each pixel, which is horizontal and points to the axis. The scatter-image weights therefore depend
+on the direction and the channel, :math:`w_k \cos\theta_{0,kc}\, D_g(\theta_{0,kc})`, and a grid transmission that
+depends on the angles is evaluated per pixel for each chunk of directions; the grid's lamellae run along the arc and
+each column is focused along its own normal (at the focal spot for the default focal distance). The collapsed-cone
+direction set keeps the axis of the normal at the panel center and covers the cylinder's edges, and the finite-cone
+footprint is computed on the plane tangent to the cylinder at the central ray (the arc length and the tangent-plane
+coordinate agree to first order in the fan angle).
+
+**Helical scan.** Every view carries a z shift of the source and the panel (a table of unwrapped view angles and
+shifts in the geometry), used by the scatter solver for each view, by MBIRTORCH and by the synthetic data. The
+reconstruction grid must hold the whole object that the helix illuminates (the projectors take the volume as zero
+outside it); the transport grid covers the reconstruction grid as for a circular scan, and each view's solve covers
+the whole grid (the collimation leaves the slabs outside the view's field dark). Short-scan Parker weights do not
+apply. The initial volume is MBIRTORCH's FDK, which for a helical scan scales every slice by the inverse fraction of
+the views that see it: an approximate reconstruction, adequate as the start of MBIR, which is exact for the helical
+geometry. With ``scatter_view_stride`` :math:`m > 1` the skipped views are interpolated along the helix, in the
+unwrapped angle between consecutive computed views, never between views a turn apart at another z; two computed
+neighbours differ in z by :math:`m` times the table feed per view, so the stride should keep that well below the
+height of the panel at the isocenter.
 
 MBIR resume
 ~~~~~~~~~~~

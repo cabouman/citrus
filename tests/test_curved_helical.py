@@ -115,7 +115,8 @@ def test_helical_table():
     # a constant shift is not helical; pixels move with the shift
     shifted = FLAT.with_helical_z_shifts([0.0, 1.0], [2.5, 2.5])
     assert not shifted.is_helical
-    assert torch.allclose(shifted.pixel_centers(0.4, dtype=F64)[..., 2], FLAT.pixel_centers(0.4, dtype=F64)[..., 2] + 2.5)
+    assert torch.allclose(shifted.pixel_centers(0.4, dtype=F64)[..., 2],
+                          FLAT.pixel_centers(0.4, dtype=F64)[..., 2] + 2.5)
     # helical_scan: a constant pitch per turn, centred on the middle of the travel
     angles = view_angles(64, end_view_angle=4 * math.pi)
     helix = helical_scan(FLAT, angles, pitch_cm=10.0, center_cm=1.0)
@@ -217,7 +218,8 @@ def test_kernels_follow_torch_on_a_curved_helical_panel():
         assert torch.equal(finite, torch.isfinite(b))
         assert float((a[finite] - b[finite]).abs().max()) <= 2e-5 * float(a[finite].abs().max())
 
-    close(reference.upstream_cumulative(mu, grid, geometry, angle), triton.upstream_cumulative(mu, grid, geometry, angle))
+    close(reference.upstream_cumulative(mu, grid, geometry, angle),
+          triton.upstream_cumulative(mu, grid, geometry, angle))
     for n in (1, 3):
         close(reference.primary_project(mu, grid, geometry, angle, samples_per_pixel_axis=n),
               triton.primary_project(mu, grid, geometry, angle, samples_per_pixel_axis=n))
@@ -270,7 +272,7 @@ def test_curved_direction_context(focused_grid):
     detector = csi_response()
     context = make_direction_context(quadrature, geometry, angle, detector, grid_response, library, "cpu", F64)
     assert not context.separable and context.grid_per_pixel == focused_grid
-    K, Cd = context.num_directions, geometry.num_det_channels
+    Cd = geometry.num_det_channels
     pixels = geometry.pixel_centers(angle, dtype=F64)
     normals = geometry.local_panel_axes(pixels[0], angle)[2]
     cos = (context.omega @ (-normals).t()).clamp(0.0, 1.0)
