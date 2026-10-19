@@ -606,15 +606,19 @@ view set counts as a full rotation when its largest circular gap is at most 1.5 
 ``None`` the skipped views keep their most recent computed scatter, which with the fixed view subset is zero, so they
 are not corrected.
 
-Short scans
-~~~~~~~~~~~
+Short scans and redundancy weights
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The views are evenly spaced over :math:`[\beta_s, \beta_e)`; the synthetic data default to a short scan,
 :math:`\beta_e = \beta_s + \pi + 2\gamma_m` with :math:`2\gamma_m = 2\arctan(N_c \Delta_c / (2\,\mathrm{SDD}))` the
-in-plane fan angle of the panel. MBIRTORCH's FDK assumes a full rotation, so before it the line integrals of a short
-scan of range :math:`\Lambda` are weighted with :math:`(\Lambda/\pi)\, w(\beta, \gamma)`, the Parker weights in the
-overscan form of Wesarg et al., which make the two measurements of every in-plane line sum to one. MBIR itself needs no
-weighting.
+in-plane fan angle of the panel. MBIRTORCH's FDK and filtered back projection weight every view by
+:math:`\pi / V`, which counts every line equally only over a whole number of rotations. Over any other range of
+:math:`\Lambda` the line integrals are weighted with :math:`(\Lambda/\pi)\, w(\beta, \gamma)` before the direct
+reconstruction (``recon.mbir_bridge.redundancy_weights``), so that the measurements of every in-plane line sum to one;
+the weights are those of cabouman/mbirtorch pull request 30, and an MBIRTORCH whose ``recon_fdk`` applies them itself
+is left to do so. Below a full rotation they are the Parker weights in the overscan form of Wesarg et al.; above it
+they ramp over the excess beyond the whole rotations at both ends of the range. A parallel beam is the case
+:math:`\gamma = 0`. MBIR itself needs no weighting.
 
 With the view position :math:`\beta = (i + 1/2)\,\Lambda / V` along the arc, the overscan
 :math:`\delta = (\Lambda - \pi)/2` and the in-plane fan angle :math:`\gamma = -\arctan(u / \mathrm{SDD})` of channel
@@ -630,9 +634,11 @@ With the view position :math:`\beta = (i + 1/2)\,\Lambda / V` along the arc, the
    \end{cases}
 
 The weights need :math:`\delta \ge \gamma_m`, i.e. a range of at least :math:`\pi` plus the fan angle; a shorter
-range gets no weights and a warning (the data are incomplete). They act per channel, the in-plane Parker weighting,
-approximate off the central plane like FDK itself. On a curved panel the fan angle of a channel is :math:`u /
-\mathrm{SDD}`.
+range gets no weights and a warning (the data are incomplete). Above a full rotation of :math:`n` whole rotations
+and excess :math:`e = \Lambda - 2\pi n`, :math:`w = \sin^2(\tfrac{\pi}{2}\beta/e)` for :math:`\beta < e`,
+:math:`\sin^2(\tfrac{\pi}{2}(\Lambda - \beta)/e)` for :math:`\beta > 2\pi n`, 1 in between, all divided by
+:math:`2n`. They act per channel, the in-plane weighting, approximate off the central plane like FDK itself. On a
+curved panel the fan angle of a channel is :math:`u / \mathrm{SDD}`.
 
 Curved panels and helical scans
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -657,8 +663,10 @@ coordinate agree to first order in the fan angle).
 shifts in the geometry), used by the scatter solver for each view, by MBIRTORCH and by the synthetic data. The
 reconstruction grid must hold the whole object that the helix illuminates (the projectors take the volume as zero
 outside it); the transport grid covers the reconstruction grid as for a circular scan, and each view's solve covers
-the whole grid (the collimation leaves the slabs outside the view's field dark). Short-scan Parker weights do not
-apply. The initial volume is MBIRTORCH's FDK, which for a helical scan scales every slice by the inverse fraction of
+the whole grid (the collimation leaves the slabs outside the view's field dark). No redundancy weights are applied:
+the per-row helical weights of the MBIRTORCH pull request give a worse starting volume near the ends of the helix,
+where few views see a slice. The initial volume is MBIRTORCH's FDK, which for a helical scan scales every slice by the
+inverse fraction of
 the views that see it: an approximate reconstruction, adequate as the start of MBIR, which is exact for the helical
 geometry. With ``scatter_view_stride`` :math:`m > 1` the skipped views are interpolated along the helix, in the
 unwrapped angle between consecutive computed views, never between views a turn apart at another z; two computed
@@ -692,8 +700,9 @@ The scatter that reaches the panel falls as the air gap ``axis_detector_dist`` g
 over a larger solid angle and leave the panel), while the primary does not depend on it. The Triton ray tracer and
 the first-collision kernel have a parallel mode (the ``PARALLEL`` constant), checked against the PyTorch path like the
 cone modes. MBIRTORCH reconstructs the parallel beam with ``ParallelBeamModel``, whose initial volume is its filtered
-back projection (``recon.mbir_bridge.direct_reconstruction``); it assumes views evenly spaced over 180 or 360
-degrees, so no short-scan weights apply, and the default range of a parallel scan (``view_angles``) is 180 degrees.
+back projection (``recon.mbir_bridge.direct_reconstruction``), with the redundancy weights of a range that is not
+a whole number of half rotations (fan angle 0, above); the default range of a parallel scan (``view_angles``) is 180
+degrees.
 The sparse-view interpolation runs along the arc of such a scan, as for a short cone-beam scan: the views at
 :math:`\beta` and :math:`\beta + \pi` see the object from opposite sides of the panel, so their scatter differs.
 

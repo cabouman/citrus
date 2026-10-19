@@ -38,8 +38,8 @@ Package layout
     ============================= ================================================================================
 
 ``citrus.recon``
-    ``mbir_bridge``: the MBIRTORCH ``ConeBeamModel`` matching the solver's geometry, FDK (with Parker weights for a
-    short scan), the warm-started single-iteration recipe.
+    ``mbir_bridge``: the MBIRTORCH ``ConeBeamModel`` matching the solver's geometry, FDK (with redundancy weights for a
+    short scan or an overscan), the warm-started single-iteration recipe.
 
 ``citrus.utilities``
     The WLAB phantom, grid and geometry, the seven-material attenuation <-> density model, the view angles (short

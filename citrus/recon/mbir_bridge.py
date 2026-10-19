@@ -30,6 +30,8 @@ __all__ = [
     "direct_reconstruction",
     "scan_range",
     "is_short_scan",
+    "redundancy_weights",
+    "redundancy_weight_function",
     "short_scan_weights",
     "mbir_iterations",
     "freeze_regularization",
@@ -262,83 +264,189 @@ def is_short_scan(angles, tolerance: float = 1e-6) -> bool:
     return scan_range(angles) < 2.0 * np.pi - tolerance
 
 
-def short_scan_weights(geometry: ConeGeometry, angles, device: DeviceLike = None) -> Optional[Tensor]:
-    """FDK redundancy (Parker) weights of a short scan, or None for a full rotation, a helical scan or a parallel beam.
+_FULL_ROTATION_TOLERANCE = 1e-6  # rad: a range within this of whole rotations needs no weights
+_PARKER_SIGN = -1.0  # gamma = -atan(u / SDD): the fan angle with MBIRTORCH's orientation (a line measured at beta
+# and channel u is measured again at beta + pi + 2 gamma and channel -u)
 
-    The weights are the overscan form of Wesarg et al. times ``Lambda / pi`` for the range Lambda of the views; a range
-    shorter than pi plus the fan angle issues a RuntimeWarning and gets no weights. The fan angle of a channel is
-    ``atan(u / SDD)`` on a flat panel and ``u / SDD`` on a curved one.
+
+def _whole_rotations(arc: float) -> Optional[int]:
+    """Number of whole rotations of an angular range, or None when the range is not a whole number of rotations.
 
     Args:
-        geometry (ConeGeometry): cone-beam geometry (panel channels and source-detector distance).
-        angles (Sequence[float], ndarray or Tensor): [V] view angles in rad.
+        arc (float): range in rad.
+
+    Returns:
+        int or None: the number of rotations.
+    """
+    rotations = arc / (2.0 * np.pi)
+    if abs(rotations - round(rotations)) * 2.0 * np.pi < _FULL_ROTATION_TOLERANCE:
+        return int(round(rotations))
+    return None
+
+
+def redundancy_weight_function(beta, gamma, arc: float) -> np.ndarray:
+    """Redundancy weights of a scan over part of a rotation or a number of rotations that is not whole.
+
+    The weights make the measurements of each line add up to one: below a full rotation they are the Parker weights
+    in the form of Wesarg, Ebert and Bortfeld (Med. Phys. 29, 2002), above it they ramp over the excess beyond the
+    whole rotations at both ends (as in cabouman/mbirtorch PR 30). A parallel beam is the case ``gamma = 0``.
+
+    Args:
+        beta (ndarray): position of each view in the scan, from 0 to ``arc``, broadcastable with ``gamma``.
+        gamma (ndarray): fan angle of each channel with MBIRTORCH's orientation (``_PARKER_SIGN`` times the angle).
+        arc (float): angular range of the scan in rad.
+
+    Returns:
+        ndarray: the weights in the broadcast shape of ``beta`` and ``gamma``, without the filter factor.
+    """
+    beta, gamma = np.broadcast_arrays(np.asarray(beta, dtype=np.float64), np.asarray(gamma, dtype=np.float64))
+    weights = np.ones(beta.shape, dtype=np.float64)
+    if arc < 2.0 * np.pi - _FULL_ROTATION_TOLERANCE:
+        delta = 0.5 * (arc - np.pi)  # the overscan beyond 180 degrees, split between the two ends
+        with np.errstate(divide="ignore", invalid="ignore"):
+            start = beta < 2.0 * (delta - gamma)
+            weights = np.where(start, np.sin(np.pi / 4.0 * beta / np.where(start, delta - gamma, 1.0)) ** 2, weights)
+            end = beta >= np.pi - 2.0 * gamma
+            end_arg = np.clip(np.pi + 2.0 * delta - beta, 0.0, None)
+            weights = np.where(end, np.sin(np.pi / 4.0 * end_arg / np.where(end, delta + gamma, 1.0)) ** 2, weights)
+        return weights
+    rotations = int(np.floor((arc + _FULL_ROTATION_TOLERANCE) / (2.0 * np.pi)))
+    excess = arc - 2.0 * np.pi * rotations
+    if excess > _FULL_ROTATION_TOLERANCE:
+        start = beta < excess
+        weights = np.where(start, np.sin(0.5 * np.pi * beta / excess) ** 2, weights)
+        end = beta > 2.0 * np.pi * rotations
+        weights = np.where(end, np.sin(0.5 * np.pi * np.clip(arc - beta, 0.0, None) / excess) ** 2, weights)
+    return weights / (2.0 * rotations)  # every line is measured twice per rotation
+
+
+def _channel_fan_angles(geometry: ScanGeometry) -> np.ndarray:
+    """Fan angle of each channel with MBIRTORCH's orientation (0 for a parallel beam).
+
+    Args:
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
+
+    Returns:
+        ndarray: [Cd] angles in rad.
+    """
+    if geometry.is_parallel:
+        return np.zeros(geometry.num_det_channels)
+    u = ((np.arange(geometry.num_det_channels) - (geometry.num_det_channels - 1) / 2.0)
+         * float(geometry.delta_det_channel) - float(geometry.det_channel_offset))
+    sdd = float(geometry.source_detector_dist)
+    return _PARKER_SIGN * (u / sdd if geometry.use_curved_detector else np.arctan(u / sdd))
+
+
+def _range_too_short(arc: float, gamma: np.ndarray) -> bool:
+    """Whether a range is shorter than 180 degrees plus the fan angle, with a RuntimeWarning if it is.
+
+    Args:
+        arc (float): range in rad.
+        gamma (ndarray): [Cd] fan angles in rad.
+
+    Returns:
+        bool: True when the range does not measure every line.
+    """
+    largest = float(np.abs(gamma).max()) if gamma.size else 0.0
+    if 0.5 * (arc - np.pi) < largest - _FULL_ROTATION_TOLERANCE:
+        import warnings
+        warnings.warn(f"scan range {np.degrees(arc):.1f} deg is shorter than 180 deg plus the fan angle "
+                      f"{np.degrees(2 * largest):.1f} deg: no redundancy weighting, the direct reconstruction is "
+                      f"incomplete", RuntimeWarning)
+        return True
+    return False
+
+
+def redundancy_weights(geometry: ScanGeometry, angles, device: DeviceLike = None) -> Optional[Tensor]:
+    """Redundancy weights of a circular cone-beam or a parallel-beam scan for FDK or filtered back projection.
+
+    The weights of ``redundancy_weight_function`` at each view (the centre of its bin over the range) and channel,
+    times ``range / pi`` for MBIRTORCH's filter scale ``pi / num_views``. A helical scan gets none (``fdk``).
+
+    Args:
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
+        angles (Sequence[float], ndarray or Tensor): [V] view angles in rad, evenly spaced.
         device (torch.device or str, optional): device of the weights. Defaults to None (torch's default device).
 
     Returns:
-        Tensor or None: [V, 1, Cd] float32 weights, or None for a full rotation, a helical scan or a range too short
-            for the weights.
+        Tensor or None: [V, 1, Cd] float32 weights, or None for a whole number of rotations, a helical scan or a
+            range shorter than 180 degrees plus the fan angle (with a RuntimeWarning).
     """
     a = _angles_array(angles)
     V = a.size
     arc = scan_range(a)
-    if V < 2 or arc >= 2.0 * np.pi - 1e-6 or geometry.is_parallel or geometry.is_helical:
+    if V < 2 or geometry.is_helical or _whole_rotations(arc) is not None:
         return None
-    source_detector_distance = float(geometry.source_detector_dist)
-    u = ((np.arange(geometry.num_det_channels) - (geometry.num_det_channels - 1) / 2.0)
-         * float(geometry.delta_det_channel) - float(geometry.det_channel_offset))
-    fan = u / source_detector_distance if geometry.use_curved_detector else np.arctan(u / source_detector_distance)
-    gamma = _PARKER_SIGN * fan  # [Cd]
-    max_fan_angle = float(np.abs(gamma).max())
-    delta = 0.5 * (arc - np.pi)
-    if delta < max_fan_angle - 1e-9:
-        import warnings
-
-        warnings.warn(f"scan range {np.degrees(arc):.1f} deg is shorter than a short scan (180 deg + fan angle "
-                      f"{np.degrees(2 * max_fan_angle):.1f} deg): no redundancy weighting, the FDK is incomplete",
-                      RuntimeWarning)
+    gamma = _channel_fan_angles(geometry)
+    if _range_too_short(arc, gamma):
         return None
     beta = (np.arange(V) + 0.5) * arc / V
     if a[-1] < a[0]:
         beta = beta[::-1].copy()
-    beta_grid, gamma_grid = beta[:, None], gamma[None, :]
-    w = np.ones((V, gamma.size))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ramp_up = beta_grid < 2.0 * (delta - gamma_grid)
-        w = np.where(ramp_up, np.sin(np.pi / 4.0 * beta_grid / np.where(ramp_up, delta - gamma_grid, 1.0)) ** 2, w)
-        ramp_down = beta_grid >= np.pi - 2.0 * gamma_grid
-        w = np.where(ramp_down, np.sin(np.pi / 4.0 * np.clip(np.pi + 2.0 * delta - beta_grid, 0.0, None)
-                                       / np.where(ramp_down, delta + gamma_grid, 1.0)) ** 2, w)
-    w = w * (arc / np.pi)
+    w = redundancy_weight_function(beta[:, None], gamma[None, :], arc) * (arc / np.pi)
     device = torch.device(device) if device is not None else None
     return torch.as_tensor(w[:, None, :].astype(np.float32), device=device)
 
 
-_PARKER_SIGN = -1.0  # gamma = -atan(u / SDD): orientation relative to the rotation in MBIRTORCH's frame (measured:
-# the other sign leaves a 13 % error on an off-center test object, this one the full-rotation FDK error; tests)
+def short_scan_weights(geometry: ScanGeometry, angles, device: DeviceLike = None) -> Optional[Tensor]:
+    """Former name of ``redundancy_weights``, kept for existing scripts.
+
+    Args:
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
+        angles (Sequence[float], ndarray or Tensor): [V] view angles in rad.
+        device (torch.device or str, optional): device of the weights. Defaults to None.
+
+    Returns:
+        Tensor or None: as ``redundancy_weights``.
+    """
+    return redundancy_weights(geometry, angles, device)
+
+
+def _weights_in_mbirtorch(method) -> bool:
+    """Whether an MBIRTORCH direct reconstruction applies the redundancy weights itself (MBIRTORCH with PR 30).
+
+    Args:
+        method (callable): ``model.recon_fdk`` or ``model.recon_fbp``.
+
+    Returns:
+        bool: True when it takes ``redundancy_weighting``.
+    """
+    import inspect
+
+    try:
+        return "redundancy_weighting" in inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def fdk(model, sinogram: Tensor, filter_name: str = "ramp", *, geometry: Optional[ConeGeometry] = None,
         angles=None) -> Tensor:
-    """FDK reconstruction of line integrals with MBIRTORCH, with Parker weights for a short scan.
+    """FDK reconstruction of line integrals with MBIRTORCH and the redundancy weights of a circular scan.
 
-    A helical scan gets no Parker weights; MBIRTORCH's FDK then scales every slice by the inverse fraction of the
-    views that see it, an approximate reconstruction that serves as the initial volume of MBIR.
+    A circular scan over a range that is not whole rotations gets ``redundancy_weights`` (short scans and overscans),
+    or MBIRTORCH's own weights when its ``recon_fdk`` applies them. A helical scan keeps MBIRTORCH's FDK without
+    redundancy weights, which scales every slice by its view coverage: the per-row helical weights give a worse
+    starting volume near the ends of the helix.
 
     Args:
         model (ConeBeamModel): MBIRTORCH model of the scan.
         sinogram (Tensor): [V, Rd, Cd] line integrals.
         filter_name (str, optional): MBIRTORCH's FDK filter. Defaults to "ramp".
-        geometry (ConeGeometry, optional): scan geometry; with ``angles``, a short scan gets ``short_scan_weights``.
-            Defaults to None.
+        geometry (ConeGeometry, optional): scan geometry; with ``angles`` a circular scan is weighted. Defaults to None.
         angles (Sequence[float] or ndarray, optional): [V] view angles in rad. Defaults to None.
 
     Returns:
         Tensor: [R, C, S] volume in 1/cm on the model device.
     """
-    if geometry is not None and angles is not None:
-        w = short_scan_weights(geometry, angles, device=sinogram.device if isinstance(sinogram, Tensor) else None)
-        if w is not None:
-            sinogram = torch.as_tensor(sinogram, dtype=torch.float32, device=w.device) * w
+    weights_in_mbirtorch = _weights_in_mbirtorch(model.recon_fdk)
+    if geometry is not None and geometry.is_helical:
+        options = {"redundancy_weighting": False} if weights_in_mbirtorch else {}
+        return model.recon_fdk(sinogram, filter_name=filter_name, output_sharded=True, **options)
+    if geometry is None or angles is None or weights_in_mbirtorch:
+        return model.recon_fdk(sinogram, filter_name=filter_name, output_sharded=True)
+    w = redundancy_weights(geometry, angles, device=sinogram.device if isinstance(sinogram, Tensor) else None)
+    if w is not None:
+        sinogram = torch.as_tensor(sinogram, dtype=torch.float32, device=w.device) * w
     return model.recon_fdk(sinogram, filter_name=filter_name, output_sharded=True)
 
 
@@ -346,24 +454,28 @@ def direct_reconstruction(model, sinogram: Tensor, filter_name: str = "ramp", *,
                           geometry: Optional[ScanGeometry] = None, angles=None) -> Tensor:
     """Direct reconstruction of line integrals: FDK for a cone beam, filtered back projection for a parallel beam.
 
-    MBIRTORCH's filtered back projection assumes views evenly spaced over pi or 2 pi; other ranges give an approximate
-    volume, adequate as the start of MBIR.
+    Both get the redundancy weights of the scan (``fdk``; ``redundancy_weights`` with fan angle 0 for a parallel
+    beam), unless MBIRTORCH applies them itself.
 
     Args:
         model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model of the scan.
         sinogram (Tensor): [V, Rd, Cd] line integrals.
         filter_name (str, optional): MBIRTORCH's filter. Defaults to "ramp".
-        geometry (ConeGeometry or ParallelGeometry, optional): scan geometry; a cone-beam short scan gets
-            ``short_scan_weights`` with ``angles``. Defaults to None (the model decides).
+        geometry (ConeGeometry or ParallelGeometry, optional): scan geometry; with ``angles`` the scan is weighted.
+            Defaults to None (the model decides the kind).
         angles (Sequence[float] or ndarray, optional): [V] view angles in rad. Defaults to None.
 
     Returns:
         Tensor: [R, C, S] volume in 1/cm on the model device.
     """
     parallel = geometry.is_parallel if geometry is not None else not hasattr(model, "recon_fdk")
-    if parallel:
-        return model.recon_fbp(sinogram, filter_name=filter_name, output_sharded=True)
-    return fdk(model, sinogram, filter_name, geometry=geometry, angles=angles)
+    if not parallel:
+        return fdk(model, sinogram, filter_name, geometry=geometry, angles=angles)
+    if geometry is not None and angles is not None and not _weights_in_mbirtorch(model.recon_fbp):
+        w = redundancy_weights(geometry, angles, device=sinogram.device if isinstance(sinogram, Tensor) else None)
+        if w is not None:
+            sinogram = torch.as_tensor(sinogram, dtype=torch.float32, device=w.device) * w
+    return model.recon_fbp(sinogram, filter_name=filter_name, output_sharded=True)
 
 
 def mbir_iterations(model, sinogram: Tensor, init_recon: Union[Tensor, np.ndarray], first_iteration: int,

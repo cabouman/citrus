@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.16.1 - 2026-10-19
+
+- **Redundancy weights for every range.** The FDK of a circular cone-beam scan and the filtered back projection of a
+  parallel beam get redundancy weights over any range that is not whole rotations: the Parker weights of a short scan
+  (as before for the cone beam) and overscan ramps above a full rotation (`recon.mbir_bridge.redundancy_weights`,
+  `redundancy_weight_function`; a port of the weights of cabouman/mbirtorch pull request 30, extended to the
+  parallel beam with fan angle 0). An MBIRTORCH whose `recon_fdk` takes `redundancy_weighting` does the cone-beam
+  weighting itself. Helical scans keep MBIRTORCH's coverage-scaled FDK as the initial volume: the per-row helical
+  weights of the pull request gave a worse start near the ends of the helix. `short_scan_weights` is now the former
+  name of `redundancy_weights`.
+
 ## v0.16.0 - 2026-10-19
 
 - **Parallel-beam geometry.** `ParallelGeometry(axis_detector_dist, num_det_rows, num_det_channels, delta_det_row,

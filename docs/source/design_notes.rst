@@ -348,9 +348,11 @@ changes between outer iterations.
 Each call draws its partitions anew, so the granularity of iteration k is that of the default schedule, while the
 random subsets differ from those of one continuous ``recon`` run.
 
-**FDK.** ``recon_fdk`` assumes a full rotation (MBIRTORCH applies no short-scan weighting). For a short scan
-``mbir_bridge.fdk(..., geometry=, angles=)`` multiplies the line integrals by (Lambda / pi) w(beta, gamma), the Parker
-weights in the overscan form of Wesarg et al., with the fan angle gamma = -atan(u / SDD) in MBIRTORCH's frame.
+**FDK and FBP.** MBIRTORCH 0.1.2's ``recon_fdk`` and ``recon_fbp`` weight every view by pi / V. Over a range
+that is not whole rotations ``mbir_bridge.fdk`` and ``direct_reconstruction`` multiply the line integrals by
+(Lambda / pi) w(beta, gamma) (``redundancy_weights``, a port of the weights of cabouman/mbirtorch pull request 30,
+with gamma = -atan(u / SDD) in MBIRTORCH's frame, 0 for a parallel beam). When the installed MBIRTORCH's ``recon_fdk``
+takes ``redundancy_weighting``, CITRUS leaves the cone-beam weighting to it and asks it to skip the helical weights.
 
 **Primary of the loop.** The loop's primary uses MBIRTORCH's projector, the reconstruction's own operator: it averages
 the line integral over the pixel like a detector pixel does, and the synthetic data define their scatter through the

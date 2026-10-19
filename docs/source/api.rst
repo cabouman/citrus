@@ -26,8 +26,8 @@ MBIRTORCH bridge
 The interface to the reconstruction package.
 
 :doc:`api/mbir_bridge`
-    The MBIRTORCH model of the solver's geometry, FDK with short-scan weights or the filtered back projection of a
-    parallel beam, warm-started MBIR iterations.
+    The MBIRTORCH model of the solver's geometry, FDK or the filtered back projection of a
+    parallel beam, with redundancy weights,, warm-started MBIR iterations.
 
 .. toctree::
    :hidden:

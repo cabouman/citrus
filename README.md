@@ -96,8 +96,8 @@ python benchmarks/citrus_study.py --help   # every flag
 
 The views are evenly spaced over `[start, end)`; the default end is a short scan, start + 180 degrees + the in-plane
 fan angle of the detector (`utilities.view_angles`, `utilities.fan_angle`). MBIRTORCH's FDK, which initializes the
-loop, has no short-scan weighting, so CITRUS applies Parker weights before it for a short scan
-(`recon.mbir_bridge.short_scan_weights`).
+loop, counts every view equally, so CITRUS applies redundancy weights before it over any range that is not whole
+rotations: short scans and overscans, also for the parallel beam (`recon.mbir_bridge.redundancy_weights`).
 
 In Python:
 
@@ -125,7 +125,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Gregery T. Buzzard and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.16.0},
+  note = {Version 0.16.1},
   year = 2026
 }
 ```

@@ -84,8 +84,9 @@ initialization, weights and partition sequence, so they differ only by the scatt
 Angular range: the views are evenly spaced over ``[start, end)`` (endpoint excluded, MBIRTORCH's angle convention).
 The default end is a short scan, start + 180 degrees + the in-plane fan angle of the panel,
 ``2 atan(0.5 num_det_channels delta_det_channel / SDD)``; ``--end-view-angle 360`` (with the default start 0) is a full
-rotation. For a short scan ``citrus_recon`` / ``mbir_recon`` apply Parker weights before MBIRTORCH's FDK
-(``recon.mbir_bridge.fdk(..., geometry=, angles=)``, ``short_scan_weights``), and the sparse-view interpolation runs
+rotation. Over a range that is not whole rotations ``citrus_recon`` / ``mbir_recon`` apply redundancy weights
+before MBIRTORCH's FDK or filtered back projection (``recon.mbir_bridge.redundancy_weights``), and the sparse-view
+interpolation runs
 along the arc. A parallel beam has no fan angle: its default range is 180 degrees.
 
 Ground truth: the scatter of every view is computed by the scatter solver from the TRUE densities with a fully

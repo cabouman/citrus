@@ -223,7 +223,7 @@ def test_short_scan_fdk_parker_weights():
     lam = 2000 * (ang[1] - ang[0])
     assert w.min() >= 0 and w.max() == pytest.approx(lam / np.pi, rel=1e-6)
     assert w.sum(0).mean() * (ang[1] - ang[0]) == pytest.approx(lam, rel=1e-2)  # sum_beta w dbeta = pi (Lambda / pi)
-    with pytest.warns(RuntimeWarning, match="shorter than a short scan"):
+    with pytest.warns(RuntimeWarning, match="shorter than 180 deg plus the fan angle"):
         assert short_scan_weights(geometry, np.linspace(0, np.pi, 50, endpoint=False)) is None
 
 
