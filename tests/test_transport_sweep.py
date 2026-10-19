@@ -486,3 +486,31 @@ def test_source_called_once_per_chunk(device, chunk):
     for d0, index, (idx_o, lent) in zip(starts, calls, calls_out):
         expect = context.direction_indices(d0, min(d0 + dc, 4))
         assert torch.equal(index, expect) and torch.equal(idx_o, expect) and lent
+
+
+# ------------------------------------------------------------------------------------------------
+# (i) cell-major source functions: written straight into the chunk's storage, swept in place by the fused kernel
+# ------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("chunk", [None, 3])
+def test_cell_major_source_matches_direction_major(sweep_backend, chunk):
+    """A source function that writes cell-major moments [D, R, C, S, G, 4] into the sweep's buffer (``cell_major``)
+    gives the same fluence as the same source given direction-major, on the PyTorch path and in place on the fused
+    path."""
+    from citrus.scatter_solver.transport_sweep import source_is_cell_major
+
+    grid = Grid((4, 5, 3), 0.7, 1.1, 0.9)
+    context = sweep_backend.context(grid, product_quadrature(4, 8, dtype=F64), 2)
+    mu, source = _random_problem(grid.shape, 3, context.num_directions, dtype=sweep_backend.dtype,
+                                 device=sweep_backend.device)
+    cell_major_source = source.permute(0, 3, 4, 5, 1, 2).contiguous()  # [M, R, C, S, G, 4]
+
+    def cell_major(index, out=None):
+        assert out is not None and out.shape == (index.numel(),) + tuple(cell_major_source.shape[1:])
+        return out.copy_(cell_major_source.index_select(0, index))
+
+    cell_major.cell_major = True
+    assert source_is_cell_major(cell_major) and not source_is_cell_major(direction_source_function(source))
+    reference = sweep(context, mu, direction_source_function(source), direction_chunk=chunk)
+    out = sweep(context, mu, cell_major, direction_chunk=chunk)
+    torch.testing.assert_close(out, reference, rtol=0, atol=0)

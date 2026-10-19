@@ -32,12 +32,15 @@ __all__ = [
     "make_sweep_context",
     "sweep",
     "source_function_accepts_out",
+    "source_is_cell_major",
 ]
 
 SourceFunction = Callable[[Tensor], Tensor]
 """source_function(direction_index [Dsel] int64, reordered direction indices) -> linear-discontinuous source moments
 [Dsel, G, 4, R, C, S]. Optionally source_function(direction_index, out=buffer) writes into the contiguous buffer
-[Dsel, G, 4, R, C, S] and returns it (see `sweep`)."""
+[Dsel, G, 4, R, C, S] and returns it (see `sweep`). A source function with the attribute ``cell_major = True`` instead
+writes the moments cell-major, [Dsel, R, C, S, G, 4] (the sweep's own layout), into the ``out`` buffer it is given and
+returns it, so the sweep uses them without a copy."""
 
 Backend = Literal["auto", "torch", "triton"]
 _BACKENDS = ("auto", "torch", "triton")
@@ -309,9 +312,8 @@ def _sweep_chunk(
     c: Tensor,
     s: Tensor,
     store: Optional[Tensor] = None,
-    use_triton: bool = False,
 ) -> Tensor:
-    """Sweep one direction chunk through all wavefront planes.
+    """Sweep one direction chunk through all wavefront planes with the PyTorch plane step.
 
     Args:
         sweep_context (SweepContext): sweep context.
@@ -319,9 +321,8 @@ def _sweep_chunk(
         mu_cells (Tensor): [N, G] total attenuation coefficient mu_t per cell in cm^-1.
         c (Tensor): [8, Dc, 3] ``|Omega_a| / Delta_a`` of the chunk directions in cm^-1.
         s (Tensor): [8, Dc, 3] ``sign(Omega_a)`` of the chunk directions.
-        store (Tensor, optional): [8, Dc, N + 1, 4G] buffer to reuse, zeroed here. Defaults to None (allocated).
-        use_triton (bool, optional): one fused Triton kernel per plane instead of the PyTorch plane step (float32 CUDA,
-            contiguous inputs). Defaults to False.
+        store (Tensor, optional): [8, Dc, N + 1, 4G] buffer to reuse; only its vacuum cell is zeroed here, since every
+            other entry is written before it is read. Defaults to None (allocated).
 
     Returns:
         Tensor: [8, Dc, N + 1, 4G] angular-fluence moments of the chunk.
@@ -330,16 +331,29 @@ def _sweep_chunk(
     Dc = c.shape[1]
     G = mu_cells.shape[1]
     if store is None:
-        store = torch.zeros(8, Dc, N + 1, 4 * G, device=mu_cells.device, dtype=mu_cells.dtype)
-    else:
-        store.zero_()
-    if use_triton:
-        if sweep_context.flat_index is None:
-            raise ValueError("the fused plane kernel needs a CUDA sweep context")
-        sweep_kernels.sweep_planes(sweep_context.flat_index, store, source, mu_cells, c)
-        return store
+        store = torch.empty(8, Dc, N + 1, 4 * G, device=mu_cells.device, dtype=mu_cells.dtype)
+    store[:, :, N].zero_()
     for plane in sweep_context.planes:
         _plane_step(plane, store, source, mu_cells, c, s)
+    return store
+
+
+def _sweep_chunk_in_place(sweep_context: SweepContext, store: Tensor, mu_cells: Tensor, c: Tensor) -> Tensor:
+    """Sweep one direction chunk with the fused Triton kernel, one launch per plane, in place.
+
+    Args:
+        sweep_context (SweepContext): sweep context with the fused kernel's entry tables (a CUDA context).
+        store (Tensor): [8, Dc, N, 4G] float32 contiguous source moments of the chunk, overwritten with the
+            angular-fluence moments.
+        mu_cells (Tensor): [N, G] total attenuation coefficient mu_t per cell in cm^-1.
+        c (Tensor): [8, Dc, 3] ``|Omega_a| / Delta_a`` of the chunk directions in cm^-1.
+
+    Returns:
+        Tensor: ``store``.
+    """
+    if sweep_context.flat_index is None:
+        raise ValueError("the fused plane kernel needs a CUDA sweep context")
+    sweep_kernels.sweep_planes(sweep_context.flat_index, store, mu_cells, c)
     return store
 
 
@@ -379,12 +393,25 @@ def source_function_accepts_out(source_function: SourceFunction) -> bool:
     return p is not None and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
 
 
+def source_is_cell_major(source_function: SourceFunction) -> bool:
+    """Tell whether a source function writes cell-major moments into the sweep's buffer (its ``cell_major`` attribute).
+
+    Args:
+        source_function (SourceFunction): the source function.
+
+    Returns:
+        bool: True if ``source_function.cell_major`` is true.
+    """
+    return bool(getattr(source_function, "cell_major", False))
+
+
 def _fill_source(sweep_context: SweepContext, source_function: SourceFunction, d0: int, d1: int, G: int,
                  out: Tensor, scratch: Optional[Tensor] = None) -> None:
     """Evaluate the source of the chunk ``d0 <= d < d1`` of every octant and copy it cell-major into ``out``.
 
-    The source function is called once with all ``8 dc`` directions, octant-major; if it accepts ``out``, it writes into
-    a view of ``scratch``, so that no temporary is allocated.
+    The source function is called once with all ``8 dc`` directions, octant-major. A cell-major source function writes
+    into ``out`` itself; otherwise, if it accepts ``out``, it writes into a view of ``scratch``, so that no temporary is
+    allocated.
 
     Args:
         sweep_context (SweepContext): sweep context.
@@ -399,8 +426,14 @@ def _fill_source(sweep_context: SweepContext, source_function: SourceFunction, d
     chunk = d1 - d0
     N = sweep_context.num_cells
     Q = 4 * G
-    expected = (8 * chunk, G, 4) + tuple(sweep_context.shape)
     direction_index = sweep_context.direction_indices(d0, d1)
+    if source_is_cell_major(source_function):
+        cell_major = out.view((8 * chunk,) + tuple(sweep_context.shape) + (G, 4))
+        chunk_source = source_function(direction_index, out=cell_major)
+        if chunk_source.data_ptr() != cell_major.data_ptr() or tuple(chunk_source.shape) != tuple(cell_major.shape):
+            raise ValueError("a cell-major source function must write its [Dsel, R, C, S, G, 4] moments into `out`")
+        return
+    expected = (8 * chunk, G, 4) + tuple(sweep_context.shape)
     if source_function_accepts_out(source_function):
         n = 8 * chunk * Q * N
         if scratch is not None and scratch.is_contiguous() and scratch.numel() >= n \
@@ -436,15 +469,17 @@ def sweep(
         mu_t (Tensor): [G, rows, cols, slices] total attenuation coefficient mu_t in cm^-1 on the context device; its
             dtype sets the computation dtype.
         source_function (SourceFunction): maps [Dsel] int64 reordered direction indices to [Dsel, G, 4, rows, cols,
-            slices] source moments per sr, called once per chunk; it may write into an ``out`` keyword buffer.
+            slices] source moments per sr, called once per chunk; it may write into an ``out`` keyword buffer, or
+            write cell-major moments into it (``cell_major``, see ``SourceFunction``).
         direction_chunk (int, optional): directions per octant swept together (Dc). Defaults to None (all D8).
         return_psi (bool, optional): also return the angular fluence (small grids and tests). Defaults to False.
         backend (Backend, optional): plane-step backend "auto", "torch" or "triton"; "auto" uses the fused Triton kernel
             for float32 CUDA sweeps when it is usable. Defaults to None (``sweep_context.backend``).
 
     Returns:
-        Tensor: [G, (L+1)^2, 4, rows, cols, slices] spherical-harmonic moments phi of the angular fluence; with
-        ``return_psi``, the tuple (phi, psi) with psi [M, G, 4, rows, cols, slices] in reordered direction order.
+        Tensor: [G, (L+1)^2, 4, rows, cols, slices] spherical-harmonic moments phi of the angular fluence, a view of
+        cell-major storage [(L+1)^2, rows, cols, slices, G, 4]; with ``return_psi``, the tuple (phi, psi) with psi
+        [M, G, 4, rows, cols, slices] in reordered direction order.
     """
     if mu_t.dim() != 4 or tuple(mu_t.shape[1:]) != tuple(sweep_context.shape):
         raise ValueError(f"mu_t must be [G, {sweep_context.shape}], got {tuple(mu_t.shape)}")
@@ -459,10 +494,10 @@ def sweep(
     Y_weighted_all = sweep_context.basis.Y_weighted.to(device=device, dtype=dtype)
     Dc = _resolve_chunk(sweep_context, direction_chunk)
     use_triton = _use_triton(sweep_context, backend, device, dtype)
-    lend_storage = source_function_accepts_out(source_function)
+    lend_storage = source_function_accepts_out(source_function) and not source_is_cell_major(source_function)
 
     mu_cells = mu_t.reshape(G, N).t().contiguous()  # [N, G]
-    moments = torch.zeros(num_moments, N * Q, device=device, dtype=dtype)  # [n, (cell, q)]
+    moments: Optional[Tensor] = None  # [n, (cell, q)], formed by the first chunk's product
     psi_out = torch.zeros(sweep_context.num_directions, G, 4, N, device=device, dtype=dtype) if return_psi else None
     for d0 in range(0, D8, Dc):
         d1 = min(d0 + Dc, D8)
@@ -470,18 +505,31 @@ def sweep(
         direction_index = sweep_context.direction_indices(d0, d1)
         c = c_all[:, d0:d1].contiguous()
         s = s_all[:, d0:d1].contiguous()
-        # Memory: an `out`-capable source_function writes into the (not yet used) storage of the chunk; otherwise the
-        # storage is allocated after the fill, so its transient result never coexists with it.
-        source = torch.empty(8, chunk, N, Q, device=device, dtype=dtype)
-        store = torch.empty(8, chunk, N + 1, Q, device=device, dtype=dtype) if lend_storage else None
-        _fill_source(sweep_context, source_function, d0, d1, G, source, scratch=store)
-        store = _sweep_chunk(sweep_context, source, mu_cells, c, s, store=store, use_triton=use_triton)
-        del source
-        psi_chunk = store.view(8 * chunk, N + 1, Q)[:, :N]  # [8 dc, N, Q] (view)
-        moments.addmm_(Y_weighted_all.index_select(0, direction_index).t(), psi_chunk.reshape(8 * chunk, N * Q))
+        if use_triton:
+            # one buffer: the source, overwritten plane by plane with the angular fluence
+            store = torch.empty(8, chunk, N, Q, device=device, dtype=dtype)
+            _fill_source(sweep_context, source_function, d0, d1, G, store)
+            _sweep_chunk_in_place(sweep_context, store, mu_cells, c)
+            psi_chunk = store.view(8 * chunk, N, Q)
+        else:
+            # Memory: a cell-major source function writes into `source` itself, and an `out`-capable one into the (not
+            # yet used) storage of the chunk; otherwise the storage is allocated after the fill, so its transient result
+            # never coexists with it.
+            source = torch.empty(8, chunk, N, Q, device=device, dtype=dtype)
+            store = torch.empty(8, chunk, N + 1, Q, device=device, dtype=dtype) if lend_storage else None
+            _fill_source(sweep_context, source_function, d0, d1, G, source, scratch=store)
+            store = _sweep_chunk(sweep_context, source, mu_cells, c, s, store=store)
+            del source
+            psi_chunk = store.view(8 * chunk, N + 1, Q)[:, :N]  # [8 dc, N, Q] (view)
+        weights = Y_weighted_all.index_select(0, direction_index).t()
+        if moments is None:
+            moments = torch.mm(weights, psi_chunk.reshape(8 * chunk, N * Q))
+        else:
+            moments.addmm_(weights, psi_chunk.reshape(8 * chunk, N * Q))
         if psi_out is not None:
             psi_out[direction_index] = psi_chunk.permute(0, 2, 1).reshape(8 * chunk, G, 4, N)
         del store, psi_chunk
+    assert moments is not None
     phi = moments.view(num_moments, N, G, 4).permute(2, 0, 3, 1).reshape(G, num_moments, 4, *sweep_context.shape)
     del moments
     if psi_out is not None:

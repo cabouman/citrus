@@ -27,6 +27,7 @@ from citrus.scatter_solver.transport_sweep import (
     _fill_source,
     _resolve_chunk,
     _sweep_chunk,
+    _sweep_chunk_in_place,
     make_sweep_context,
     source_function_accepts_out,
     sweep,
@@ -148,14 +149,22 @@ def breakdown(context: SweepContext, mu_t: torch.Tensor, source_function, chunk:
         s = s_all[:, d0:d1].contiguous()
         e = [ev() for _ in range(4)]
         e[0].record()
-        source = torch.empty(8, directions_in_chunk, N, Q, device=device, dtype=dtype)
-        store = torch.empty(8, directions_in_chunk, N + 1, Q, device=device, dtype=dtype) if lend else None
-        _fill_source(context, source_function, d0, d1, G, source, scratch=store)
-        e[1].record()
-        store = _sweep_chunk(context, source, mu_cells, c, s, store=store, use_triton=use_triton)
-        del source
-        e[2].record()
-        psi_chunk = store.view(8 * directions_in_chunk, N + 1, Q)[:, :N]
+        if use_triton:  # one buffer, swept in place (transport_sweep.sweep)
+            store = torch.empty(8, directions_in_chunk, N, Q, device=device, dtype=dtype)
+            _fill_source(context, source_function, d0, d1, G, store)
+            e[1].record()
+            _sweep_chunk_in_place(context, store, mu_cells, c)
+            e[2].record()
+            psi_chunk = store.view(8 * directions_in_chunk, N, Q)
+        else:
+            source = torch.empty(8, directions_in_chunk, N, Q, device=device, dtype=dtype)
+            store = torch.empty(8, directions_in_chunk, N + 1, Q, device=device, dtype=dtype) if lend else None
+            _fill_source(context, source_function, d0, d1, G, source, scratch=store)
+            e[1].record()
+            store = _sweep_chunk(context, source, mu_cells, c, s, store=store)
+            del source
+            e[2].record()
+            psi_chunk = store.view(8 * directions_in_chunk, N + 1, Q)[:, :N]
         accumulator.addmm_(Y_weighted.index_select(0, index).t(), psi_chunk.reshape(8 * directions_in_chunk, N * Q))
         e[3].record()
         marks.append(e)

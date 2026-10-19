@@ -49,51 +49,60 @@ class SourceIterationResult:
 def scatter_moments(mu_s_l_volume: Tensor, phi: Tensor) -> Tensor:
     """Scattering-source spherical-harmonic moments ``T[g, n] = sum_g_in mu_s_l_volume[g_in, g, l(n)] phi[g_in, n]``.
 
-    Zero transfer blocks (such as upscatter) are skipped, and ``T.movedim(1, 0)`` is contiguous, so
-    ``scatter_source_function`` contracts over it without a copy.
+    T is a view of the sweep's cell-major storage ``[N, *spatial, G_out, (4)]``, so ``scatter_source_function``
+    contracts over it without a copy.
 
     Args:
         mu_s_l_volume (Tensor): ``[G_in, G_out, L+1, *spatial]`` Legendre transfer moments in 1/cm.
         phi (Tensor): ``[G_in, N, *rest]`` moments, N = (L_phi+1)^2 with L_phi <= L, rest = spatial or (4, spatial).
 
     Returns:
-        Tensor: ``[G_out, N, *rest]`` moments T, a non-contiguous view of a moment-major ``[N, G_out, *rest]`` buffer.
+        Tensor: ``[G_out, N, *rest]`` moments T, a non-contiguous view of cell-major storage.
     """
-    return scatter_source_moments(mu_s_l_volume, phi, moment_major=True)
+    return scatter_source_moments(mu_s_l_volume, phi, cell_major=True)
 
 
 def scatter_source_function(sweep_context: SweepContext, T: Tensor) -> SourceFunction:
     """Source function for the sweep from the spherical-harmonic moments T of a scattering source.
 
     The callable maps reordered direction indices to the linear-discontinuous source moments
-    ``sum_n Y[direction_index, n] T[:, n]`` with one matrix product, written into ``out`` when a buffer is given.
+    ``sum_n Y[direction_index, n] T[:, n]`` with one matrix product, cell-major (the sweep's layout, ``cell_major``),
+    written into ``out`` when a buffer is given or added to it with ``accumulate=True``.
 
     Args:
         sweep_context (SweepContext): sweep context with the spherical-harmonic basis Y of the sweep directions.
-        T (Tensor): [G, (L+1)^2, 4, R, C, S] moments; one moment-major copy is made unless they come from
+        T (Tensor): [G, (L+1)^2, 4, R, C, S] moments; one cell-major copy is made unless they come from
             ``scatter_moments``.
 
     Returns:
-        SourceFunction: callable ``source(direction_index [Dsel], out=None)`` returning [Dsel, G, 4, R, C, S] moments.
+        SourceFunction: callable ``source(direction_index [Dsel], out=None, accumulate=False)`` returning
+        [Dsel, R, C, S, G, 4] moments.
 
     Raises:
-        ValueError: if T does not have the context's number of spherical-harmonic moments.
+        ValueError: if T does not have the context's number of spherical-harmonic moments or shape.
     """
     if T.shape[1] != sweep_context.num_moments:
         raise ValueError(f"T has {T.shape[1]} spherical-harmonic moments, context has {sweep_context.num_moments}")
+    if T.dim() != 6 or T.shape[2] != 4 or tuple(T.shape[3:]) != tuple(sweep_context.shape):
+        raise ValueError(f"T must be [G, {sweep_context.num_moments}, 4, {sweep_context.shape}], got {tuple(T.shape)}")
     Y = sweep_context.basis.Y.to(device=T.device, dtype=T.dtype)
-    rest = tuple(T.shape[2:])
     G, num_moments = T.shape[0], T.shape[1]
-    # no copy when T is a view of moment-major storage
-    moments_matrix = T.movedim(1, 0).contiguous().view(num_moments, -1)
+    spatial = tuple(T.shape[3:])
+    # cell-major moments [(L+1)^2, R, C, S, G, 4]: no copy when T is a view of cell-major storage
+    moments_matrix = T.permute(1, 3, 4, 5, 0, 2).contiguous().view(num_moments, -1)
 
-    def source(direction_index: Tensor, out: Optional[Tensor] = None) -> Tensor:
+    def source(direction_index: Tensor, out: Optional[Tensor] = None, accumulate: bool = False) -> Tensor:
         Y_selected = Y.index_select(0, direction_index.to(Y.device))  # [Dsel, N_sh]
         if out is None:
-            return (Y_selected @ moments_matrix).view(Y_selected.shape[0], G, *rest)
-        torch.mm(Y_selected, moments_matrix, out=out.view(Y_selected.shape[0], -1))
+            return (Y_selected @ moments_matrix).view((Y_selected.shape[0],) + spatial + (G, 4))
+        flat = out.view(Y_selected.shape[0], -1)
+        if accumulate:
+            flat.addmm_(Y_selected, moments_matrix)
+        else:
+            torch.mm(Y_selected, moments_matrix, out=flat)
         return out
 
+    source.cell_major = True  # type: ignore[attr-defined]
     return source
 
 
@@ -114,16 +123,16 @@ def multiple_collision_source_moments(mu_s_l_volume_coarse: Tensor, phi_total: T
     return scatter_moments(mu_s_l_volume_coarse, phi_total)
 
 
-def _scalar_norm(phi: Tensor) -> float:
-    """Frobenius norm of the scalar-flux cell means over all groups and cells.
+def _scalar_norms(*phis: Tensor) -> list[float]:
+    """Frobenius norms of the scalar-flux cell means over all groups and cells, with one host synchronization.
 
     Args:
-        phi (Tensor): [G, (L+1)^2, 4, R, C, S] moments.
+        *phis (Tensor): [G, (L+1)^2, 4, R, C, S] moments.
 
     Returns:
-        float: norm of ``phi[:, 0, 0]``.
+        list[float]: norm of ``phi[:, 0, 0]`` of each.
     """
-    return float(torch.linalg.vector_norm(phi[:, 0, 0]))
+    return torch.stack([torch.linalg.vector_norm(phi[:, 0, 0]) for phi in phis]).tolist()
 
 
 def source_iteration(
@@ -175,8 +184,7 @@ def source_iteration(
             phi_total = phi_n.clone()
         else:
             phi_total.add_(phi_n)
-        norm_n = _scalar_norm(phi_n)
-        norm_total = _scalar_norm(phi_total)
+        norm_n, norm_total = _scalar_norms(phi_n, phi_total)
         relative_change = norm_n / norm_total if norm_total > 0 else 0.0
         history.append(relative_change)
         norms.append(norm_n)

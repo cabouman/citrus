@@ -55,8 +55,7 @@ class SolverConfig:
         cone_num_polar (int): polar directions of the cone direction set of the scatter image. Defaults to 16.
         cone_num_azimuthal (int): azimuthal directions of the cone direction set of the scatter image. Defaults to 32.
         direction_chunk (int): directions per octant per sweep chunk and per batch of the scatter image (with the
-            fused first-collision kernels the image takes larger batches, as many as fit a memory budget). Defaults
-            to 8.
+            fused kernels both take more, as many as fit a memory budget). Defaults to 8.
         dtype (str): "float32" (production) or "float64" (reference and tests). Defaults to "float32".
     """
 

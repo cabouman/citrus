@@ -12,6 +12,7 @@ built-in tables, and :func:`tabulated_detector_response` from a user table. :fun
 from __future__ import annotations
 
 import math
+import weakref
 from dataclasses import dataclass, replace
 from typing import Callable, Optional, Sequence, Union
 
@@ -19,7 +20,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .geometry import ConeGeometry
+from .geometry import ConeGeometry, device_tensor
 
 __all__ = [
     "DetectorResponse",
@@ -164,6 +165,30 @@ def _bracket(nodes: Tensor, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
 
 # ---- detector -------------------------------------------------------------------------------------
 
+# device copies of the response tables: response -> {(names, device, dtype): tensors}, dropped with the response
+_DEVICE_TABLES: "weakref.WeakKeyDictionary[object, dict]" = weakref.WeakKeyDictionary()
+
+
+def _tables_on(owner, names: tuple[str, ...], device, dtype: torch.dtype) -> tuple[Tensor, ...]:
+    """The tensors ``owner.<name>`` on ``device`` in ``dtype``, copied once per owner, device and dtype.
+
+    Args:
+        owner: a frozen response object.
+        names (tuple[str, ...]): attribute names of its tensors.
+        device (torch.device | str): the device.
+        dtype (torch.dtype): the dtype.
+
+    Returns:
+        tuple[Tensor, ...]: the tensors, in the order of ``names``.
+    """
+    per_owner = _DEVICE_TABLES.setdefault(owner, {})
+    key = (names, str(torch.device(device)), dtype)
+    tables = per_owner.get(key)
+    if tables is None:
+        tables = tuple(getattr(owner, name).to(device, dtype) for name in names)
+        per_owner[key] = tables
+    return tables
+
 @dataclass(frozen=True, eq=False)
 class DetectorResponse:
     """Detector response lookup table D(E, theta0), in keV deposited per incident photon.
@@ -200,9 +225,7 @@ class DetectorResponse:
             Tensor: [G, ...] response, on the device and in the dtype of ``theta``.
         """
         device, dtype = theta.device, theta.dtype
-        energy_nodes = self.energy_kev.to(device, dtype)
-        theta_nodes = self.theta_rad.to(device, dtype)
-        table = self.response.to(device, dtype)
+        energy_nodes, theta_nodes, table = _tables_on(self, ("energy_kev", "theta_rad", "response"), device, dtype)
         e = group_energy.to(device, dtype).reshape(-1)
         ie0, ie1, we = _bracket(energy_nodes, e)  # [G]
         it0, it1, wt = _bracket(theta_nodes, theta.abs())  # [...]
@@ -542,10 +565,8 @@ class GridResponse:
         """
         device, dtype = theta1.device, theta1.dtype
         theta1, theta2 = torch.broadcast_tensors(theta1, theta2.to(device, dtype))
-        energy_nodes = self.energy_kev.to(device, dtype)
-        theta1_nodes = self.theta1_rad.to(device, dtype)
-        theta2_nodes = self.theta2_rad.to(device, dtype)
-        table = self.transmission.to(device, dtype)
+        energy_nodes, theta1_nodes, theta2_nodes, table = _tables_on(
+            self, ("energy_kev", "theta1_rad", "theta2_rad", "transmission"), device, dtype)
         e = group_energy.to(device, dtype).reshape(-1)
         ie0, ie1, we = _bracket(energy_nodes, e)
         table_at_energy = table[ie0] + (table[ie1] - table[ie0]) * we[:, None, None]  # [G, T1, T2]
@@ -744,7 +765,7 @@ def detector_angle(omega: Tensor, geometry: ConeGeometry, angle: float,
         Tensor: [...] angles theta0 in rad.
     """
     _, _, n_hat = geometry.panel_axes(angle)
-    n = torch.tensor(n_hat, device=omega.device, dtype=omega.dtype)
+    n = device_tensor(n_hat, omega.device, omega.dtype)
     if geometry.use_curved_detector and pixel_positions is not None:
         n = geometry.local_panel_axes(pixel_positions.to(omega.device, omega.dtype), angle)[2]
     c = (omega * (-n)).sum(-1) / torch.linalg.norm(omega, dim=-1)
@@ -783,12 +804,12 @@ def grid_angles(omega: Tensor, pixel_positions: Tensor, geometry: ConeGeometry, 
     omega = omega.to(device, dtype)
     if septa_along not in ("channels", "rows"):
         raise ValueError(f"septa_along must be one of {SEPTA_DIRECTIONS}, got {septa_along!r}")
-    u_hat, v_hat, n_hat = (torch.tensor(a, device=device, dtype=dtype) for a in geometry.panel_axes(angle))
+    u_hat, v_hat, n_hat = (device_tensor(a, device, dtype) for a in geometry.panel_axes(angle))
     if focal_distance is None:
         focal_distance = default_focal_distance(geometry)
     focal_distance = float(focal_distance)
     unfocused = math.isinf(focal_distance)  # the septa are parallel to the panel normal
-    panel_center = torch.tensor(geometry.panel_center(angle), device=device, dtype=dtype)
+    panel_center = device_tensor(geometry.panel_center(angle), device, dtype)
     if omega.dim() == 2 and pixel_positions.dim() == 3:
         a = -omega[:, None, None, :]  # [K, 1, 1, 3]
         pixels = pixel_positions[None]

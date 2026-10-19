@@ -96,10 +96,11 @@ in :math:`q` between them.
 :math:`\sum_m P_m m_m(E)`, one ray trace per material gives the exact polychromatic transmission
 (``group_transmission``), without the within-group beam hardening of group-averaged attenuation.
 
-``group_transmission`` evaluates the sum in blocks of at most :math:`2^{22}` (fine energy, ray) pairs: per block
-one optical-depth tensor (M fused multiply-adds), an in-place exponential and one matrix product with the
-fine-to-group weights, accumulated into the result. The float32 matrix product assumes that TF32 is off
-(``torch.backends.cuda.matmul.allow_tf32 = False``, the PyTorch default).
+On float32 CUDA one kernel sums the fine energies of every ray, group by group (the library sorts them by group),
+so no (fine energy, ray) tensor is formed. The PyTorch path evaluates the sum in blocks of at most :math:`2^{22}`
+(fine energy, ray) pairs: per block one optical-depth tensor (M fused multiply-adds), an in-place exponential and one
+matrix product with the fine-to-group weights, accumulated into the result. The float32 matrix product assumes that
+TF32 is off (``torch.backends.cuda.matmul.allow_tf32 = False``, the PyTorch default).
 
 **Cache.** ``build_library`` caches the library as ``mglib_<hash>.pt`` in ``$CITRUS_CACHE_DIR`` (default
 ``~/.cache/citrus``); the key covers the configuration, the spectrum, the backend, the numerical parameters and the
@@ -159,8 +160,10 @@ Angular quadratures
 Real spherical harmonics are evaluated by stable normalized recurrences in :math:`z` and :math:`(x + iy)^k` (no
 trigonometric functions, no division by :math:`\sin\theta`). Relation to the complex harmonics of SciPy (which carry
 the Condon-Shortley phase): :math:`Y_{l,+k} = \sqrt2 (-1)^k \mathrm{Re}\,Y_l^k`, :math:`Y_{l,-k} = \sqrt2 (-1)^k
-\mathrm{Im}\,Y_l^k`. The scattering-source operator accumulates every non-zero (g_in, g_out) block in place into a
-moment-major buffer, so its only temporary is one gather of the transfer instead of a broadcast over all group pairs.
+\mathrm{Im}\,Y_l^k`. On float32 CUDA one kernel forms the scattering-source moments of every point and moment, all
+groups of a moment per program, and writes them in the layout their user contracts without a copy: cell-major for
+the sweep, moment-major for the scatter image. The PyTorch path accumulates every non-zero (g_in, g_out) block in place
+into the buffer, so its only temporary is one gather of the transfer instead of a broadcast over all group pairs.
 
 With :math:`Q_{lk} = N_{lk} P_l^k / \sin^k\theta`, a polynomial in :math:`z`, the harmonics are
 :math:`Y_{l,+k} = \sqrt2\, Q_{lk}(z)\,\mathrm{Re}((x + iy)^k)`, :math:`Y_{l,-k} = \sqrt2\, Q_{lk}(z)\,
@@ -173,25 +176,37 @@ Transport sweep and source iteration
 ------------------------------------
 
 **Layout.** Directions are grouped by octant; a chunk of :math:`D_c` directions per octant is swept at once. The
-angular fluence of the chunk lives in one tensor ``store [8, Dc, cells + 1, 4G]`` whose last cell is a zero "vacuum
-cell": upstream indices of boundary faces point to it, so a plain gather returns zero inflow. The source is written
-cell-major into the same layout, and after the chunk the moments are accumulated with one matrix product straight from
-the storage, so the angular fluence of all directions is never held at once.
+source and the angular fluence of the chunk are cell-major, ``[8, Dc, cells, 4G]``. The fused plane kernel sweeps one
+such buffer in place: each lane reads the source of its entry and overwrites it with the angular fluence, and a face
+on the vacuum boundary reads zero inflow through a masked load. The PyTorch path keeps the source apart and stores the
+fluence in ``[8, Dc, cells + 1, 4G]``, whose last cell is a zero "vacuum cell" that the upstream indices of boundary
+faces point to, so a plain gather returns zero inflow. After the chunk the moments are accumulated with one matrix
+product straight from the storage, so the angular fluence of all directions is never held at once.
+
+**Chunks.** With the fused kernel the solver takes as many directions per octant as fit a fixed memory budget
+(``ScatterSolver.sweep_direction_chunk``, at least ``direction_chunk``, in chunks of equal size): fewer chunks make
+fewer plane launches and accumulate the moments with fewer matrix products.
 
 **Source function.** The sweep asks for the source of a chunk with one call ``source_function(direction_index)``
 covering all 8 Dc directions of the chunk, octant-major (indices ``o * D8 + d``), so a source formed from moments by a
-matrix product reads its moments once per chunk. A source function that accepts an ``out`` keyword is lent the
-not-yet-used storage tensor of the chunk to write its ``[8 Dc, G, 4, rows, cols, slices]`` result into, so no
-source-sized temporary is allocated; otherwise the storage is allocated after the fill, so the two never coexist.
+matrix product reads its moments once per chunk. A cell-major source function (``cell_major``) writes the chunk's
+moments in the sweep's own layout, ``[8 Dc, rows, cols, slices, G, 4]``, into the buffer it is given: the solver's
+first-collision source (the fused moment kernel writes them so) and scattering source (one matrix product of the
+harmonics with cell-major moments) do, and the step's scattering source adds into the first-collision source with
+one accumulating product. Any other source function that accepts an ``out`` keyword is lent memory for its
+``[8 Dc, G, 4, rows, cols, slices]`` result, which the sweep then transposes; otherwise its result is copied.
 
 **Memory of the source iteration.** The peak during one collision order is the running sum ``phi_total``, the
 scattering-source moments T of the previous order and the sweep's moment accumulator (three fields of
-:math:`G (L+1)^2 \cdot 4\,N` values for N transport cells) plus the sweep buffers (:math:`2 \cdot 8\,D_c\,N \cdot 4G`
-values); the previous scattering source is released before the next one is formed.
+:math:`G (L+1)^2 \cdot 4\,N` values for N transport cells) plus the sweep buffer (:math:`8\,D_c\,N \cdot 4G`
+values on the fused path, twice that on the PyTorch path); the previous scattering source is released before the next
+one is formed.
 
 **Fused plane kernel.** On float32 CUDA one Triton kernel launch solves a whole diagonal plane, in place of the many
 small PyTorch operations of the reference plane step. It follows ``linear_discontinuous_cell`` term by term, so both
-paths agree to float32 rounding.
+paths agree to float32 rounding. The planes of a chunk share their tensors, so after the first launch, which compiles
+the kernel with the specializations of its arguments, the planes run the compiled binary directly
+(``triton_utilities.LaunchSequence``).
 
 The plane kernel runs one lane per (entry, direction, group) of the plane with the group fastest, so the lanes of a
 warp read contiguous 4G-value rows of the cell-major storage. Entries of a plane never read each other (their
@@ -231,7 +246,15 @@ responses is precomputed once per view (``make_direction_context``): the panel-f
 the detector response per direction and the grid response per direction and detector row (exact for a flat panel with
 a 1-D grid whose septa run along the channels, whose angles do not depend on the channel). The accumulation of a
 chunk is then one batched matrix product, and an LRU of contexts lets the repeated images of a view (every CITRUS
-outer iteration) run without host synchronization.
+outer iteration) run without host synchronization. The panel-facing selection and the separability of a view, which
+need one, are kept with its direction set, which the CITRUS state keeps per view, so a context rebuilt for the view in a
+later outer iteration needs none either.
+
+**Host synchronizations.** The small tensors of a view (panel axes, focal spot, the response tables) reach the device
+without a host synchronization: ``geometry.device_tensor`` copies them asynchronously from pinned memory, and each
+response copies its tables once. The materials to trace are found once per density field
+(``MaterialFields.traced_materials``). The scatter solve of a view in the loop then waits for the device only for the
+convergence norms of its step.
 
 The detector response depends on a direction only through :math:`\theta_0` and is stored as ``[K, G]``; the grid
 response of a flat panel with a 1-D grid is stored as ``[K, G, Rd]``, and the three accumulation weights (fluence,
@@ -416,7 +439,9 @@ Memory
 **Densities one material at a time.** The density volume of all M reference materials on the reconstruction grid
 would be M reconstruction-sized volumes. The loop instead builds the solver's fields from X one material map at a time
 (``ScatterSolver.material_fields_from_attenuation``, ``DensityModel.material`` slab by slab) and the primary projects
-the maps one at a time again, so the fine-grid footprint stays at about one map above X.
+the maps one at a time again, so the fine-grid footprint stays at about one map above X. When the maps of all M
+materials fit ``FINE_MAP_BUDGET_BYTES``, the fields keep the nonzero ones for the primary of every view of the outer
+iteration (``MaterialFields.fine_maps``) instead of evaluating them again per view.
 The upstream line integrals of the uncollided fluence (``uncollided.uncollided_path_lengths``) are linear and channel
 by channel, so for fields built from the attenuation the solver traces them one material map at a time as well and
 concatenates the results.

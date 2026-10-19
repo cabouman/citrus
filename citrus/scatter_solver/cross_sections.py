@@ -22,6 +22,8 @@ import torch
 import xraylib
 from torch import Tensor
 
+from .kernels import transmission_kernels
+
 # ---- material catalogue (docs/source/conventions.rst, "Materials") ----------------------------------------------
 # the material strings of XrayPhysics (the materials of citrus <= 0.6, verbatim; the air terms are read as mass
 # fractions of the compounds, `parse_formula`)
@@ -796,8 +798,9 @@ def group_transmission(library: MultigroupLibrary, path: Tensor, block: int = _T
                        materials: Optional[Sequence[int]] = None) -> Tensor:
     """Return the group-integrated transmission from material line integrals, exact in energy up to the fine quadrature.
 
-    ``T_g = sum_{e: fine_group[e] = g} fine_weight[e] exp(-sum_m fine_mu_t[m, e] path[m])``, evaluated in blocks of at
-    most ``block`` (fine energy, ray) pairs.
+    ``T_g = sum_{e: fine_group[e] = g} fine_weight[e] exp(-sum_m fine_mu_t[m, e] path[m])``. On float32 CUDA one fused
+    kernel sums the fine energies of every ray (``kernels.transmission_kernels``); the PyTorch path evaluates the sum in
+    blocks of at most ``block`` (fine energy, ray) pairs.
 
     Args:
         library (MultigroupLibrary): the cross-section library.
@@ -809,6 +812,24 @@ def group_transmission(library: MultigroupLibrary, path: Tensor, block: int = _T
     Returns:
         Tensor: [G, ...] source photons per steradian per group surviving the path (sum 1 over g for a zero path), in
         the dtype and on the device of ``path``.
+    """
+    if transmission_kernels.use_kernel(library, path):
+        return transmission_kernels.group_transmission(library, path, materials)
+    return _group_transmission_torch(library, path, block, materials)
+
+
+def _group_transmission_torch(library: MultigroupLibrary, path: Tensor, block: int,
+                              materials: Optional[Sequence[int]]) -> Tensor:
+    """PyTorch path of ``group_transmission``, in blocks of at most ``block`` (fine energy, ray) pairs.
+
+    Args:
+        library (MultigroupLibrary): the cross-section library.
+        path (Tensor): [M', ...] line integrals of the density maps in g/cm^2.
+        block (int): maximum number of (fine energy, ray) pairs per block.
+        materials (Sequence[int] or None): library indices of the rows of ``path``, or None for all.
+
+    Returns:
+        Tensor: [G, ...] transmission per group.
     """
     device, dtype = path.device, path.dtype
     M = path.shape[0]

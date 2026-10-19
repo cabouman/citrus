@@ -252,9 +252,13 @@ def _self_check_fused(device: torch.device) -> tuple[bool, object]:
             worst = max(worst, deviation(sums[3:], exact))
             corrected = FirstCollisionSamplingCorrection(scale, beta, omega_uncollided).apply(source, directions)
             for f in (1, 2, 3):
+                reference_moments = restrict_to_linear_discontinuous_moments(corrected, grid, f)
                 moments = first_collision_moments(library, density, phi, grid, geometry, angle, directions, scale,
                                                   beta, f, pairs=pair)
-                worst = max(worst, deviation(moments, restrict_to_linear_discontinuous_moments(corrected, grid, f)))
+                worst = max(worst, deviation(moments, reference_moments))
+                moments = first_collision_moments(library, density, phi, grid, geometry, angle, directions, scale,
+                                                  beta, f, pairs=pair, cell_major=True)
+                worst = max(worst, deviation(moments, reference_moments.permute(0, 3, 4, 5, 1, 2)))
                 coarse = grid.coarsen(f)
                 tau = torch.rand(5, G, *coarse.shape, generator=generator).to(device) * 3.0
                 tau[0, 0, 0, 0, 0] = float("inf")
@@ -500,7 +504,7 @@ if triton is not None:
                                        V, C, S, NC, CC, SC, K, N, KM, r0x, r0y, r0z, eta_lo, eta_hi, slope_scale,
                                        G: tl.constexpr, GP: tl.constexpr, KB: tl.constexpr, BLOCK: tl.constexpr,
                                        MT: tl.constexpr, F: tl.constexpr, PAIR: tl.constexpr, MAPPED: tl.constexpr,
-                                       PARALLEL: tl.constexpr):
+                                       PARALLEL: tl.constexpr, CELL_MAJOR: tl.constexpr):
         """Linear-discontinuous moments of the corrected first-collision source of BLOCK transport cells.
 
         For every cell (program_id 0) and KB directions (program_id 1) the source is evaluated at the F^3 quadrature
@@ -512,7 +516,8 @@ if triton is not None:
                 as in ``_first_collision_kernel``, on the quadrature grid.
             scale_ptr: [G, V] float32 correction scale.
             beta_ptr: [G, V] float32 correction coefficient beta.
-            out_ptr: [K, G, 4, NC] float32 moments [mean, x slope, y slope, z slope] per cell.
+            out_ptr: [K, G, 4, NC] float32 moments [mean, x slope, y slope, z slope] per cell, or [K, NC, G, 4] with
+                CELL_MAJOR (the sweep's layout).
             V, C, S: points, columns and slices of the quadrature grid.
             NC, CC, SC: cells, columns and slices of the transport grid.
             K, N, KM, r0x, r0y, r0z, eta_lo, eta_hi: as in ``_first_collision_kernel``.
@@ -520,6 +525,7 @@ if triton is not None:
             G, GP, KB, MT, PAIR, MAPPED, PARALLEL (constexpr): as in ``_first_collision_kernel``.
             BLOCK (constexpr): cells per program.
             F (constexpr): quadrature points per axis per cell.
+            CELL_MAJOR (constexpr): write the moments cell-major.
         """
         pid_c = tl.program_id(0)
         pid_k = tl.program_id(1)
@@ -564,11 +570,16 @@ if triton is not None:
                     mx += s * ub
                     my += s * ua
                     mz += s * ud
-                obase = ((k.to(tl.int64) * G + go[:, None].to(tl.int64)) * 4) * NC + c[None, :]
+                if CELL_MAJOR:
+                    obase = (k.to(tl.int64) * NC + c[None, :]) * (4 * G) + go[:, None] * 4
+                    step = 1
+                else:
+                    obase = ((k.to(tl.int64) * G + go[:, None].to(tl.int64)) * 4) * NC + c[None, :]
+                    step = NC
                 tl.store(out_ptr + obase, m0 * inv_points, mask=smask)
-                tl.store(out_ptr + obase + NC, mx * (inv_points * slope_scale), mask=smask)
-                tl.store(out_ptr + obase + 2 * NC, my * (inv_points * slope_scale), mask=smask)
-                tl.store(out_ptr + obase + 3 * NC, mz * (inv_points * slope_scale), mask=smask)
+                tl.store(out_ptr + obase + step, mx * (inv_points * slope_scale), mask=smask)
+                tl.store(out_ptr + obase + 2 * step, my * (inv_points * slope_scale), mask=smask)
+                tl.store(out_ptr + obase + 3 * step, mz * (inv_points * slope_scale), mask=smask)
 
     @triton.jit
     def _first_collision_sums_kernel(rho_ptr, index_ptr, phi_ptr, x_axis_ptr, y_axis_ptr, z_axis_ptr, direction_ptr,
@@ -772,7 +783,8 @@ def prepared_table(library, device: torch.device) -> tuple[Tensor, float, float,
     entry = (kernel_table.contiguous(), float(eta_grid[0]), float(eta_grid[-1]), kernel_map)
     table_id = id(source_table)
     if hit is None or hit[0]() is not source_table:
-        _TABLES[table_id] = (weakref.ref(source_table, lambda _r, table_id=table_id: _TABLES.pop(table_id, None)), {})
+        _TABLES[table_id] = (weakref.ref(source_table, lambda _r, table_id=table_id, tables=_TABLES:
+                                         tables.pop(table_id, None)), {})
     per_version = _TABLES[table_id][1]
     per_version.clear()  # keep only the latest version per source tensor
     per_version[key] = entry
@@ -805,7 +817,8 @@ def prepared_moment_table(library, device: torch.device) -> Tensor:
     table = table.contiguous()
     source_id = id(source)
     if hit is None or hit[0]() is not source:
-        _TABLES[source_id] = (weakref.ref(source, lambda _r, source_id=source_id: _TABLES.pop(source_id, None)), {})
+        _TABLES[source_id] = (weakref.ref(source, lambda _r, source_id=source_id, tables=_TABLES:
+                                          tables.pop(source_id, None)), {})
     per_version = _TABLES[source_id][1]
     per_version.clear()
     per_version[key] = table
@@ -938,7 +951,7 @@ def first_collision_source(library, rho: Tensor, phi_uncollided: Tensor, grid, g
 
 def first_collision_moments(library, rho: Tensor, phi_uncollided: Tensor, grid, geometry, angle: float,
                             omegas: Tensor, scale: Tensor, beta: Tensor, factor: int, pairs=None,
-                            out: Optional[Tensor] = None) -> Tensor:
+                            out: Optional[Tensor] = None, cell_major: bool = False) -> Tensor:
     """Linear-discontinuous moments of the corrected first-collision source on the cells of a refined grid.
 
     The fused form of ``first_collision_source_at_directions``, ``FirstCollisionSamplingCorrection.apply`` and
@@ -956,11 +969,13 @@ def first_collision_moments(library, rho: Tensor, phi_uncollided: Tensor, grid, 
         beta (Tensor): [G, rows, cols, slices] correction coefficient beta.
         factor (int): quadrature points per axis per cell.
         pairs (MaterialPairs, optional): pair representation of ``rho``, or None for dense mode. Defaults to None.
-        out (Tensor, optional): contiguous [K, G, 4, rows/f, cols/f, slices/f] float32 tensor to fill. Defaults to None
-            (allocated).
+        out (Tensor, optional): contiguous float32 tensor of the result's shape to fill. Defaults to None (allocated).
+        cell_major (bool, optional): write the moments cell-major, [K, rows/f, cols/f, slices/f, G, 4] (the sweep's
+            layout). Defaults to False.
 
     Returns:
-        Tensor: [K, G, 4, rows/f, cols/f, slices/f] moments ordered [0, x, y, z].
+        Tensor: [K, G, 4, rows/f, cols/f, slices/f] moments ordered [0, x, y, z], or [K, rows/f, cols/f, slices/f, G, 4]
+        with ``cell_major``.
     """
     a = _kernel_inputs(library, rho, phi_uncollided, grid, geometry, angle, pairs)
     device = phi_uncollided.device
@@ -969,7 +984,7 @@ def first_collision_moments(library, rho: Tensor, phi_uncollided: Tensor, grid, 
     Rc, Cc, Sc = coarse.shape
     directions = omegas.to(device=device, dtype=torch.float32).reshape(-1, 3).contiguous()
     K, G = int(directions.shape[0]), a["G"]
-    expected = (K, G, 4, Rc, Cc, Sc)
+    expected = (K, Rc, Cc, Sc, G, 4) if cell_major else (K, G, 4, Rc, Cc, Sc)
     if out is None:
         out = torch.empty(expected, device=device, dtype=torch.float32)
     elif tuple(out.shape) != expected or not out.is_contiguous() or out.dtype != torch.float32:
@@ -987,7 +1002,7 @@ def first_collision_moments(library, rho: Tensor, phi_uncollided: Tensor, grid, 
         beta_flat, out, a["V"], a["C"], a["S"], NC, Cc, Sc, K, a["N"], a["KM"], *a["r0"], a["eta_lo"],
         a["eta_hi"], slope_scale,
         G=G, GP=a["GP"], KB=1, BLOCK=BLOCK_V, MT=a["MT"], F=f, PAIR=a["PAIR"], MAPPED=a["MAPPED"],
-        PARALLEL=a["PARALLEL"], num_warps=NUM_WARPS)
+        PARALLEL=a["PARALLEL"], CELL_MAJOR=bool(cell_major), num_warps=NUM_WARPS)
     return out
 
 

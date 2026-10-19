@@ -23,7 +23,7 @@ from .scatter_solver.config import SolverConfig
 from .scatter_solver.cross_sections import MATERIALS, MultigroupLibrary, material_index
 from .scatter_solver.detector import DetectorResponse, GridResponse, ideal_counting_response, no_grid
 from .scatter_solver.source import SourceModel
-from .scatter_solver.geometry import ConeGeometry, Grid, ParallelGeometry
+from .scatter_solver.geometry import ConeGeometry, Grid, ParallelGeometry, device_tensor
 from .scatter_solver.scatter_solver import ScatterSolver
 
 __all__ = [
@@ -603,10 +603,10 @@ def attenuation_to_density(library: MultigroupLibrary, X: Tensor, material: int,
         raise ValueError(f"material {material} outside the library's {M} materials {tuple(library.materials)}")
     order = material_order(library, energy_kev)
     slot = order.index(material_index)
-    slot_order = torch.as_tensor(order, device=X.device, dtype=torch.long)
-    # [M] mass attenuations in bracketing order
-    mass_attenuation = _mass_attenuation_coefficients(library, energy_kev, X)[slot_order]
-    nominal = nominal_densities(library).to(device=X.device, dtype=X.dtype)[slot_order]
+    e = effective_energy(library) if energy_kev is None else float(energy_kev)
+    # [M] mass attenuations and nominal densities in bracketing order, copied without a host synchronization
+    mass_attenuation = device_tensor(mass_attenuation_at(library, e)[order], X.device, X.dtype)
+    nominal = device_tensor(nominal_densities(library)[order], X.device, X.dtype)
     mu = nominal * mass_attenuation  # nominal attenuations in bracketing order (ascending, positive)
     out: Optional[Tensor] = None
 

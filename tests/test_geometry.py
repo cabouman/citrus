@@ -63,3 +63,27 @@ def test_pixel_uv_offsets_follow_mbirtorch():
     # channel = (u + off)/delta + (n-1)/2  ->  u = (c - (n-1)/2) delta - off
     assert torch.allclose(u, torch.tensor([-2.0 + 0.5, 0.5, 2.0 + 0.5], dtype=torch.float64))
     assert torch.allclose(v, torch.tensor([-0.5 - 0.25, 0.5 - 0.25], dtype=torch.float64))
+
+
+def test_device_tensor():
+    """device_tensor equals torch.tensor on every device (None meaning the CPU), takes numbers, sequences and CPU
+    tensors, and on CUDA needs no host synchronization."""
+    from citrus.scatter_solver.geometry import device_tensor
+
+    values = [[1.5, -2.0, 3.25], [0.0, 4.0, 1e-3]]
+    for device in [None, "cpu"] + (["cuda"] if torch.cuda.is_available() else []):
+        for dtype in (torch.float32, torch.float64):
+            t = device_tensor(values, device, dtype)
+            assert t.dtype == dtype and t.device.type == (device or "cpu")
+            assert torch.equal(t.cpu(), torch.tensor(values, dtype=dtype))
+        assert torch.equal(device_tensor(torch.tensor(values), device, torch.float64).cpu(),
+                           torch.tensor(values).double())
+        assert float(device_tensor(2.5, device, torch.float32)) == 2.5
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            t = device_tensor(values, "cuda", torch.float32) * 2.0
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        assert torch.equal(t.cpu(), 2.0 * torch.tensor(values))

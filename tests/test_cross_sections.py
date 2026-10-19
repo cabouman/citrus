@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from citrus.scatter_solver.cross_sections import (synthetic_library, mu_t_volume, transfer_moments_volume,
@@ -74,3 +75,27 @@ def test_volume_helpers(device):
     # value at eta=0.3 for water-only voxel equals analytic a(1+b eta)/4pi with a=0.15, b=0.5 (g_in=g_out=0)
     assert torch.allclose(te[0, 0, 1, 1, 1], torch.tensor(0.15 * (1 + 0.5 * 0.3) / (4 * torch.pi), device=device,
                                                           dtype=te.dtype), rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_group_transmission_kernel_matches_torch():
+    """float32 CUDA: the fused transmission kernel (fine energies summed per ray, group by group) equals the PyTorch
+    path to float32 rounding, for a subset of the materials, zero and long paths and a non-contiguous path tensor."""
+    from citrus.scatter_solver.cross_sections import _group_transmission_torch, group_transmission
+    from citrus.scatter_solver.kernels import transmission_kernels
+
+    device = torch.device("cuda")
+    if not transmission_kernels.kernels_usable(device)[0]:
+        pytest.skip("transmission kernel unusable")
+    library = synthetic_library(num_groups=4, num_materials=5, num_fine_per_group=7, fine_spread=0.5)
+    g = torch.Generator().manual_seed(2)
+    materials = [1, 3, 4]
+    path = (torch.rand(5, 9, 11, generator=g) * 30.0).to(device)[materials[::-1]].flip(0)  # a gathered, flipped view
+    path[:, 0, 0] = 0.0
+    path[:, 1, 1] = 300.0
+    assert transmission_kernels.use_kernel(library, path)
+    out = group_transmission(library, path, materials=materials)
+    reference = _group_transmission_torch(library, path, 2 ** 22, materials)
+    assert out.shape == reference.shape == (4, 9, 11)
+    torch.testing.assert_close(out, reference, rtol=1e-6, atol=1e-7 * float(reference.abs().max()))
+    torch.testing.assert_close(out[:, 0, 0], library.spectrum_fraction.to(device, torch.float32))

@@ -24,7 +24,7 @@ from .cross_sections import (MaterialPairs, MultigroupLibrary, check_material_na
                              material_table, mu_t_volume, transfer_moments_volume)
 from .detector import DetectorResponse, GridResponse
 from .geometry import ConeGeometry, Grid, resample_conservative
-from .kernels import uncollided_kernels
+from .kernels import sweep_kernels, uncollided_kernels
 from .ray_tracing import Projectors, SiddonProjectors
 from .scatter_image import (DirectionSetContext, combined_scatter_image, make_direction_context, panel_direction_set,
                             primary_from_path_lengths, primary_image, primary_path_lengths, scatter_fraction)
@@ -32,12 +32,16 @@ from .source import SourceModel
 from .source_iteration import SourceIterationResult, scatter_moments, scatter_source_function, source_iteration
 from .transport_sweep import SourceFunction, SweepContext, make_sweep_context, sweep
 from .uncollided import (DENSE, FirstCollisionSamplingCorrection, first_collision_moments_at_directions,
-                         first_collision_sampling_correction, uncollided_fluence, uncollided_from_path_lengths,
-                         uncollided_path_lengths)
+                         first_collision_sampling_correction, present_materials, uncollided_fluence,
+                         uncollided_from_path_lengths, uncollided_path_lengths)
 
 # The scatter image with the fused kernels takes up to this many directions per chunk, as many as fit the budget.
 IMAGE_CHUNK_MAX_DIRECTIONS = 32
 IMAGE_CHUNK_BUDGET_BYTES = 256 * 2 ** 20
+# The sweep with the fused plane kernel takes as many directions per octant per chunk as fit this budget.
+SWEEP_CHUNK_BUDGET_BYTES = 512 * 2 ** 20
+# Fields built from the attenuation keep their fine density maps (for the primary of every view) when all M fit this.
+FINE_MAP_BUDGET_BYTES = 256 * 2 ** 20
 
 __all__ = [
     "truncated_library",
@@ -166,6 +170,10 @@ class MaterialFields:
         density_model (MaterialDensityModel): the density model of ``attenuation``, or None. Defaults to None.
         fine_materials (tuple): library indices of the materials with a nonzero fine map (fields built from the
             attenuation), else None. Defaults to None.
+        traced_materials (tuple): library indices of the materials with a nonzero map on Q, the ones the uncollided
+            fluence traces (``uncollided.present_materials``), or None for all. Defaults to None.
+        fine_maps (dict): the nonzero fine density maps by library index of fields built from the attenuation, kept
+            when the maps of all M materials fit ``FINE_MAP_BUDGET_BYTES``, else None. Defaults to None.
     """
 
     grid_fine: Grid
@@ -181,6 +189,8 @@ class MaterialFields:
     attenuation: Optional[Tensor] = None
     density_model: Optional[MaterialDensityModel] = None
     fine_materials: Optional[tuple[int, ...]] = None
+    traced_materials: Optional[tuple[int, ...]] = None
+    fine_maps: Optional[dict[int, Tensor]] = None
 
     @property
     def first_collision_pairs(self):
@@ -203,6 +213,8 @@ class MaterialFields:
         """
         if self.rho_fine is not None:
             return self.rho_fine[m]
+        if self.fine_maps is not None and int(m) in self.fine_maps:
+            return self.fine_maps[int(m)]
         if self.attenuation is None or self.density_model is None:
             raise ValueError("MaterialFields without rho_fine need attenuation and density_model")
         return self.density_model.material(self.attenuation, int(m)).to(self.rho_coarse.dtype)
@@ -581,6 +593,32 @@ class ScatterSolver:
                                   + 3 * Rd * Cd) + Rd * Rd + Cd * Cd)
         return int(max(base, min(IMAGE_CHUNK_MAX_DIRECTIONS, IMAGE_CHUNK_BUDGET_BYTES // max(1, per_direction))))
 
+    def sweep_direction_chunk(self, fields: MaterialFields) -> int:
+        """Directions per octant of each chunk of the transport sweep.
+
+        With the fused plane kernel (float32 CUDA) the source and the angular fluence of a chunk share one buffer of
+        ``8 Dc cells 4G`` values; the sweep then takes as many directions per octant as fit
+        ``SWEEP_CHUNK_BUDGET_BYTES``, at least ``config.direction_chunk``, in chunks of equal size, since fewer and
+        larger chunks make fewer launches and matrix products. The PyTorch path keeps ``config.direction_chunk``.
+
+        Args:
+            fields (MaterialFields): density fields of the volume (for the transport grid).
+
+        Returns:
+            int: directions per octant per chunk.
+        """
+        base = int(self.config.direction_chunk)
+        sweep_context = self.sweep_context(fields.grid_coarse)
+        fused = (self.device.type == "cuda" and self.dtype == torch.float32 and sweep_context.flat_index is not None
+                 and sweep_kernels.kernels_usable(self.device)[0])
+        if not fused:
+            return base
+        D8 = sweep_context.directions_per_octant
+        per_direction = 8 * sweep_context.num_cells * 4 * int(self.num_groups) * 4
+        largest = max(base, min(D8, SWEEP_CHUNK_BUDGET_BYTES // max(1, per_direction)))
+        chunks = -(-D8 // largest)
+        return -(-D8 // chunks)
+
     def clear_caches(self) -> None:
         """Drop every cache: transport grids, sweep contexts, collapsed-cone direction sets and direction contexts."""
         self._sweep_contexts.clear()
@@ -613,12 +651,14 @@ class ScatterSolver:
         rho_coarse = coarsen_density(rho, grid_fine, grid_coarse)
         rho_quadrature = (rho_coarse if grid_quadrature == grid_coarse
                           else coarsen_density(rho, grid_fine, grid_quadrature))
+        traced = present_materials(rho_quadrature)
         return MaterialFields(
             grid_fine=grid_fine, grid_coarse=grid_coarse, grid_quadrature=grid_quadrature, q=q, rho_fine=rho,
             rho_coarse=rho_coarse, rho_quadrature=rho_quadrature,
             mu_t_coarse=mu_t_volume(self.transport_library, rho_coarse),
             mu_s_l_coarse=transfer_moments_volume(self.transport_library, rho_coarse),
             pairs_quadrature=material_pairs_if_compact(rho_quadrature),
+            traced_materials=None if traced is None else tuple(traced),
         )
 
     def material_fields_from_attenuation(self, X: Tensor, grid_fine: Grid,
@@ -626,7 +666,9 @@ class ScatterSolver:
         """Build the :class:`MaterialFields` of the densities ``density_model(X)`` one material map at a time.
 
         Each nonzero material map is resampled onto C and Q and dropped, so the largest fine-grid tensors are ``X`` and
-        one map; the result equals :meth:`material_fields` of the stacked maps to float rounding.
+        one map, unless the maps of all M materials fit ``FINE_MAP_BUDGET_BYTES``: then the nonzero ones are kept for
+        the primary of every view (``MaterialFields.fine_maps``). The result equals :meth:`material_fields` of the
+        stacked maps to float rounding.
 
         Args:
             X (Tensor): [R, C, S] attenuation in cm^-1 on ``grid_fine``.
@@ -647,6 +689,8 @@ class ScatterSolver:
         rho_quadrature = (rho_coarse if grid_quadrature == grid_coarse
                           else torch.zeros((M,) + tuple(grid_quadrature.shape), device=self.device, dtype=self.dtype))
         present = []
+        keep = M * X.numel() * X.element_size() <= FINE_MAP_BUDGET_BYTES
+        fine_maps: Optional[dict[int, Tensor]] = {} if keep else None
         for m in range(M):
             r = density_model.material(X, m).to(device=self.device, dtype=self.dtype)
             if tuple(r.shape) != tuple(grid_fine.shape):
@@ -656,6 +700,8 @@ class ScatterSolver:
                 rho_coarse[m] = coarsen_density(r, grid_fine, grid_coarse)
                 if grid_quadrature != grid_coarse:
                     rho_quadrature[m] = coarsen_density(r, grid_fine, grid_quadrature)
+                if fine_maps is not None:
+                    fine_maps[m] = r
             del r
         return MaterialFields(
             grid_fine=grid_fine, grid_coarse=grid_coarse, grid_quadrature=grid_quadrature, q=q, rho_fine=None,
@@ -664,6 +710,8 @@ class ScatterSolver:
             mu_s_l_coarse=transfer_moments_volume(self.transport_library, rho_coarse),
             pairs_quadrature=material_pairs_if_compact(rho_quadrature), attenuation=X, density_model=density_model,
             fine_materials=tuple(present) if present else (0,),
+            traced_materials=None if len(present) == M or M <= 2 else tuple(present) if present else (0,),
+            fine_maps=fine_maps,
         )
 
     def uncollided_fluence(self, fields: MaterialFields, angle: float) -> Tensor:
@@ -693,7 +741,7 @@ class ScatterSolver:
         else:
             rho, grid = fields.rho_coarse, fields.grid_coarse
         return uncollided_fluence(self.library, rho, grid, self.geometry, angle, self.source, self.projectors,
-                                  points=fields.grid_quadrature)
+                                  points=fields.grid_quadrature, materials=fields.traced_materials)
 
     def first_collision_moment_source(self, fields: MaterialFields, angle: float, phi_uncollided: Tensor,
                                       sweep_context: Optional[SweepContext] = None) -> SourceFunction:
@@ -702,7 +750,7 @@ class ScatterSolver:
         The source is evaluated at the quadrature points for the requested sweep directions, scaled by the sampling
         correction (:meth:`first_collision_sampling_correction`, computed once here) and restricted to
         linear-discontinuous moments (``uncollided.first_collision_moments_at_directions``, one fused kernel on float32
-        CUDA tensors).
+        CUDA tensors), cell-major as the sweep stores them.
 
         Args:
             fields (MaterialFields): density fields of the volume.
@@ -711,7 +759,8 @@ class ScatterSolver:
             sweep_context (SweepContext, optional): sweep context. Defaults to None, that of ``fields.grid_coarse``.
 
         Returns:
-            SourceFunction: maps reordered direction indices [D] to moments [D, G, 4, Rc, Cc, Sc].
+            SourceFunction: maps reordered direction indices [D] to cell-major moments [D, Rc, Cc, Sc, G, 4]
+            (``cell_major``).
         """
         sweep_context = self.sweep_context(fields.grid_coarse) if sweep_context is None else sweep_context
         omega = sweep_context.quadrature.omega.to(device=self.device, dtype=self.dtype)
@@ -729,7 +778,7 @@ class ScatterSolver:
             return first_collision_moments_at_directions(self.library, fields.rho_quadrature, phi_uncollided,
                                                          fields.grid_quadrature, self.geometry, angle, directions,
                                                          correction, fields.q, chunk=self.first_collision_chunk,
-                                                         pairs=pairs, out=out)
+                                                         pairs=pairs, out=out, cell_major=True)
 
         def source_function(direction_index: Tensor, out: Optional[Tensor] = None) -> Tensor:
             n = int(direction_index.numel())
@@ -743,6 +792,7 @@ class ScatterSolver:
                 del part
             return out
 
+        source_function.cell_major = True  # type: ignore[attr-defined]
         return source_function
 
     def first_collision_sampling_correction(self, fields: MaterialFields, angle: float, phi_uncollided: Tensor,
@@ -779,7 +829,8 @@ class ScatterSolver:
             sweep_context (SweepContext, optional): sweep context. Defaults to None, that of ``fields.grid_coarse``.
 
         Returns:
-            SourceFunction: the scattering source with ``T = scatter_moments(mu_s_l_coarse, phi)``.
+            SourceFunction: the scattering source with ``T = scatter_moments(mu_s_l_coarse, phi)``, cell-major; it also
+            adds into a given buffer with ``accumulate=True``.
         """
         sweep_context = self.sweep_context(fields.grid_coarse) if sweep_context is None else sweep_context
         return scatter_source_function(sweep_context, scatter_moments(fields.mu_s_l_coarse, phi))
@@ -795,7 +846,8 @@ class ScatterSolver:
             Tensor: [G, (L+1)^2, 4, Rc, Cc, Sc] fluence moments.
         """
         sweep_context = self.sweep_context(fields.grid_coarse)
-        return sweep(sweep_context, fields.mu_t_coarse, source_function, direction_chunk=self.config.direction_chunk)
+        return sweep(sweep_context, fields.mu_t_coarse, source_function,
+                     direction_chunk=self.sweep_direction_chunk(fields))
 
     def run_source_iteration(self, fields: MaterialFields,
                              first_collision_source_function: SourceFunction) -> SourceIterationResult:
@@ -813,7 +865,8 @@ class ScatterSolver:
         config = self.config
         return source_iteration(sweep_context, fields.mu_t_coarse, fields.mu_s_l_coarse,
                                 first_collision_source_function, tolerance=config.source_iteration_tolerance,
-                                max_iterations=config.max_source_iterations, direction_chunk=config.direction_chunk)
+                                max_iterations=config.max_source_iterations,
+                                direction_chunk=self.sweep_direction_chunk(fields))
 
     def multiple_collision_source_moments(self, fields: MaterialFields, phi_collided: Tensor) -> Tensor:
         """Cell-mean spherical-harmonic moments T of the multiple-collision source.
@@ -823,9 +876,10 @@ class ScatterSolver:
             phi_collided (Tensor): [G, (L+1)^2, 4, Rc, Cc, Sc] collided-fluence moments; only the cell means are used.
 
         Returns:
-            Tensor: [G, (L+1)^2, Rc, Cc, Sc] source moments T.
+            Tensor: [G, (L+1)^2, Rc, Cc, Sc] source moments T, a view of moment-major storage (the layout the scatter
+            image contracts without a copy).
         """
-        return scatter_source_moments(fields.mu_s_l_coarse, phi_collided[:, :, 0])
+        return scatter_source_moments(fields.mu_s_l_coarse, phi_collided[:, :, 0], moment_major=True)
 
     def scatter_image(self, fields: MaterialFields, angle: float, phi_uncollided: Tensor,
                       scatter_source_moments: Tensor, quadrature: Optional[Quadrature] = None,

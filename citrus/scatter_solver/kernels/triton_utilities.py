@@ -2,8 +2,9 @@
 
 ``triton_available`` runs a trivial probe kernel once per process; ``CITRUS_DISABLE_TRITON=1`` (``DISABLE_ENV_VAR``)
 turns every kernel off. ``launch`` launches a kernel through its cached compiled binary on triton 3.8, unless
-``CITRUS_TRITON_FAST_LAUNCH=0`` (``FAST_LAUNCH_ENV_VAR``). The module attributes ``triton`` and ``tl`` are None when
-Triton cannot be imported.
+``CITRUS_TRITON_FAST_LAUNCH=0`` (``FAST_LAUNCH_ENV_VAR``), and ``LaunchSequence`` runs repeated launches of one kernel
+on the same tensors (the planes of a sweep chunk) through the binary of the first. The module attributes ``triton``
+and ``tl`` are None when Triton cannot be imported.
 """
 
 from __future__ import annotations
@@ -117,3 +118,50 @@ def launch(kernel, grid: tuple[int, int, int], args: tuple, constexprs: dict, nu
     compiled, constexpr_values = entry
     compiled.run(grid[0], grid[1], grid[2], torch._C._cuda_getCurrentRawStream(device), compiled.function,
                  compiled.packed_metadata, None, None, None, *args, *constexpr_values)
+
+
+class LaunchSequence:
+    """Repeated launches of one kernel with the same constexprs and pointer arguments.
+
+    The first launch goes through Triton's public path, which compiles the kernel (or loads it) with the
+    specializations of its arguments; the later ones run that binary directly. The caller passes the same tensors and
+    the same specialized integers to every launch and varies only the integers the kernel does not specialize, as the
+    planes of one sweep chunk do.
+
+    Attributes:
+        kernel (triton.JITFunction): the kernel.
+        constexprs (dict): the constexpr parameters by name.
+        num_warps (int): warps per program.
+    """
+
+    def __init__(self, kernel, constexprs: dict, num_warps: int) -> None:
+        """Record the kernel and its launch constants.
+
+        Args:
+            kernel (triton.JITFunction): the kernel.
+            constexprs (dict): the constexpr parameters by name.
+            num_warps (int): warps per program.
+        """
+        self.kernel = kernel
+        self.constexprs = constexprs
+        self.num_warps = num_warps
+        self._compiled = None
+        self._constexpr_values: list = []
+        self._stream = None
+
+    def __call__(self, grid: tuple[int, int, int], args: tuple) -> None:
+        """Launch the kernel on ``grid`` with ``args``, the kernel's non-constexpr parameters in order.
+
+        Args:
+            grid (tuple[int, int, int]): the launch grid.
+            args (tuple): the non-constexpr arguments.
+        """
+        if self._compiled is not None:
+            self._compiled.run(grid[0], grid[1], grid[2], self._stream, self._compiled.function,
+                               self._compiled.packed_metadata, None, None, None, *args, *self._constexpr_values)
+            return
+        compiled = self.kernel[grid](*args, **self.constexprs, num_warps=self.num_warps)
+        if _FAST_LAUNCH:
+            self._compiled = compiled
+            self._constexpr_values = [self.constexprs[p.name] for p in self.kernel.params if p.is_constexpr]
+            self._stream = torch._C._cuda_getCurrentRawStream(torch.cuda.current_device())

@@ -112,21 +112,30 @@ def test_source_iteration_device_float32(device):
 
 
 def test_scatter_source_fn_matches_angular():
+    """The scattering source function writes cell-major moments [D, R, C, S, G, 4] (the sweep's layout), from a
+    contiguous T or from the cell-major T of scatter_moments, into a given buffer or added to it."""
     from citrus.scatter_solver.angular_quadrature import scatter_source_at_directions, scatter_source_moments
+    from citrus.scatter_solver.source_iteration import scatter_moments
+    from citrus.scatter_solver.transport_sweep import source_is_cell_major
 
     context, mu_t, mu_s, _ = _problem(n=3)
     phi = torch.randn(4, context.num_moments, 4, *context.shape, dtype=F64)
     T = scatter_source_moments(mu_s, phi)
     index = torch.tensor([0, 5, 17, 31, 30])
-    reference = scatter_source_at_directions(T, context.basis.Y[index])
-    out = scatter_source_function(context, T)(index)
-    assert out.shape == (5, 4, 4) + context.shape
-    assert torch.allclose(out, reference, rtol=1e-13, atol=1e-14)
-    # `out=` (lent by the sweep) is written in place
-    buf = torch.full((5, 4, 4) + context.shape, float("nan"), dtype=F64)
-    result = scatter_source_function(context, T)(index, out=buf)
-    assert result.data_ptr() == buf.data_ptr()
-    assert torch.allclose(buf, reference, rtol=1e-13, atol=1e-14)
+    reference = scatter_source_at_directions(T, context.basis.Y[index]).permute(0, 3, 4, 5, 1, 2)  # cell-major
+    for moments in (T, scatter_moments(mu_s, phi)):
+        source = scatter_source_function(context, moments)
+        assert source_is_cell_major(source)
+        out = source(index)
+        assert out.shape == (5,) + context.shape + (4, 4)
+        assert torch.allclose(out, reference, rtol=1e-13, atol=1e-14)
+        # `out=` (lent by the sweep) is written in place, or added to with accumulate=True
+        buf = torch.full((5,) + context.shape + (4, 4), float("nan"), dtype=F64)
+        result = source(index, out=buf)
+        assert result.data_ptr() == buf.data_ptr()
+        assert torch.allclose(buf, reference, rtol=1e-13, atol=1e-14)
+        source(index, out=buf, accumulate=True)
+        assert torch.allclose(buf, 2 * reference, rtol=1e-13, atol=1e-14)
 
 
 def test_scatter_moments_matches_angular(device):
@@ -143,4 +152,6 @@ def test_scatter_moments_matches_angular(device):
         out = scatter_moments(mu_s, phi)
         assert out.shape == reference.shape and out.device == reference.device
         assert torch.allclose(out, reference, rtol=1e-13, atol=1e-14)
-        assert out.movedim(1, 0).is_contiguous()
+        # a view of the sweep's cell-major storage [N, *spatial, G, (4)]
+        cell_major = out.permute(1, 3, 4, 5, 0, 2) if len(rest) == 4 else out.permute(1, 2, 3, 4, 0)
+        assert cell_major.is_contiguous()

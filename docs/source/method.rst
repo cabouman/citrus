@@ -758,9 +758,10 @@ float rounding.
 Memory
 ~~~~~~
 
-The densities of all :math:`M` materials never exist on the reconstruction grid: the density model is evaluated one
-material map at a time, each map resampled onto the transport and quadrature grids and dropped
-(``ScatterSolver.material_fields_from_attenuation``), and the primary projects the maps one at a time again. The
+The densities of all :math:`M` materials never exist on the reconstruction grid unless they are small: the density
+model is evaluated one material map at a time, each map resampled onto the transport and quadrature grids and dropped
+(``ScatterSolver.material_fields_from_attenuation``), and the primary projects the maps one at a time again; maps that
+fit a fixed budget are kept for the primary of every view instead. The
 per-view accumulators are stored compactly (the linear-discontinuous cell mean in scaled float16, ``StateStore``): on
 the GPU while their total fits ``CitrusConfig.gpu_state_budget_mib``, else in pinned host memory. The aged accumulator
 re-enters only through the scattering source of the next sweep, to which the dropped slopes contribute little.

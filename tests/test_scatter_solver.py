@@ -199,6 +199,53 @@ def test_image_direction_chunk(rho, monkeypatch):
         assert _rel(image[k], small_image[k]) < 1e-6, k
 
 
+def test_sweep_direction_chunk(rho, monkeypatch):
+    """With the fused plane kernel the sweep takes as many directions per octant as fit SWEEP_CHUNK_BUDGET_BYTES, at
+    least config.direction_chunk, in chunks of equal size; otherwise config.direction_chunk. The solve does not depend
+    on the chunk."""
+    import citrus.scatter_solver.scatter_solver as scatter_solver_module
+    from citrus.scatter_solver.kernels import sweep_kernels
+
+    config = replace(CONFIG, direction_chunk=1)
+    s = make_solver(config)
+    f = s.material_fields(rho, GRID)
+    D8 = s.sweep_context(f.grid_coarse).directions_per_octant
+    if not (DEVICE.type == "cuda" and sweep_kernels.kernels_usable(DEVICE)[0]):
+        assert s.sweep_direction_chunk(f) == 1
+        pytest.skip("the fused sweep kernel is unusable here")
+    assert s.sweep_direction_chunk(f) == D8  # a small problem: all directions of an octant at once
+    per_direction = 8 * f.grid_coarse.num_voxels * 4 * s.num_groups * 4
+    for budget, expected in ((3 * per_direction, -(-D8 // -(-D8 // 3))), (0, 1)):
+        monkeypatch.setattr(scatter_solver_module, "SWEEP_CHUNK_BUDGET_BYTES", budget)
+        assert s.sweep_direction_chunk(f) == expected, budget
+    one = s.solve_view(rho, GRID, 0.0, keep_phi_total=True)
+    monkeypatch.undo()
+    many = s.solve_view(rho, GRID, 0.0, keep_phi_total=True)
+    assert one.source_iteration_result.num_iterations == many.source_iteration_result.num_iterations
+    assert _rel(one.phi_total, many.phi_total) < 1e-5
+
+
+def test_traced_materials_of_the_fields(rho):
+    """The fields record the materials of the quadrature grid once, and the uncollided fluence traced with them equals
+    the one that finds them itself; from the attenuation, the nonzero fine maps are kept within the budget."""
+    from citrus.citrus import DensityModel
+    from citrus.scatter_solver.uncollided import present_materials, uncollided_fluence
+    from citrus.utilities import densities_to_attenuation
+
+    s = make_solver()
+    f = s.material_fields(rho, GRID)
+    present = present_materials(f.rho_quadrature)
+    assert f.traced_materials == (None if present is None else tuple(present))
+    auto = uncollided_fluence(s.library, f.rho_quadrature, f.grid_quadrature, s.geometry, 0.3, s.source,
+                              s.projectors, points=f.grid_quadrature)
+    torch.testing.assert_close(s.uncollided_fluence(f, 0.3), auto, rtol=0, atol=0)
+    X = densities_to_attenuation(s.library, rho)
+    fx = s.material_fields_from_attenuation(X, GRID, DensityModel.from_library(s.library))
+    assert fx.fine_maps is not None and sorted(fx.fine_maps) == list(fx.fine_materials)
+    assert fx.traced_materials == (None if len(fx.fine_materials) == s.library.num_materials
+                                   else tuple(fx.fine_materials))
+
+
 # ---- anti-scatter grid ----------------------------------------------------------------------------------------
 
 def test_grid_lowers_scatter_fraction(rho, base_result):
@@ -245,7 +292,8 @@ def test_fc_sampling_conservative(rho):
     exact = restrict_to_linear_discontinuous_moments(E[0], Q, f.q)
     scale = float(exact[:, 0].abs().max())
     # [G, 4, Rc, Cc, Sc]
-    got = torch.einsum("d,dg...->g...", w, solver.first_collision_moment_source(f, 0.0, phi_uncollided, context)(index))
+    source = solver.first_collision_moment_source(f, 0.0, phi_uncollided, context)(index)  # cell-major [D, ..., G, 4]
+    got = torch.einsum("d,dg...->g...", w, source.permute(0, 4, 5, 1, 2, 3))
     pt = torch.einsum("d,dg...->g...", w, restrict_to_linear_discontinuous_moments(first_collision_point, Q, f.q))
     assert float((got - exact).abs().max()) < 1e-6 * scale
     assert float((got[:, 0].sum() - exact[:, 0].sum()).abs()) < 1e-6 * float(exact[:, 0].sum())

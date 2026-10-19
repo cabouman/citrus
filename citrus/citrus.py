@@ -215,10 +215,10 @@ def accumulator_update_operator(solver: ScatterSolver, rho: Tensor, grid: Grid, 
                                                   sweep_context)
 
     def summed_source(direction_index: Tensor, out: Optional[Tensor] = None) -> Tensor:
-        source = first_collision_source(direction_index, out)  # fills `out` when the sweep lends its storage
-        source.add_(scatter_source(direction_index))
-        return source
+        source = first_collision_source(direction_index, out)  # cell-major, into the sweep's buffer
+        return scatter_source(direction_index, out=source, accumulate=True)  # one accumulating matrix product
 
+    summed_source.cell_major = True  # type: ignore[attr-defined]
     return solver.transport_sweep(fields, summed_source)
 
 
@@ -309,12 +309,14 @@ def citrus_view_step(solver: ScatterSolver, state: CitrusState, fields: Material
                               cone_quadrature)["signal"]
     del phi_uncollided
     primary_signal = solver.primary(fields, angle)["signal"] if primary else None
-    new_norm = float(torch.linalg.vector_norm(new_collided_moments[:, 0, 0]))
     if state.collided_moments is None:
+        new_norm = float(torch.linalg.vector_norm(new_collided_moments[:, 0, 0]))
         relative_change = 1.0 if new_norm > 0 else 0.0
     else:
         previous = state.collided_moments[:, 0, 0].to(new_collided_moments)
-        difference = float(torch.linalg.vector_norm(new_collided_moments[:, 0, 0] - previous))
+        new_norm, difference = torch.stack([torch.linalg.vector_norm(new_collided_moments[:, 0, 0]),
+                                            torch.linalg.vector_norm(new_collided_moments[:, 0, 0] - previous)]
+                                           ).tolist()  # one host synchronization
         relative_change = difference / new_norm if new_norm > 0 else 0.0
     new_state = CitrusState(angle=float(angle), collided_moments=new_collided_moments,
                             cone_quadrature=cone_quadrature, num_steps=state.num_steps + 1,

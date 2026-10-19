@@ -17,7 +17,7 @@ import torch
 from torch import Tensor
 
 from .cross_sections import MultigroupLibrary
-from .geometry import ConeGeometry
+from .geometry import ConeGeometry, device_tensor
 
 ArrayLike = Union[Tensor, np.ndarray, Sequence[float]]
 
@@ -131,8 +131,7 @@ class SourceModel:
         Returns:
             Tensor: [...] weights, on the device and in the dtype of ``directions``, 0 off the panel.
         """
-        source_position = torch.tensor(geometry.source_position(angle), device=directions.device,
-                                       dtype=directions.dtype)
+        source_position = device_tensor(geometry.source_position(angle), directions.device, directions.dtype)
         t = geometry.panel_distance_along(source_position.expand_as(directions), directions, angle)  # [...]
         forward = torch.isfinite(t) & (t > 0)
         t_safe = torch.where(forward, t, torch.zeros_like(t))

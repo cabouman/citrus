@@ -12,6 +12,7 @@ dtype of its inputs.
 from __future__ import annotations
 
 import math
+import weakref
 from dataclasses import dataclass, field, replace
 from typing import Callable, Optional, Sequence, Union
 
@@ -22,7 +23,7 @@ from .angular_quadrature import Quadrature, hemisphere_quadrature, real_spherica
 from .config import SolverConfig
 from .cross_sections import MultigroupLibrary, group_transmission, mu_t_volume
 from .detector import DetectorResponse, GridResponse, detector_angle, grid_angles
-from .geometry import ConeGeometry, Grid, resample_conservative
+from .geometry import ConeGeometry, Grid, device_tensor, resample_conservative
 from .kernels import triton_utilities, uncollided_kernels
 from .ray_tracing import Projectors
 from .source import SourceModel
@@ -404,6 +405,11 @@ def _subcell_offsets(omega: Tensor, grid_quadrature: Grid, f: int) -> Tensor:
             + directions[:, 2, None, None, None] * (dz * centered_index)[None, None, None, :])
 
 
+# the panel-facing directions and the separability of a view, kept with its direction set: quadrature -> {(angle,
+# device, dtype, id(geometry), id(grid response), factorize): [kept, separable]}, dropped with the set
+_SELECTIONS: "weakref.WeakKeyDictionary[Quadrature, dict]" = weakref.WeakKeyDictionary()
+
+
 def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle: float, detector: DetectorResponse,
                            grid_response: GridResponse, library: Optional[MultigroupLibrary] = None,
                            device=None, dtype: Optional[torch.dtype] = None, *,
@@ -446,12 +452,18 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
     omega64 = quadrature.omega.detach().to(device, float64)
     weight64 = quadrature.weight.detach().to(device, float64)
     _, _, n_hat = geometry.panel_axes(angle)
-    cos64 = (omega64 * (-torch.tensor(n_hat, device=device, dtype=float64))).sum(-1)
-    # the same selection as before in the dtype of the images (a direction grazing the panel plane must be kept or
-    # dropped exactly as the projectors see it)
-    cos_image_dtype = (quadrature.omega.detach().to(device, dtype)
-                       * (-torch.tensor(n_hat, device=device, dtype=dtype))).sum(-1)
-    kept = torch.nonzero(cos_image_dtype > 0).reshape(-1)
+    cos64 = (omega64 * (-device_tensor(n_hat, device, float64))).sum(-1)
+    # the selection and the separability need host synchronizations; they are kept with the direction set
+    known = _SELECTIONS.setdefault(quadrature, {})
+    selection_key = (float(angle), str(device), dtype, id(geometry), id(grid_response), bool(factorize))
+    if selection_key not in known:
+        # the same selection as before in the dtype of the images (a direction grazing the panel plane must be kept
+        # or dropped exactly as the projectors see it)
+        cos_image_dtype = (quadrature.omega.detach().to(device, dtype)
+                           * (-device_tensor(n_hat, device, dtype))).sum(-1)
+        known[selection_key] = [torch.nonzero(cos_image_dtype > 0).reshape(-1), None]
+    selection = known[selection_key]
+    kept = selection[0]
     omega64, weight64, cos64 = omega64[kept], weight64[kept], cos64[kept]
     K = int(omega64.shape[0])
     pixels = geometry.pixel_centers(angle, device, float64)  # [Rd, Cd, 3]
@@ -465,8 +477,10 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
                          else torch.zeros(G, 0, device=device, dtype=float64))
     # grid response: the grid angles of one probe direction over the full panel decide separability
     separable = False
-    if factorize and grid_response.crossed is None:  # septa along the rows vary along the channels
-        probe = torch.tensor(n_hat, device=device, dtype=float64)[None].neg()
+    if selection[1] is not None:
+        separable = selection[1]
+    elif factorize and grid_response.crossed is None:  # septa along the rows vary along the channels
+        probe = device_tensor(n_hat, device, float64)[None].neg()
         if K:
             probe = torch.cat([probe, omega64[:1]])
         probe_theta1, probe_theta2 = grid_angles(probe, pixels, geometry, angle, focal_distance,
@@ -474,6 +488,7 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
         max_deviation = torch.maximum((probe_theta1 - probe_theta1[..., :1]).abs().max(),
                                       (probe_theta2 - probe_theta2[..., :1]).abs().max())
         separable = bool(max_deviation <= 1e-10)  # rad; float64 rounding of the pixel positions is ~1e-17
+    selection[1] = separable
     pixel_columns = pixels[:, Cd // 2:Cd // 2 + 1] if separable else pixels  # [Rd, Cg, 3]
     Cg = int(pixel_columns.shape[1])
     detector_weight = detector_response.transpose(0, 1)  # [K, G]
@@ -872,8 +887,8 @@ def panel_height_field(grid: Grid, geometry: ConeGeometry, angle: float, device=
     """
     _, _, n_hat = geometry.panel_axes(angle)
     r = grid.center_coordinates(device, torch.float64)
-    panel_center = torch.tensor(geometry.panel_center(angle), device=device, dtype=torch.float64)
-    return ((r - panel_center) @ torch.tensor(n_hat, device=device, dtype=torch.float64)).to(dtype)
+    panel_center = device_tensor(geometry.panel_center(angle), device, torch.float64)
+    return ((r - panel_center) @ device_tensor(n_hat, device, torch.float64)).to(dtype)
 
 
 class _Footprint:
@@ -910,8 +925,7 @@ class _Footprint:
         cached = context._cache.get(key)
         if cached is None:
             device, dtype = context.device, context.dtype
-            scale = torch.tensor([1.0 / geometry.delta_det_channel, 1.0 / geometry.delta_det_row], device=device,
-                                 dtype=dtype)
+            scale = device_tensor([1.0 / geometry.delta_det_channel, 1.0 / geometry.delta_det_row], device, dtype)
             heights = panel_height_field(grid, geometry, angle, device, dtype).reshape(-1)  # [voxels]
             # height of the box centre from its corners (host arithmetic)
             _, _, n_hat = geometry.panel_axes(angle)
@@ -1206,7 +1220,7 @@ def primary_from_path_lengths(library: MultigroupLibrary, path: Tensor, material
         fluence = source.beam_weight(pixels, geometry, angle)[None] * transmission
         omega_p = geometry.primary_directions(angle, device, dtype)
     else:
-        r0 = torch.tensor(geometry.source_position(angle), device=device, dtype=dtype)
+        r0 = device_tensor(geometry.source_position(angle), device, dtype)
         d = pixels - r0
         distance_squared = (d * d).sum(-1)
         b = source.angular_weight(d, geometry, angle)
@@ -1251,7 +1265,7 @@ def primary_image(library: MultigroupLibrary, rho: Tensor, grid: Grid, geometry:
     if int(rho.shape[0]) != library.num_materials:
         raise ValueError(f"rho has {int(rho.shape[0])} materials, the library {library.num_materials}")
     present = present_materials(rho)
-    present_rho = rho if present is None else rho[present]
+    present_rho = rho if present is None else rho.index_select(0, device_tensor(present, rho.device, torch.long))
     # [M', Rd n, Cd n] g/cm^2
     path_lengths = primary_path_lengths(projectors, present_rho, grid, geometry, angle, samples_per_pixel_axis)
     return primary_from_path_lengths(library, path_lengths, present, geometry, angle, source, detector, grid_response)

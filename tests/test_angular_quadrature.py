@@ -280,3 +280,34 @@ def test_builders_device_dtype(device, dtype):
         assert b.Y.device.type == device.type and b.Y.dtype == dtype and b.degree_of_moment.device.type == device.type
     x = torch.linspace(-1, 1, 5, device=device, dtype=dtype)
     assert legendre_polynomials(3, x).dtype == dtype and legendre_polynomials(3, x).device.type == device.type
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("linear_discontinuous", [True, False])
+def test_scatter_moments_kernel_matches_torch(linear_discontinuous):
+    """float32 CUDA: the fused scattering-moments kernel equals the PyTorch path (every non-zero transfer block added in
+    place) to float32 rounding, from a strided view of cell-major flux moments, into each of the three storages."""
+    from citrus.scatter_solver.angular_quadrature import _scatter_source_moments_torch, scatter_source_moments
+    from citrus.scatter_solver.kernels import scattering_kernels
+
+    device = torch.device("cuda")
+    if not scattering_kernels.kernels_usable(device)[0]:
+        pytest.skip("scattering-moments kernel unusable")
+    g = torch.Generator().manual_seed(4)
+    G, L, spatial = 4, 3, (5, 6, 7)
+    transfer = torch.rand(G, G, L + 2, *spatial, generator=g)
+    transfer[2, 0] = 0.0  # an upscatter block, skipped by the PyTorch path
+    transfer = transfer.to(device)
+    ld = (4,) if linear_discontinuous else ()
+    storage = torch.randn((L + 1) ** 2, *spatial, G, *ld, generator=g).to(device)
+    phi = scattering_kernels.cell_major_view(storage, 3)  # [G, N, (4), *spatial], not contiguous
+    assert not phi.is_contiguous()
+    reference = _scatter_source_moments_torch(transfer, phi, torch.zeros(G, *phi.shape[1:], device=device))
+    for keywords, storage_order in (({}, None), (dict(moment_major=True), (1, 0)),
+                                    (dict(cell_major=True), (1, 3, 4, 5, 0, 2) if ld else (1, 2, 3, 4, 0))):
+        out = scatter_source_moments(transfer, phi, **keywords)
+        assert out.shape == reference.shape
+        torch.testing.assert_close(out, reference, rtol=1e-6, atol=1e-6 * float(reference.abs().max()))
+        layout = out if storage_order is None else out.permute(*storage_order) if len(storage_order) > 2 \
+            else out.movedim(1, 0)
+        assert layout.is_contiguous(), keywords

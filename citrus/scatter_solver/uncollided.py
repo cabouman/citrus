@@ -18,7 +18,7 @@ from torch import Tensor
 
 from .cross_sections import (MaterialPairs, MultigroupLibrary, group_transmission, material_pairs_if_compact,
                              transfer_eta_at, transfer_eta_at_pairs)
-from .geometry import ConeGeometry, Grid
+from .geometry import ConeGeometry, Grid, device_tensor
 from .kernels import uncollided_kernels
 from .ray_tracing import Projectors
 from .source import SourceModel
@@ -88,16 +88,17 @@ def primary_directions_to_voxels(grid: Grid, geometry: ConeGeometry, angle: floa
         Tensor: [rows, cols, slices, 3] unit directions in the reconstruction frame.
     """
     if geometry.is_parallel:
-        beam = torch.tensor(geometry.beam_direction(angle), device=device, dtype=dtype)
+        beam = device_tensor(geometry.beam_direction(angle), device, dtype)
         return beam.expand(*grid.shape, 3).contiguous()
     r = grid.center_coordinates(device, dtype)
-    r0 = torch.tensor(geometry.source_position(angle), device=device, dtype=dtype)
+    r0 = device_tensor(geometry.source_position(angle), device, dtype)
     d = r - r0
     return d / torch.linalg.norm(d, dim=-1, keepdim=True)
 
 
 def uncollided_fluence(library: MultigroupLibrary, rho: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
-                       source: SourceModel, projectors: Projectors, points: Optional[Grid] = None) -> Tensor:
+                       source: SourceModel, projectors: Projectors, points: Optional[Grid] = None,
+                       materials: Union[Sequence[int], str, None] = "auto") -> Tensor:
     """Uncollided scalar fluence at the voxel centers of ``points``, exact in energy within each group.
 
     ``phi_UC,g(r) = b(Omega_UC(r)) / |r - r0|^2 sum_{E in g} w_E exp(-sum_m P_m(r) m_m(E))``, with the upstream density
@@ -112,6 +113,9 @@ def uncollided_fluence(library: MultigroupLibrary, rho: Tensor, grid: Grid, geom
         source (SourceModel): source model giving the angular weight b.
         projectors (Projectors): ray tracers of the upstream line integrals.
         points (Grid, optional): grid whose voxel centers receive the fluence. Defaults to None (``grid``).
+        materials (Sequence[int] | str | None, optional): library indices of the materials with a nonzero map, the ones
+            traced (as ``present_materials`` returns them), None for all, or "auto" to find them (one host
+            synchronization). Defaults to "auto".
 
     Returns:
         Tensor: [G, rows, cols, slices] fluence on ``points`` in photons/cm^2 per source photon/sr.
@@ -119,8 +123,9 @@ def uncollided_fluence(library: MultigroupLibrary, rho: Tensor, grid: Grid, geom
     if int(rho.shape[0]) != library.num_materials:
         raise ValueError(f"rho has {int(rho.shape[0])} materials, the library {library.num_materials}")
     point_grid = grid if points is None else points
-    present = present_materials(rho)
-    traced_rho = rho if present is None else rho[present]
+    present = present_materials(rho) if isinstance(materials, str) else (None if materials is None
+                                                                        else [int(m) for m in materials])
+    traced_rho = rho if present is None else rho.index_select(0, device_tensor(present, rho.device, torch.long))
     # [M', *point_grid.shape] g/cm^2
     path_lengths = uncollided_path_lengths(projectors, traced_rho, grid, geometry, angle, point_grid)
     return uncollided_from_path_lengths(library, path_lengths, present, point_grid, geometry, angle, source)
@@ -178,7 +183,7 @@ def uncollided_from_path_lengths(library: MultigroupLibrary, path_lengths: Tenso
     r = points.center_coordinates(device, dtype)
     if geometry.is_parallel:
         return transmission.mul_(source.beam_weight(r, geometry, angle)[None])
-    r0 = torch.tensor(geometry.source_position(angle), device=device, dtype=dtype)
+    r0 = device_tensor(geometry.source_position(angle), device, dtype)
     d = r - r0
     distance_squared = (d * d).sum(-1)  # [R, C, S]
     b = source.angular_weight(d, geometry, angle)  # [R, C, S]
@@ -452,7 +457,8 @@ def first_collision_sampling_correction(library: MultigroupLibrary, rho: Tensor,
 def first_collision_moments_at_directions(library: MultigroupLibrary, rho: Tensor, phi_uncollided: Tensor, grid: Grid,
                                           geometry: ConeGeometry, angle: float, omegas: Tensor,
                                           correction: FirstCollisionSamplingCorrection, factor: int, chunk: int = 4,
-                                          pairs: PairsArgument = None, out: Optional[Tensor] = None) -> Tensor:
+                                          pairs: PairsArgument = None, out: Optional[Tensor] = None,
+                                          cell_major: bool = False) -> Tensor:
     """Linear-discontinuous moments of the corrected first-collision source on the cells of a refined grid.
 
     The source at the points of ``grid`` (``first_collision_source_at_directions``) is corrected
@@ -472,10 +478,13 @@ def first_collision_moments_at_directions(library: MultigroupLibrary, rho: Tenso
         factor (int): points per axis per cell.
         chunk (int, optional): directions per batch of the PyTorch path of the source. Defaults to 4.
         pairs (MaterialPairs | str | None, optional): as in ``first_collision_source_at_directions``. Defaults to None.
-        out (Tensor, optional): contiguous [K, G, 4, rows/f, cols/f, slices/f] tensor to fill. Defaults to None.
+        out (Tensor, optional): contiguous tensor of the result's shape to fill. Defaults to None.
+        cell_major (bool, optional): return the moments cell-major, [K, rows/f, cols/f, slices/f, G, 4] (the sweep's
+            layout). Defaults to False.
 
     Returns:
-        Tensor: [K, G, 4, rows/f, cols/f, slices/f] moments ordered [0, x, y, z].
+        Tensor: [K, G, 4, rows/f, cols/f, slices/f] moments ordered [0, x, y, z], or [K, rows/f, cols/f, slices/f, G, 4]
+        with ``cell_major``.
     """
     pairs = resolve_pairs(rho, pairs)
     compact_pairs = pairs if isinstance(pairs, MaterialPairs) else None
@@ -483,13 +492,15 @@ def first_collision_moments_at_directions(library: MultigroupLibrary, rho: Tenso
             out is None or (out.is_contiguous() and out.dtype == torch.float32)):
         return uncollided_kernels.first_collision_moments(library, rho, phi_uncollided, grid, geometry, angle, omegas,
                                                           correction.scale, correction.beta, factor,
-                                                          pairs=compact_pairs, out=out)
+                                                          pairs=compact_pairs, out=out, cell_major=cell_major)
     source = first_collision_source_at_directions(library, rho, phi_uncollided, grid, geometry, angle, omegas,
                                                   chunk=chunk, pairs=pairs)
     moments = restrict_to_linear_discontinuous_moments(correction.apply(source, omegas), grid, factor)
     del source
+    if cell_major:
+        moments = moments.permute(0, 3, 4, 5, 1, 2)
     if out is None:
-        return moments
+        return moments.contiguous()
     return out.copy_(moments)
 
 

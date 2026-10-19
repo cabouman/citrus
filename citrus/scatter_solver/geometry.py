@@ -19,6 +19,27 @@ import torch
 from torch import Tensor
 
 
+def device_tensor(values, device, dtype: torch.dtype) -> Tensor:
+    """A small tensor of Python numbers (or a small CPU tensor) on ``device``, without a host synchronization on CUDA.
+
+    ``torch.tensor(values, device=...)`` copies a CUDA tensor from pageable memory, which waits for all the work queued
+    on the stream; the values go through pinned memory and an asynchronous copy instead.
+
+    Args:
+        values: a number, a nested sequence of numbers or a CPU tensor.
+        device (torch.device | str | None): the device, None for the CPU.
+        dtype (torch.dtype): the dtype.
+
+    Returns:
+        Tensor: the values on ``device``.
+    """
+    device = torch.device("cpu") if device is None else torch.device(device)
+    host = values.detach().to("cpu", dtype) if isinstance(values, Tensor) else torch.tensor(values, dtype=dtype)
+    if device.type != "cuda":
+        return host.to(device)
+    return host.pin_memory().to(device, non_blocking=True)
+
+
 @dataclass(frozen=True)
 class Grid:
     """Uniform cuboid voxel grid centered on the rotation axis, in MBIRTORCH conventions.
@@ -566,9 +587,9 @@ class ConeGeometry:
         if self.use_curved_detector:
             return self.panel_points(u[None, :], v[:, None], angle)
         u_hat, v_hat, _ = self.panel_axes(angle)
-        pc = torch.tensor(self.panel_center(angle), device=device, dtype=dtype)
-        u_hat = torch.tensor(u_hat, device=device, dtype=dtype)
-        v_hat = torch.tensor(v_hat, device=device, dtype=dtype)
+        pc = device_tensor(self.panel_center(angle), device, dtype)
+        u_hat = device_tensor(u_hat, device, dtype)
+        v_hat = device_tensor(v_hat, device, dtype)
         return pc + u[None, :, None] * u_hat + v[:, None, None] * v_hat
 
     def panel_points(self, u: Tensor, v: Tensor, angle: float) -> Tensor:
@@ -588,8 +609,8 @@ class ConeGeometry:
         """
         device, dtype = u.device, u.dtype
         u, v = torch.broadcast_tensors(u, v.to(device, dtype))
-        u_hat, v_hat, n_hat = (torch.tensor(a, device=device, dtype=dtype) for a in self.panel_axes(angle))
-        pc = torch.tensor(self.panel_center(angle), device=device, dtype=dtype)
+        u_hat, v_hat, n_hat = (device_tensor(a, device, dtype) for a in self.panel_axes(angle))
+        pc = device_tensor(self.panel_center(angle), device, dtype)
         if not self.use_curved_detector:
             return pc + u[..., None] * u_hat + v[..., None] * v_hat
         radius = float(self.source_detector_dist)
@@ -614,11 +635,11 @@ class ConeGeometry:
             (Tensor, Tensor, Tensor): ``u_hat``, ``v_hat`` and ``n_hat`` [..., 3], ``n_hat`` toward the source.
         """
         device, dtype = points.device, points.dtype
-        u_hat, v_hat, n_hat = (torch.tensor(a, device=device, dtype=dtype).expand_as(points)
+        u_hat, v_hat, n_hat = (device_tensor(a, device, dtype).expand_as(points)
                                for a in self.panel_axes(angle))
         if not self.use_curved_detector:
             return u_hat, v_hat, n_hat
-        source_position = torch.tensor(self.source_position(angle), device=device, dtype=dtype)
+        source_position = device_tensor(self.source_position(angle), device, dtype)
         to_axis = source_position - points
         to_axis = to_axis - (to_axis * v_hat).sum(-1, keepdim=True) * v_hat  # horizontal part
         n_local = to_axis / torch.linalg.norm(to_axis, dim=-1, keepdim=True)
@@ -655,7 +676,7 @@ class ConeGeometry:
         Returns:
             Tensor: [rows, channels, 3] unit directions.
         """
-        source_position = torch.tensor(self.source_position(angle), device=device, dtype=dtype)
+        source_position = device_tensor(self.source_position(angle), device, dtype)
         d = self.pixel_centers(angle, device, dtype) - source_position
         return d / torch.linalg.norm(d, dim=-1, keepdim=True)
 
@@ -676,8 +697,8 @@ class ConeGeometry:
         if self.use_curved_detector:
             return self._cylinder_distance_along(points, omega, angle)
         _, _, n_hat = self.panel_axes(angle)
-        n = torch.tensor(n_hat, device=points.device, dtype=points.dtype)
-        pc = torch.tensor(self.panel_center(angle), device=points.device, dtype=points.dtype)
+        n = device_tensor(n_hat, points.device, points.dtype)
+        pc = device_tensor(self.panel_center(angle), points.device, points.dtype)
         denom = (omega * n).sum(-1)
         return ((pc - points) * n).sum(-1) / denom
 
@@ -695,7 +716,7 @@ class ConeGeometry:
         Returns:
             Tensor: [...] distances in cm.
         """
-        source_position = torch.tensor(self.source_position(angle), device=points.device, dtype=points.dtype)
+        source_position = device_tensor(self.source_position(angle), points.device, points.dtype)
         d = (points - source_position)[..., :2]
         w = omega.to(points.dtype)[..., :2]
         a = (w * w).sum(-1)
@@ -727,16 +748,16 @@ class ConeGeometry:
             (Tensor, Tensor): u and v [...] in cm.
         """
         if self.use_curved_detector:
-            u_hat, v_hat, n_hat = (torch.tensor(a, device=points.device, dtype=points.dtype)
+            u_hat, v_hat, n_hat = (device_tensor(a, points.device, points.dtype)
                                    for a in self.panel_axes(angle))
-            d = points - torch.tensor(self.source_position(angle), device=points.device, dtype=points.dtype)
+            d = points - device_tensor(self.source_position(angle), points.device, points.dtype)
             depth = -(d * n_hat).sum(-1)
             radius = float(self.source_detector_dist)
             return radius * torch.atan2((d * u_hat).sum(-1), depth), radius * (d * v_hat).sum(-1) / depth
         u_hat, v_hat, _ = self.panel_axes(angle)
-        pc = torch.tensor(self.panel_center(angle), device=points.device, dtype=points.dtype)
-        uh = torch.tensor(u_hat, device=points.device, dtype=points.dtype)
-        vh = torch.tensor(v_hat, device=points.device, dtype=points.dtype)
+        pc = device_tensor(self.panel_center(angle), points.device, points.dtype)
+        uh = device_tensor(u_hat, points.device, points.dtype)
+        vh = device_tensor(v_hat, points.device, points.dtype)
         d = points - pc
         return (d * uh).sum(-1), (d * vh).sum(-1)
 
@@ -959,8 +980,8 @@ class ParallelGeometry:
         """
         device, dtype = u.device, u.dtype
         u, v = torch.broadcast_tensors(u, v.to(device, dtype))
-        u_hat, v_hat, _ = (torch.tensor(a, device=device, dtype=dtype) for a in self.panel_axes(angle))
-        pc = torch.tensor(self.panel_center(angle), device=device, dtype=dtype)
+        u_hat, v_hat, _ = (device_tensor(a, device, dtype) for a in self.panel_axes(angle))
+        pc = device_tensor(self.panel_center(angle), device, dtype)
         return pc + u[..., None] * u_hat + v[..., None] * v_hat
 
     def pixel_centers(self, angle: float, device=None, dtype=torch.float32) -> Tensor:
@@ -987,7 +1008,7 @@ class ParallelGeometry:
         Returns:
             (Tensor, Tensor, Tensor): ``u_hat``, ``v_hat`` and ``n_hat`` [..., 3], the axes of ``panel_axes``.
         """
-        u_hat, v_hat, n_hat = (torch.tensor(a, device=points.device, dtype=points.dtype).expand_as(points)
+        u_hat, v_hat, n_hat = (device_tensor(a, points.device, points.dtype).expand_as(points)
                                for a in self.panel_axes(angle))
         return u_hat, v_hat, n_hat
 
@@ -1022,7 +1043,7 @@ class ParallelGeometry:
         Returns:
             Tensor: [rows, channels, 3] unit directions.
         """
-        beam = torch.tensor(self.beam_direction(angle), device=device, dtype=dtype)
+        beam = device_tensor(self.beam_direction(angle), device, dtype)
         return beam.expand(self.num_det_rows, self.num_det_channels, 3).clone()
 
     def panel_distance_along(self, points: Tensor, omega: Tensor, angle: float) -> Tensor:
@@ -1039,8 +1060,8 @@ class ParallelGeometry:
             Tensor: [...] distances in cm.
         """
         _, _, n_hat = self.panel_axes(angle)
-        n = torch.tensor(n_hat, device=points.device, dtype=points.dtype)
-        pc = torch.tensor(self.panel_center(angle), device=points.device, dtype=points.dtype)
+        n = device_tensor(n_hat, points.device, points.dtype)
+        pc = device_tensor(self.panel_center(angle), points.device, points.dtype)
         return ((pc - points) * n).sum(-1) / (omega * n).sum(-1)
 
     def panel_uv_of_points(self, points: Tensor, angle: float) -> tuple[Tensor, Tensor]:
@@ -1053,8 +1074,8 @@ class ParallelGeometry:
         Returns:
             (Tensor, Tensor): u and v [...] in cm.
         """
-        u_hat, v_hat, _ = (torch.tensor(a, device=points.device, dtype=points.dtype) for a in self.panel_axes(angle))
-        d = points - torch.tensor(self.panel_center(angle), device=points.device, dtype=points.dtype)
+        u_hat, v_hat, _ = (device_tensor(a, points.device, points.dtype) for a in self.panel_axes(angle))
+        d = points - device_tensor(self.panel_center(angle), points.device, points.dtype)
         return (d * u_hat).sum(-1), (d * v_hat).sum(-1)
 
     # ---- the primary rays ------------------------------------------------------------------------
@@ -1087,6 +1108,6 @@ class ParallelGeometry:
         Returns:
             Tensor: [..., 3] start points in cm, on the device and in the dtype of ``points``.
         """
-        beam = torch.tensor(self.beam_direction(angle), device=points.device, dtype=points.dtype)
+        beam = device_tensor(self.beam_direction(angle), points.device, points.dtype)
         along = (points * beam).sum(-1, keepdim=True) + self.upstream_distance(grid)
         return points - along * beam

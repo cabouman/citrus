@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.20.0 - 2026-10-19
+
+- **Sweep.** On float32 CUDA one fused kernel forms the scattering-source moments of every sweep
+  (`kernels.scattering_kernels`) in the sweep's cell-major layout, so the sweep's source is one matrix product without
+  a transposition, and the step's scattering source adds into the first-collision source with one accumulating
+  product. The fused plane kernel sweeps a chunk in place in one buffer (each source overwritten by its angular
+  fluence, the vacuum faces read through masked loads), so the solver takes as many directions per octant as fit a
+  memory budget (`ScatterSolver.sweep_direction_chunk`); the planes of a chunk run the compiled kernel directly after
+  the first launch (`triton_utilities.LaunchSequence`); and the source iteration takes one host synchronization per
+  sweep for its norms.
+- **Source functions.** A source function with `cell_major = True` writes its moments in the sweep's layout
+  `[D, rows, cols, slices, G, 4]` into the buffer the sweep gives it. `scatter_source_function` and the solver's
+  first-collision source are cell-major (`first_collision_moments_at_directions(cell_major=True)`), and the scattering
+  source adds into the buffer with `accumulate=True`. `scatter_moments` returns a view of cell-major storage, and
+  `scatter_source_moments` takes `cell_major`.
+- **Transmission.** On float32 CUDA `group_transmission` sums the fine energies of every ray in one fused kernel
+  (`kernels.transmission_kernels`), for the uncollided fluence and the primary.
+- **Host synchronizations.** The small tensors of a view reach the device without a host synchronization
+  (`geometry.device_tensor`), the detector and grid responses copy their tables to the device once, the fields record
+  the materials to trace (`MaterialFields.traced_materials`, `uncollided_fluence(materials=...)`), the panel-facing
+  selection of a view is kept with its direction set, and the step's history norms take one synchronization.
+- **Fine maps.** Fields built from the attenuation keep their nonzero fine density maps for the primary of every view
+  when the maps of all materials fit `FINE_MAP_BUDGET_BYTES` (`MaterialFields.fine_maps`); larger grids evaluate them
+  per view as before.
+
 ## v0.19.0 - 2026-10-19
 
 - **Fused first-collision kernels.** On float32 CUDA the first-collision source is evaluated where it is used, so the

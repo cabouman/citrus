@@ -127,6 +127,12 @@ Fused GPU kernels of the scatter solver, with PyTorch reference paths.
 :doc:`api/sweep_kernels`
     Fused Triton kernel of the sweep's per-plane cell solve.
 
+:doc:`api/scattering_kernels`
+    Fused Triton kernel of the spherical-harmonic moments of the scattering source.
+
+:doc:`api/transmission_kernels`
+    Fused Triton kernel of the group transmission along material line integrals.
+
 .. toctree::
    :hidden:
 
@@ -134,3 +140,5 @@ Fused GPU kernels of the scatter solver, with PyTorch reference paths.
    api/ray_tracing_kernels
    api/uncollided_kernels
    api/sweep_kernels
+   api/scattering_kernels
+   api/transmission_kernels

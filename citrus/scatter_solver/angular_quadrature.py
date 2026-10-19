@@ -17,6 +17,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from .kernels import scattering_kernels
+
 __all__ = [
     "Quadrature",
     "octant_of",
@@ -595,11 +597,13 @@ def ordinates_from_moments(phi: Tensor, basis: SphericalHarmonicBasis) -> Tensor
 # Scattering source
 # =====================================================================================================
 
-def scatter_source_moments(mu_s_l_volume: Tensor, phi: Tensor, *, moment_major: bool = False) -> Tensor:
+def scatter_source_moments(mu_s_l_volume: Tensor, phi: Tensor, *, moment_major: bool = False,
+                           cell_major: bool = False) -> Tensor:
     """Spherical-harmonic moments T of the scattering source from the flux moments and the Legendre transfer moments.
 
-    ``T[g, n] = sum_g' mu_s_l_volume[g', g, l(n)] phi[g', n]``, so that ``S_g(Omega) = sum_n T[g, n] Y_n(Omega)``; the
-    all-zero transfer blocks (upscatter) are skipped.
+    ``T[g, n] = sum_g' mu_s_l_volume[g', g, l(n)] phi[g', n]``, so that ``S_g(Omega) = sum_n T[g, n] Y_n(Omega)``. On
+    float32 CUDA tensors one fused kernel forms T (``kernels.scattering_kernels``); the PyTorch path skips the all-zero
+    transfer blocks (upscatter).
 
     Args:
         mu_s_l_volume (Tensor): ``[G_in, G_out, L+1, *spatial]`` Legendre transfer moments ``mu_s_l`` per voxel in
@@ -607,11 +611,14 @@ def scatter_source_moments(mu_s_l_volume: Tensor, phi: Tensor, *, moment_major: 
         phi (Tensor): ``[G_in, N, *rest]`` flux moments, ``N = (L_phi+1)^2`` with ``L_phi <= L``; rest is spatial or
             ``(4, *spatial)`` (linear-discontinuous moments), and phi may be a non-contiguous view.
         moment_major (bool, optional): allocate the result moment-major, ``[N, G_out, *rest]``, and return its
-            ``movedim(0, 1)`` view (the layout ``scatter_source_function`` contracts without a copy). Defaults to False.
+            ``movedim(0, 1)`` view (the layout ``combined_scatter_image`` contracts without a copy). Defaults to False.
+        cell_major (bool, optional): allocate the result in the sweep's layout, ``[N, *spatial, G_out, (4)]``, and
+            return its ``[G_out, N, *rest]`` view (the layout ``scatter_source_function`` contracts without a copy).
+            Defaults to False.
 
     Returns:
         Tensor: ``[G_out, N, *rest]`` source moments T in cm^-1 times the unit of phi, contiguous unless
-        ``moment_major``.
+        ``moment_major`` or ``cell_major``.
     """
     G_in, G_out, num_legendre = mu_s_l_volume.shape[:3]
     spatial = tuple(mu_s_l_volume.shape[3:])
@@ -624,19 +631,41 @@ def scatter_source_moments(mu_s_l_volume: Tensor, phi: Tensor, *, moment_major: 
     if L_phi + 1 > num_legendre:
         raise ValueError(f"phi has degree {L_phi} > transfer Legendre order {num_legendre - 1}")
     rest = tuple(phi.shape[2:])
-    if rest == spatial:
-        linear_discontinuous_axis = False
-    elif len(rest) == len(spatial) + 1 and rest[1:] == spatial:
-        linear_discontinuous_axis = True
-    else:
+    if not (rest == spatial or (len(rest) == len(spatial) + 1 and rest[1:] == spatial)):
         raise ValueError(f"phi trailing shape {rest} must be spatial {spatial} or (4, *spatial)")
-    degree_of_moment = spherical_harmonic_degree_index(L_phi, mu_s_l_volume.device)
-    nonzero = (mu_s_l_volume.reshape(G_in, G_out, -1) != 0).any(dim=-1).cpu()  # one host sync
+    if moment_major and cell_major:
+        raise ValueError("choose at most one of moment_major and cell_major")
+    if scattering_kernels.use_kernel(mu_s_l_volume, phi):
+        layout = "cell_major" if cell_major else "moment_major" if moment_major else "contiguous"
+        return scattering_kernels.scattering_moments(mu_s_l_volume, phi, layout)
     if moment_major:
-        buffer = torch.zeros((N, G_out) + rest, device=phi.device, dtype=phi.dtype)
-        out = buffer.movedim(0, 1)  # [G_out, N, *rest] view
+        out = torch.zeros((N, G_out) + rest, device=phi.device, dtype=phi.dtype).movedim(0, 1)
+    elif cell_major:
+        storage = torch.zeros((N,) + spatial + (G_out,) + rest[:len(rest) - len(spatial)], device=phi.device,
+                              dtype=phi.dtype)
+        out = scattering_kernels.cell_major_view(storage, len(spatial))
     else:
         out = torch.zeros((G_out, N) + rest, device=phi.device, dtype=phi.dtype)
+    return _scatter_source_moments_torch(mu_s_l_volume, phi, out)
+
+
+def _scatter_source_moments_torch(mu_s_l_volume: Tensor, phi: Tensor, out: Tensor) -> Tensor:
+    """PyTorch path of ``scatter_source_moments``: accumulate every non-zero transfer block in place into ``out``.
+
+    Args:
+        mu_s_l_volume (Tensor): ``[G_in, G_out, L+1, *spatial]`` Legendre transfer moments.
+        phi (Tensor): ``[G_in, N, *rest]`` flux moments.
+        out (Tensor): ``[G_out, N, *rest]`` zeros (any strides), filled in place.
+
+    Returns:
+        Tensor: ``out``.
+    """
+    G_in, G_out = mu_s_l_volume.shape[:2]
+    spatial = tuple(mu_s_l_volume.shape[3:])
+    N = phi.shape[1]
+    linear_discontinuous_axis = tuple(phi.shape[2:]) != spatial
+    degree_of_moment = spherical_harmonic_degree_index(math.isqrt(N) - 1, mu_s_l_volume.device)
+    nonzero = (mu_s_l_volume.reshape(G_in, G_out, -1) != 0).any(dim=-1).cpu()  # one host sync
     for g_in in range(G_in):
         for g_out in range(G_out):
             if not bool(nonzero[g_in, g_out]):

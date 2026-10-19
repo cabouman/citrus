@@ -127,10 +127,14 @@ def test_fields_from_attenuation_equal_the_density_path(device, trace):
 
 
 @cuda
-def test_fields_from_attenuation_hold_no_density_volume():
+def test_fields_from_attenuation_hold_no_density_volume(monkeypatch):
     """The X path's peak memory above X: the fields it returns plus one material map, the resampling intermediates
     (about one more map at q = 2: measured 2.2 maps in all) and the density model's slab temporaries, never the
-    [7, R, C, S] density volume (0.25 cm WLAB grid, 1.5 M voxels, 16 slabs)."""
+    [7, R, C, S] density volume (0.25 cm WLAB grid, 1.5 M voxels, 16 slabs) when the maps exceed
+    FINE_MAP_BUDGET_BYTES. Within the budget the fields keep exactly the nonzero maps, and the peak is those plus the
+    same intermediates."""
+    import citrus.scatter_solver.scatter_solver as scatter_solver_module
+
     set_memory_cap(4400.0)
     grid = wlab_grid(0.25)
     library = _library7()
@@ -138,18 +142,26 @@ def test_fields_from_attenuation_hold_no_density_volume():
     X = _noisy_attenuation(library, grid, "cuda")
     dm = DensityModel.from_library(library)
     dm.slab_voxels = X.numel() // 16
-    s.material_fields_from_attenuation(X, grid, dm)  # warm-up (resampling matrices cached)
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    base = torch.cuda.memory_allocated()
-    f = s.material_fields_from_attenuation(X, grid, dm)
-    torch.cuda.synchronize()
-    peak = torch.cuda.max_memory_allocated() - base
-    kept = torch.cuda.memory_allocated() - base
     one_map = X.numel() * X.element_size()
-    assert peak <= kept + 2.5 * one_map, (peak / one_map, kept / one_map)
-    assert peak < 7 * one_map  # far below the density volume alone
-    del f
+    for budget in (0, scatter_solver_module.FINE_MAP_BUDGET_BYTES):
+        monkeypatch.setattr(scatter_solver_module, "FINE_MAP_BUDGET_BYTES", budget)
+        s.material_fields_from_attenuation(X, grid, dm)  # warm-up (resampling matrices cached)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        f = s.material_fields_from_attenuation(X, grid, dm)
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - base
+        kept = torch.cuda.memory_allocated() - base
+        assert peak <= kept + 2.5 * one_map, (budget, peak / one_map, kept / one_map)
+        if budget == 0:
+            assert f.fine_maps is None
+            assert peak < 7 * one_map  # far below the density volume alone
+        else:
+            assert sorted(f.fine_maps) == list(f.fine_materials)
+            for m in f.fine_materials:
+                assert torch.equal(f.fine_material(m), dm.material(X, m))
+        del f
 
 
 # ---- the two-step primary --------------------------------------------------------------------------------------

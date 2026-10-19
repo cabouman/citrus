@@ -876,6 +876,36 @@ def test_combined_scatter_image_fused_matches_torch(footprint, monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_direction_context_selection_kept_with_the_set():
+    """The panel-facing selection and the separability of a view are kept with its direction set: a second context of
+    the same set is built without any host synchronization and equals the first."""
+    from citrus.scatter_solver.scatter_image import make_direction_context
+
+    device = torch.device("cuda")
+    geometry = wlab_setup(2.0, device=device, dtype=torch.float32)[1]
+    grid = Grid((10, 16, 20), 2.0)
+    library = synthetic_library(num_groups=3, legendre_order=2, num_materials=7).to(device, torch.float32)
+    q = panel_direction_set(geometry, 0.3, (8, 16), max_polar_angle=grid, device=device, dtype=torch.float32)
+    detector, grid_response = csi_response(), focused_1d_grid()
+
+    def build():
+        return make_direction_context(q, geometry, 0.3, detector, grid_response, library, device, torch.float32,
+                                      chunk=8)
+
+    first = build()
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        second = build()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert second.separable == first.separable and second.chunk_bounds == first.chunk_bounds
+    for name in ("omega", "weight", "signal_weight", "accumulation_weight"):
+        a, b = getattr(first, name), getattr(second, name)
+        assert (a is None and b is None) or torch.equal(a, b), name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_combined_scatter_image_no_sync():
     """The combined pass (one projection per chunk, with and without the finite-cone footprint) runs its whole chunk
     loop without any host-device synchronization with a prebuilt context and the fused Siddon projectors (sync debug

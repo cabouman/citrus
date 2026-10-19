@@ -14,7 +14,7 @@ from typing import Protocol
 import torch
 from torch import Tensor
 
-from .geometry import ConeGeometry, Grid
+from .geometry import ConeGeometry, Grid, device_tensor
 from .kernels import ray_tracing_kernels
 
 __all__ = ["Projectors", "SiddonProjectors", "line_integrals"]
@@ -128,10 +128,10 @@ def _box_tensors(grid: Grid, device, dtype) -> tuple[Tensor, Tensor, Tensor, tup
         (lo, hi, delta, n): lo and hi are the [3] lower and upper corners in cm, delta the [3] voxel sizes in cm and
         n the voxel counts (nx, ny, nz).
     """
-    lo = torch.tensor(grid.lower_corner(), device=device, dtype=dtype)
-    delta = torch.tensor(grid.deltas, device=device, dtype=dtype)
+    lo = device_tensor(grid.lower_corner(), device, dtype)
+    delta = device_tensor(grid.deltas, device, dtype)
     n = (grid.num_cols, grid.num_rows, grid.num_slices)
-    hi = lo + delta * torch.tensor(n, device=device, dtype=dtype)
+    hi = lo + delta * device_tensor(n, device, dtype)
     return lo, hi, delta, n
 
 
@@ -377,7 +377,7 @@ class SiddonProjectors:
         if neg is None:
             if len(self._negative_normals) >= 256:
                 self._negative_normals.clear()
-            neg = self._negative_normals[key] = -torch.tensor(n_hat, device=directions.device, dtype=directions.dtype)
+            neg = self._negative_normals[key] = -device_tensor(n_hat, directions.device, directions.dtype)
         return ((directions * neg).sum(-1) > 0).view(torch.uint8)
 
     # ---- core ---------------------------------------------------------------------------------
@@ -416,7 +416,7 @@ class SiddonProjectors:
         centers = grid.center_coordinates(mu.device, mu.dtype).reshape(-1, 3)
         if geometry.is_parallel:  # each ray starts upstream of the box on the beam's line through its end
             return self.line_integrals(mu, geometry.ray_starts(centers, angle, grid), centers, grid).reshape(mu.shape)
-        source_position = torch.tensor(geometry.source_position(angle), device=mu.device, dtype=mu.dtype)
+        source_position = device_tensor(geometry.source_position(angle), mu.device, mu.dtype)
         tau = self.line_integrals(mu, source_position.expand_as(centers), centers, grid)
         return tau.reshape(mu.shape)
 
@@ -437,7 +437,7 @@ class SiddonProjectors:
         pts = points.to(device=mu.device, dtype=mu.dtype).reshape(-1, 3)
         if geometry.is_parallel:
             return self.line_integrals(mu, geometry.ray_starts(pts, angle, grid), pts, grid)
-        source_position = torch.tensor(geometry.source_position(angle), device=mu.device, dtype=mu.dtype)
+        source_position = device_tensor(geometry.source_position(angle), mu.device, mu.dtype)
         return self.line_integrals(mu, source_position.expand_as(pts), pts, grid)
 
     # ---- (b) ----------------------------------------------------------------------------------
@@ -473,7 +473,7 @@ class SiddonProjectors:
             ends = pixels.reshape(-1, 3) if n == 1 else geometry.subpixel_centers(angle, n, device, dtype).reshape(-1, 3)
             tau = self.line_integrals(mu, geometry.ray_starts(ends, angle, grid), ends, grid).reshape(G, Rd, Cd, n * n)
             return tau[..., 0] if n == 1 else -(torch.logsumexp(-tau, dim=-1) - math.log(n * n))
-        source_position = torch.tensor(geometry.source_position(angle), device=device, dtype=dtype)
+        source_position = device_tensor(geometry.source_position(angle), device, dtype)
         if samples_per_pixel_axis == 1:
             ends = pixels.reshape(-1, 3)
             tau = self.line_integrals(mu, source_position.expand_as(ends), ends, grid)
@@ -484,8 +484,8 @@ class SiddonProjectors:
             tau = self.line_integrals(mu, source_position.expand_as(ends), ends, grid).reshape(G, Rd, Cd, n * n)
             return -(torch.logsumexp(-tau, dim=-1) - math.log(n * n))
         u_hat, v_hat, _ = geometry.panel_axes(angle)
-        u_axis = torch.tensor(u_hat, device=device, dtype=dtype)
-        v_axis = torch.tensor(v_hat, device=device, dtype=dtype)
+        u_axis = device_tensor(u_hat, device, dtype)
+        v_axis = device_tensor(v_hat, device, dtype)
         offsets = (2 * torch.arange(n, device=device, dtype=dtype) + 1) / (2 * n) - 0.5  # [n]
         offset_u = offsets * geometry.delta_det_channel
         offset_v = offsets * geometry.delta_det_row
@@ -520,7 +520,7 @@ class SiddonProjectors:
         K = omegas.shape[0]
         out = torch.full((K, *mu.shape), math.inf, device=device, dtype=dtype)
         _, _, n_hat = geometry.panel_axes(angle)
-        n = torch.tensor(n_hat, device=device, dtype=dtype)
+        n = device_tensor(n_hat, device, dtype)
         toward = (omegas * (-n)).sum(-1) > 0
         toward_indices = torch.nonzero(toward).flatten()
         if toward_indices.numel() == 0:
@@ -566,8 +566,8 @@ class SiddonProjectors:
         pixels = geometry.pixel_centers(angle, device, dtype)
         Rd, Cd = pixels.shape[:2]
         p = pixels.reshape(-1, 3)  # [Np, 3]
-        lo = torch.tensor(grid.lower_corner(), device=device, dtype=dtype)
-        center = lo + 0.5 * torch.tensor(grid.extent, device=device, dtype=dtype)
+        lo = device_tensor(grid.lower_corner(), device, dtype)
+        center = lo + 0.5 * device_tensor(grid.extent, device, dtype)
         half = 0.5 * math.sqrt(sum(e * e for e in grid.extent)) * (1 + 1e-6) + 1e-6
 
         def endpoints(directions: Tensor) -> tuple[Tensor, Tensor]:
