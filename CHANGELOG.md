@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.13.0 - 2026-10-19
+
+- **Open-field image.** The flat field of `citrus_recon` / `mbir_recon` may be a number, a [rows, channels] image or a
+  [views, rows, channels] stack: the normalization `-log(Y / F)` and the weights `Y / F` are elementwise, and the
+  scatter solver's source gets the emission profile of the open field, the measured open field divided by the
+  solver's own open field for a uniform source (and by an optional `detector_gain` map), with a mean of one
+  (`emission_profile_from_open_field`, `SourceModel(emission_profile=...)`, `info["emission_profile"]`), so a bowtie
+  filter or the heel effect changes the scatter estimate. A number keeps the previous behaviour exactly.
+  `bowtie_emission_profile` builds an analytic profile for synthetic data. The profile is energy independent.
+- **Detector response from the photon data.** `detector_response(material, thickness_cm, mode="energy_integrating" |
+  "photon_counting", deposition="full" | "local")` for any catalogue material, and `tabulated_detector_response` for
+  a user table; `csi_response` is unchanged.
+- **Anti-scatter grid from its septa.** `anti_scatter_grid(geometry, septum_thickness_cm, septum_height_cm,
+  septum_material="lead", focal_distance_cm=None, pitch_cm=None, septa_along="channels" | "rows")`, with the pitch
+  defaulting to the detector pixel pitch; `focused_1d_grid` is unchanged.
+- **Synthetic data** use the detector signal behind the grid for the scatter-to-primary ratio (unchanged for the ideal
+  counting detector without grid), take an emission profile and a gain map, and return `open_field`;
+  `synthesize_wlab_dataset` and `wlab_solver` take `detector=`, `grid_response=` and `source=`.
+
 ## v0.12.0 - 2026-10-19
 
 - **User-defined reference materials.** `citrus.scatter_solver.Material(name, density, composition)` stands wherever

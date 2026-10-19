@@ -426,7 +426,8 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
         probe = torch.tensor(n_hat, device=device, dtype=float64)[None].neg()
         if K:
             probe = torch.cat([probe, omega64[:1]])
-        probe_theta1, probe_theta2 = grid_angles(probe, pixels, geometry, angle, focal_distance)  # [P, Rd, Cd]
+        probe_theta1, probe_theta2 = grid_angles(probe, pixels, geometry, angle, focal_distance,
+                                                 grid_response.septa_along)  # [P, Rd, Cd]
         max_deviation = torch.maximum((probe_theta1 - probe_theta1[..., :1]).abs().max(),
                                       (probe_theta2 - probe_theta2[..., :1]).abs().max())
         separable = bool(max_deviation <= 1e-10)  # rad; float64 rounding of the pixel positions is ~1e-17
@@ -441,7 +442,8 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
     block = max(1, (1 << 22) // max(1, G * Rd * Cg))
     for start in range(0, K, block):
         stop = min(start + block, K)
-        th1, th2 = grid_angles(omega64[start:stop], pixel_columns, geometry, angle, focal_distance)  # [b, Rd, Cg]
+        th1, th2 = grid_angles(omega64[start:stop], pixel_columns, geometry, angle, focal_distance,
+                               grid_response.septa_along)  # [b, Rd, Cg]
         grid_block = grid_response.at(energy64, th1, th2).permute(1, 0, 2, 3)  # [b, G, Rd, Cg]
         if grid_weight is not None:
             grid_weight[start:stop] = grid_block
@@ -1074,7 +1076,8 @@ def primary_from_path_lengths(library: MultigroupLibrary, path: Tensor, material
     theta0 = detector_angle(omega_p, geometry, angle)  # [Rd, Cd]
     planar = fluence * torch.cos(theta0)
     detector_response = detector.at(group_energy, theta0)  # [G, Rd, Cd]
-    theta1, theta2 = grid_angles(omega_p, pixels, geometry, angle, grid_response.focal_distance_cm)  # [Rd, Cd]
+    theta1, theta2 = grid_angles(omega_p, pixels, geometry, angle, grid_response.focal_distance_cm,
+                                 grid_response.septa_along)  # [Rd, Cd]
     grid_transmission = grid_response.at(group_energy, theta1, theta2)
     signal_per_group = planar * grid_transmission * detector_response
     return {"fluence": fluence, "planar_fluence": planar, "signal_per_group": signal_per_group,

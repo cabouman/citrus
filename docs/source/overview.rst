@@ -25,7 +25,7 @@ Package layout
     ``photon_data``               the photon data: NIST XCOM cross sections (downloaded on first use), xraylib
                                   angular distributions
     ``cross_section_library``     the library builder from those data, cached on disk
-    ``source``, ``detector``      point source with collimation; detector and anti-scatter-grid responses
+    ``source``, ``detector``      point source with emission profile; detector and anti-scatter-grid responses
     ``angular_quadrature``        direction sets, real spherical harmonics, the scattering-source operator
     ``linear_discontinuous_cell`` the linear-discontinuous cell equations and their closed-form solve
     ``wavefront``                 the diagonal-plane ordering of the sweep

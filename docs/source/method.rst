@@ -13,7 +13,8 @@ Outer iteration
 ~~~~~~~~~~~~~~~
 
 MBIR reconstructs a monoenergetic attenuation map :math:`X` at an effective energy :math:`E_{eff}` (the spectrum mean)
-from the measured counts :math:`Y`, primary plus scatter, with flat field :math:`I_0`. The loop starts from the FDK
+from the measured counts :math:`Y`, primary plus scatter, with flat field :math:`I_0` (a number, or the measured
+open-field image, below "Source emission profile and open field"). The loop starts from the FDK
 reconstruction :math:`X_0` of the uncorrected data, and outer iteration :math:`k = 1, \dots, N`
 
 1. converts :math:`X_{k-1}` into the densities :math:`\rho_k` of the library's reference materials (the density
@@ -65,7 +66,8 @@ Scatter-to-primary correction
 The correction is multiplicative: :math:`Y_c = Y\,p/(p+s) = Y/(1 + \mathrm{SPR})` with :math:`\mathrm{SPR} = s/p` per
 pixel, both signals from the solver at the current densities. It is independent of the flat field and of the mismatch
 between the solver's polychromatic primary and MBIR's monoenergetic model, and it only rescales the noise of :math:`Y`,
-so the weights :math:`W = Y/I_0` of the measured counts are the exact weights of :math:`y_c = -\log(Y_c/I_0)`.
+so the weights :math:`W = Y/I_0` of the measured counts are the exact weights of :math:`y_c = -\log(Y_c/I_0)`
+(elementwise for an open-field image).
 
 Warm-started MBIR
 ~~~~~~~~~~~~~~~~~
@@ -95,7 +97,9 @@ Boltzmann transport equation (LBTE)
 
 with vacuum boundaries and a point source at the focal spot :math:`\mathbf r_0`,
 :math:`q = s(E)\,b(\boldsymbol\Omega)\,\delta(\mathbf r - \mathbf r_0)`, where :math:`s(E)` is the normalized spectrum
-and :math:`b` the collimation (1 for directions that hit the panel, else 0). Interactions: photoelectric absorption
+and :math:`b` the angular weight of the source: 0 for directions that miss the panel (the collimation), else the
+emission profile toward the panel, 1 by default ("Source emission profile and open field", below). Interactions:
+photoelectric absorption
 (local deposition), Compton scattering (Klein-Nishina kinematics with the incoherent scattering function, no Doppler
 broadening) and Rayleigh scattering (form factors), and pair production (local deposition) at MV energies, with the
 cross sections of NIST XCOM and the angular distributions of xraylib. Every voxel is a mixture of the
@@ -379,11 +383,31 @@ panel normal :math:`\hat n` (by default the source-detector distance, a grid foc
 :math:`\theta_1` in the plane spanned by :math:`\hat v` and :math:`\hat n` (perpendicular to the lamellae) from the
 focusing direction and :math:`\theta_2` in the plane spanned by :math:`\hat u` and :math:`\hat n` from the normal.
 A primary ray of a grid focused at the focal spot has :math:`\theta_1 = 0` exactly and
-:math:`\theta_2 = -\arctan(u / \text{SDD})`.
+:math:`\theta_2 = -\arctan(u / \text{SDD})`. A grid whose lamellae run along the rows (``septa_along="rows"``, parallel
+to the rotation axis of a circular scan) swaps the roles of :math:`\hat u` and :math:`\hat v`: it is focused on the line
+parallel to :math:`\hat v` and :math:`\theta_1` lies in the plane of :math:`\hat u` and :math:`\hat n`. Its response
+varies along the channels, so the scatter image then stores the grid weights per pixel rather than per row.
 
-**Analytic models.** ``csi_response`` assumes that every interacting photon deposits its full energy (no escape, no
-fluorescence) along the oblique path :math:`t/\cos\theta_0`:
-:math:`D(E, \theta_0) = E\,\big(1 - e^{-\mu_{CsI}(E)\,\rho\,t/\cos\theta_0}\big)`. ``focused_1d_grid`` is a
+**Detector models.** A detector layer of thickness :math:`t`, density :math:`\rho` and total mass attenuation
+:math:`\mu(E)` (``detector_response``: any catalogue material, with the cross sections of the photon data) stops a
+photon at incidence angle :math:`\theta_0` with probability
+:math:`P(E, \theta_0) = 1 - e^{-\mu(E)\,\rho\,t/\cos\theta_0}`. An energy-integrating detector records
+:math:`D = E\,P\,f(E)` and a photon-counting detector :math:`D = P\,c(E)`, with two models of what an interaction
+leaves in the layer:
+
+* ``deposition="full"``: every interacting photon deposits its whole energy and is counted, :math:`f = c = 1` (no
+  escape of scattered or fluorescence photons; adequate for a thick scintillator at kV energies);
+* ``deposition="local"``: only the energy given to charged particles in the first interaction stays, and the
+  secondary photons escape: :math:`f = (\mu_{pe} + \mu_{C}\,\bar T_{KN}(E)/E + \mu_{pair}\,(1 - 2 m_e c^2/E))/\mu`
+  with :math:`\bar T_{KN}` the mean Klein-Nishina electron energy, and a counting detector counts every interaction
+  except Rayleigh scattering, :math:`c = (\mu - \mu_{R})/\mu` (adequate for a thin layer and at MV energies, where
+  full deposition overestimates the signal).
+
+The two bracket a real detector, which also loses part of the fluorescence and re-absorbs part of the scattered
+photons; a Monte Carlo table (``tabulated_detector_response``, a function of energy and optionally of the angle)
+replaces both. ``csi_response`` is the full-deposition model of CsI with a coarse built-in attenuation table.
+
+**Grid model.** ``focused_1d_grid`` and ``anti_scatter_grid`` are a
 geometric lamella-shadow model for lamellae of thickness :math:`t` and height :math:`h` at pitch :math:`p`. A photon
 tilted by :math:`\theta_1` passes the interspace only with the open fraction
 :math:`o = \max(0, (p - t) - h|\tan\theta_1|)/p`; the mean lead path over all photons is
@@ -392,13 +416,49 @@ tilted by :math:`\theta_1` passes the interspace only with the open fraction
 :math:`G = o + (1 - o)\,e^{-\mu_{Pb}(E)\,\rho_{Pb}\,L_s}`. A tilt along the lamellae does not change the shadow, so
 :math:`G` does not depend on :math:`\theta_2`; the interspace material and the cover are ignored. The geometry is
 set by :math:`(t, h, p)` alone: the nominal ratio is only a label (with the default lamellae,
-:math:`h/(p - t) = 11.5` and :math:`h/p = 9.0` for a nominal 10:1 grid).
+:math:`h/(p - t) = 11.5` and :math:`h/p = 9.0` for a nominal 10:1 grid). The open fraction is the mean over one
+period, so it is exact for a pixel that spans whole periods. ``anti_scatter_grid`` builds the grid from its septa:
+any catalogue material (attenuation from the photon data), thickness, height, focal distance, direction and pitch, by
+default the pixel pitch across the septa, one septum per pixel, so that every pixel sees the same septum shadow. The
+grid transmission enters the primary and the scatter signals alike, so the scatter-to-primary ratio of the solver is
+that of the detector behind the grid, in the CITRUS loop and in the synthetic data.
 
-**Attenuation of the models.** The mass attenuation of CsI and lead are coarse tables of NIST XCOM total
+**Attenuation of the built-in models.** The mass attenuation of CsI and lead in ``csi_response`` and
+``focused_1d_grid`` are coarse tables of NIST XCOM total
 attenuation (coherent scattering included), rounded to 2 to 3 significant digits and interpolated in log-log
 (linear extrapolation in log-log outside them). Each absorption edge is a pair of nodes 1 eV apart (I K 33.17 keV,
 Cs K 35.98 keV, Pb L3 13.04 keV, Pb K 88.00 keV; the lead L2 and L1 edges are omitted since lead is opaque there).
-The interpolation is adequate for detector modelling, not for dosimetry.
+The interpolation is adequate for detector modelling, not for dosimetry. The tables end at 150 keV (clamped above);
+``detector_response`` and ``anti_scatter_grid`` tabulate 10 keV to 20 MeV.
+
+Source emission profile and open field
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The focal spot is an isotropic point source; a bowtie or beam filter, the heel effect or any other non-uniform
+emission enters as the angular weight :math:`b(\boldsymbol\Omega)` of the source (``SourceModel.emission_profile``),
+given per detector pixel: :math:`b` is the profile at the point where the ray from the focal spot hits the panel,
+interpolated bilinearly between the pixel centres, constant from the outermost pixel centres to the panel edge, and
+0 off the panel. The same :math:`b` weights the uncollided fluence, and with it the first-collision source and every
+collision order of the scatter, and the solver's primary, so the scatter-to-primary ratio accounts for the parts of
+the object that a bowtie spares. The scale of :math:`b` cancels in that ratio.
+
+The profile comes from the measured open field :math:`F` (flat-field image) of the scanner. The solver's images are
+per source photon per steradian through the true geometry, so its own open field of a uniform source,
+:math:`F_{solver}` (``ScatterSolver.open_field_signal``, the primary signal of an empty volume), already contains the
+inverse-square and obliquity falloff of the point source and the grid and detector responses. With a per-pixel
+detector gain :math:`g` (the open field is gain times emission),
+
+.. math::
+
+   b = \frac{F}{g\,F_{solver}} \Big/ \operatorname{mean}\Big(\frac{F}{g\,F_{solver}}\Big),
+
+per view for a per-view open field (``emission_profile_from_open_field``). No absolute scale or :math:`I_0` is
+involved. Without a gain map the whole open field is treated as emission; a gain pattern then appears in :math:`b`,
+which matters only where it is large. ``citrus_recon`` given an open-field image normalizes the counts pixel by pixel,
+:math:`y = -\log(Y/F)`, and gives the solver's source this profile for the duration of the call; given a number
+:math:`I_0` it keeps the solver's source (uniform by default), and :math:`I_0` then stands for the open field with the
+falloff of :math:`F_{solver}` divided out. The profile is a single spectrum-integrated weight per direction: it does
+not represent the spectral hardening of a real bowtie, whose thicker parts harden the beam toward the edges.
 
 One view of the solver
 ~~~~~~~~~~~~~~~~~~~~~~
