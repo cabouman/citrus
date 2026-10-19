@@ -420,19 +420,25 @@ def focused_1d_grid(ratio: float = 10.0, lamella_thickness_cm: float = 0.0036, l
 
 # ---- angles -------------------------------------------------------------------------------------------
 
-def detector_angle(omega: Tensor, geometry: ConeGeometry, angle: float) -> Tensor:
+def detector_angle(omega: Tensor, geometry: ConeGeometry, angle: float,
+                   pixel_positions: Optional[Tensor] = None) -> Tensor:
     """Compute the angle theta0 between the photon direction and the inward panel normal ``-n_hat``.
 
     Args:
         omega (Tensor): [..., 3] photon directions in the recon frame (any length).
         geometry (ConeGeometry): the scan geometry.
         angle (float): view angle in rad.
+        pixel_positions (Tensor, optional): [..., 3] panel points broadcastable with ``omega`` whose local normal is
+            used on a curved panel (``ConeGeometry.local_panel_axes``). Defaults to None, the normal at the panel
+            center.
 
     Returns:
         Tensor: [...] angles theta0 in rad.
     """
     _, _, n_hat = geometry.panel_axes(angle)
     n = torch.tensor(n_hat, device=omega.device, dtype=omega.dtype)
+    if geometry.use_curved_detector and pixel_positions is not None:
+        n = geometry.local_panel_axes(pixel_positions.to(omega.device, omega.dtype), angle)[2]
     c = (omega * (-n)).sum(-1) / torch.linalg.norm(omega, dim=-1)
     return torch.arccos(c.clamp(-1.0, 1.0))
 
@@ -443,7 +449,9 @@ def grid_angles(omega: Tensor, pixel_positions: Tensor, geometry: ConeGeometry, 
 
     The grid is 1-D, its lamellae run along u and repeat along v, focused on the line parallel to u at
     ``focal_distance`` from the panel along ``n_hat``; theta1 is the angle in the v-source plane from the focusing
-    direction and theta2 the angle in the u-source plane from the panel normal.
+    direction and theta2 the angle in the u-source plane from the panel normal. On a curved panel the axes are those
+    of the surface at each pixel (``ConeGeometry.local_panel_axes``) and the focal line of a pixel lies at
+    ``focal_distance`` along its normal from the central row of its column.
 
     Args:
         omega (Tensor): [K, 3] or [..., 3] unit photon directions in the recon frame.
@@ -469,6 +477,10 @@ def grid_angles(omega: Tensor, pixel_positions: Tensor, geometry: ConeGeometry, 
     else:
         a = -omega
         pixels = pixel_positions
+    if geometry.use_curved_detector:  # the axes of the cylinder at each pixel, focused along its own normal
+        u_hat, v_hat, n_hat = geometry.local_panel_axes(pixels, angle)
+        panel_center = torch.tensor(geometry.panel_center(angle), device=device, dtype=dtype)
+        focus = pixels - ((pixels - panel_center) * v_hat).sum(-1, keepdim=True) * v_hat + focal_distance * n_hat
     f = focus - pixels
     a_normal = (a * n_hat).sum(-1)
     theta_a = torch.atan2((a * v_hat).sum(-1), a_normal)

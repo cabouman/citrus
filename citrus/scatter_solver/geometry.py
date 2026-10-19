@@ -1,17 +1,19 @@
-"""Voxel grids, conservative resampling between them, and the flat-panel cone-beam geometry.
+"""Voxel grids, conservative resampling between them, and the cone-beam geometry.
 
 The conventions are MBIRTORCH's (docs/source/conventions.rst): lengths in cm, angles in radians, volumes
 [rows, cols, slices] with columns along x, rows along y and slices along z. :class:`Grid` builds the solver's fine,
 transport and quadrature grids, :func:`resample_conservative` carries densities between them by exact cell averages,
-and :class:`ConeGeometry` places the source and the panel of each view.
+and :class:`ConeGeometry` places the source and the (flat or curved) panel of each (circular or helical) view.
 """
 
 from __future__ import annotations
 
+import bisect
 import math
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -305,10 +307,12 @@ def resample_conservative(field: Tensor, grid_from: Grid, grid_to: Grid) -> Tens
 
 @dataclass(frozen=True)
 class ConeGeometry:
-    """Flat-panel cone-beam geometry in MBIRTORCH conventions (docs/source/conventions.rst).
+    """Cone-beam geometry with a flat or cylindrical panel and circular or helical views, in MBIRTORCH conventions.
 
-    In the view frame the source sits at ``(0, +source_iso_dist, 0)`` and the panel lies in the plane
-    ``y_view = source_iso_dist - source_detector_dist``, with u along +x_view (channels) and v along +z (rows).
+    In the view frame the source sits at ``(0, +source_iso_dist, z_shift)`` with u along +x_view (channels) and v along
+    +z (rows); the flat panel lies in the plane ``y_view = source_iso_dist - source_detector_dist`` and the curved panel
+    on the cylinder of radius ``source_detector_dist`` about the vertical axis through the source
+    (docs/source/conventions.rst, "Frames"). A helical scan moves the source and the panel by ``z_shift(angle)``.
 
     Attributes:
         source_iso_dist (float): distance from the source to the rotation axis in cm.
@@ -316,9 +320,15 @@ class ConeGeometry:
         num_det_rows (int): number of detector rows.
         num_det_channels (int): number of detector channels.
         delta_det_row (float): detector row pitch in cm.
-        delta_det_channel (float): detector channel pitch in cm.
+        delta_det_channel (float): detector channel pitch in cm (arc length on a curved panel).
         det_row_offset (float): offset in cm subtracted from the v of every pixel center. Defaults to 0.0.
         det_channel_offset (float): offset in cm subtracted from the u of every pixel center. Defaults to 0.0.
+        use_curved_detector (bool): cylindrical panel (MBIRTORCH's ``use_curved_detector``) instead of a flat one.
+            Defaults to False.
+        helical_view_angles (tuple[float, ...]): view angles in rad of the helical table, strictly monotone, stored
+            ascending. Defaults to () (no z shift).
+        helical_z_shifts (tuple[float, ...]): z shift in cm of the source and the panel at each angle of the table
+            (MBIRTORCH's ``helical_z_shifts``). Defaults to ().
     """
 
     source_iso_dist: float
@@ -329,6 +339,81 @@ class ConeGeometry:
     delta_det_channel: float
     det_row_offset: float = 0.0
     det_channel_offset: float = 0.0
+    use_curved_detector: bool = False
+    helical_view_angles: tuple[float, ...] = ()
+    helical_z_shifts: tuple[float, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Store the helical table as float tuples sorted by angle and check it."""
+        angles = tuple(float(a) for a in self.helical_view_angles)
+        shifts = tuple(float(z) for z in self.helical_z_shifts)
+        if len(angles) != len(shifts):
+            raise ValueError(f"helical_view_angles ({len(angles)}) and helical_z_shifts ({len(shifts)}) must have the "
+                             f"same length")
+        steps = [b - a for a, b in zip(angles, angles[1:])]
+        if steps and not (all(s > 0 for s in steps) or all(s < 0 for s in steps)):
+            raise ValueError("helical_view_angles must be strictly monotone (unwrapped view angles of a helix)")
+        if steps and steps[0] < 0:
+            angles, shifts = angles[::-1], shifts[::-1]
+        object.__setattr__(self, "helical_view_angles", angles)
+        object.__setattr__(self, "helical_z_shifts", shifts)
+        object.__setattr__(self, "use_curved_detector", bool(self.use_curved_detector))
+
+    # ---- helical views --------------------------------------------------------------------------
+    def with_helical_z_shifts(self, angles, z_shifts) -> "ConeGeometry":
+        """Return this geometry with a helical table: view ``angles[i]`` has the z shift ``z_shifts[i]``.
+
+        Args:
+            angles (Sequence[float] or ndarray): [V] unwrapped view angles in rad, strictly monotone.
+            z_shifts (Sequence[float] or ndarray): [V] z shifts in cm of the source and the panel (MBIRTORCH's
+                ``helical_z_shifts``).
+
+        Returns:
+            ConeGeometry: the helical geometry.
+        """
+        angles = np.asarray(angles, dtype=np.float64).reshape(-1)
+        z_shifts = np.asarray(z_shifts, dtype=np.float64).reshape(-1)
+        return replace(self, helical_view_angles=tuple(angles.tolist()), helical_z_shifts=tuple(z_shifts.tolist()))
+
+    @property
+    def is_helical(self) -> bool:
+        """True when the z shift varies over the views (MBIRTORCH's criterion)."""
+        return len(self.helical_z_shifts) > 0 and max(self.helical_z_shifts) > min(self.helical_z_shifts)
+
+    def z_shift(self, angle: float) -> float:
+        """Return the z shift of the source and the panel at a view angle.
+
+        The shift is interpolated linearly in the helical table and held constant outside it (exact at its angles).
+
+        Args:
+            angle (float): view angle in rad.
+
+        Returns:
+            float: z shift in cm, 0.0 without a table.
+        """
+        angles, shifts = self.helical_view_angles, self.helical_z_shifts
+        if not angles:
+            return 0.0
+        a = float(angle)
+        if a <= angles[0]:
+            return shifts[0]
+        if a >= angles[-1]:
+            return shifts[-1]
+        j = bisect.bisect_right(angles, a) - 1
+        t = (a - angles[j]) / (angles[j + 1] - angles[j])
+        return shifts[j] + t * (shifts[j + 1] - shifts[j])
+
+    def z_shifts(self, angles) -> np.ndarray:
+        """Return the z shifts of a list of views (``z_shift`` of each angle).
+
+        Args:
+            angles (Sequence[float] or ndarray): [V] view angles in rad.
+
+        Returns:
+            np.ndarray: [V] float64 z shifts in cm.
+        """
+        return np.asarray([self.z_shift(a) for a in np.asarray(angles, dtype=np.float64).reshape(-1)],
+                          dtype=np.float64)
 
     @property
     def magnification(self) -> float:
@@ -426,7 +511,7 @@ class ConeGeometry:
             (float, float, float): (x, y, z) of the focal spot in cm.
         """
         c, s = self._rot(angle)
-        return (s * self.source_iso_dist, c * self.source_iso_dist, 0.0)
+        return (s * self.source_iso_dist, c * self.source_iso_dist, self.z_shift(angle))
 
     def panel_center(self, angle: float) -> tuple[float, float, float]:
         """Return the point where the central ray meets the panel (u = v = 0), in the recon frame.
@@ -439,11 +524,14 @@ class ConeGeometry:
         """
         c, s = self._rot(angle)
         yv = self.panel_y_view
-        return (s * yv, c * yv, 0.0)
+        return (s * yv, c * yv, self.z_shift(angle))
 
     def panel_axes(self, angle: float) -> tuple[tuple[float, float, float], tuple[float, float, float],
                                                 tuple[float, float, float]]:
-        """Return the unit vectors of the panel in the recon frame.
+        """Return the unit vectors of the panel at its center in the recon frame.
+
+        On a curved panel these are the axes of the tangent plane at the central ray; ``local_panel_axes`` gives the
+        axes at any panel point.
 
         Args:
             angle (float): view angle in rad.
@@ -469,11 +557,86 @@ class ConeGeometry:
             Tensor: [num_det_rows, num_det_channels, 3] positions in cm.
         """
         u, v = self.pixel_uv(device, dtype)
+        if self.use_curved_detector:
+            return self.panel_points(u[None, :], v[:, None], angle)
         u_hat, v_hat, _ = self.panel_axes(angle)
         pc = torch.tensor(self.panel_center(angle), device=device, dtype=dtype)
         u_hat = torch.tensor(u_hat, device=device, dtype=dtype)
         v_hat = torch.tensor(v_hat, device=device, dtype=dtype)
         return pc + u[None, :, None] * u_hat + v[:, None, None] * v_hat
+
+    def panel_points(self, u: Tensor, v: Tensor, angle: float) -> Tensor:
+        """Return the recon-frame positions of panel points given by their panel coordinates.
+
+        On a curved panel the point (u, v) lies on the cylinder at the azimuth ``gamma = u / source_detector_dist``
+        from the central ray and at the height ``v cos(gamma)``, where the ray from the focal spot through the point
+        (``source_detector_dist tan(gamma)``, v) of the tangent plane meets the cylinder (MBIRTORCH's rows).
+
+        Args:
+            u (Tensor): [...] channel coordinates in cm (arc length on a curved panel).
+            v (Tensor): [...] row coordinates in cm, broadcastable with ``u``.
+            angle (float): view angle in rad.
+
+        Returns:
+            Tensor: [..., 3] positions in cm, on the device and in the dtype of ``u``.
+        """
+        device, dtype = u.device, u.dtype
+        u, v = torch.broadcast_tensors(u, v.to(device, dtype))
+        u_hat, v_hat, n_hat = (torch.tensor(a, device=device, dtype=dtype) for a in self.panel_axes(angle))
+        pc = torch.tensor(self.panel_center(angle), device=device, dtype=dtype)
+        if not self.use_curved_detector:
+            return pc + u[..., None] * u_hat + v[..., None] * v_hat
+        radius = float(self.source_detector_dist)
+        gamma = u / radius
+        # pc + R sin(g) u_hat + R (1 - cos g) n_hat + v cos(g) v_hat, with 1 - cos g = 2 sin^2(g / 2)
+        along_u = radius * torch.sin(gamma)
+        along_n = 2.0 * radius * torch.sin(0.5 * gamma) ** 2
+        along_v = v * torch.cos(gamma)
+        return pc + along_u[..., None] * u_hat + along_n[..., None] * n_hat + along_v[..., None] * v_hat
+
+    def local_panel_axes(self, points: Tensor, angle: float) -> tuple[Tensor, Tensor, Tensor]:
+        """Return the unit vectors of the panel surface at panel points in the recon frame.
+
+        A flat panel has the axes of ``panel_axes`` everywhere; a curved panel has, at each point, the normal toward
+        the cylinder axis, the vertical ``v_hat`` and ``u_hat = n_hat x v_hat`` along the arc.
+
+        Args:
+            points (Tensor): [..., 3] points on the panel in cm.
+            angle (float): view angle in rad.
+
+        Returns:
+            (Tensor, Tensor, Tensor): ``u_hat``, ``v_hat`` and ``n_hat`` [..., 3], ``n_hat`` toward the source.
+        """
+        device, dtype = points.device, points.dtype
+        u_hat, v_hat, n_hat = (torch.tensor(a, device=device, dtype=dtype).expand_as(points)
+                               for a in self.panel_axes(angle))
+        if not self.use_curved_detector:
+            return u_hat, v_hat, n_hat
+        source_position = torch.tensor(self.source_position(angle), device=device, dtype=dtype)
+        to_axis = source_position - points
+        to_axis = to_axis - (to_axis * v_hat).sum(-1, keepdim=True) * v_hat  # horizontal part
+        n_local = to_axis / torch.linalg.norm(to_axis, dim=-1, keepdim=True)
+        return torch.linalg.cross(n_local, v_hat, dim=-1), v_hat, n_local
+
+    def subpixel_centers(self, angle: float, samples_per_pixel_axis: int, device=None,
+                         dtype=torch.float32) -> Tensor:
+        """Return the centers of the n x n sub-pixels of every pixel (the midpoint lattice in u and v).
+
+        Args:
+            angle (float): view angle in rad.
+            samples_per_pixel_axis (int): sub-pixels n per axis, at least 1.
+            device (torch.device, optional): device of the tensor. Defaults to None.
+            dtype (torch.dtype, optional): dtype of the tensor. Defaults to torch.float32.
+
+        Returns:
+            Tensor: [num_det_rows, num_det_channels, n (along v), n (along u), 3] positions in cm.
+        """
+        n = int(samples_per_pixel_axis)
+        u, v = self.pixel_uv(device, dtype)
+        offsets = (2 * torch.arange(n, device=device, dtype=dtype) + 1) / (2 * n) - 0.5  # [n]
+        u_sub = u[None, :, None, None] + (offsets * self.delta_det_channel)[None, None, None, :]
+        v_sub = v[:, None, None, None] + (offsets * self.delta_det_row)[None, None, :, None]
+        return self.panel_points(u_sub, v_sub, angle)
 
     def primary_directions(self, angle: float, device=None, dtype=torch.float32) -> Tensor:
         """Return the unit vectors from the focal spot to each pixel center in the recon frame.
@@ -491,8 +654,9 @@ class ConeGeometry:
         return d / torch.linalg.norm(d, dim=-1, keepdim=True)
 
     def panel_distance_along(self, points: Tensor, omega: Tensor, angle: float) -> Tensor:
-        """Compute the signed distance t such that ``points + t * omega`` lies on the panel plane.
+        """Compute the signed distance t such that ``points + t * omega`` lies on the panel surface.
 
+        The surface is the panel plane, or for a curved panel the cylinder (the larger root for points inside it).
         Negative or infinite values mean that the direction does not reach the panel.
 
         Args:
@@ -503,14 +667,51 @@ class ConeGeometry:
         Returns:
             Tensor: [...] distances in cm.
         """
+        if self.use_curved_detector:
+            return self._cylinder_distance_along(points, omega, angle)
         _, _, n_hat = self.panel_axes(angle)
         n = torch.tensor(n_hat, device=points.device, dtype=points.dtype)
         pc = torch.tensor(self.panel_center(angle), device=points.device, dtype=points.dtype)
         denom = (omega * n).sum(-1)
         return ((pc - points) * n).sum(-1) / denom
 
+    def _cylinder_distance_along(self, points: Tensor, omega: Tensor, angle: float) -> Tensor:
+        """Distance t to the cylinder of the curved panel, the larger root of ``|h(p + t omega - source)| = SDD``.
+
+        ``h`` keeps the x and y components (the cylinder axis is vertical); a vertical direction or a line that misses
+        the cylinder gets +inf.
+
+        Args:
+            points (Tensor): [..., 3] points in the recon frame in cm.
+            omega (Tensor): [3] or [..., 3] directions.
+            angle (float): view angle in rad.
+
+        Returns:
+            Tensor: [...] distances in cm.
+        """
+        source_position = torch.tensor(self.source_position(angle), device=points.device, dtype=points.dtype)
+        d = (points - source_position)[..., :2]
+        w = omega.to(points.dtype)[..., :2]
+        a = (w * w).sum(-1)
+        b = (d * w).sum(-1)  # half of the linear coefficient
+        c = (d * d).sum(-1) - float(self.source_detector_dist) ** 2
+        a, b, c = torch.broadcast_tensors(a, b, c)
+        discriminant = b * b - a * c
+        root = torch.sqrt(discriminant.clamp_min(0.0))
+        # the larger root without cancellation: -c / (b + root) for b >= 0, (root - b) / a otherwise
+        safe_a = torch.where(a > 0, a, torch.ones_like(a))
+        positive_b = b >= 0
+        denominator = torch.where(positive_b, b + root, safe_a)
+        numerator = torch.where(positive_b, -c, root - b)
+        safe_denominator = torch.where(denominator != 0, denominator, torch.ones_like(denominator))
+        t = numerator / safe_denominator
+        return torch.where((a > 0) & (discriminant >= 0) & (denominator != 0), t, torch.full_like(t, math.inf))
+
     def panel_uv_of_points(self, points: Tensor, angle: float) -> tuple[Tensor, Tensor]:
-        """Return the panel coordinates of points that lie on the panel plane.
+        """Return the panel coordinates of points that lie on the panel surface.
+
+        On a curved panel they are the coordinates of the ray from the focal spot through each point:
+        ``u = SDD atan2(d . u_hat, -d . n_hat)`` and ``v = SDD (d . v_hat) / (-d . n_hat)`` for ``d = point - source``.
 
         Args:
             points (Tensor): [..., 3] points in the recon frame in cm.
@@ -519,6 +720,13 @@ class ConeGeometry:
         Returns:
             (Tensor, Tensor): u and v [...] in cm.
         """
+        if self.use_curved_detector:
+            u_hat, v_hat, n_hat = (torch.tensor(a, device=points.device, dtype=points.dtype)
+                                   for a in self.panel_axes(angle))
+            d = points - torch.tensor(self.source_position(angle), device=points.device, dtype=points.dtype)
+            depth = -(d * n_hat).sum(-1)
+            radius = float(self.source_detector_dist)
+            return radius * torch.atan2((d * u_hat).sum(-1), depth), radius * (d * v_hat).sum(-1) / depth
         u_hat, v_hat, _ = self.panel_axes(angle)
         pc = torch.tensor(self.panel_center(angle), device=points.device, dtype=points.dtype)
         uh = torch.tensor(u_hat, device=points.device, dtype=points.dtype)

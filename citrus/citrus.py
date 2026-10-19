@@ -883,7 +883,8 @@ def _unwrap_arc(angles: np.ndarray) -> np.ndarray:
 
 
 def interpolation_weights(angles: Union[Sequence[float], np.ndarray], computed: Union[Sequence[int], np.ndarray],
-                          order: Literal[0, 1, 2, 3] | None = 3, circular: Optional[bool] = None) -> np.ndarray:
+                          order: Literal[0, 1, 2, 3] | None = 3, circular: Optional[bool] = None, *,
+                          helical: bool = False) -> np.ndarray:
     """Interpolation matrix ``M`` with ``s_all = M s_computed`` from the ``angular_neighbors`` weights.
 
     The rows of the computed views are one-hot; with order None the rows of the skipped views are zero.
@@ -894,6 +895,8 @@ def interpolation_weights(angles: Union[Sequence[float], np.ndarray], computed: 
         order (int or None, optional): interpolation order 0 to 3, or None for no interpolation. Defaults to 3.
         circular (bool, optional): interpolate circularly in angle; False interpolates along the arc of a short scan.
             Defaults to None (``full_rotation(angles)``).
+        helical (bool, optional): interpolate along the unwrapped angles of a helical scan as given (each view has its
+            own z, so views a turn apart are not neighbours); overrides ``circular``. Defaults to False.
 
     Returns:
         ndarray: [V, Vc] interpolation weights.
@@ -912,8 +915,11 @@ def interpolation_weights(angles: Union[Sequence[float], np.ndarray], computed: 
     if order is not None:
         is_computed = np.zeros(angle_array.size, dtype=bool)
         is_computed[computed_index] = True
-        is_circular = full_rotation(angle_array) if circular is None else bool(circular)
-        arc = angle_array if is_circular else _unwrap_arc(angle_array)
+        if helical:
+            is_circular, arc = False, angle_array
+        else:
+            is_circular = full_rotation(angle_array) if circular is None else bool(circular)
+            arc = angle_array if is_circular else _unwrap_arc(angle_array)
         computed_arc = arc[computed_index]
         for v in np.flatnonzero(~is_computed):
             for j, w in angular_neighbors(computed_arc, float(arc[v]), order, circular=is_circular):
@@ -924,7 +930,8 @@ def interpolation_weights(angles: Union[Sequence[float], np.ndarray], computed: 
 def interpolate_scatter(computed_scatter: Tensor, angles: Union[Sequence[float], np.ndarray],
                         computed: Union[Sequence[int], np.ndarray],
                         order: Literal[0, 1, 2, 3] | None = 3,
-                        previous: Optional[Tensor] = None, weights: Optional[Tensor] = None) -> Tensor:
+                        previous: Optional[Tensor] = None, weights: Optional[Tensor] = None, *,
+                        helical: bool = False) -> Tensor:
     """Scatter of every view from the scatter of the computed views, interpolated in angle per pixel.
 
     The computed views keep their values exactly; a skipped view v gets ``max(0, sum_j w_vj s_j)``.
@@ -938,6 +945,7 @@ def interpolate_scatter(computed_scatter: Tensor, angles: Union[Sequence[float],
         previous (Tensor, optional): [V, ...] most recent scatter of every view, used by order None. Defaults to None.
         weights (Tensor, optional): [V, Vc] precomputed ``interpolation_weights(angles, computed, order)``.
             Defaults to None (computed here).
+        helical (bool, optional): the views of a helical scan (``interpolation_weights``). Defaults to False.
 
     Returns:
         Tensor: [V, ...] scatter of every view.
@@ -965,7 +973,7 @@ def interpolate_scatter(computed_scatter: Tensor, angles: Union[Sequence[float],
         out[computed_index_tensor] = computed_scatter
         return out
     if weights is None:
-        weights = torch.as_tensor(interpolation_weights(angle_array, computed_index, order),
+        weights = torch.as_tensor(interpolation_weights(angle_array, computed_index, order, helical=helical),
                                   device=computed_scatter.device, dtype=computed_scatter.dtype)
     if tuple(weights.shape) != (V, Vc):
         raise ValueError(f"weights must be [{V}, {Vc}], got {tuple(weights.shape)}")
@@ -1341,7 +1349,8 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
     weights = None
     view_interpolated = np.zeros(V, dtype=bool)
     if sparse and interpolation_order is not None:
-        weights = torch.as_tensor(interpolation_weights(angle_array, computed, interpolation_order), device=device,
+        weights = torch.as_tensor(interpolation_weights(angle_array, computed, interpolation_order,
+                                                        helical=geometry.is_helical), device=device,
                                   dtype=torch.float32)
         view_interpolated[skipped] = True
     state_store = StateStore(len(computed), full_shape, device, gpu_budget_mib=config.gpu_state_budget_mib,

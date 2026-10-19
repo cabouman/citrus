@@ -468,10 +468,14 @@ class SiddonProjectors:
             ends = pixels.reshape(-1, 3)
             tau = self.line_integrals(mu, source_position.expand_as(ends), ends, grid)
             return tau.reshape(G, Rd, Cd)
+        n = samples_per_pixel_axis
+        if geometry.use_curved_detector:  # sub-pixels on the cylinder
+            ends = geometry.subpixel_centers(angle, n, device, dtype).reshape(-1, 3)
+            tau = self.line_integrals(mu, source_position.expand_as(ends), ends, grid).reshape(G, Rd, Cd, n * n)
+            return -(torch.logsumexp(-tau, dim=-1) - math.log(n * n))
         u_hat, v_hat, _ = geometry.panel_axes(angle)
         u_axis = torch.tensor(u_hat, device=device, dtype=dtype)
         v_axis = torch.tensor(v_hat, device=device, dtype=dtype)
-        n = samples_per_pixel_axis
         offsets = (2 * torch.arange(n, device=device, dtype=dtype) + 1) / (2 * n) - 0.5  # [n]
         offset_u = offsets * geometry.delta_det_channel
         offset_v = offsets * geometry.delta_det_row
