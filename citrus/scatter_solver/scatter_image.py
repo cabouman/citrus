@@ -157,7 +157,8 @@ class DirectionSetContext:
         grid_weight (Tensor): [K, G, Rd, 1] grid transmission per detector row when separable, else None.
         signal_weight (Tensor): [K, G, Rd, Cg] signal weights ``w_k cos(theta0_k) D_g G_g`` (Cg = 1 when separable,
             else Cd); [K, G, 1, Cd] on a curved panel, without the grid when ``grid_per_pixel``.
-        accumulation_weight (Tensor): [G Rd, 3, K] fused weights of :meth:`accumulate` when separable, else None.
+        accumulation_weight (Tensor): [Rd G, 3, K] fused weights of :meth:`accumulate` (rows outer) when separable,
+            else None.
         separable (bool): the grid response depends on the detector row only (flat panel).
         chunk (int): directions per chunk.
         chunk_bounds (tuple): (start, stop) of every chunk.
@@ -168,6 +169,9 @@ class DirectionSetContext:
             Defaults to None.
         planar_weight (Tensor): [K, Cd] weights ``w_k cos(theta0_kc)`` with the incidence angle at each channel of a
             curved panel (zero where the direction meets the panel from behind), else None. Defaults to None.
+        signal_group_weight (Tensor): [K, G] signal weights of the directions when they are the same at every pixel (a
+            flat panel and a grid response that does not depend on the angles, such as no grid), else None; the signal
+            is then the projection of the emission summed over the groups with them.
         grid_per_pixel (bool): a curved panel whose grid transmission depends on the angles: :meth:`accumulate`
             evaluates it per pixel for each chunk of directions. Defaults to False.
     """
@@ -194,6 +198,7 @@ class DirectionSetContext:
     cell_width: Optional[Tensor] = None
     planar_weight: Optional[Tensor] = None
     grid_per_pixel: bool = False
+    signal_group_weight: Optional[Tensor] = None
     _cache: dict = field(default_factory=dict, repr=False)
 
     # ---- sizes ----------------------------------------------------------------------------------
@@ -312,29 +317,32 @@ class DirectionSetContext:
         """Zeroed image accumulator for :meth:`accumulate`.
 
         Returns:
-            Tensor: [G Rd, 3, Cd] when separable, else [3, G, Rd, Cd].
+            Tensor: [Rd G, 3, Cd] when separable, else [3, G, Rd, Cd].
         """
         G, (Rd, Cd) = self.num_groups, self.image_shape
         if self.separable:
-            return torch.zeros(G * Rd, 3, Cd, device=self.device, dtype=self.dtype)
+            return torch.zeros(Rd * G, 3, Cd, device=self.device, dtype=self.dtype)
         return torch.zeros(3, G, Rd, Cd, device=self.device, dtype=self.dtype)
 
     def accumulate(self, accumulator: Tensor, image: Tensor, chunk_index: int) -> None:
         """Add the weighted image of one direction chunk to the accumulator in place (fluence, planar fluence, signal).
 
         When separable this is one batched matrix product,
-        ``accumulator[(g, r), j, c] += sum_k W[(g, r), j, k] image[k, g, r, c]``.
+        ``accumulator[(r, g), j, c] += sum_k W[(r, g), j, k] image[k, g, r, c]``, which reads an image stored rows-outer
+        in place.
 
         Args:
             accumulator (Tensor): the accumulator of :meth:`new_accumulator`.
-            image (Tensor): [k, G, Rd, Cd] projected attenuated emission of the chunk in photons/(cm^2 sr).
+            image (Tensor): [k, G, Rd, Cd] projected attenuated emission of the chunk in photons/(cm^2 sr), at best
+                stored rows-outer ([k, Rd, G, Cd] seen as [k, G, Rd, Cd], as :func:`combined_scatter_image` projects
+                it).
             chunk_index (int): index of the chunk.
         """
         start, stop = self.chunk_bounds[chunk_index]
         k = stop - start
         G, (Rd, Cd) = self.num_groups, self.image_shape
         if self.separable:
-            image_view = image.permute(1, 2, 0, 3).reshape(G * Rd, k, Cd)  # a view for a contiguous image
+            image_view = image.permute(2, 1, 0, 3).reshape(Rd * G, k, Cd)  # a view for a rows-outer image
             accumulator.baddbmm_(self.accumulation_weight[:, :, start:stop], image_view)
             return
         weights = self.weight_chunks[chunk_index]
@@ -379,7 +387,7 @@ class DirectionSetContext:
         """
         G, (Rd, Cd) = self.num_groups, self.image_shape
         if self.separable:
-            accumulator = accumulator.reshape(G, Rd, 3, Cd).permute(2, 0, 1, 3)
+            accumulator = accumulator.reshape(Rd, G, 3, Cd).permute(2, 1, 0, 3)
         fluence, planar, signal_per_group = (accumulator[j].contiguous() for j in range(3))
         return {"fluence": fluence, "planar_fluence": planar, "signal_per_group": signal_per_group,
                 "signal": signal_per_group.sum(0)}
@@ -509,11 +517,11 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
         del grid_block
     accumulation_weight = None
     if separable:
-        accumulation_weight = torch.empty(G, Rd, 3, K, device=device, dtype=dtype)
+        accumulation_weight = torch.empty(Rd, G, 3, K, device=device, dtype=dtype)  # rows outer
         accumulation_weight[:, :, 0] = weight64.to(dtype)
         accumulation_weight[:, :, 1] = (weight64 * cos64).to(dtype)
-        accumulation_weight[:, :, 2] = signal_weight[..., 0].permute(1, 2, 0)
-        accumulation_weight = accumulation_weight.reshape(G * Rd, 3, K)
+        accumulation_weight[:, :, 2] = signal_weight[..., 0].permute(2, 1, 0)
+        accumulation_weight = accumulation_weight.reshape(Rd * G, 3, K)
     chunk = max(1, int(chunk))
     chunk_bounds = tuple((start, min(start + chunk, K)) for start in range(0, K, chunk))
     omega = omega64.to(dtype).contiguous()
@@ -527,7 +535,9 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
         signal_weight=signal_weight, accumulation_weight=accumulation_weight, separable=separable, chunk=chunk,
         chunk_bounds=chunk_bounds, omega_chunks=tuple(omega[start:stop] for start, stop in chunk_bounds),
         weight_chunks=tuple(weight[start:stop] for start, stop in chunk_bounds), image_shape=(Rd, Cd),
-        cell_width=cell_width)
+        cell_width=cell_width,
+        # the same weight at every pixel: a grid response that does not depend on the angles
+        signal_group_weight=None if grid_response.depends_on_angles else signal_weight[:, :, 0, 0].contiguous())
 
 
 def _curved_panel_context(quadrature: Quadrature, geometry: ConeGeometry, angle: float, detector: DetectorResponse,
@@ -793,7 +803,8 @@ def box_blur_rows_cols(image: Tensor, width_channels: Tensor, width_rows: Tensor
     """Separable box blur of each image with its own fractional width in pixels along the channels and the rows.
 
     The window is centred on each pixel, clipped to the panel and renormalized there; a width of at most one pixel
-    leaves the image unchanged.
+    leaves the image unchanged. Images stored rows-outer ([k, Rd, G, Cd] seen as [k, G, Rd, Cd]) are blurred along
+    the rows with one product per direction and returned in the same layout.
 
     Args:
         image (Tensor): [k, G, Rd, Cd] images.
@@ -804,10 +815,43 @@ def box_blur_rows_cols(image: Tensor, width_channels: Tensor, width_rows: Tensor
         Tensor: [k, G, Rd, Cd] blurred images.
     """
     k, G, Rd, Cd = image.shape
+    rows_outer = image.permute(0, 2, 1, 3)
+    if G > 1 and rows_outer.is_contiguous():
+        channel_matrix = box_matrix(Cd, width_channels, image.dtype)  # [k, Cd, Cd]
+        row_matrix = box_matrix(Rd, width_rows, image.dtype)  # [k, Rd, Rd]
+        blurred = torch.bmm(rows_outer.view(k, Rd * G, Cd), channel_matrix.transpose(1, 2))
+        return torch.bmm(row_matrix, blurred.view(k, Rd, G * Cd)).view(k, Rd, G, Cd).permute(0, 2, 1, 3)
+    return box_blur_rows(box_blur_channels(image, width_channels), width_rows)
+
+
+def box_blur_channels(image: Tensor, width_channels: Tensor) -> Tensor:
+    """The box blur of :func:`box_blur_rows_cols` along the channels only.
+
+    Args:
+        image (Tensor): [k, G, Rd, Cd] images.
+        width_channels (Tensor): [k] widths along the channels in pixels.
+
+    Returns:
+        Tensor: [k, G, Rd, Cd] images blurred along the channels.
+    """
+    k, G, Rd, Cd = image.shape
     channel_matrix = box_matrix(Cd, width_channels, image.dtype)  # [k, Cd, Cd]
+    return torch.bmm(image.reshape(k, G * Rd, Cd), channel_matrix.transpose(1, 2)).view(k, G, Rd, Cd)
+
+
+def box_blur_rows(image: Tensor, width_rows: Tensor) -> Tensor:
+    """The box blur of :func:`box_blur_rows_cols` along the rows only.
+
+    Args:
+        image (Tensor): [k, G, Rd, Cd] images.
+        width_rows (Tensor): [k] widths along the rows in pixels.
+
+    Returns:
+        Tensor: [k, G, Rd, Cd] images blurred along the rows.
+    """
+    Rd = int(image.shape[2])
     row_matrix = box_matrix(Rd, width_rows, image.dtype)  # [k, Rd, Rd]
-    out = torch.bmm(image.reshape(k, G * Rd, Cd), channel_matrix.transpose(1, 2)).view(k, G, Rd, Cd)
-    return torch.matmul(row_matrix[:, None], out)
+    return torch.matmul(row_matrix[:, None], image)
 
 
 def box_matrix(N: int, w: Tensor, dtype: Optional[torch.dtype] = None) -> Tensor:
@@ -978,10 +1022,21 @@ class _Footprint:
         Returns:
             Tensor: [k, G, Rd, Cd] footprint images.
         """
-        start, stop = self.context.chunk_bounds[chunk_index]
-        # [k, 2] pixels (channels, rows)
-        widths = mean_heights[:, None] * self.context.cell_width[start:stop] * self.scale
+        widths = self.widths(chunk_index, mean_heights)
         return box_blur_rows_cols(image, widths[:, 0], widths[:, 1])
+
+    def widths(self, chunk_index: int, mean_heights: Tensor) -> Tensor:
+        """Box widths of the footprint of the directions of one chunk.
+
+        Args:
+            chunk_index (int): index of the chunk.
+            mean_heights (Tensor): [k] mean panel heights in cm.
+
+        Returns:
+            Tensor: [k, 2] widths in pixels along the channels and the rows.
+        """
+        start, stop = self.context.chunk_bounds[chunk_index]
+        return mean_heights[:, None] * self.context.cell_width[start:stop] * self.scale
 
 
 # =====================================================================================================
@@ -994,14 +1049,18 @@ def combined_scatter_image(library: MultigroupLibrary, rho_quadrature: Tensor, p
                            mu_t_coarse: Optional[Tensor], projectors: Projectors, detector: DetectorResponse,
                            grid_response: GridResponse, context: Optional[DirectionSetContext] = None,
                            chunk: int = 8, *, first_collision_chunk: int = 4, footprint: bool = True,
-                           pairs=None, grid_coarse: Optional[Grid] = None) -> dict[str, Tensor]:
+                           pairs=None, grid_coarse: Optional[Grid] = None,
+                           signal_only: bool = False) -> dict[str, Tensor]:
     """Total scatter image (first order plus multiple collision) of one view in one collapsed-cone pass.
 
     Per direction chunk the first-collision source at the quadrature points and the multiple-collision source of the
     transport cells are summed, attenuated (:func:`supervoxel_subpoint_emission`), projected from the quadrature points,
     footprint-blurred and accumulated (docs/source/method.rst, "Collapsed-cone scatter image"). On float32 CUDA tensors
     one fused kernel per chunk forms the attenuated emission and the sums of its mean height
-    (``uncollided_kernels.attenuated_emission``).
+    (``uncollided_kernels.attenuated_emission``). With ``signal_only`` the groups are summed with the signal weights
+    in that kernel when the weights are the same at every pixel, or between the blurs along the rows and the channels
+    when they vary along the rows only, which gives the signal of the full image to float rounding
+    (docs/source/design_notes.rst, "The signal alone").
 
     Args:
         library (MultigroupLibrary): cross-section library.
@@ -1029,9 +1088,11 @@ def combined_scatter_image(library: MultigroupLibrary, rho_quadrature: Tensor, p
             Defaults to None, decided here.
         grid_coarse (Grid, optional): the transport grid C, with ``grid_quadrature = C.refine(q)``. Defaults to None,
             ``grid_quadrature.coarsen(q)``.
+        signal_only (bool, optional): return the detector signal only. Defaults to False.
 
     Returns:
-        dict: fluence, planar_fluence and signal_per_group [G, Rd, Cd] and signal [Rd, Cd] of the total scatter.
+        dict: fluence, planar_fluence and signal_per_group [G, Rd, Cd] and signal [Rd, Cd] of the total scatter, or
+        the signal alone with ``signal_only``.
 
     Raises:
         ValueError: if a shape or the direction context does not match.
@@ -1072,10 +1133,18 @@ def combined_scatter_image(library: MultigroupLibrary, rho_quadrature: Tensor, p
     # one fused kernel per chunk on float32 CUDA: source, attenuation and mean-height sums without temporaries
     compact_pairs = pairs if not isinstance(pairs, str) else None
     fused = uncollided_kernels.fused_kernels_usable(library, rho, phi_uncollided, compact_pairs)
-
-    accumulator = context.new_accumulator()
+    # the signal alone: from the emission summed over the groups with the signal weights of each direction, or from
+    # the groups summed with the weights of each detector row between the blur of the rows and of the channels
+    group_weight = context.signal_group_weight if signal_only and fused else None
+    row_weight = (context.signal_weight if signal_only and group_weight is None and context.separable
+                  and context.planar_weight is None else None)  # [K, G, Rd, 1]
+    if group_weight is not None or row_weight is not None:
+        accumulator = torch.zeros(context.image_shape, device=device, dtype=dtype)
+    else:
+        accumulator = context.new_accumulator()
     for i, directions in enumerate(context.omega_chunks):
         k = int(directions.shape[0])
+        start, stop = context.chunk_bounds[i]
         # [k, G, Rc, Cc, Sc]
         tau = projectors.downstream_cumulative(mu_t_coarse, grid_coarse, geometry, angle, directions)
         # S_MC(Omega_k) per supervoxel
@@ -1085,7 +1154,9 @@ def combined_scatter_image(library: MultigroupLibrary, rho_quadrature: Tensor, p
             emission, height_sums = uncollided_kernels.attenuated_emission(
                 library, rho, phi_uncollided, grid_quadrature, geometry, angle, directions, tau, mu_t_coarse,
                 multiple_collision, f, None if footprint_blur is None else footprint_blur.heights,
-                pairs=compact_pairs)
+                pairs=compact_pairs, signal_weight=None if group_weight is None else group_weight[start:stop])
+            if group_weight is not None:
+                emission = emission[:, None]  # one group: the signal's emission
             if footprint_blur is not None:
                 mean_heights = footprint_blur.mean_height_from_sums(height_sums)
             del multiple_collision, tau, height_sums
@@ -1105,14 +1176,34 @@ def combined_scatter_image(library: MultigroupLibrary, rho_quadrature: Tensor, p
             del total_source, tau
             if footprint_blur is not None:
                 mean_heights = footprint_blur.mean_height(emission)
-        # [k, G, Rd, Cd] photons/(cm^2 sr)
-        image = projectors.oblique_project(emission, grid_quadrature, geometry, angle, directions)
-        if footprint_blur is not None:
-            image = footprint_blur.blur(image, i, mean_heights)
+        # [k, G, Rd, Cd] photons/(cm^2 sr), stored rows-outer: the blur along the rows is then one product per
+        # direction, and the accumulation reads the images in place
+        Rd, Cd = context.image_shape
+        rows_outer = torch.empty(k, Rd, int(emission.shape[1]), Cd, device=device, dtype=dtype)
+        image = projectors.oblique_project(emission, grid_quadrature, geometry, angle, directions,
+                                           out=rows_outer.permute(0, 2, 1, 3))
         del emission
-        context.accumulate(accumulator, image, i)
+        if row_weight is not None:
+            widths = None if footprint_blur is None else footprint_blur.widths(i, mean_heights)
+            if widths is not None:
+                rows_outer = torch.bmm(box_matrix(Rd, widths[:, 1], dtype), rows_outer.view(k, Rd, G * Cd))
+            weights = row_weight[start:stop, :, :, 0].transpose(1, 2)  # [k, Rd, G]
+            image = torch.bmm(weights.reshape(k * Rd, 1, G), rows_outer.view(k * Rd, G, Cd)).view(k, 1, Rd, Cd)
+            if widths is not None:
+                image = box_blur_channels(image, widths[:, 0])
+            accumulator.add_(image.sum(dim=(0, 1)))
+        else:
+            if footprint_blur is not None:
+                image = footprint_blur.blur(image, i, mean_heights)
+            if group_weight is not None:
+                accumulator.add_(image.sum(dim=(0, 1)))
+            else:
+                context.accumulate(accumulator, image, i)
         del image
-    return context.finalize(accumulator)
+    if group_weight is not None or row_weight is not None:
+        return {"signal": accumulator}
+    image = context.finalize(accumulator)
+    return {"signal": image["signal"]} if signal_only else image
 
 
 # =====================================================================================================

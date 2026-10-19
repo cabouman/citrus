@@ -224,7 +224,7 @@ def accumulator_update_operator(solver: ScatterSolver, rho: Tensor, grid: Grid, 
 
 def project_scatter(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float, phi_uncollided: Tensor,
                     collided_moments: Tensor, fields: Optional[MaterialFields] = None,
-                    quadrature: Optional[Quadrature] = None) -> dict[str, Tensor]:
+                    quadrature: Optional[Quadrature] = None, signal_only: bool = False) -> dict[str, Tensor]:
     """Total scatter image (first order and multiple collision) of one view in one collapsed-cone pass.
 
     Args:
@@ -239,15 +239,17 @@ def project_scatter(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float
         fields (MaterialFields, optional): prebuilt material fields of ``rho``. Defaults to None (built here).
         quadrature (Quadrature, optional): collapsed-cone direction set. Defaults to None (the solver's
             ``cone_quadrature``).
+        signal_only (bool, optional): the detector signal only (``ScatterSolver.scatter_image``). Defaults to False.
 
     Returns:
         dict[str, Tensor]: the image of ``ScatterSolver.scatter_image``: ``fluence``, ``planar_fluence``,
-            ``signal_per_group`` [G, Rd, Cd] and ``signal`` [Rd, Cd].
+            ``signal_per_group`` [G, Rd, Cd] and ``signal`` [Rd, Cd], or ``signal`` alone.
     """
     fields = _material_fields_or_build(solver, rho, grid, fields)
     scatter_source_moments = solver.multiple_collision_source_moments(
         fields, collided_moments.to(solver.device, solver.dtype))
-    return solver.scatter_image(fields, angle, phi_uncollided, scatter_source_moments, quadrature)
+    return solver.scatter_image(fields, angle, phi_uncollided, scatter_source_moments, quadrature,
+                                signal_only=signal_only)
 
 
 def citrus_step(solver: ScatterSolver, state: CitrusState, rho: Tensor, grid: Grid,
@@ -306,7 +308,7 @@ def citrus_view_step(solver: ScatterSolver, state: CitrusState, fields: Material
     new_collided_moments = accumulator_update_operator(solver, None, grid, angle, phi_uncollided,
                                                        state.collided_moments, fields)
     scatter = project_scatter(solver, None, grid, angle, phi_uncollided, new_collided_moments, fields,
-                              cone_quadrature)["signal"]
+                              cone_quadrature, signal_only=True)["signal"]
     del phi_uncollided
     primary_signal = solver.primary(fields, angle)["signal"] if primary else None
     if state.collided_moments is None:

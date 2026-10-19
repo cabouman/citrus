@@ -25,6 +25,12 @@ SELF_CHECK_REL_TOL = 1e-5
 BLOCK_V = 64  # points per program (tile [GP, BLOCK_V], about 2 elements per thread: the fastest size tried, see
 # docs/source/design_notes.rst)
 NUM_WARPS = 8
+# the emission kernel: 64 points per program on one warp while the fluence tiles of the diagonals, held through the
+# direction loop, stay small (D GP <= EMISSION_SMALL_BAND), else 32 points on two or four warps (the fastest tried)
+EMISSION_SMALL_BAND = 40
+EMISSION_MEDIUM_BAND = 160
+# directions per emission program at most: the fluence tiles of the points, loaded once, serve that many directions
+EMISSION_DIRECTIONS = 16
 
 _SELF_CHECK: dict[str, tuple[bool, str]] = {}
 # prepared tables: id(library.mu_s_eta) -> (weak reference to it, {(device, versions): (tab, eta_lo, eta_hi, map)});
@@ -190,8 +196,8 @@ def _self_check_fused(device: torch.device) -> tuple[bool, object]:
 
     The references are the PyTorch first-collision source with ``FirstCollisionSamplingCorrection.apply`` and
     ``restrict_to_linear_discontinuous_moments``, the weighted direction sums, and ``supervoxel_subpoint_emission`` of
-    the source plus the cell's multiple-collision source with its mean-height sums; in pair and dense mode, for
-    1, 2 and 3 points per cell, for a cone and a parallel beam.
+    the source plus the cell's multiple-collision source with its mean-height sums and its weighted group sum; in pair
+    and dense mode, for 1, 2 and 3 points per cell, for a cone and a parallel beam.
 
     Args:
         device (torch.device): the CUDA device to check.
@@ -271,6 +277,10 @@ def _self_check_fused(device: torch.device) -> tuple[bool, object]:
                          + multiple[:, :, :, None, :, None, :, None]).reshape(source.shape)
                 reference = supervoxel_subpoint_emission(total, tau, mu, directions, grid, f)
                 worst = max(worst, deviation(emission, reference))
+                signal_weight = torch.rand(5, G, generator=generator).to(device)
+                signal, _ = attenuated_emission(library, density, phi, grid, geometry, angle, directions, tau, mu,
+                                                multiple, f, heights, pairs=pair, signal_weight=signal_weight)
+                worst = max(worst, deviation(signal, torch.einsum("kg,kg...->k...", signal_weight, reference)))
                 per_point = reference.sum(dim=1).reshape(5, -1)
                 worst = max(worst, deviation(height_sums, torch.stack([per_point.sum(-1), per_point @ heights], -1)))
     torch.cuda.synchronize(device)
@@ -353,7 +363,8 @@ if triton is not None:
             PAIR (constexpr): pair mode.
 
         Returns:
-            (rh0, rh1, ma, mb): [1, BLOCK] densities and material indices of slots 0 and 1.
+            (rh0, rh1, ma, mb, second): [1, BLOCK] densities and material indices of slots 0 and 1, and whether a
+            point of the block has a second material.
         """
         if PAIR:
             rh0 = tl.load(rho_ptr + v, mask=vm, other=0.0)[None, :]
@@ -365,12 +376,34 @@ if triton is not None:
             rh1 = rh0
             ma = (v * 0)[None, :]
             mb = ma
-        return rh0, rh1, ma, mb
+        return rh0, rh1, ma, mb, tl.max(rh1) > 0
 
     @triton.jit
-    def _first_collision_at(v, vm, ux, uy, uz, ox, oy, oz, rh0, rh1, ma, mb, rho_ptr, phi_ptr, table_ptr, map_ptr,
+    def _phi_band(phi_ptr, v, vm, V, G: tl.constexpr, GP: tl.constexpr, D: tl.constexpr):
+        """Uncollided fluence of the incoming group of every diagonal of the table, ``phi[g - d, v]`` (0 for g < d).
+
+        Args:
+            phi_ptr: [G, V] float32 uncollided fluence.
+            v: [BLOCK] flat point indices.
+            vm: [BLOCK] mask of the valid points.
+            V: points.
+            G, GP, D (constexpr): groups, groups padded to a power of two and diagonals of the table.
+
+        Returns:
+            tuple: D [GP, BLOCK] tiles, row g of tile d the fluence of group g - d.
+        """
+        go = tl.arange(0, GP)
+        phis = ()
+        for d in tl.static_range(D):
+            g_in = go - d
+            mask = ((g_in >= 0) & (go < G))[:, None] & vm[None, :]
+            phis = phis + (tl.load(phi_ptr + g_in[:, None] * V + v[None, :], mask=mask, other=0.0),)
+        return phis
+
+    @triton.jit
+    def _first_collision_at(v, vm, ux, uy, uz, ox, oy, oz, rh0, rh1, ma, mb, second, rho_ptr, phis, table_ptr, map_ptr,
                             V, N, KM, eta_lo, eta_hi, G: tl.constexpr, GP: tl.constexpr, BLOCK: tl.constexpr,
-                            MT: tl.constexpr, PAIR: tl.constexpr, MAPPED: tl.constexpr):
+                            MT: tl.constexpr, PAIR: tl.constexpr, MAPPED: tl.constexpr, D: tl.constexpr):
         """First-collision source of the points v for one direction (ox, oy, oz), every outgoing group.
 
         Args:
@@ -378,14 +411,14 @@ if triton is not None:
             vm: [BLOCK] mask of the valid points.
             ux, uy, uz: [BLOCK] primary direction at the points.
             ox, oy, oz: the direction.
-            rh0, rh1, ma, mb: pair slots of the points (``_pair_slots``).
+            rh0, rh1, ma, mb, second: pair slots of the points (``_pair_slots``).
             rho_ptr: [MT, V] float32 densities (dense mode).
-            phi_ptr: [G, V] float32 uncollided fluence.
-            table_ptr: [MT, N, G, GP] float32 transfer table.
+            phis: the D [GP, BLOCK] fluence tiles of the diagonals (``_phi_band``).
+            table_ptr: [MT, N, D, GP] float32 transfer table by diagonals (``prepared_table``).
             map_ptr: [KM] float32 node map of an adaptive table.
             V, N, KM: points, eta nodes, map knots.
             eta_lo, eta_hi: ends of the eta grid.
-            G, GP, BLOCK, MT, PAIR, MAPPED (constexpr): as in ``_first_collision_kernel``.
+            G, GP, BLOCK, MT, PAIR, MAPPED, D (constexpr): as in ``_first_collision_kernel``.
 
         Returns:
             (acc, cosine): [GP, BLOCK] source (rows g >= G are 0) and the [BLOCK] unclamped cosine
@@ -395,7 +428,7 @@ if triton is not None:
         smask = (go < G)[:, None] & vm[None, :]
         nm1 = (N - 1).to(tl.float32)
         km1 = (KM - 1).to(tl.float32)
-        ROW: tl.constexpr = G * GP  # floats per eta node of one material; the next node's row follows
+        ROW: tl.constexpr = D * GP  # floats per eta node of one material; the next node's row follows
         cosine = ux * ox + uy * oy + uz * oz
         eta = tl.minimum(tl.maximum(cosine, eta_lo), eta_hi)
         if MAPPED:
@@ -416,33 +449,49 @@ if triton is not None:
         basea = rowoff + ma * (N * ROW)
         baseb = rowoff + mb * (N * ROW)
         acc = tl.zeros((GP, BLOCK), dtype=tl.float32)
-        for gi in tl.static_range(G):
-            ph = tl.load(phi_ptr + gi * V + v, mask=vm, other=0.0)
+        for d in tl.static_range(D):  # the diagonal g_out - g_in = d of every outgoing group
+            ph = phis[d]
             if PAIR:
-                offa = basea + gi * GP
-                offb = baseb + gi * GP
+                offa = basea + d * GP
                 a0 = tl.load(table_ptr + offa, mask=smask, other=0.0)
                 a1 = tl.load(table_ptr + offa + ROW, mask=smask, other=0.0)
-                b0 = tl.load(table_ptr + offb, mask=smask, other=0.0)
-                b1 = tl.load(table_ptr + offb + ROW, mask=smask, other=0.0)
-                T = rh0 * (a0 + (a1 - a0) * w) + rh1 * (b0 + (b1 - b0) * w)
+                T = rh0 * (a0 + (a1 - a0) * w)
+                if second:  # the second slot only in a block where a point has a second material
+                    offb = baseb + d * GP
+                    b0 = tl.load(table_ptr + offb, mask=smask, other=0.0)
+                    b1 = tl.load(table_ptr + offb + ROW, mask=smask, other=0.0)
+                    T += rh1 * (b0 + (b1 - b0) * w)
             else:
                 T = tl.zeros((GP, BLOCK), dtype=tl.float32)
                 for m in tl.static_range(MT):
                     rm = tl.load(rho_ptr + m * V + v, mask=vm, other=0.0)[None, :]
-                    off = rowoff + m * (N * ROW) + gi * GP
+                    off = rowoff + m * (N * ROW) + d * GP
                     t0 = tl.load(table_ptr + off, mask=smask, other=0.0)
                     t1 = tl.load(table_ptr + off + ROW, mask=smask, other=0.0)
                     T += rm * (t0 + (t1 - t0) * w)
-            acc += T * ph[None, :]
+            acc += T * ph
         return acc, cosine
+
+    @triton.jit
+    def _add_pairs(a0, a1, b0, b1):
+        """Combine of a reduction of two tensors at once: their elementwise sums.
+
+        Args:
+            a0, a1: the first pair.
+            b0, b1: the second pair.
+
+        Returns:
+            (a0 + b0, a1 + b1).
+        """
+        return a0 + b0, a1 + b1
 
     @triton.jit
     def _first_collision_kernel(rho_ptr, index_ptr, phi_ptr, x_axis_ptr, y_axis_ptr, z_axis_ptr, direction_ptr,
                                 table_ptr, map_ptr, out_ptr,
                                 V, C, S, K, N, KM, r0x, r0y, r0z, eta_lo, eta_hi,
                                 G: tl.constexpr, GP: tl.constexpr, KB: tl.constexpr, BLOCK: tl.constexpr,
-                                MT: tl.constexpr, PAIR: tl.constexpr, MAPPED: tl.constexpr, PARALLEL: tl.constexpr):
+                                MT: tl.constexpr, PAIR: tl.constexpr, MAPPED: tl.constexpr, PARALLEL: tl.constexpr,
+                                D: tl.constexpr):
         """First-collision source of BLOCK voxels (program_id 0) for KB directions (program_id 1).
 
         Args:
@@ -453,7 +502,7 @@ if triton is not None:
             y_axis_ptr: [R] float32 y of the voxel centers (rows) in cm.
             z_axis_ptr: [S] float32 z of the voxel centers (slices) in cm.
             direction_ptr: [K, 3] float32 unit directions.
-            table_ptr: [MT, N, G, GP] float32 transfer table from ``prepared_table``.
+            table_ptr: [MT, N, D, GP] float32 transfer table by diagonals from ``prepared_table``.
             map_ptr: [KM] float32 node map of an adaptive table (MAPPED).
             out_ptr: [K, G, V] float32 first-collision source.
             V: number of voxels.
@@ -475,6 +524,7 @@ if triton is not None:
             PAIR (constexpr): pair mode (two materials per voxel by index) instead of dense mode.
             MAPPED (constexpr): adaptive table read through ``map_ptr``; else uniform in eta.
             PARALLEL (constexpr): a parallel beam: ``Omega_UC`` is the beam direction (r0x, r0y, r0z) at every voxel.
+            D (constexpr): diagonals of the table, ``g_out - g_in = 0, ..., D - 1``.
         """
         pid_v = tl.program_id(0)
         pid_k = tl.program_id(1)
@@ -483,18 +533,19 @@ if triton is not None:
         i, j, kk = _point_indices(v, C, S)
         ux, uy, uz = _uncollided_direction(i, j, kk, vm, x_axis_ptr, y_axis_ptr, z_axis_ptr, r0x, r0y, r0z,
                                            BLOCK, PARALLEL)
-        rh0, rh1, ma, mb = _pair_slots(v, vm, rho_ptr, index_ptr, V, PAIR)
+        rh0, rh1, ma, mb, second = _pair_slots(v, vm, rho_ptr, index_ptr, V, PAIR)
         go = tl.arange(0, GP)
         smask = (go < G)[:, None] & vm[None, :]
+        phis = _phi_band(phi_ptr, v, vm, V, G, GP, D)
         for kb in range(KB):
             k = pid_k * KB + kb
             if k < K:
                 ox = tl.load(direction_ptr + 3 * k)
                 oy = tl.load(direction_ptr + 3 * k + 1)
                 oz = tl.load(direction_ptr + 3 * k + 2)
-                acc, cosine = _first_collision_at(v, vm, ux, uy, uz, ox, oy, oz, rh0, rh1, ma, mb, rho_ptr, phi_ptr,
-                                                  table_ptr, map_ptr, V, N, KM, eta_lo, eta_hi, G, GP, BLOCK, MT, PAIR,
-                                                  MAPPED)
+                acc, cosine = _first_collision_at(v, vm, ux, uy, uz, ox, oy, oz, rh0, rh1, ma, mb, second, rho_ptr,
+                                                  phis, table_ptr, map_ptr, V, N, KM, eta_lo, eta_hi, G, GP, BLOCK, MT,
+                                                  PAIR, MAPPED, D)
                 obase = (k.to(tl.int64) * G + go[:, None].to(tl.int64)) * V + v[None, :]
                 tl.store(out_ptr + obase, acc, mask=smask)
 
@@ -504,7 +555,7 @@ if triton is not None:
                                        V, C, S, NC, CC, SC, K, N, KM, r0x, r0y, r0z, eta_lo, eta_hi, slope_scale,
                                        G: tl.constexpr, GP: tl.constexpr, KB: tl.constexpr, BLOCK: tl.constexpr,
                                        MT: tl.constexpr, F: tl.constexpr, PAIR: tl.constexpr, MAPPED: tl.constexpr,
-                                       PARALLEL: tl.constexpr, CELL_MAJOR: tl.constexpr):
+                                       PARALLEL: tl.constexpr, CELL_MAJOR: tl.constexpr, D: tl.constexpr):
         """Linear-discontinuous moments of the corrected first-collision source of BLOCK transport cells.
 
         For every cell (program_id 0) and KB directions (program_id 1) the source is evaluated at the F^3 quadrature
@@ -522,7 +573,7 @@ if triton is not None:
             NC, CC, SC: cells, columns and slices of the transport grid.
             K, N, KM, r0x, r0y, r0z, eta_lo, eta_hi: as in ``_first_collision_kernel``.
             slope_scale: ``1 / mean(u^2)`` of the local coordinates ``u = (2j + 1)/F - 1``.
-            G, GP, KB, MT, PAIR, MAPPED, PARALLEL (constexpr): as in ``_first_collision_kernel``.
+            G, GP, KB, MT, PAIR, MAPPED, PARALLEL, D (constexpr): as in ``_first_collision_kernel``.
             BLOCK (constexpr): cells per program.
             F (constexpr): quadrature points per axis per cell.
             CELL_MAJOR (constexpr): write the moments cell-major.
@@ -558,10 +609,11 @@ if triton is not None:
                     v = (i * C + j) * S + kk
                     ux, uy, uz = _uncollided_direction(i, j, kk, cm, x_axis_ptr, y_axis_ptr, z_axis_ptr, r0x, r0y,
                                                        r0z, BLOCK, PARALLEL)
-                    rh0, rh1, ma, mb = _pair_slots(v, cm, rho_ptr, index_ptr, V, PAIR)
-                    acc, cosine = _first_collision_at(v, cm, ux, uy, uz, ox, oy, oz, rh0, rh1, ma, mb, rho_ptr,
-                                                      phi_ptr, table_ptr, map_ptr, V, N, KM, eta_lo, eta_hi, G, GP,
-                                                      BLOCK, MT, PAIR, MAPPED)
+                    rh0, rh1, ma, mb, second = _pair_slots(v, cm, rho_ptr, index_ptr, V, PAIR)
+                    phis = _phi_band(phi_ptr, v, cm, V, G, GP, D)
+                    acc, cosine = _first_collision_at(v, cm, ux, uy, uz, ox, oy, oz, rh0, rh1, ma, mb, second, rho_ptr,
+                                                      phis, table_ptr, map_ptr, V, N, KM, eta_lo, eta_hi, G, GP,
+                                                      BLOCK, MT, PAIR, MAPPED, D)
                     gv = go[:, None] * V + v[None, :]
                     sc = tl.load(scale_ptr + gv, mask=smask, other=0.0)
                     be = tl.load(beta_ptr + gv, mask=smask, other=0.0)
@@ -586,7 +638,8 @@ if triton is not None:
                                      weight_ptr, table_ptr, map_ptr, moment_ptr, out_ptr,
                                      V, C, S, K, N, KM, r0x, r0y, r0z, eta_lo, eta_hi,
                                      G: tl.constexpr, GP: tl.constexpr, BLOCK: tl.constexpr, MT: tl.constexpr,
-                                     PAIR: tl.constexpr, MAPPED: tl.constexpr, PARALLEL: tl.constexpr):
+                                     PAIR: tl.constexpr, MAPPED: tl.constexpr, PARALLEL: tl.constexpr,
+                                     D: tl.constexpr):
         """Quadrature sums I0, I1, I2 of the first-collision source over all K directions, and its exact moments.
 
         ``I_n = sum_k w_k cosine_k^n S_k`` with ``cosine_k = Omega_UC . omega_k`` (``uncollided.
@@ -601,7 +654,7 @@ if triton is not None:
             moment_ptr: [MT, G, 2, GP] float32 Legendre transfer moments l = 0, 1 (``prepared_moment_table``).
             out_ptr: [5, G, V] float32 sums I0, I1, I2 and moments E0, E1.
             V, C, S, K, N, KM, r0x, r0y, r0z, eta_lo, eta_hi: as in ``_first_collision_kernel``.
-            G, GP, BLOCK, MT, PAIR, MAPPED, PARALLEL (constexpr): as in ``_first_collision_kernel``.
+            G, GP, BLOCK, MT, PAIR, MAPPED, PARALLEL, D (constexpr): as in ``_first_collision_kernel``.
         """
         pid_v = tl.program_id(0)
         v = pid_v * BLOCK + tl.arange(0, BLOCK)
@@ -609,7 +662,7 @@ if triton is not None:
         i, j, kk = _point_indices(v, C, S)
         ux, uy, uz = _uncollided_direction(i, j, kk, vm, x_axis_ptr, y_axis_ptr, z_axis_ptr, r0x, r0y, r0z,
                                            BLOCK, PARALLEL)
-        rh0, rh1, ma, mb = _pair_slots(v, vm, rho_ptr, index_ptr, V, PAIR)
+        rh0, rh1, ma, mb, second = _pair_slots(v, vm, rho_ptr, index_ptr, V, PAIR)
         go = tl.arange(0, GP)
         smask = (go < G)[:, None] & vm[None, :]
         # the exact moments, once per point
@@ -635,14 +688,15 @@ if triton is not None:
         I0 = tl.zeros((GP, BLOCK), dtype=tl.float32)
         I1 = tl.zeros((GP, BLOCK), dtype=tl.float32)
         I2 = tl.zeros((GP, BLOCK), dtype=tl.float32)
+        phis = _phi_band(phi_ptr, v, vm, V, G, GP, D)
         for k in range(K):
             ox = tl.load(direction_ptr + 3 * k)
             oy = tl.load(direction_ptr + 3 * k + 1)
             oz = tl.load(direction_ptr + 3 * k + 2)
             wk = tl.load(weight_ptr + k)
-            acc, cosine = _first_collision_at(v, vm, ux, uy, uz, ox, oy, oz, rh0, rh1, ma, mb, rho_ptr, phi_ptr,
+            acc, cosine = _first_collision_at(v, vm, ux, uy, uz, ox, oy, oz, rh0, rh1, ma, mb, second, rho_ptr, phis,
                                               table_ptr, map_ptr, V, N, KM, eta_lo, eta_hi, G, GP, BLOCK, MT, PAIR,
-                                              MAPPED)
+                                              MAPPED, D)
             ws = acc * wk
             mu = cosine[None, :]
             I0 += ws
@@ -657,17 +711,18 @@ if triton is not None:
 
     @triton.jit
     def _attenuated_emission_kernel(rho_ptr, index_ptr, phi_ptr, x_axis_ptr, y_axis_ptr, z_axis_ptr, direction_ptr,
-                                    table_ptr, map_ptr, tau_ptr, mu_ptr, multiple_ptr, height_ptr, out_ptr,
+                                    table_ptr, map_ptr, tau_ptr, mu_ptr, multiple_ptr, height_ptr, weight_ptr, out_ptr,
                                     partial_ptr,
                                     V, C, S, NC, CC, SC, K, N, KM, r0x, r0y, r0z, eta_lo, eta_hi, dx, dy, dz, NP,
                                     G: tl.constexpr, GP: tl.constexpr, KB: tl.constexpr, BLOCK: tl.constexpr,
                                     MT: tl.constexpr, F: tl.constexpr, PAIR: tl.constexpr, MAPPED: tl.constexpr,
-                                    PARALLEL: tl.constexpr):
+                                    PARALLEL: tl.constexpr, SIGNAL: tl.constexpr, D: tl.constexpr):
         """Attenuated total emission of BLOCK quadrature points for KB directions, with the sums of its mean height.
 
         ``e = (S_FC + S_MC,cell) exp(-max(0, tau_cell - mu_t,cell (omega . (r - r_cell))))`` per point and group
         (``scatter_image.supervoxel_subpoint_emission`` of the first-collision plus the multiple-collision source), and
-        per program the sums of ``e`` and ``e h`` over its points and groups, h the panel height of each point.
+        per program the sums of ``e`` and ``e h`` over its points and groups, h the panel height of each point. With
+        SIGNAL the groups are summed with the signal weights of the direction, ``sum_g W[k, g] e_g``.
 
         Args:
             rho_ptr, index_ptr, phi_ptr, x_axis_ptr, y_axis_ptr, z_axis_ptr, direction_ptr, table_ptr, map_ptr:
@@ -676,15 +731,17 @@ if triton is not None:
             mu_ptr: [G, NC] float32 total attenuation of the cells in cm^-1.
             multiple_ptr: [K, G, NC] float32 multiple-collision source of the cells.
             height_ptr: [V] float32 panel height of the points in cm.
-            out_ptr: [K, G, V] float32 attenuated emission.
+            weight_ptr: [K, G] float32 signal weights (SIGNAL).
+            out_ptr: [K, G, V] float32 attenuated emission, or [K, V] its weighted group sum (SIGNAL).
             partial_ptr: [K, NP, 2] float32 sums of e and of e h per program.
             V, C, S: points, columns and slices of the quadrature grid.
             NC, CC, SC: cells, columns and slices of the transport grid.
             K, N, KM, r0x, r0y, r0z, eta_lo, eta_hi: as in ``_first_collision_kernel``.
             dx, dy, dz: point pitches of the quadrature grid along x (cols), y (rows), z (slices) in cm.
             NP: number of point programs (program_id 0).
-            G, GP, KB, BLOCK, MT, PAIR, MAPPED, PARALLEL (constexpr): as in ``_first_collision_kernel``.
+            G, GP, KB, BLOCK, MT, PAIR, MAPPED, PARALLEL, D (constexpr): as in ``_first_collision_kernel``.
             F (constexpr): quadrature points per axis per cell.
+            SIGNAL (constexpr): store the weighted group sum.
         """
         pid_v = tl.program_id(0)
         pid_k = tl.program_id(1)
@@ -693,7 +750,7 @@ if triton is not None:
         i, j, kk = _point_indices(v, C, S)
         ux, uy, uz = _uncollided_direction(i, j, kk, vm, x_axis_ptr, y_axis_ptr, z_axis_ptr, r0x, r0y, r0z,
                                            BLOCK, PARALLEL)
-        rh0, rh1, ma, mb = _pair_slots(v, vm, rho_ptr, index_ptr, V, PAIR)
+        rh0, rh1, ma, mb, second = _pair_slots(v, vm, rho_ptr, index_ptr, V, PAIR)
         ic = i // F
         jc = j // F
         kc = kk // F
@@ -708,15 +765,16 @@ if triton is not None:
         smask = (go < G)[:, None] & vm[None, :]
         gcell = go[:, None] * NC + cell[None, :]
         mu = tl.load(mu_ptr + gcell, mask=smask, other=0.0)
+        phis = _phi_band(phi_ptr, v, vm, V, G, GP, D)
         for kb in range(KB):
             k = pid_k * KB + kb
             if k < K:
                 ox = tl.load(direction_ptr + 3 * k)
                 oy = tl.load(direction_ptr + 3 * k + 1)
                 oz = tl.load(direction_ptr + 3 * k + 2)
-                acc, cosine = _first_collision_at(v, vm, ux, uy, uz, ox, oy, oz, rh0, rh1, ma, mb, rho_ptr, phi_ptr,
-                                                  table_ptr, map_ptr, V, N, KM, eta_lo, eta_hi, G, GP, BLOCK, MT, PAIR,
-                                                  MAPPED)
+                acc, cosine = _first_collision_at(v, vm, ux, uy, uz, ox, oy, oz, rh0, rh1, ma, mb, second, rho_ptr,
+                                                  phis, table_ptr, map_ptr, V, N, KM, eta_lo, eta_hi, G, GP, BLOCK, MT,
+                                                  PAIR, MAPPED, D)
                 offset = oy * oy_cell + ox * ox_cell + oz * oz_cell
                 kcell = k.to(tl.int64) * G * NC + gcell
                 tau = tl.load(tau_ptr + kcell, mask=smask, other=0.0)
@@ -724,9 +782,14 @@ if triton is not None:
                 depth = tl.maximum(tau - mu * offset[None, :], 0.0)
                 e = (acc + multiple) * _exp(-depth)
                 e = tl.where(smask, e, 0.0)
-                obase = (k.to(tl.int64) * G + go[:, None].to(tl.int64)) * V + v[None, :]
-                tl.store(out_ptr + obase, e, mask=smask)
-                per_point = tl.sum(e, axis=0)
+                if SIGNAL:  # the plain and the weighted group sums in one reduction
+                    w = tl.load(weight_ptr + k * G + go, mask=go < G, other=0.0)
+                    per_point, weighted = tl.reduce((e, e * w[:, None]), 0, _add_pairs)
+                    tl.store(out_ptr + k.to(tl.int64) * V + v, weighted, mask=vm)
+                else:
+                    obase = (k.to(tl.int64) * G + go[:, None].to(tl.int64)) * V + v[None, :]
+                    tl.store(out_ptr + obase, e, mask=smask)
+                    per_point = tl.sum(e, axis=0)
                 pbase = (k.to(tl.int64) * NP + pid_v) * 2
                 tl.store(partial_ptr + pbase, tl.sum(per_point, axis=0))
                 tl.store(partial_ptr + pbase + 1, tl.sum(per_point * h, axis=0))
@@ -759,9 +822,10 @@ def prepared_table(library, device: torch.device) -> tuple[Tensor, float, float,
         device (torch.device): the CUDA device.
 
     Returns:
-        (table, eta_lo, eta_hi, map): table is the [M, N, G_in, GP] float32 transfer table in cm^2/g/sr, zero where
-        ``g_out < g_in`` or ``g_out >= G``; eta_lo and eta_hi the ends of the eta grid; map the [KM] float32 node map
-        (None for a uniform table).
+        (table, eta_lo, eta_hi, map): table is the [M, N, D, GP] float32 transfer table in cm^2/g/sr by diagonals,
+        entry [m, n, d, g] the transfer from group g - d to group g at node n (zero for g < d and g >= G), for the D
+        diagonals up to the last one with a nonzero entry (no upscatter); eta_lo and eta_hi the ends of the eta grid;
+        map the [KM] float32 node map (None for a uniform table).
     """
     source_table = library.mu_s_eta
     eta_map = getattr(library, "eta_map", None)
@@ -776,8 +840,14 @@ def prepared_table(library, device: torch.device) -> tuple[Tensor, float, float,
     GP = _next_pow2(G)
     t = source_table.to(device=device, dtype=torch.float32)
     t = t * torch.triu(torch.ones(G, G, device=device, dtype=torch.float32))[None, :, :, None]
-    kernel_table = torch.zeros(M, N, G, GP, device=device, dtype=torch.float32)
-    kernel_table[..., :G] = t.permute(0, 3, 1, 2)
+    # the diagonals g_out - g_in = d up to the last one with a nonzero entry (the downscatter band)
+    nonzero = (t != 0).any(dim=3).any(dim=0).cpu()
+    offsets = torch.arange(G)[None, :] - torch.arange(G)[:, None]
+    D = int(offsets[nonzero].max()) + 1 if bool(nonzero.any()) else 1
+    kernel_table = torch.zeros(M, N, D, GP, device=device, dtype=torch.float32)
+    for d in range(D):
+        g_out = torch.arange(d, G, device=device)
+        kernel_table[:, :, d, d:G] = t[:, g_out - d, g_out, :].permute(0, 2, 1)
     eta_grid = library.eta_grid.detach().to("cpu", torch.float64)
     kernel_map = None if eta_map is None else eta_map.detach().to(device=device, dtype=torch.float32).contiguous()
     entry = (kernel_table.contiguous(), float(eta_grid[0]), float(eta_grid[-1]), kernel_map)
@@ -825,21 +895,38 @@ def prepared_moment_table(library, device: torch.device) -> Tensor:
     return table
 
 
-def _directions_per_program(K: int, num_vblocks: int, device: torch.device) -> int:
-    """Choose the directions per program: as many as possible (up to 8) while keeping at least 8 programs per SM.
+def _emission_launch(diagonals: int, padded_groups: int) -> tuple[int, int]:
+    """Points per program and warps of the emission kernel for a table of D diagonals of GP padded groups.
+
+    Args:
+        diagonals (int): diagonals D of the transfer table.
+        padded_groups (int): groups padded to a power of two, GP.
+
+    Returns:
+        (int, int): points per program and warps.
+    """
+    size = diagonals * padded_groups
+    if size <= EMISSION_SMALL_BAND:
+        return 64, 1
+    return (32, 2) if size <= EMISSION_MEDIUM_BAND else (32, 4)
+
+
+def _directions_per_program(K: int, num_vblocks: int, device: torch.device, most: int = 8) -> int:
+    """Choose the directions per program: as many as possible (up to ``most``) while keeping at least 8 programs per SM.
 
     Args:
         K (int): number of directions.
         num_vblocks (int): number of voxel blocks.
         device (torch.device): the CUDA device.
+        most (int, optional): the largest number of directions per program, a power of two. Defaults to 8.
 
     Returns:
-        int: directions per program, a power of two in [1, 8].
+        int: directions per program, a power of two in [1, most].
     """
     num_multiprocessors = torch.cuda.get_device_properties(device).multi_processor_count
     target = 8 * num_multiprocessors
     per_program = 1
-    while per_program < 8 and per_program < K and num_vblocks * -(-K // (2 * per_program)) >= target:
+    while per_program < most and per_program < K and num_vblocks * -(-K // (2 * per_program)) >= target:
         per_program *= 2
     return per_program
 
@@ -880,7 +967,7 @@ def _kernel_inputs(library, rho: Tensor, phi_uncollided: Tensor, grid, geometry,
     Returns:
         dict: the kernel arguments ``rho``, ``index``, ``phi``, ``x``, ``y``, ``z``, ``table``, ``map``, the sizes
             ``V``, ``C``, ``S``, ``N``, ``KM``, the focal spot (or beam direction) ``r0``, ``eta_lo``, ``eta_hi`` and
-            the constexprs ``G``, ``GP``, ``MT``, ``PAIR``, ``MAPPED``, ``PARALLEL``.
+            the constexprs ``G``, ``GP``, ``MT``, ``PAIR``, ``MAPPED``, ``PARALLEL``, ``D``.
 
     Raises:
         ValueError: if the tensors are not float32 CUDA tensors or do not match the table and the grid.
@@ -912,7 +999,7 @@ def _kernel_inputs(library, rho: Tensor, phi_uncollided: Tensor, grid, geometry,
                 KM=2 if kernel_map is None else int(kernel_map.shape[0]), r0=(float(r0[0]), float(r0[1]),
                                                                              float(r0[2])),
                 eta_lo=eta_lo, eta_hi=eta_hi, G=G, GP=_next_pow2(G), MT=int(table.shape[0]), PAIR=pairs is not None,
-                MAPPED=kernel_map is not None, PARALLEL=parallel)
+                MAPPED=kernel_map is not None, PARALLEL=parallel, D=int(table.shape[2]))
 
 
 def first_collision_source(library, rho: Tensor, phi_uncollided: Tensor, grid, geometry, angle: float, omegas: Tensor,
@@ -945,7 +1032,7 @@ def first_collision_source(library, rho: Tensor, phi_uncollided: Tensor, grid, g
         a["rho"], a["index"], a["phi"], a["x"], a["y"], a["z"], directions, a["table"], a["map"], out,
         V, a["C"], a["S"], K, a["N"], a["KM"], *a["r0"], a["eta_lo"], a["eta_hi"],
         G=a["G"], GP=a["GP"], KB=directions_per_program, BLOCK=BLOCK_V, MT=a["MT"], PAIR=a["PAIR"],
-        MAPPED=a["MAPPED"], PARALLEL=a["PARALLEL"], num_warps=NUM_WARPS)
+        MAPPED=a["MAPPED"], D=a["D"], PARALLEL=a["PARALLEL"], num_warps=NUM_WARPS)
     return out
 
 
@@ -1001,7 +1088,7 @@ def first_collision_moments(library, rho: Tensor, phi_uncollided: Tensor, grid, 
         a["rho"], a["index"], a["phi"], a["x"], a["y"], a["z"], directions, a["table"], a["map"], scale_flat,
         beta_flat, out, a["V"], a["C"], a["S"], NC, Cc, Sc, K, a["N"], a["KM"], *a["r0"], a["eta_lo"],
         a["eta_hi"], slope_scale,
-        G=G, GP=a["GP"], KB=1, BLOCK=BLOCK_V, MT=a["MT"], F=f, PAIR=a["PAIR"], MAPPED=a["MAPPED"],
+        G=G, GP=a["GP"], KB=1, BLOCK=BLOCK_V, MT=a["MT"], F=f, PAIR=a["PAIR"], MAPPED=a["MAPPED"], D=a["D"],
         PARALLEL=a["PARALLEL"], CELL_MAJOR=bool(cell_major), num_warps=NUM_WARPS)
     return out
 
@@ -1043,19 +1130,21 @@ def first_collision_sums(library, rho: Tensor, phi_uncollided: Tensor, grid, geo
         a["rho"], a["index"], a["phi"], a["x"], a["y"], a["z"], directions, weight, a["table"], a["map"], moments,
         out,
         V, a["C"], a["S"], K, a["N"], a["KM"], *a["r0"], a["eta_lo"], a["eta_hi"],
-        G=G, GP=a["GP"], BLOCK=BLOCK_V, MT=a["MT"], PAIR=a["PAIR"], MAPPED=a["MAPPED"], PARALLEL=a["PARALLEL"],
-        num_warps=NUM_WARPS)
+        G=G, GP=a["GP"], BLOCK=BLOCK_V, MT=a["MT"], PAIR=a["PAIR"], MAPPED=a["MAPPED"], D=a["D"],
+        PARALLEL=a["PARALLEL"], num_warps=NUM_WARPS)
     return out if exact_moments else out[:3]
 
 
 def attenuated_emission(library, rho: Tensor, phi_uncollided: Tensor, grid, geometry, angle: float, omegas: Tensor,
                         tau_coarse: Tensor, mu_t_coarse: Tensor, multiple_collision: Tensor, factor: int,
-                        heights: Optional[Tensor] = None, pairs=None) -> tuple[Tensor, Tensor]:
+                        heights: Optional[Tensor] = None, pairs=None,
+                        signal_weight: Optional[Tensor] = None) -> tuple[Tensor, Tensor]:
     """Attenuated total emission at the quadrature points and the sums of its mean panel height, per direction.
 
     The fused form of ``first_collision_source_at_directions``, the addition of the cell's multiple-collision source
     and ``scatter_image.supervoxel_subpoint_emission``; the per-direction sums replace the reduction of
-    ``scatter_image._Footprint.mean_height``.
+    ``scatter_image._Footprint.mean_height``. With ``signal_weight`` the groups are summed with those weights, the
+    emission of the detector signal when the weights are the same over the whole panel.
 
     Args:
         library (MultigroupLibrary): the library.
@@ -1071,10 +1160,12 @@ def attenuated_emission(library, rho: Tensor, phi_uncollided: Tensor, grid, geom
         factor (int): quadrature points per axis per cell.
         heights (Tensor, optional): [rows * cols * slices] panel heights of the points in cm. Defaults to None (zeros).
         pairs (MaterialPairs, optional): pair representation of ``rho``, or None for dense mode. Defaults to None.
+        signal_weight (Tensor, optional): [K, G] signal weights of the directions. Defaults to None (every group).
 
     Returns:
-        (Tensor, Tensor): the [K, G, rows, cols, slices] attenuated emission and the [K, 2] sums of the emission and of
-            the emission times the height.
+        (Tensor, Tensor): the [K, G, rows, cols, slices] attenuated emission, or [K, rows, cols, slices] its group sum
+            with ``signal_weight``, and the [K, 2] sums of the emission and of the emission times the height (over the
+            groups, unweighted).
     """
     a = _kernel_inputs(library, rho, phi_uncollided, grid, geometry, angle, pairs)
     device = phi_uncollided.device
@@ -1093,19 +1184,24 @@ def attenuated_emission(library, rho: Tensor, phi_uncollided: Tensor, grid, geom
     mu = mu_t_coarse.to(device=device, dtype=torch.float32).contiguous()
     h = (torch.zeros(V, device=device, dtype=torch.float32) if heights is None
          else heights.to(device=device, dtype=torch.float32).reshape(-1).contiguous())
-    out = torch.empty(K, G, *grid.shape, device=device, dtype=torch.float32)
-    num_voxel_blocks = -(-V // BLOCK_V)
+    signal = signal_weight is not None
+    if signal and tuple(signal_weight.shape) != (K, G):
+        raise ValueError(f"signal_weight {tuple(signal_weight.shape)} != {(K, G)}")
+    weight = (signal_weight.to(device=device, dtype=torch.float32).contiguous() if signal else h)
+    out = torch.empty((K,) + (() if signal else (G,)) + tuple(grid.shape), device=device, dtype=torch.float32)
+    block, warps = _emission_launch(a["D"], a["GP"])
+    num_voxel_blocks = -(-V // block)
     partial = torch.empty(K, num_voxel_blocks, 2, device=device, dtype=torch.float32)
     if K == 0 or V == 0:
         return out, torch.zeros(K, 2, device=device, dtype=torch.float32)
-    directions_per_program = _directions_per_program(K, num_voxel_blocks, device)
+    directions_per_program = _directions_per_program(K, num_voxel_blocks, device, most=EMISSION_DIRECTIONS)
     dx, dy, dz = (float(d) for d in grid.deltas)
     _attenuated_emission_kernel[(num_voxel_blocks, -(-K // directions_per_program))](
         a["rho"], a["index"], a["phi"], a["x"], a["y"], a["z"], directions, a["table"], a["map"], tau, mu, multiple,
-        h, out, partial, V, a["C"], a["S"], NC, Cc, Sc, K, a["N"], a["KM"], *a["r0"], a["eta_lo"], a["eta_hi"],
-        dx, dy, dz, num_voxel_blocks,
-        G=G, GP=a["GP"], KB=directions_per_program, BLOCK=BLOCK_V, MT=a["MT"], F=f, PAIR=a["PAIR"],
-        MAPPED=a["MAPPED"], PARALLEL=a["PARALLEL"], num_warps=NUM_WARPS)
+        h, weight, out, partial, V, a["C"], a["S"], NC, Cc, Sc, K, a["N"], a["KM"], *a["r0"], a["eta_lo"],
+        a["eta_hi"], dx, dy, dz, num_voxel_blocks,
+        G=G, GP=a["GP"], KB=directions_per_program, BLOCK=block, MT=a["MT"], F=f, PAIR=a["PAIR"],
+        MAPPED=a["MAPPED"], D=a["D"], PARALLEL=a["PARALLEL"], SIGNAL=signal, num_warps=warps)
     return out, partial.sum(dim=1)
 
 

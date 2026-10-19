@@ -883,7 +883,7 @@ class ScatterSolver:
 
     def scatter_image(self, fields: MaterialFields, angle: float, phi_uncollided: Tensor,
                       scatter_source_moments: Tensor, quadrature: Optional[Quadrature] = None,
-                      context: Optional[DirectionSetContext] = None) -> dict[str, Tensor]:
+                      context: Optional[DirectionSetContext] = None, signal_only: bool = False) -> dict[str, Tensor]:
         """Total scatter image of a view in one collapsed-cone pass (first-collision plus multiple-collision source).
 
         Both sources share the downstream attenuation, one projection per direction chunk and the finite-cone footprint
@@ -897,9 +897,11 @@ class ScatterSolver:
             quadrature (Quadrature, optional): collapsed-cone direction set. Defaults to None, :meth:`cone_quadrature`.
             context (DirectionSetContext, optional): direction context of the view. Defaults to None,
                 :meth:`direction_context`.
+            signal_only (bool, optional): the detector signal only, from one image per direction when the signal
+                weights are the same at every pixel (``combined_scatter_image``). Defaults to False.
 
         Returns:
-            dict: fluence, planar_fluence and signal_per_group [G, Rd, Cd] and signal [Rd, Cd].
+            dict: fluence, planar_fluence and signal_per_group [G, Rd, Cd] and signal [Rd, Cd], or the signal alone.
         """
         quadrature = self.cone_quadrature(fields.grid_fine, angle) if quadrature is None else quadrature
         context = self.direction_context(fields, angle, quadrature) if context is None else context
@@ -908,7 +910,7 @@ class ScatterSolver:
             scatter_source_moments, self.L, self.geometry, angle, quadrature, fields.mu_t_coarse, self.projectors,
             self.detector, self.grid_response, context, chunk=self.config.direction_chunk,
             first_collision_chunk=self.first_collision_chunk, pairs=fields.first_collision_pairs,
-            grid_coarse=fields.grid_coarse)
+            grid_coarse=fields.grid_coarse, signal_only=signal_only)
 
     def primary(self, fields: MaterialFields, angle: float) -> dict[str, Tensor]:
         """Primary image of a view, exact in energy, ray traced on the fine grid.

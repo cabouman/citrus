@@ -6,6 +6,7 @@ The oracle tests compare single rays per pixel, so the image functions are calle
 finite-cone footprint is tested in tests/test_footprint.py."""
 
 import functools
+from dataclasses import replace
 import math
 
 import numpy as np
@@ -832,12 +833,13 @@ def test_combined_scatter_image_wlab_cuda():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("narrow_band", [False, True])
 @pytest.mark.parametrize("footprint", [False, True])
-def test_combined_scatter_image_fused_matches_torch(footprint, monkeypatch):
+def test_combined_scatter_image_fused_matches_torch(footprint, narrow_band, monkeypatch):
     """float32 CUDA, WLAB 2 cm: the combined pass with the fused emission kernel (first-collision source, the cell's
     multiple-collision source, in-cell attenuation and the mean-height sums in one kernel per chunk) == the PyTorch
     composition to 1e-5 (every key), with and without the finite-cone footprint, whose mean heights then come from the
-    kernel's sums."""
+    kernel's sums; also for a transfer table that ends two groups below the incoming one (two diagonals of three)."""
     from citrus.utilities import wlab_phantom
     from citrus.scatter_solver.kernels import uncollided_kernels
     from citrus.scatter_solver.scatter_image import make_direction_context
@@ -849,6 +851,10 @@ def test_combined_scatter_image_fused_matches_torch(footprint, monkeypatch):
     grid = Grid((10, 16, 20), 2.0)  # padded along x to be divisible by 2
     rho = wlab_phantom(grid, device=device, dtype=torch.float32)
     library = synthetic_library(num_groups=3, legendre_order=2, num_materials=7).to(device, torch.float32)
+    if narrow_band:  # no transfer two groups down: the kernels' table holds two diagonals
+        below = torch.arange(3)[None, :] - torch.arange(3)[:, None]
+        library = replace(library, mu_s_eta=library.mu_s_eta * (below < 2).to(device, torch.float32)[None, :, :, None])
+        assert uncollided_kernels.prepared_table(library, device)[0].shape[2] == 2
     angle = 0.3
     phi_uncollided = uncollided_fluence(library, rho, grid, geometry, angle, SourceModel(), PROJECTION)
     q = panel_direction_set(geometry, angle, (8, 16), max_polar_angle=grid, device=device, dtype=torch.float32)
@@ -873,6 +879,90 @@ def test_combined_scatter_image_fused_matches_torch(footprint, monkeypatch):
                    functools.partial(first_collision_source_at_directions, backend="torch"))
         reference = image()
     _assert_images_close(fused, reference, rtol=1e-5, msg=f"footprint={footprint}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("route", ["groups in the emission", "rows", "full image", "unfused"])
+def test_signal_only_matches_full_signal(route, monkeypatch):
+    """combined_scatter_image(signal_only=True) returns the signal of the full image to float rounding on each of its
+    routes: the groups summed with the signal weights in the emission kernel (no grid on a flat panel), the groups
+    summed per detector row between the blurs along the rows and the channels (a 1-D grid with septa along the
+    channels), the full image (septa along the rows) and the PyTorch emission (then the row route); with and without
+    the footprint."""
+    from citrus.utilities import wlab_phantom
+    from citrus.scatter_solver.kernels import uncollided_kernels
+    from citrus.scatter_solver.scatter_image import make_direction_context
+
+    device = torch.device("cuda")
+    if not uncollided_kernels.kernel_usable(device)[0]:
+        pytest.skip("first-collision kernels unusable on this machine")
+    geometry = wlab_setup(2.0, device=device, dtype=torch.float32)[1]
+    grid = Grid((10, 16, 20), 2.0)  # padded along x to be divisible by 2
+    rho = wlab_phantom(grid, device=device, dtype=torch.float32)
+    library = synthetic_library(num_groups=3, legendre_order=2, num_materials=7).to(device, torch.float32)
+    angle = 0.3
+    phi_uncollided = uncollided_fluence(library, rho, grid, geometry, angle, SourceModel(), PROJECTION)
+    q = panel_direction_set(geometry, angle, (8, 16), max_polar_angle=grid, device=device, dtype=torch.float32)
+    detector = csi_response()
+    grid_response = {"groups in the emission": no_grid(), "unfused": no_grid(), "rows": focused_1d_grid(),
+                     "full image": replace(focused_1d_grid(), septa_along="rows")}[route]
+    coarse = grid.coarsen(2)
+    mu_coarse_values = coarsen_mu_t(mu_t_volume(library, rho), grid, coarse)
+    L = 2
+    g = torch.Generator().manual_seed(5)
+    T = (torch.rand(3, num_spherical_harmonics(L), *coarse.shape, generator=g) * 0.01).to(device)
+    context = make_direction_context(q, geometry, angle, detector, grid_response, library, device, torch.float32,
+                                     chunk=8)
+    assert (context.signal_group_weight is not None) == (route in ("groups in the emission", "unfused"))
+    assert context.separable == (route != "full image")
+    if route == "unfused":
+        monkeypatch.setattr(uncollided_kernels, "fused_kernels_usable", lambda *args, **kwargs: False)
+        monkeypatch.setattr(scatter_image_module, "first_collision_source_at_directions",
+                            functools.partial(first_collision_source_at_directions, backend="torch"))
+    for footprint in (False, True):
+        def image(signal_only):
+            return scatter_image_module.combined_scatter_image(library, rho, phi_uncollided, grid, 2, T, L, geometry,
+                                                               angle, q, mu_coarse_values, PROJECTION, detector,
+                                                               grid_response, context, footprint=footprint,
+                                                               signal_only=signal_only)
+
+        signal, reference = image(True), image(False)["signal"]
+        assert set(signal) == {"signal"} and float(reference.abs().max()) > 0
+        torch.testing.assert_close(signal["signal"], reference, rtol=1e-5, atol=1e-5 * float(reference.abs().max()),
+                                   msg=lambda m: f"footprint={footprint}: {m}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_attenuated_emission_signal_mode():
+    """The emission kernel with signal weights stores the weighted group sum of its emission, sum_g W[k, g] e_g, with
+    the same mean-height sums (over the groups, unweighted)."""
+    from citrus.utilities import wlab_phantom
+    from citrus.scatter_solver.kernels import uncollided_kernels
+
+    device = torch.device("cuda")
+    if not uncollided_kernels.kernel_usable(device)[0]:
+        pytest.skip("first-collision kernels unusable on this machine")
+    geometry = wlab_setup(2.0, device=device, dtype=torch.float32)[1]
+    grid = Grid((10, 16, 20), 2.0)
+    rho = wlab_phantom(grid, device=device, dtype=torch.float32)
+    library = synthetic_library(num_groups=3, legendre_order=2, num_materials=7).to(device, torch.float32)
+    phi_uncollided = uncollided_fluence(library, rho, grid, geometry, 0.3, SourceModel(), PROJECTION)
+    coarse = grid.coarsen(2)
+    g = torch.Generator().manual_seed(6)
+    directions = torch.nn.functional.normalize(torch.randn(5, 3, generator=g), dim=-1).to(device)
+    tau = (torch.rand(5, 3, *coarse.shape, generator=g) * 4).to(device)
+    multiple = (torch.rand(5, 3, *coarse.shape, generator=g) * 1e-3).to(device)
+    mu = coarsen_mu_t(mu_t_volume(library, rho), grid, coarse)
+    heights = torch.rand(grid.num_voxels, generator=g).to(device)
+    weight = torch.rand(5, 3, generator=g).to(device)
+    pairs = material_pairs(rho)
+    args = (library, rho, phi_uncollided, grid, geometry, 0.3, directions, tau, mu, multiple, 2, heights)
+    emission, sums = uncollided_kernels.attenuated_emission(*args, pairs=pairs)
+    signal, signal_sums = uncollided_kernels.attenuated_emission(*args, pairs=pairs, signal_weight=weight)
+    reference = torch.einsum("kg,kg...->k...", weight, emission)
+    assert signal.shape == (5, *grid.shape)
+    torch.testing.assert_close(signal, reference, rtol=1e-5, atol=1e-6 * float(reference.abs().max()))
+    torch.testing.assert_close(signal_sums, sums, rtol=1e-5, atol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

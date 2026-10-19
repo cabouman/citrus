@@ -7,7 +7,7 @@ MBIRTORCH bridge (``citrus.recon``) and the WLAB phantom, density model, view an
 helpers (``citrus.utilities``). The main entry points of the loop are re-exported here.
 """
 
-__version__ = "0.20.0"
+__version__ = "0.21.0"
 
 from .citrus import (CitrusConfig, CitrusState, citrus_recon, citrus_step, mbir_recon)  # noqa: E402
 

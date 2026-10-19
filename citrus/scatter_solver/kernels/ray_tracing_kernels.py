@@ -19,8 +19,7 @@ from torch import Tensor
 from . import triton_utilities
 
 SELF_CHECK_REL_TOL = 1e-5
-BLOCK_RAYS = 128  # rays per program of `_ray_kernel` (tile [GP, 128], 4 warps)
-BLOCK_DOWN = 128  # voxels per program of `_downstream_shared_kernel`
+BLOCK_RAYS = 128  # rays per program of `_ray_kernel` (tile [GP, 128], 4 warps), except the oblique projection
 NUM_WARPS = 4
 BIG = 3.0e38  # "no crossing" parameter (finite, so that products stay finite)
 _BIG_INT = 1 << 30
@@ -171,7 +170,8 @@ if triton is not None:
     _BIG_C = tl.constexpr(BIG)
     _BIG_INT_C = tl.constexpr(_BIG_INT)
 
-    _RAY_INTS = ["M", "sa_n", "sa_c", "sb_n", "sb_c", "sK", "sG", "sR", "sC", "sS", "NX", "NY", "NZ", "Rd", "Cd"]
+    _RAY_INTS = ["M", "sa_n", "sa_c", "sb_n", "sb_c", "sK", "sG", "sR", "sC", "sS", "NX", "NY", "NZ", "Rd", "Cd",
+                 "oK", "oG", "oR", "oC"]
     _RAY_PTRS = ["volume_ptr", "out_ptr", "a_ptr", "b_ptr", "volume_index_ptr", "direction_ptr"]
 
     @triton.jit
@@ -328,7 +328,7 @@ if triton is not None:
 
     @triton.jit(do_not_specialize=_RAY_INTS, do_not_specialize_on_alignment=_RAY_PTRS)
     def _ray_kernel(volume_ptr, out_ptr, a_ptr, b_ptr, volume_index_ptr, direction_ptr,
-                    M, sa_n, sa_c, sb_n, sb_c, sK, sG, sR, sC, sS, NX, NY, NZ, Rd, Cd,
+                    M, sa_n, sa_c, sb_n, sb_c, sK, sG, sR, sC, sS, NX, NY, NZ, Rd, Cd, oK, oG, oR, oC,
                     lox, loy, loz, hix, hiy, hiz, ddx, ddy, ddz, zoff,
                     qx, qy, qz, ux_, uy_, uz_, vx_, vy_, vz_,
                     rmid, cmid, drow, dch, rowoff, choff, bcx, bcy, bcz, half, nx_, ny_, nz_, rad,
@@ -337,12 +337,13 @@ if triton is not None:
                     CURVED: tl.constexpr, PARALLEL: tl.constexpr, BLOCK: tl.constexpr):
         """Trace one block of rays (program_id 0) of direction or volume index k (program_id 1) into ``out``.
 
-        Writes ``out[(k G + g) M + m]``, with m the segment (MODE 0), the pixel ``r * Cd + c`` (MODE 1, 3) or the
-        flat voxel index (MODE 2).
+        Writes ``out[(k G + g) M + m]``, with m the segment (MODE 0) or the flat voxel index (MODE 2), and
+        ``out[k oK + g oG + r oR + c oC]`` for the pixel (r, c) (MODE 1, 3).
 
         Args:
             volume_ptr: float32 voxel field [G, rows, cols, slices] per volume, any strides.
-            out_ptr: [K, G, M] float32 line integrals.
+            out_ptr: [K, G, M] float32 line integrals, or [K, G, Rd, Cd] with the strides oK, oG, oR, oC (MODE 1,
+                3).
             a_ptr: [M, 3] float32 segment starts in cm (MODE 0).
             b_ptr: [M, 3] float32 segment ends in cm (MODE 0).
             volume_index_ptr: [M] int64 volume index per ray (MODE 0 with HAS_VOLUME_INDEX).
@@ -362,6 +363,10 @@ if triton is not None:
             NZ: number of slices (voxels along z).
             Rd: number of detector rows.
             Cd: number of detector channels.
+            oK: element stride of ``out`` between directions (MODE 1, 3).
+            oG: element stride of ``out`` between groups (MODE 1, 3).
+            oR: element stride of ``out`` between detector rows (MODE 1, 3).
+            oC: element stride of ``out`` between detector channels (MODE 1, 3).
             lox: x of the lower box corner in cm.
             loy: y of the lower box corner in cm.
             loz: z of the lower box corner in cm.
@@ -412,7 +417,7 @@ if triton is not None:
         m = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         live = m < M
         mm = tl.where(live, m, 0)
-        o_idx = mm
+        o_off = mm.to(tl.int64)  # the output offset of the ray (MODE 1, 3)
         kk = k.to(tl.int64)
         vbase = tl.zeros([BLOCK], dtype=tl.int64) + kk * sK
         if MODE == 0:
@@ -432,7 +437,7 @@ if triton is not None:
             # detector rows (v ~ z, the contiguous volume axis), so neighbouring rays gather neighbouring slices
             r = mm % Rd
             c = mm // Rd
-            o_idx = r * Cd + c
+            o_off = r.to(tl.int64) * oR + c.to(tl.int64) * oC
             u = (c.to(tl.float32) - cmid) * dch - choff
             v = (r.to(tl.float32) - rmid) * drow - rowoff
             if CURVED:
@@ -501,8 +506,9 @@ if triton is not None:
                      lox, loy, loz, hix, hiy, hiz, ddx, ddy, ddz, NX, NY, NZ, G, GP, BLOCK)
         g = tl.arange(0, GP)
         if MODE == 1 or MODE == 3:
-            m = o_idx
-        optr = out_ptr + (kk * G + g.to(tl.int64))[:, None] * M + m[None, :].to(tl.int64)
+            optr = out_ptr + (kk * oK + g.to(tl.int64) * oG)[:, None] + o_off[None, :]
+        else:
+            optr = out_ptr + (kk * G + g.to(tl.int64))[:, None] * M + m[None, :].to(tl.int64)
         tl.store(optr, acc, mask=(g < G)[:, None] & live[None, :])
 
     _DOWN_INTS = ["V", "sG", "sR", "sC", "sS", "NX", "NY", "NZ"]
@@ -679,15 +685,45 @@ def _check_cuda_f32(t: Tensor, name: str) -> None:
         raise ValueError(f"the Siddon kernels need a float32 CUDA {name}, got {t.dtype} on {t.device}")
 
 
+def _oblique_launch(padded_groups: int) -> tuple[int, int]:
+    """Rays per program and warps of the oblique projection: 64 rays with about four elements of the [GP, 64] tile
+    per thread, or 32 rays on one warp for one group (the fastest tried).
+
+    Args:
+        padded_groups (int): groups padded to a power of two, GP.
+
+    Returns:
+        (int, int): rays per program and warps.
+    """
+    if padded_groups == 1:
+        return 32, 1
+    return 64, min(8, max(1, padded_groups // 2))
+
+
+def _downstream_launch(padded_groups: int) -> tuple[int, int]:
+    """Voxels per program and warps of the downstream optical depth: one warp holding many voxels, which share the
+    crossing sequence (128 up to eight padded groups, the fastest tried).
+
+    Args:
+        padded_groups (int): groups padded to a power of two, GP.
+
+    Returns:
+        (int, int): voxels per program and warps.
+    """
+    return max(32, min(128, 1024 // padded_groups)), 1
+
+
 def _launch_ray(volume: Tensor, out: Tensor, num_rays: int, num_major: int, mode: int, G: int, grid, *,
                 a: Optional[Tensor] = None, b: Optional[Tensor] = None, volume_index: Optional[Tensor] = None,
                 directions: Optional[Tensor] = None, volume_stride: int = 0,
-                geometry_scalars: Optional[dict] = None) -> None:
-    """Launch ``_ray_kernel`` over ``num_major`` x ceil(``num_rays`` / ``BLOCK_RAYS``) programs.
+                geometry_scalars: Optional[dict] = None, launch: Optional[tuple[int, int]] = None,
+                out_strides: Optional[tuple[int, int, int, int]] = None) -> None:
+    """Launch ``_ray_kernel`` over ``num_major`` x ceil(``num_rays`` / rays per program) programs.
 
     Args:
         volume (Tensor): [..., G, rows, cols, slices] float32 CUDA field; its last four strides are used.
-        out (Tensor): [num_major, G, num_rays] float32 output, written in place.
+        out (Tensor): [num_major, G, num_rays] float32 output, written in place (or [num_major, G, Rd, Cd] with
+            ``out_strides`` in the pixel modes).
         num_rays (int): rays per direction or volume index.
         num_major (int): number of directions or volume indices (program_id 1).
         mode (int): the kernel's ``MODE`` (``MODE_GENERIC``, ``MODE_OBLIQUE``, ``MODE_UPSTREAM``, ``MODE_PRIMARY``).
@@ -701,8 +737,15 @@ def _launch_ray(volume: Tensor, out: Tensor, num_rays: int, num_major: int, mode
         geometry_scalars (dict, optional): mode-specific scalars with keys "q", "u", "v", "Rd", "Cd", "pixel",
             "box_center", "half", "n", "radius", "curved", "beam", "upstream_distance" and "parallel"; missing keys
             are zero (1 for "Rd", "Cd", False for "curved" and "parallel"). Defaults to None.
+        launch (tuple[int, int], optional): rays per program and warps. Defaults to None, ``BLOCK_RAYS`` and
+            ``NUM_WARPS``.
+        out_strides (tuple[int, int, int, int], optional): element strides of ``out`` along the direction, group,
+            detector row and channel (MODE 1, 3). Defaults to None, those of a contiguous [num_major, G, Rd, Cd].
     """
     geometry_scalars = geometry_scalars or {}
+    block, warps = (BLOCK_RAYS, NUM_WARPS) if launch is None else launch
+    if out_strides is None:
+        out_strides = (int(G) * int(num_rays), int(num_rays), int(geometry_scalars.get("Cd", 1)), 1)
     sG, sR, sC, sS = (int(x) for x in volume.stride()[-4:])
     dummy = volume
     a_t = a if a is not None else dummy
@@ -720,7 +763,7 @@ def _launch_ray(volume: Tensor, out: Tensor, num_rays: int, num_major: int, mode
             directions if directions is not None else dummy,
             int(num_rays), *sa, *sb, int(volume_stride), sG, sR, sC, sS,
             int(grid.num_cols), int(grid.num_rows), int(grid.num_slices), int(geometry_scalars.get("Rd", 1)),
-            int(geometry_scalars.get("Cd", 1)),
+            int(geometry_scalars.get("Cd", 1)), *(int(x) for x in out_strides),
             lox, loy, loz, hix, hiy, hiz, dx, dy, dz, float(grid.recon_slice_offset),
             *(float(x) for x in q), *(float(x) for x in u_axis), *(float(x) for x in v_axis),
             *(float(x) for x in pixel_parameters), *(float(x) for x in box_center),
@@ -730,9 +773,9 @@ def _launch_ray(volume: Tensor, out: Tensor, num_rays: int, num_major: int, mode
             float(geometry_scalars.get("upstream_distance", 0.0)))
     constexprs = dict(MODE=int(mode), G=int(G), GP=_next_pow2(G), HAS_VOLUME_INDEX=volume_index is not None,
                       CURVED=bool(geometry_scalars.get("curved", False)),
-                      PARALLEL=bool(geometry_scalars.get("parallel", False)), BLOCK=BLOCK_RAYS)
-    triton_utilities.launch(_ray_kernel, (triton.cdiv(max(num_rays, 1), BLOCK_RAYS), int(num_major), 1), args,
-                            constexprs, NUM_WARPS)
+                      PARALLEL=bool(geometry_scalars.get("parallel", False)), BLOCK=block)
+    triton_utilities.launch(_ray_kernel, (triton.cdiv(max(num_rays, 1), block), int(num_major), 1), args,
+                            constexprs, warps)
 
 
 def line_integrals_triton(volume: Tensor, starts: Tensor, ends: Tensor, grid, *,
@@ -961,12 +1004,14 @@ def downstream_cumulative(mu: Tensor, grid, geometry, angle: float, omegas: Tens
     args = (mu, directions, toward, out, int(V), sG, sR, sC, sS, int(grid.num_cols), int(grid.num_rows),
             int(grid.num_slices), dx, dy, dz, float(grid.recon_slice_offset), *(float(x) for x in panel_center),
             *(float(x) for x in n_hat), float(diag), float(source_position[0]), float(source_position[1]), radius)
-    triton_utilities.launch(_downstream_shared_kernel, (triton.cdiv(V, BLOCK_DOWN), K, 1), args,
-                            dict(G=int(G), GP=_next_pow2(G), CURVED=curved, BLOCK=BLOCK_DOWN), NUM_WARPS)
+    block, warps = _downstream_launch(_next_pow2(G))
+    triton_utilities.launch(_downstream_shared_kernel, (triton.cdiv(V, block), K, 1), args,
+                            dict(G=int(G), GP=_next_pow2(G), CURVED=curved, BLOCK=block), warps)
     return out
 
 
-def oblique_project(field: Tensor, grid, geometry, angle: float, omegas: Tensor) -> Tensor:
+def oblique_project(field: Tensor, grid, geometry, angle: float, omegas: Tensor,
+                    out: Optional[Tensor] = None) -> Tensor:
     """Fused ``SiddonProjectors.oblique_project``: line integrals through each pixel center along each direction.
 
     Args:
@@ -976,9 +1021,12 @@ def oblique_project(field: Tensor, grid, geometry, angle: float, omegas: Tensor)
         geometry (ConeGeometry or ParallelGeometry): the scan geometry.
         angle (float): view angle in radians.
         omegas (Tensor): [K, 3] directions (recon frame).
+        out (Tensor, optional): [K, G, num_det_rows, num_det_channels] float32 output of any strides, written in
+            place. Defaults to None, a new contiguous tensor.
 
     Returns:
-        Tensor: [K, G, num_det_rows, num_det_channels] line integrals in units of field times cm.
+        Tensor: [K, G, num_det_rows, num_det_channels] line integrals in units of field times cm (``out`` when
+        given).
     """
     _check_cuda_f32(field, "field")
     device = field.device
@@ -997,7 +1045,11 @@ def oblique_project(field: Tensor, grid, geometry, angle: float, omegas: Tensor)
     else:
         raise ValueError(f"field must be [G, ...] or [K={K}, G, ...], got {tuple(field.shape)}")
     Rd, Cd = geometry.num_det_rows, geometry.num_det_channels
-    out = torch.empty(K, G, Rd, Cd, device=device, dtype=torch.float32)
+    if out is None:
+        out = torch.empty(K, G, Rd, Cd, device=device, dtype=torch.float32)
+    elif tuple(out.shape) != (K, G, Rd, Cd) or out.dtype != torch.float32 or out.device != device:
+        raise ValueError(f"out must be a float32 [{K}, {G}, {Rd}, {Cd}] tensor on {device}, got {out.dtype} "
+                         f"{tuple(out.shape)} on {out.device}")
     if K == 0:
         return out
     lo = grid.lower_corner()
@@ -1006,7 +1058,8 @@ def oblique_project(field: Tensor, grid, geometry, angle: float, omegas: Tensor)
     geometry_scalars["box_center"] = tuple(lo[a] + 0.5 * extent[a] for a in range(3))
     geometry_scalars["half"] = 0.5 * math.sqrt(sum(e * e for e in extent)) * (1 + 1e-6) + 1e-6
     _launch_ray(field, out, Rd * Cd, K, MODE_OBLIQUE, G, grid, directions=directions, volume_stride=volume_stride,
-                geometry_scalars=geometry_scalars)
+                geometry_scalars=geometry_scalars, launch=_oblique_launch(_next_pow2(G)),
+                out_strides=tuple(int(x) for x in out.stride()))
     return out
 
 
@@ -1030,4 +1083,5 @@ def warmup(device: torch.device, num_groups: int) -> None:
     downstream_cumulative(mu, grid, geometry, 0.0, directions)
     oblique_project(mu, grid, geometry, 0.0, directions)
     oblique_project(mu[None].expand(2, -1, -1, -1, -1), grid, geometry, 0.0, directions)
+    oblique_project(mu[None, :1].expand(2, -1, -1, -1, -1), grid, geometry, 0.0, directions)  # the signal alone
     torch.cuda.synchronize(device)

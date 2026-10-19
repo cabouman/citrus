@@ -68,6 +68,25 @@ def test_box_blur(device):
         assert torch.allclose(box_matrix(37, w), box_matrix(37, w.double()).float(), atol=1e-6)
 
 
+def test_box_blur_rows_outer(device):
+    """An image stored rows-outer ([k, Rd, G, Cd] seen as [k, G, Rd, Cd], as the scatter image projects it) is blurred
+    like the same image stored contiguously, and stays rows-outer; so are the blurs along one axis in turn."""
+    from citrus.scatter_solver.scatter_image import box_blur_channels, box_blur_rows
+
+    g = torch.Generator().manual_seed(3)
+    x = torch.rand(3, 4, 7, 9, generator=g, dtype=F64).to(device)
+    widths_channels = torch.tensor([0.5, 2.3, 4.0], dtype=F64, device=device)
+    widths_rows = torch.tensor([1.7, 0.9, 3.2], dtype=F64, device=device)
+    reference = box_blur_rows_cols(x, widths_channels, widths_rows)
+    rows_outer = x.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
+    assert not rows_outer.is_contiguous()
+    y = box_blur_rows_cols(rows_outer, widths_channels, widths_rows)
+    torch.testing.assert_close(y, reference, rtol=1e-12, atol=1e-12)
+    assert y.permute(0, 2, 1, 3).is_contiguous()
+    torch.testing.assert_close(box_blur_rows(box_blur_channels(x, widths_channels), widths_rows), reference,
+                               rtol=1e-12, atol=1e-12)
+
+
 def _single_voxel_case(device):
     geometry = ConeGeometry(50.0, 60.0, 48, 48, 0.25, 0.25)
     grid = Grid((4, 4, 4), 1.0)

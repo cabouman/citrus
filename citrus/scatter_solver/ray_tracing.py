@@ -9,7 +9,7 @@ group axis for one view angle in the recon frame. ``SiddonProjectors`` implement
 from __future__ import annotations
 
 import math
-from typing import Protocol
+from typing import Optional, Protocol
 
 import torch
 from torch import Tensor
@@ -96,7 +96,7 @@ class Projectors(Protocol):
         ...
 
     def oblique_project(self, field: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
-                        omegas: Tensor) -> Tensor:
+                        omegas: Tensor, out: Optional[Tensor] = None) -> Tensor:
         """Line integral of a field along each direction through every pixel center.
 
         Args:
@@ -105,9 +105,12 @@ class Projectors(Protocol):
             geometry (ConeGeometry or ParallelGeometry): the scan geometry.
             angle (float): view angle in radians.
             omegas (Tensor): [K, 3] unit directions (recon frame).
+            out (Tensor, optional): [K, G, num_det_rows, num_det_channels] output of any strides, written in place.
+                Defaults to None, a new tensor.
 
         Returns:
-            Tensor: [K, G, num_det_rows, num_det_channels] line integrals in units of field times cm.
+            Tensor: [K, G, num_det_rows, num_det_channels] line integrals in units of field times cm (``out`` when
+            given).
         """
         ...
 
@@ -543,10 +546,32 @@ class SiddonProjectors:
 
     # ---- (d) ----------------------------------------------------------------------------------
     def oblique_project(self, field: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
-                        omegas: Tensor) -> Tensor:
+                        omegas: Tensor, out: Optional[Tensor] = None) -> Tensor:
         """Full line integral of a field along the line through each pixel center with direction ``omega_k``.
 
         The line is clipped to the grid box on both sides of the pixel center.
+
+        Args:
+            field (Tensor): [K, G, rows, cols, slices], or [G, rows, cols, slices] shared by all directions.
+            grid (Grid): the grid of ``field``.
+            geometry (ConeGeometry or ParallelGeometry): the scan geometry.
+            angle (float): view angle in radians.
+            omegas (Tensor): [K, 3] directions (recon frame).
+            out (Tensor, optional): [K, G, num_det_rows, num_det_channels] output of any strides (a rows-outer buffer
+                seen as [K, G, Rd, Cd], for instance), written in place. Defaults to None, a new contiguous tensor.
+
+        Returns:
+            Tensor: [K, G, num_det_rows, num_det_channels] line integrals in units of field times cm (``out`` when
+            given).
+        """
+        if self._use_triton(field):
+            return ray_tracing_kernels.oblique_project(field, grid, geometry, angle, omegas, out=out)
+        image = self._oblique_project_torch(field, grid, geometry, angle, omegas)
+        return image if out is None else out.copy_(image)
+
+    def _oblique_project_torch(self, field: Tensor, grid: Grid, geometry: ConeGeometry, angle: float,
+                               omegas: Tensor) -> Tensor:
+        """The PyTorch path of :meth:`oblique_project`.
 
         Args:
             field (Tensor): [K, G, rows, cols, slices], or [G, rows, cols, slices] shared by all directions.
@@ -558,8 +583,6 @@ class SiddonProjectors:
         Returns:
             Tensor: [K, G, num_det_rows, num_det_channels] line integrals in units of field times cm.
         """
-        if self._use_triton(field):
-            return ray_tracing_kernels.oblique_project(field, grid, geometry, angle, omegas)
         device, dtype = field.device, field.dtype
         omegas = omegas.to(device=device, dtype=dtype).reshape(-1, 3)
         K = omegas.shape[0]

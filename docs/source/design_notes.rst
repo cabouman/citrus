@@ -258,7 +258,8 @@ convergence norms of its step.
 
 The detector response depends on a direction only through :math:`\theta_0` and is stored as ``[K, G]``; the grid
 response of a flat panel with a 1-D grid is stored as ``[K, G, Rd]``, and the three accumulation weights (fluence,
-planar fluence, signal) as one ``[G Rd, 3, K]`` matrix, a factor ``Cd / 3`` smaller than per-pixel tables. Separability
+planar fluence, signal) as one ``[Rd G, 3, K]`` matrix in the rows-outer order of the images, a factor ``Cd / 3``
+smaller than per-pixel tables. Separability
 is checked numerically on probe directions when the context is built; a panel that fails it (a grid whose septa run
 along the rows, or along both directions) falls back to per-pixel weights, and a curved panel has its own context, whose
 weights depend on the direction and the channel. The responses are evaluated in float64 and stored in the image dtype.
@@ -273,6 +274,18 @@ matrices of its directions. It then takes as many directions as fit a fixed memo
 (``ScatterSolver.image_direction_chunk``, at least ``direction_chunk`` and at most 32), since fewer and larger chunks
 launch fewer kernels and keep the GPU busy; the PyTorch path, whose temporaries are several times larger, keeps
 ``direction_chunk``.
+
+**Rows-outer images.** The projections of a chunk are written rows-outer, ``[k, Rd, G, Cd]`` seen as
+``[k, G, Rd, Cd]``: the footprint blur along the rows is then one matrix product per direction for all groups at once
+instead of one per group, and the accumulation reads the images in place.
+
+**The signal alone.** A CITRUS step needs only the detector signal of the scatter (``signal_only``). When the signal
+weights of a direction are the same at every pixel (a flat panel with a grid response that does not depend on the
+angles, such as no grid), the emission kernel sums the groups with them, so one image per direction is projected,
+blurred and accumulated instead of G. When they vary along the rows only (a flat panel with a 1-D grid whose septa run
+along the channels), the rows of every group are blurred, the groups summed with the weights of each row and the
+channels of the one image blurred. The projection, the blur and the sums are linear, so the signal equals that of the
+full image to float rounding; other panels form the full image and keep its signal.
 
 **Direction set and footprint.** The cone product set is limited to the smallest cone about the panel normal that
 contains every direction from the transport-grid box to the panel. Per-pixel scatter of a finite direction set carries
@@ -305,8 +318,10 @@ correction (each point over all sweep directions, with the exact moments) and th
 source plus the cell's multiple-collision source, attenuated to the panel, with the per-direction sums of the
 footprint's mean height). They share the source evaluation as Triton helper functions, so all four kernels compute it
 with the same arithmetic. The mean-height sums, the only reduction across programs, are written per program and added
-by PyTorch, so the kernels use no atomics. A program handles 64 points (or cells) on 8 warps, about two elements of
-its ``[GP, 64]`` tile per thread, the fastest of the block sizes tried.
+by PyTorch, so the kernels use no atomics. A program of the sweep's kernels handles 64 points (or cells) on 8 warps,
+about two elements of its ``[GP, 64]`` tile per thread. The emission kernel keeps the fluence of its points through up
+to 16 directions and runs 64 points on one warp, or 32 points on two or four warps when the band of the table is
+wide; both are the fastest of the sizes tried.
 
 **Siddon traversal.** A segment is parametrized as :math:`\mathbf p(a) = \mathbf p_0 + a(\mathbf p_1 - \mathbf p_0)`,
 :math:`a \in [0, 1]`, and clipped to the grid box by the slab method, giving :math:`[a_{lo}, a_{hi}]`. The parameters
@@ -345,13 +360,22 @@ larger root of the ray's intersection with the cylinder, in the reference's canc
 exact for any direction. Directions with :math:`\omega \cdot (-\hat n) \le 0` give +inf; that decision is passed in
 as flags computed with the reference's own PyTorch expression, so it agrees bit for bit for grazing directions.
 
-**Kernel transfer table.** The first-collision kernels read the transfer table re-laid out as
-``[M, N, G_in, GP]`` float32 (GP the next power of two of G), zero where ``g_out < g_in`` (no upscatter) and for the
-padding ``g_out >= G``. All entries a point needs from one material, every incoming and outgoing group at the two eta
-nodes of its interpolation, then form one contiguous block, so the gathers of a point touch few cache lines; the
-table stays in the L2 cache and neighbouring points hit neighbouring rows. Packing the triangle ``g_out >= g_in``
-without the padding reads fewer bytes but loses the aligned loads, which costs more than it saves. The re-laid table
-is cached per library tensor, device and tensor version and dropped when the library tensor is freed.
+**Kernel transfer table.** The first-collision kernels read the transfer table by diagonals, ``[M, N, D, GP]``
+float32 (GP the next power of two of G): entry ``[m, n, d, g]`` is the transfer from group ``g - d`` to group ``g`` at
+eta node ``n``, zero for ``g < d`` and for the padding ``g >= G``. A scattered photon loses at most a bounded fraction
+of its energy (and upscatter is not kept), so the table is zero beyond some diagonal; only the band of diagonals up to
+the last nonzero one is stored, which at kV energies spans a few groups. The source of a point then reads D rows of
+GP entries per material and eta node instead of G, all entries of its interpolation in one material form one
+contiguous block, the table stays in the L2 cache and neighbouring points hit neighbouring rows. Each diagonal pairs
+every outgoing group with its own incoming group, so the uncollided fluence enters as one ``[GP, BLOCK]`` tile per
+diagonal, which the kernels load once per program and keep through its directions. In pair mode a block of points
+without a second material (most blocks of an object in air) reads the table of its first material only. The re-laid
+table is cached per library tensor, device and tensor version and dropped when the library tensor is freed.
+
+**Launch shapes.** The oblique projection runs 64 rays per program with about four elements of its ``[GP, 64]``
+tile per thread (32 rays on one warp for a single group, the signal alone), the downstream optical depth 128 voxels
+on one warp (64 above eight padded groups), sharing their crossing sequence, and the other modes 128 rays on four
+warps; each is the fastest of the shapes tried.
 
 **Kernel launch.** The kernels are compiled without value or alignment specialization of their integer and pointer
 arguments, so one binary fits every problem size; ``triton_utilities.launch`` caches it per (kernel, constexpr

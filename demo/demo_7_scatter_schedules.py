@@ -116,7 +116,7 @@ def converged(fields, angle):                                  # a converged sou
 def first_order(fields, angle):                                # the first-collision source projected, no sweep
     uncollided = uncollided_operator(solver, None, grid, angle, fields)
     no_collided = multiple_collision_operator(solver, None, grid, angle, None, fields)
-    return project_scatter(solver, None, grid, angle, uncollided, no_collided, fields)["signal"]
+    return project_scatter(solver, None, grid, angle, uncollided, no_collided, fields, signal_only=True)["signal"]
 
 
 def fit(X, corrected):                                        # the residual |A X - y_c| / |y_c| of the stop rules

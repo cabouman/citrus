@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.21.0 - 2026-10-19
+
+- **Signal-only scatter image.** The CITRUS step forms only the detector signal of the scatter
+  (`ScatterSolver.scatter_image(signal_only=True)`, `project_scatter(signal_only=True)`). On a flat panel whose signal
+  weights are the same at every pixel (no grid, or a grid response that does not depend on the angles) the emission
+  kernel sums the groups with the signal weights, so one image per direction is projected, blurred and accumulated
+  instead of one per group; with a 1-D grid whose septa run along the channels the groups are summed per detector row
+  between the blurs along the rows and the channels. The signal equals that of the full image to float rounding.
+- **Transfer table by diagonals.** The first-collision kernels store the transfer table by diagonals `g_out - g_in`,
+  only the band up to the last nonzero diagonal (`uncollided_kernels.prepared_table`, `[M, N, D, GP]`), so the source
+  of a point reads D table rows per material and node instead of G. The fluence of a program's points is loaded once
+  for all its directions, and in pair mode a block of points without a second material skips the second table. The
+  emission kernel runs one warp per 64 points (32 points on two or four warps for a wide band) with up to 16
+  directions per program. The sweep's first-collision source, its sampling correction and the image's emission take
+  less time, more so with more groups.
+- **Rows-outer images.** `oblique_project` writes into a given output of any strides (`out=`), and the scatter image
+  projects each chunk rows-outer (`[k, Rd, G, Cd]`), so the footprint blur along the rows is one matrix product per
+  direction for all groups and the accumulation reads the images in place (the separable accumulation weights are
+  stored rows-outer, `[Rd G, 3, K]`). `box_blur_channels` and `box_blur_rows` blur along one axis.
+- **Ray kernel launches.** The oblique projection and the downstream optical depth have their own launch shapes, per
+  padded group count.
+
 ## v0.20.0 - 2026-10-19
 
 - **Sweep.** On float32 CUDA one fused kernel forms the scattering-source moments of every sweep

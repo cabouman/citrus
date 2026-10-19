@@ -384,7 +384,8 @@ def _triton_directions(geometry: ConeGeometry, angle: float, device) -> torch.Te
 @pytest.mark.parametrize("angle", [0.0, 0.7])
 def test_triton_projector_operations_match_torch(G, angle):
     """SiddonProjectors(backend="triton") == the PyTorch reference path for all four operations (shared and
-    per-direction oblique fields, non-contiguous inputs, samples_per_pixel_axis > 1, +inf directions)."""
+    per-direction oblique fields, non-contiguous inputs, samples_per_pixel_axis > 1, +inf directions), and the oblique
+    projection into a given rows-outer output on both paths."""
     device = torch.device("cuda")
     geometry = small_geometry(det_channel_offset=0.3, det_row_offset=-0.2)
     T = SiddonProjectors(backend="torch")
@@ -421,6 +422,13 @@ def test_triton_projector_operations_match_torch(G, angle):
     assert not f_nc.is_contiguous()
     _assert_close_rel(P.oblique_project(f_nc, UGRID, geometry, angle, directions_nc),
                       T.oblique_project(fields, UGRID, geometry, angle, directions))
+    # into a given output of other strides: a rows-outer buffer seen as [K, G, Rd, Cd]
+    Rd, Cd = geometry.num_det_rows, geometry.num_det_channels
+    for projectors in (P, T):
+        buffer = torch.full((K, Rd, G, Cd), float("nan"), device=device)
+        out = projectors.oblique_project(fields, UGRID, geometry, angle, directions, out=buffer.permute(0, 2, 1, 3))
+        assert out.data_ptr() == buffer.data_ptr()
+        _assert_close_rel(out, T.oblique_project(fields, UGRID, geometry, angle, directions))
     # the generic line_integrals method dispatches too
     s = torch.randn(50, 3, device=device, generator=generator) * 4
     e = torch.randn(50, 3, device=device, generator=generator) * 4

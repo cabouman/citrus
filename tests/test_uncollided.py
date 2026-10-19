@@ -567,3 +567,63 @@ def test_fused_quadrature_sums_and_correction_match_torch(pair, parallel, monkey
     assert float((correction.beta - reference_correction.beta).abs().max()) < 1e-5
     assert float(reference_correction.beta.abs().max()) > 1e-2  # the correction is not trivial
     assert torch.equal(correction.omega_uncollided, reference_correction.omega_uncollided)
+
+
+def _narrow_band(library, diagonals: int):
+    """The library without the transfer to ``diagonals`` or more groups below the incoming one, so the kernels' table
+    holds ``diagonals`` diagonals instead of G."""
+    import dataclasses
+
+    G = library.num_groups
+    below = torch.arange(G)[None, :] - torch.arange(G)[:, None]  # g_out - g_in
+    keep = (below < diagonals).to(library.mu_s_eta.dtype)
+    return dataclasses.replace(library, mu_s_eta=library.mu_s_eta * keep[None, :, :, None])
+
+
+@pytest.mark.parametrize("one_material", ["half", "all"])
+def test_fused_kernels_narrow_band_and_one_material_blocks(one_material, monkeypatch):
+    """A transfer table that ends three groups below the incoming one (three diagonals stored instead of six) and a
+    pair volume with one material per point in its first half of rows or everywhere (point blocks without a second
+    material skip its table): the source, the sweep moments and the quadrature sums of the kernels == the PyTorch
+    path to 1e-5."""
+    from citrus.scatter_solver.cross_sections import material_pairs
+    from citrus.scatter_solver.kernels import uncollided_kernels
+    from citrus.scatter_solver.uncollided import (FirstCollisionSamplingCorrection,
+                                                  first_collision_moments_at_directions,
+                                                  first_collision_quadrature_sums)
+
+    device = _first_collision_kernel_or_skip()
+    library, rho, _, phi, grid, geometry = _fused_case(True, 2, False, seed=11)
+    library = _narrow_band(library, 3)
+    assert uncollided_kernels.prepared_table(library, device)[0].shape[2] == 3
+    rows = grid.shape[0] // 2 if one_material == "half" else grid.shape[0]
+    top = rho[:, :rows].max(dim=0, keepdim=True)  # the larger of the two materials of each point
+    rho[:, :rows] = torch.zeros_like(rho[:, :rows]).scatter_(0, top.indices, top.values)
+    pairs = material_pairs(rho)
+    assert bool((pairs.density[1, :rows] == 0).all())
+    assert bool((pairs.density[1] > 0).any()) == (one_material == "half")
+    angle = 0.7
+    g = torch.Generator().manual_seed(4)
+    directions = torch.nn.functional.normalize(torch.randn(9, 3, generator=g), dim=-1).to(device)
+    weights = (torch.rand(9, generator=g) * 4 * math.pi / 9).to(device)
+    omega_uncollided = primary_directions_to_voxels(grid, geometry, angle, device, torch.float32)
+    scale = (torch.rand(6, *grid.shape, generator=g) + 0.5).to(device)
+    beta = (2 * torch.rand(6, *grid.shape, generator=g) - 1).to(device)
+    correction = FirstCollisionSamplingCorrection(scale, beta, omega_uncollided)
+
+    def sweep_parts():
+        return (first_collision_moments_at_directions(library, rho, phi, grid, geometry, angle, directions,
+                                                      correction, 2, pairs=pairs),
+                first_collision_quadrature_sums(library, rho, phi, grid, geometry, angle, directions, weights,
+                                                pairs=pairs))
+
+    fused = sweep_parts()
+    with monkeypatch.context() as mp:
+        _pytorch_first_collision(mp)
+        reference = sweep_parts()
+    for a, b in zip(fused, reference):
+        _assert_rel(a, b, 1e-5)
+    source = first_collision_source_at_directions(library, rho, phi, grid, geometry, angle, directions, pairs=pairs,
+                                                  backend="triton")
+    _assert_rel(source, first_collision_source_at_directions(library, rho, phi, grid, geometry, angle, directions,
+                                                             pairs=pairs, backend="torch"), 1e-5)
