@@ -423,7 +423,7 @@ def check_material_names(names: Sequence[MaterialEntry], minimum: int = 2) -> tu
 
 
 def material_definition(material: MaterialEntry, materials: Sequence[MaterialEntry] = ()) -> Material:
-    """Return the definition of a reference material given as a ``Material``, a user material's name or a catalogue name.
+    """Return the definition of a reference material: a ``Material`` itself, or a user material's or catalogue name.
 
     Args:
         material (str or Material): the material; a name is looked up among the Material entries of ``materials``

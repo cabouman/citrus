@@ -3,9 +3,9 @@
 :func:`build_library` fills a :class:`~citrus.scatter_solver.cross_sections.MultigroupLibrary` for a table of
 reference materials (catalogue entries or user-defined ``Material`` definitions) from the integrated cross sections of
 NIST XCOM and the angular shapes of xraylib (``photon_data``) and caches it on disk. The module also holds the steps of
-the build: material formulas, the source spectrum, the group edges, the fine energy grid, the angular quadratures and the node placement of adaptive angular tables. The physics
-and the conventions are described in the documentation pages "Design notes" (section "Cross sections") and
-"Conventions".
+the build: material formulas, the source spectrum, the group edges, the fine energy grid, the angular quadratures and
+the node placement of adaptive angular tables. The physics and the conventions are described in the documentation
+pages "Design notes" (section "Cross sections") and "Conventions".
 """
 
 from __future__ import annotations
