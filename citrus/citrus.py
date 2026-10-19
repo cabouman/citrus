@@ -1506,7 +1506,7 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Tens
             (estimated once on the first sinogram).
         init_recon (Tensor, optional): [R, C, S] initial volume in 1/cm. Defaults to None (FDK, or the filtered back
             projection of a parallel beam).
-        model (ConeBeamModel, optional): prebuilt MBIRTORCH model. Defaults to None.
+        model (ConeBeamModel or ParallelBeamModel, optional): prebuilt MBIRTORCH model. Defaults to None.
         device (torch.device or str, optional): device of the loop. Defaults to None (the device of a tensor sinogram,
             else CUDA if available).
         callback (callable, optional): ``callback(k, X_k, record)`` as in ``citrus_recon``. Defaults to None.
