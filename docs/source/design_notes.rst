@@ -203,8 +203,11 @@ specialization, so there is one compiled variant per group count and chunk size.
 **First-collision sampling correction.** Point samples of the forward-peaked first-collision source at the sweep
 directions miss part of its :math:`l = 0` and :math:`l = 1` moments. Matching both moments per quadrature point and
 group (``first_collision_sampling_correction``) lets the default sweep quadrature stand in for a finer point-sampled
-one. The quadrature sums are formed by float32 matrix products per batch of directions and accumulated in float64.
-The float32 products assume TF32 is off (``torch.backends.cuda.matmul.allow_tf32 = False``, the PyTorch default).
+one. The PyTorch path forms the quadrature sums by float32 matrix products per batch of directions and accumulates
+them in float64; the float32 products assume TF32 is off (``torch.backends.cuda.matmul.allow_tf32 = False``, the
+PyTorch default). On float32 CUDA one fused kernel accumulates the sums of each point over all sweep directions in
+float32, together with the exact moments, without forming the source; both paths give the same factors to float32
+rounding.
 
 Scatter image
 -------------
@@ -241,6 +244,13 @@ exactly as the projectors see it, and they are stored as one contiguous tensor, 
 once per context. The context does not depend on the voxel grid; the tables that do (sub-cell offsets, footprint
 heights) and the spherical harmonics per order are cached in it on first use.
 
+**Image chunks.** With the fused first-collision kernels a chunk of the image holds only the attenuated emission at
+the quadrature points, the optical depths and multiple-collision source of the cells, the images and the footprint
+matrices of its directions. It then takes as many directions as fit a fixed memory budget
+(``ScatterSolver.image_direction_chunk``, at least ``direction_chunk`` and at most 32), since fewer and larger chunks
+launch fewer kernels and keep the GPU busy; the PyTorch path, whose temporaries are several times larger, keeps
+``direction_chunk``.
+
 **Direction set and footprint.** The cone product set is limited to the smallest cone about the panel normal that
 contains every direction from the transport-grid box to the panel. Per-pixel scatter of a finite direction set carries
 ray effects where the emission has sharp structure (insert and object shadows along the beam). The finite-cone
@@ -264,6 +274,16 @@ use no atomics, so their results are bitwise reproducible.
 The fused first-collision source kernel evaluates the interpolated transfer table, the density mixing and the group
 sum in one pass without temporaries. Where the Rayleigh peak of the table is steep, one float32 ulp of :math:`\eta`
 moves the interpolation point, so both float32 paths deviate slightly from a float64 evaluation there.
+
+**Fused uses of the first-collision source.** Three more kernels evaluate the source where it is used, so the
+``[K, G, rows, cols, slices]`` source is never stored: the sweep's source (the source at the points of each transport
+cell, times the sampling correction, restricted to the cell's linear-discontinuous moments), the sums of the sampling
+correction (each point over all sweep directions, with the exact moments) and the emission of the scatter image (the
+source plus the cell's multiple-collision source, attenuated to the panel, with the per-direction sums of the
+footprint's mean height). They share the source evaluation as Triton helper functions, so all four kernels compute it
+with the same arithmetic. The mean-height sums, the only reduction across programs, are written per program and added
+by PyTorch, so the kernels use no atomics. A program handles 64 points (or cells) on 8 warps, about two elements of
+its ``[GP, 64]`` tile per thread, the fastest of the block sizes tried.
 
 **Siddon traversal.** A segment is parametrized as :math:`\mathbf p(a) = \mathbf p_0 + a(\mathbf p_1 - \mathbf p_0)`,
 :math:`a \in [0, 1]`, and clipped to the grid box by the slab method, giving :math:`[a_{lo}, a_{hi}]`. The parameters
@@ -302,11 +322,13 @@ larger root of the ray's intersection with the cylinder, in the reference's canc
 exact for any direction. Directions with :math:`\omega \cdot (-\hat n) \le 0` give +inf; that decision is passed in
 as flags computed with the reference's own PyTorch expression, so it agrees bit for bit for grazing directions.
 
-**Kernel transfer table.** The first-collision source kernel reads the transfer table re-laid out as
-``[N, G_in, M, GP]`` float32 (GP the next power of two of G), zero where ``g_out < g_in`` (no upscatter) and for the
-padding ``g_out >= G``, so all entries a point needs lie in two contiguous rows, one per eta node; the table stays in
-the L2 cache and neighbouring points hit neighbouring rows. The re-laid table is cached per library tensor, device
-and tensor version and dropped when the library tensor is freed.
+**Kernel transfer table.** The first-collision kernels read the transfer table re-laid out as
+``[M, N, G_in, GP]`` float32 (GP the next power of two of G), zero where ``g_out < g_in`` (no upscatter) and for the
+padding ``g_out >= G``. All entries a point needs from one material, every incoming and outgoing group at the two eta
+nodes of its interpolation, then form one contiguous block, so the gathers of a point touch few cache lines; the
+table stays in the L2 cache and neighbouring points hit neighbouring rows. Packing the triangle ``g_out >= g_in``
+without the padding reads fewer bytes but loses the aligned loads, which costs more than it saves. The re-laid table
+is cached per library tensor, device and tensor version and dropped when the library tensor is freed.
 
 **Kernel launch.** The kernels are compiled without value or alignment specialization of their integer and pointer
 arguments, so one binary fits every problem size; ``triton_utilities.launch`` caches it per (kernel, constexpr

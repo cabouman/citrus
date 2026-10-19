@@ -44,6 +44,7 @@ SPECTRUM = load_spectrum_txt(os.path.join(os.path.dirname(os.path.abspath(__file
 
 FIRST_COLLISION_BACKENDS = ("torch", "triton")
 ORIGINAL_FIRST_COLLISION = uncollided_module.first_collision_source_at_directions
+ORIGINAL_FUSED_USABLE = uncollided_kernels.fused_kernels_usable
 CAP_MIB = 5000
 
 
@@ -54,9 +55,10 @@ def sync() -> None:
 
 class use_first_collision_backend:
     """Context manager that routes ``first_collision_source_at_directions`` (in ``uncollided`` and ``scatter_image``)
-    to one backend.
+    to one backend; ``"torch"`` also switches off the fused kernels of the source's uses (the image's emission).
 
     Attributes:
+        backend (str): the first-collision backend.
         fn (Callable): ``first_collision_source_at_directions`` with the backend bound.
     """
 
@@ -66,20 +68,23 @@ class use_first_collision_backend:
         Args:
             backend (str): first-collision backend, ``"torch"`` or ``"triton"``.
         """
+        self.backend = backend
         self.fn = functools.partial(ORIGINAL_FIRST_COLLISION, backend=backend)
 
     def __enter__(self):
-        """Patch both module names to the bound function.
+        """Patch both module names to the bound function (and the fused kernels off for ``"torch"``).
 
         Returns:
             use_first_collision_backend: this context manager.
         """
         uncollided_module.first_collision_source_at_directions = self.fn
         scatter_image_module.first_collision_source_at_directions = self.fn
+        if self.backend == "torch":
+            uncollided_kernels.fused_kernels_usable = lambda *args, **kwargs: False
         return self
 
     def __exit__(self, *exc):
-        """Restore the original function.
+        """Restore the original functions.
 
         Args:
             *exc: exception type, value and traceback (ignored).
@@ -89,6 +94,7 @@ class use_first_collision_backend:
         """
         uncollided_module.first_collision_source_at_directions = ORIGINAL_FIRST_COLLISION
         scatter_image_module.first_collision_source_at_directions = ORIGINAL_FIRST_COLLISION
+        uncollided_kernels.fused_kernels_usable = ORIGINAL_FUSED_USABLE
         return False
 
 

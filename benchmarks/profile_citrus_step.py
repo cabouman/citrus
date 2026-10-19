@@ -31,6 +31,7 @@ from citrus.citrus import CitrusState, StateStore, citrus_step  # noqa: E402
 from citrus.utilities import wlab_solver  # noqa: E402
 from citrus.scatter_solver import scatter_image as scatter_image_module  # noqa: E402
 from citrus.scatter_solver import scatter_solver as scatter_solver_module  # noqa: E402
+from citrus.scatter_solver.kernels import uncollided_kernels  # noqa: E402
 from citrus.scatter_solver.config import SolverConfig  # noqa: E402
 from citrus.scatter_solver.cross_section_library import load_spectrum_txt  # noqa: E402
 from citrus.scatter_solver.scatter_image import covering_polar_angle  # noqa: E402
@@ -162,9 +163,9 @@ def main() -> None:
     wrap(scatter_image_module, "supervoxel_subpoint_emission", "sub-point emission")
     wrap(solver.projectors, "oblique_project", "oblique projection")
     wrap(scatter_image_module.DirectionSetContext, "accumulate", "accumulation")
-    wrap(scatter_solver_module, "first_collision_source_at_directions", "first-collision source (solver binding)")
-    wrap(scatter_solver_module, "restrict_to_linear_discontinuous_moments",
-         "restrict first-collision to linear-discontinuous moments")
+    wrap(scatter_solver_module, "first_collision_moments_at_directions",
+         "first-collision moments of the sweep source (source, correction, restriction)")
+    wrap(uncollided_kernels, "attenuated_emission", "fused attenuated emission")
 
     # pass 1: build the accumulators (also compiles everything)
     states = {}

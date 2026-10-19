@@ -24,15 +24,20 @@ from .cross_sections import (MaterialPairs, MultigroupLibrary, check_material_na
                              material_table, mu_t_volume, transfer_moments_volume)
 from .detector import DetectorResponse, GridResponse
 from .geometry import ConeGeometry, Grid, resample_conservative
+from .kernels import uncollided_kernels
 from .ray_tracing import Projectors, SiddonProjectors
 from .scatter_image import (DirectionSetContext, combined_scatter_image, make_direction_context, panel_direction_set,
                             primary_from_path_lengths, primary_image, primary_path_lengths, scatter_fraction)
 from .source import SourceModel
 from .source_iteration import SourceIterationResult, scatter_moments, scatter_source_function, source_iteration
 from .transport_sweep import SourceFunction, SweepContext, make_sweep_context, sweep
-from .uncollided import (DENSE, FirstCollisionSamplingCorrection, first_collision_sampling_correction,
-                         first_collision_source_at_directions, restrict_to_linear_discontinuous_moments,
-                         uncollided_fluence, uncollided_from_path_lengths, uncollided_path_lengths)
+from .uncollided import (DENSE, FirstCollisionSamplingCorrection, first_collision_moments_at_directions,
+                         first_collision_sampling_correction, uncollided_fluence, uncollided_from_path_lengths,
+                         uncollided_path_lengths)
+
+# The scatter image with the fused kernels takes up to this many directions per chunk, as many as fit the budget.
+IMAGE_CHUNK_MAX_DIRECTIONS = 32
+IMAGE_CHUNK_BUDGET_BYTES = 256 * 2 ** 20
 
 __all__ = [
     "truncated_library",
@@ -535,19 +540,46 @@ class ScatterSolver:
             DirectionSetContext: panel-facing directions, their chunking and the detector and grid response weights.
         """
         quadrature = self.cone_quadrature(fields.grid_fine, angle) if quadrature is None else quadrature
+        chunk = self.image_direction_chunk(fields)
         key = (float(angle), id(quadrature), tuple(fields.grid_fine.shape), tuple(fields.grid_coarse.shape),
-               tuple(fields.grid_quadrature.shape), int(self.config.direction_chunk))
+               tuple(fields.grid_quadrature.shape), chunk)
         context = self._direction_contexts.get(key)
         if context is not None and context.quadrature is quadrature:
             self._direction_contexts.move_to_end(key)
             return context
         context = make_direction_context(quadrature, self.geometry, angle, self.detector, self.grid_response,
-                                         self.library, self.device, self.dtype, chunk=self.config.direction_chunk)
+                                         self.library, self.device, self.dtype, chunk=chunk)
         if self.direction_context_cache_size > 0:
             self._direction_contexts[key] = context
             while len(self._direction_contexts) > self.direction_context_cache_size:
                 self._direction_contexts.popitem(last=False)
         return context
+
+    def image_direction_chunk(self, fields: MaterialFields) -> int:
+        """Directions per chunk of the scatter image.
+
+        With the fused first-collision kernels (float32 CUDA) a chunk holds the attenuated emission at the quadrature
+        points, the optical depths and multiple-collision source of the cells, the images and the footprint matrices of
+        its directions; it takes as many directions as fit ``IMAGE_CHUNK_BUDGET_BYTES``, between
+        ``config.direction_chunk`` and ``IMAGE_CHUNK_MAX_DIRECTIONS``, since fewer and larger chunks launch fewer
+        kernels. The PyTorch path, whose temporaries are several times larger, keeps ``config.direction_chunk``.
+
+        Args:
+            fields (MaterialFields): density fields of the volume (for the sizes of the grids).
+
+        Returns:
+            int: directions per chunk.
+        """
+        base = int(self.config.direction_chunk)
+        fused = (self.device.type == "cuda" and self.dtype == torch.float32
+                 and uncollided_kernels.kernel_usable(self.device)[0])
+        if not fused:
+            return base
+        G = int(self.num_groups)
+        Rd, Cd = int(self.geometry.num_det_rows), int(self.geometry.num_det_channels)
+        per_direction = 4 * (G * (fields.grid_quadrature.num_voxels + 2 * fields.grid_coarse.num_voxels
+                                  + 3 * Rd * Cd) + Rd * Rd + Cd * Cd)
+        return int(max(base, min(IMAGE_CHUNK_MAX_DIRECTIONS, IMAGE_CHUNK_BUDGET_BYTES // max(1, per_direction))))
 
     def clear_caches(self) -> None:
         """Drop every cache: transport grids, sweep contexts, collapsed-cone direction sets and direction contexts."""
@@ -669,7 +701,8 @@ class ScatterSolver:
 
         The source is evaluated at the quadrature points for the requested sweep directions, scaled by the sampling
         correction (:meth:`first_collision_sampling_correction`, computed once here) and restricted to
-        linear-discontinuous moments.
+        linear-discontinuous moments (``uncollided.first_collision_moments_at_directions``, one fused kernel on float32
+        CUDA tensors).
 
         Args:
             fields (MaterialFields): density fields of the volume.
@@ -687,19 +720,21 @@ class ScatterSolver:
         # source in batches of at most direction_chunk directions so that its quadrature-grid temporaries stay bounded
         batch = max(1, min(int(self.config.direction_chunk), sweep_context.directions_per_octant))
 
-        def restricted_source(direction_index: Tensor) -> Tensor:
+        pairs = fields.first_collision_pairs
+        fused = uncollided_kernels.fused_kernels_usable(
+            self.library, fields.rho_quadrature, phi_uncollided, pairs if isinstance(pairs, MaterialPairs) else None)
+
+        def restricted_source(direction_index: Tensor, out: Optional[Tensor] = None) -> Tensor:
             directions = omega.index_select(0, direction_index.to(omega.device))
-            source = first_collision_source_at_directions(self.library, fields.rho_quadrature, phi_uncollided,
-                                                          fields.grid_quadrature, self.geometry, angle, directions,
-                                                          chunk=self.first_collision_chunk,
-                                                          pairs=fields.first_collision_pairs)
-            source = correction.apply(source, directions)
-            return restrict_to_linear_discontinuous_moments(source, fields.grid_quadrature, fields.q)
+            return first_collision_moments_at_directions(self.library, fields.rho_quadrature, phi_uncollided,
+                                                         fields.grid_quadrature, self.geometry, angle, directions,
+                                                         correction, fields.q, chunk=self.first_collision_chunk,
+                                                         pairs=pairs, out=out)
 
         def source_function(direction_index: Tensor, out: Optional[Tensor] = None) -> Tensor:
             n = int(direction_index.numel())
-            if n <= batch and out is None:
-                return restricted_source(direction_index)
+            if fused or (n <= batch and out is None):  # the fused kernel forms no quadrature-grid temporaries
+                return restricted_source(direction_index, out)
             for i in range(0, n, batch):
                 part = restricted_source(direction_index[i:i + batch])
                 if out is None:

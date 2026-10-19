@@ -23,7 +23,7 @@ from .config import SolverConfig
 from .cross_sections import MultigroupLibrary, group_transmission, mu_t_volume
 from .detector import DetectorResponse, GridResponse, detector_angle, grid_angles
 from .geometry import ConeGeometry, Grid, resample_conservative
-from .kernels import triton_utilities
+from .kernels import triton_utilities, uncollided_kernels
 from .ray_tracing import Projectors
 from .source import SourceModel
 from .uncollided import first_collision_source_at_directions, present_materials, resolve_pairs
@@ -923,6 +923,20 @@ class _Footprint:
             context._cache[key] = cached
         self.scale, self.heights, self.center_height = cached
 
+    def mean_height_from_sums(self, sums: Tensor) -> Tensor:
+        """Mean panel height per direction from the sums of the emission and of the emission times the height.
+
+        Args:
+            sums (Tensor): [k, 2] sums ``(sum e, sum e h)`` over the voxels and groups (the fused emission kernel).
+
+        Returns:
+            Tensor: [k] mean heights in cm (the box-center height where the emission vanishes).
+        """
+        numerator, denominator = sums[:, 1], sums[:, 0]
+        tiny = torch.finfo(denominator.dtype).tiny
+        return torch.where(denominator > 0, numerator / denominator.clamp_min(tiny),
+                           torch.full_like(denominator, self.center_height))
+
     def mean_height(self, emission: Tensor) -> Tensor:
         """Emission-weighted mean panel height of an attenuated emission per direction.
 
@@ -971,7 +985,9 @@ def combined_scatter_image(library: MultigroupLibrary, rho_quadrature: Tensor, p
 
     Per direction chunk the first-collision source at the quadrature points and the multiple-collision source of the
     transport cells are summed, attenuated (:func:`supervoxel_subpoint_emission`), projected from the quadrature points,
-    footprint-blurred and accumulated (docs/source/method.rst, "Collapsed-cone scatter image").
+    footprint-blurred and accumulated (docs/source/method.rst, "Collapsed-cone scatter image"). On float32 CUDA tensors
+    one fused kernel per chunk forms the attenuated emission and the sums of its mean height
+    (``uncollided_kernels.attenuated_emission``).
 
     Args:
         library (MultigroupLibrary): cross-section library.
@@ -1039,30 +1055,46 @@ def combined_scatter_image(library: MultigroupLibrary, rho_quadrature: Tensor, p
     moments_by_cell = scatter_source_moments.to(device=device, dtype=dtype).transpose(0, 1).reshape(num_moments, -1)
     quadrature_shape = tuple(grid_quadrature.shape)
     footprint_blur = _Footprint(grid_quadrature, geometry, angle, context) if footprint else None
+    # one fused kernel per chunk on float32 CUDA: source, attenuation and mean-height sums without temporaries
+    compact_pairs = pairs if not isinstance(pairs, str) else None
+    fused = uncollided_kernels.fused_kernels_usable(library, rho, phi_uncollided, compact_pairs)
 
     accumulator = context.new_accumulator()
     for i, directions in enumerate(context.omega_chunks):
         k = int(directions.shape[0])
-        first_collision = first_collision_source_at_directions(library, rho, phi_uncollided, grid_quadrature, geometry,
-                                                               angle, directions, chunk=first_collision_chunk,
-                                                               pairs=pairs)
-        if tuple(first_collision.shape) != (k, G, *quadrature_shape):
-            raise ValueError(f"first-collision source {tuple(first_collision.shape)} != {(k, G, *quadrature_shape)}")
         # [k, G, Rc, Cc, Sc]
         tau = projectors.downstream_cumulative(mu_t_coarse, grid_coarse, geometry, angle, directions)
         # S_MC(Omega_k) per supervoxel
         multiple_collision = torch.mm(harmonics[i], moments_by_cell).view(k, G, Rc, Cc, Sc)
-        # one source at the quadrature points, one attenuation, one projection
-        total_source = (first_collision.reshape(k, G, Rc, f, Cc, f, Sc, f)
-                        .add(multiple_collision[:, :, :, None, :, None, :, None]).view(k, G, *quadrature_shape))
-        del first_collision, multiple_collision
-        emission = supervoxel_subpoint_emission(total_source, tau, mu_t_coarse, directions, grid_quadrature, f,
-                                                offsets=None if subcell_offsets is None else subcell_offsets[i])
-        del total_source, tau
+        mean_heights = None
+        if fused:
+            emission, height_sums = uncollided_kernels.attenuated_emission(
+                library, rho, phi_uncollided, grid_quadrature, geometry, angle, directions, tau, mu_t_coarse,
+                multiple_collision, f, None if footprint_blur is None else footprint_blur.heights,
+                pairs=compact_pairs)
+            if footprint_blur is not None:
+                mean_heights = footprint_blur.mean_height_from_sums(height_sums)
+            del multiple_collision, tau, height_sums
+        else:
+            first_collision = first_collision_source_at_directions(library, rho, phi_uncollided, grid_quadrature,
+                                                                   geometry, angle, directions,
+                                                                   chunk=first_collision_chunk, pairs=pairs)
+            if tuple(first_collision.shape) != (k, G, *quadrature_shape):
+                raise ValueError(f"first-collision source {tuple(first_collision.shape)} != "
+                                 f"{(k, G, *quadrature_shape)}")
+            # one source at the quadrature points, one attenuation, one projection
+            total_source = (first_collision.reshape(k, G, Rc, f, Cc, f, Sc, f)
+                            .add(multiple_collision[:, :, :, None, :, None, :, None]).view(k, G, *quadrature_shape))
+            del first_collision, multiple_collision
+            emission = supervoxel_subpoint_emission(total_source, tau, mu_t_coarse, directions, grid_quadrature, f,
+                                                    offsets=None if subcell_offsets is None else subcell_offsets[i])
+            del total_source, tau
+            if footprint_blur is not None:
+                mean_heights = footprint_blur.mean_height(emission)
         # [k, G, Rd, Cd] photons/(cm^2 sr)
         image = projectors.oblique_project(emission, grid_quadrature, geometry, angle, directions)
         if footprint_blur is not None:
-            image = footprint_blur.blur(image, i, footprint_blur.mean_height(emission))
+            image = footprint_blur.blur(image, i, mean_heights)
         del emission
         context.accumulate(accumulator, image, i)
         del image

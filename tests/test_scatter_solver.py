@@ -171,6 +171,34 @@ def test_independent_of_direction_chunk(rho, base_result):
     assert _rel(r1.scatter_signal, r.scatter_signal) < 1e-5
 
 
+def test_image_direction_chunk(rho, monkeypatch):
+    """With the fused first-collision kernels the scatter image takes as many directions per chunk as fit
+    IMAGE_CHUNK_BUDGET_BYTES, between config.direction_chunk and IMAGE_CHUNK_MAX_DIRECTIONS; otherwise
+    config.direction_chunk. The image does not depend on the chunk."""
+    import citrus.scatter_solver.scatter_solver as scatter_solver_module
+    from citrus.scatter_solver.kernels import uncollided_kernels
+
+    s = make_solver()
+    f = s.material_fields(rho, GRID)
+    chunk = s.image_direction_chunk(f)
+    if not (DEVICE.type == "cuda" and uncollided_kernels.kernel_usable(DEVICE)[0]):
+        assert chunk == CONFIG.direction_chunk
+        pytest.skip("the fused first-collision kernels are unusable here")
+    assert chunk == scatter_solver_module.IMAGE_CHUNK_MAX_DIRECTIONS > CONFIG.direction_chunk  # a small problem
+    assert max(int(c.shape[0]) for c in s.direction_context(f, 0.0).omega_chunks) == chunk
+    phi_uncollided = s.uncollided_fluence(f, 0.0)
+    T = s.multiple_collision_source_moments(f, 0.01 * torch.rand(s.num_groups, (s.L + 1) ** 2, 4, *f.grid_coarse.shape,
+                                                                 device=DEVICE))
+    image = s.scatter_image(f, 0.0, phi_uncollided, T)
+    monkeypatch.setattr(scatter_solver_module, "IMAGE_CHUNK_BUDGET_BYTES", 1)  # nothing fits: the configured chunk
+    small = make_solver()
+    assert small.image_direction_chunk(f) == CONFIG.direction_chunk
+    assert max(int(c.shape[0]) for c in small.direction_context(f, 0.0).omega_chunks) == CONFIG.direction_chunk
+    small_image = small.scatter_image(f, 0.0, phi_uncollided, T)
+    for k in IMAGE_KEYS:
+        assert _rel(image[k], small_image[k]) < 1e-6, k
+
+
 # ---- anti-scatter grid ----------------------------------------------------------------------------------------
 
 def test_grid_lowers_scatter_fraction(rho, base_result):

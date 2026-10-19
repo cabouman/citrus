@@ -87,7 +87,9 @@ Repository
     ``build_docs.sh``, ``check_cuda.sh`` (PyTorch / CUDA / Triton availability, the kernel self-checks and the photon
     data), ``wsl_install_test.sh`` (an installation test from GitHub in a fresh environment).
 ``benchmarks/``
-    Benchmarks of the sweep, the first-collision source kernel and the ray tracer, a per-stage profile of the CITRUS
-    step, the GPU memory of the loop (``bench_citrus_memory.py``), fixed against adaptive numbers of MBIR iterations
-    (``adaptive_mbir_study.py``), demo 2's data at another voxel pitch (``make_demo_data.py``), and
-    ``citrus_study.py``, the CITRUS study script with every setting as a flag (:doc:`usage`).
+    Benchmarks of the sweep, the first-collision source kernel, the ray tracer and the scatter image per direction
+    chunk (``bench_scatter_image.py``), profiles of the CITRUS step per stage (``profile_citrus_step.py``) and per
+    kernel (``kernel_profile_step.py``), the GPU memory of the loop (``bench_citrus_memory.py``), fixed against
+    adaptive numbers of MBIR iterations (``adaptive_mbir_study.py``), demo 2's data at another voxel pitch
+    (``make_demo_data.py``), and ``citrus_study.py``, the CITRUS study script with every setting as a flag
+    (:doc:`usage`).

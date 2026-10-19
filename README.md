@@ -79,9 +79,9 @@ Install PyTorch first if you need a specific CUDA build. Every dependency instal
   it, or on the CPU, the PyTorch reference paths are used automatically (`CITRUS_DISABLE_TRITON=1` forces them).
 
 Developer tools: `dev_scripts/` (conda test environment, clean install, tests, docs, CUDA check);
-`benchmarks/` (benchmarks of the sweep, the first-collision source and the ray tracer, a profile of the CITRUS
-step, the GPU memory of the loop, fixed against adaptive numbers of MBIR iterations, and the CITRUS study script
-`citrus_study.py`).
+`benchmarks/` (benchmarks of the sweep, the first-collision source, the ray tracer and the scatter image, profiles of
+the CITRUS step per stage and per kernel, the GPU memory of the loop, fixed against adaptive numbers of MBIR
+iterations, and the CITRUS study script `citrus_study.py`).
 
 ## Quick start
 
@@ -144,7 +144,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Gregery T. Buzzard and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.18.3},
+  note = {Version 0.19.0},
   year = 2026
 }
 ```

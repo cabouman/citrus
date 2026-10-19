@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.19.0 - 2026-10-19
+
+- **Fused first-collision kernels.** On float32 CUDA the first-collision source is evaluated where it is used, so the
+  `[K, G, rows, cols, slices]` source is never formed: one kernel gives the sweep's source (the source at the
+  quadrature points of each transport cell, times the sampling correction, restricted to the cell's
+  linear-discontinuous moments; `uncollided.first_collision_moments_at_directions`), one the sums of the sampling
+  correction over all sweep directions together with the exact moments, and one the emission of the scatter image
+  (the source plus the cell's multiple-collision source, attenuated to the panel, with the sums of the footprint's
+  mean height). The kernels share the evaluation of the source, use no atomics and are checked against their PyTorch
+  compositions once per device; the PyTorch paths stay the reference and serve float64 and the CPU. The
+  first-collision source and the scatter image, the two largest stages of a CITRUS step, take a fraction of their
+  former time.
+- **Kernel transfer table.** The kernels read the transfer table per material with the eta nodes in order
+  (`[M, N, G_in, GP]`), so all entries of a point's interpolation in one material are one contiguous block.
+- **Scatter image chunks.** With the fused kernels the scatter image takes as many directions per chunk as fit a
+  memory budget (`ScatterSolver.image_direction_chunk`, between `direction_chunk` and 32).
+- **Benchmarks.** `benchmarks/kernel_profile_step.py` gives the CUDA time per kernel and stage of a CITRUS step and
+  `benchmarks/bench_scatter_image.py` the scatter image per chunk size; `bench_uncollided_kernel.py` switches the fused
+  kernels off for its PyTorch runs.
+
 ## v0.18.3 - 2026-10-19
 
 - **Demo 7.** The convergence plot is against MBIR iterations again, with a dot on each curve at the volume each

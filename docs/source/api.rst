@@ -122,7 +122,7 @@ Fused GPU kernels of the scatter solver, with PyTorch reference paths.
     Fused Triton kernels of the ray tracer.
 
 :doc:`api/uncollided_kernels`
-    Fused Triton kernel of the first-collision source.
+    Fused Triton kernels of the first-collision source and of its uses in the sweep and the scatter image.
 
 :doc:`api/sweep_kernels`
     Fused Triton kernel of the sweep's per-plane cell solve.

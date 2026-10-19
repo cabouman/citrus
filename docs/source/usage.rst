@@ -428,7 +428,8 @@ descriptions. The first setting of each group names the group.
      - azimuthal directions of the cone direction set
    * - ``direction_chunk``
      - ``8``
-     - directions per batch of the scatter image and per octant per sweep chunk
+     - directions per octant per sweep chunk and per batch of the scatter image (larger image batches with the
+       fused kernels, as many as fit a memory budget)
    * - ``dtype`` (numerics)
      - ``"float32"``
      - float32 (production) or float64 (reference and tests)

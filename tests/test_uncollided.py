@@ -2,6 +2,7 @@
 law, the first-collision source against a direct evaluation, linear-discontinuous restriction, the sampling correction
 and the fused Triton kernel."""
 
+import math
 import os
 
 import numpy as np
@@ -385,14 +386,13 @@ def test_fc_source_triton_kill_switch(monkeypatch):
 
 def _first_collision_moment_sources(library, monkeypatch) -> tuple[torch.Tensor, torch.Tensor]:
     """solver.first_collision_moment_source (all sweep directions, linear-discontinuous moments, with the conservative
-    sampling correction) of the 2 cm WLAB problem of test_scatter_solver.py, once with the Triton first-collision source
-    and once with the PyTorch path (forced by
-    patching the names that scatter_solver.py and uncollided.first_collision_sampling_correction resolve at call
-    time)."""
+    sampling correction) of the 2 cm WLAB problem of test_scatter_solver.py, once with the fused Triton kernels (moments
+    and quadrature sums) and once with the PyTorch path (forced by switching the fused kernels off and patching the
+    source that uncollided.py resolves at call time)."""
     import functools
 
-    from citrus.scatter_solver import scatter_solver as scatter_solver_module
     from citrus.scatter_solver import uncollided as uncollided_module
+    from citrus.scatter_solver.kernels import uncollided_kernels
     from citrus.scatter_solver.config import SolverConfig
     from citrus.scatter_solver.detector import csi_response, no_grid
     from citrus.utilities import wlab_geometry
@@ -417,7 +417,8 @@ def _first_collision_moment_sources(library, monkeypatch) -> tuple[torch.Tensor,
         with monkeypatch.context() as mp:
             fn = functools.partial(original, backend=be)
             mp.setattr(uncollided_module, "first_collision_source_at_directions", fn)
-            mp.setattr(scatter_solver_module, "first_collision_source_at_directions", fn)
+            if be == "torch":
+                mp.setattr(uncollided_kernels, "fused_kernels_usable", lambda *args, **kwargs: False)
             out[be] = solver.first_collision_moment_source(f, 0.0, phi_uncollided, context)(index)
     return out["triton"], out["torch"]
 
@@ -443,3 +444,126 @@ def test_fc_moment_source_triton_real_library(monkeypatch):
     library = build_solver_library(SolverConfig(num_groups=6, legendre_order=10), SPECTRUM_125KVP)
     tri, reference = _first_collision_moment_sources(library, monkeypatch)
     _assert_rel(tri, reference, 1e-5)
+
+
+# ---- fused uses of the source: sweep moments, quadrature sums and the sampling correction
+# -------------------------------------------------------------
+
+def _pytorch_first_collision(monkeypatch):
+    """Switch off the fused first-collision kernels and send the source to its PyTorch path (inside a monkeypatch
+    context)."""
+    import functools
+
+    from citrus.scatter_solver import uncollided as uncollided_module
+    from citrus.scatter_solver.kernels import uncollided_kernels
+
+    monkeypatch.setattr(uncollided_kernels, "fused_kernels_usable", lambda *args, **kwargs: False)
+    monkeypatch.setattr(uncollided_module, "first_collision_source_at_directions",
+                        functools.partial(first_collision_source_at_directions, backend="torch"))
+
+
+def _fused_case(pair: bool, factor: int, parallel: bool, seed: int):
+    """A random float32 CUDA first-collision problem: seven materials with at most two per point (pair mode) or up to
+    seven (dense mode), vacuum points, an anisotropic quadrature grid of 4 x 3 x 2 cells with ``factor`` points per axis
+    and a slice offset, an adaptive transfer table, and a cone or parallel beam."""
+    from citrus.scatter_solver.cross_sections import material_pairs
+    from citrus.scatter_solver.geometry import ParallelGeometry
+
+    device = torch.device("cuda")
+    g = torch.Generator().manual_seed(seed)
+    library = synthetic_library(6, legendre_order=1, num_eta=301, num_materials=7, angular_table_grid="adaptive")
+    grid = Grid(shape=(4 * factor, 3 * factor, 2 * factor), delta_voxel=1.2 / factor, voxel_row_aspect=1.3,
+                voxel_slice_aspect=0.8, recon_slice_offset=0.3)
+    if parallel:
+        geometry = ParallelGeometry(axis_detector_dist=10.0, num_det_rows=8, num_det_channels=8, delta_det_row=1.0,
+                                    delta_det_channel=1.0)
+    else:
+        geometry = wide_geometry()
+    if pair:
+        rho = torch.zeros(7, *grid.shape)
+        slots = torch.randint(0, 7, (2,) + tuple(grid.shape), generator=g)
+        rho.scatter_(0, slots, torch.rand((2,) + tuple(grid.shape), generator=g) + 0.1)
+    else:
+        rho = torch.rand(7, *grid.shape, generator=g) * (torch.rand(7, *grid.shape, generator=g) > 0.4)
+    rho[:, 0, 0] = 0.0  # vacuum points
+    rho = rho.to(device)
+    phi = (torch.rand(6, *grid.shape, generator=g) + 0.01).to(device)
+    return library, rho, material_pairs(rho) if pair else None, phi, grid, geometry
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("factor", [1, 2, 3])
+@pytest.mark.parametrize("pair", [True, False])
+def test_fused_first_collision_moments_match_torch(pair, factor, parallel, monkeypatch):
+    """first_collision_moments_at_directions: the fused kernel (source, sampling correction and linear-discontinuous
+    restriction in one pass, no [K, G, rows, cols, slices] source) == the PyTorch composition to 1e-5, into a given
+    ``out`` as well."""
+    from citrus.scatter_solver.uncollided import (FirstCollisionSamplingCorrection,
+                                                  first_collision_moments_at_directions)
+
+    device = _first_collision_kernel_or_skip()
+    library, rho, pairs, phi, grid, geometry = _fused_case(pair, factor, parallel, seed=10 * factor + parallel)
+    angle = 0.7
+    g = torch.Generator().manual_seed(factor)
+    omega_uncollided = primary_directions_to_voxels(grid, geometry, angle, device, torch.float32)
+    directions = torch.nn.functional.normalize(torch.randn(9, 3, generator=g), dim=-1).to(device)
+    directions[0] = omega_uncollided[1, 2, 1]  # eta = 1 at one point: the table end
+    scale = (torch.rand(6, *grid.shape, generator=g) + 0.5).to(device)
+    beta = (2 * torch.rand(6, *grid.shape, generator=g) - 1).to(device)
+    correction = FirstCollisionSamplingCorrection(scale, beta, omega_uncollided)
+
+    def moments(out=None):
+        return first_collision_moments_at_directions(library, rho, phi, grid, geometry, angle, directions, correction,
+                                                     factor, pairs=pairs, out=out)
+
+    fused = moments()
+    out = torch.full_like(fused, float("nan"))
+    assert moments(out) is out and torch.equal(out, fused)
+    with monkeypatch.context() as mp:
+        _pytorch_first_collision(mp)
+        reference = moments()
+        out = torch.full_like(fused, float("nan"))
+        assert moments(out) is out and torch.equal(out, reference)
+    assert fused.shape == reference.shape == (9, 6, 4, *grid.coarsen(factor).shape)
+    _assert_rel(fused, reference, 1e-5)
+    if factor > 1:
+        _assert_rel(fused[:, :, 1:], reference[:, :, 1:], 1e-5)  # the slopes, relative to their own scale
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("pair", [True, False])
+def test_fused_quadrature_sums_and_correction_match_torch(pair, parallel, monkeypatch):
+    """The fused sums kernel accumulates I0, I1, I2 over 160 directions in float32 and the exact moments E0, E1; each
+    equals its PyTorch counterpart (float64 accumulation) to 1e-5, and so do the sampling correction factors built on
+    them (scale relative per point; beta absolute, i.e. relative to the unit factor 1 + beta mu, as in
+    test_scatter_solver.test_fc_sampling_float32_accumulation)."""
+    from citrus.scatter_solver.kernels import uncollided_kernels
+    from citrus.scatter_solver.uncollided import (first_collision_exact_moments, first_collision_quadrature_sums,
+                                                  first_collision_sampling_correction)
+
+    device = _first_collision_kernel_or_skip()
+    library, rho, pairs, phi, grid, geometry = _fused_case(pair, 2, parallel, seed=3 + parallel)
+    angle = 0.4
+    g = torch.Generator().manual_seed(7)
+    directions = torch.nn.functional.normalize(torch.randn(160, 3, generator=g), dim=-1).to(device)
+    weights = (torch.rand(160, generator=g) * 4 * math.pi / 80).to(device)
+    args = (library, rho, phi, grid, geometry, angle, directions, weights)
+    sums = first_collision_quadrature_sums(*args, pairs=pairs)
+    sums_and_moments = uncollided_kernels.first_collision_sums(*args, pairs=pairs, exact_moments=True)
+    correction = first_collision_sampling_correction(*args, pairs=pairs)
+    with monkeypatch.context() as mp:
+        _pytorch_first_collision(mp)
+        reference_sums = first_collision_quadrature_sums(*args, pairs=pairs)
+        reference_correction = first_collision_sampling_correction(*args, pairs=pairs)
+    exact = first_collision_exact_moments(library, rho, phi.double(), l_max=1)
+    assert sums.dtype == reference_sums.dtype == torch.float64
+    assert sums.shape == reference_sums.shape == (3, 6, *grid.shape) and sums_and_moments.shape == (5, 6, *grid.shape)
+    assert torch.equal(sums, sums_and_moments[:3].double())
+    for n in range(3):
+        _assert_rel(sums[n], reference_sums[n], 1e-5)
+    for l in range(2):
+        _assert_rel(sums_and_moments[3 + l], exact[l], 1e-5)
+    assert float(((correction.scale - reference_correction.scale).abs() / reference_correction.scale.abs()).max()) < 1e-5
+    assert float((correction.beta - reference_correction.beta).abs().max()) < 1e-5
+    assert float(reference_correction.beta.abs().max()) > 1e-2  # the correction is not trivial
+    assert torch.equal(correction.omega_uncollided, reference_correction.omega_uncollided)

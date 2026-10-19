@@ -430,13 +430,67 @@ def first_collision_sampling_correction(library: MultigroupLibrary, rho: Tensor,
     if weights.shape[0] != omegas.shape[0]:
         raise ValueError("weights and omegas disagree in length")
     omega_uncollided = primary_directions_to_voxels(grid, geometry, angle, device, dtype)
-    sums = first_collision_quadrature_sums(library, rho, phi_uncollided, grid, geometry, angle, omegas, weights,
-                                           omega_uncollided=omega_uncollided, chunk=chunk, batch=batch,
-                                           pairs=resolve_pairs(rho, pairs))
-    exact_moments = first_collision_exact_moments(library, rho, phi_uncollided.double(), l_max=1)
+    pairs = resolve_pairs(rho, pairs)
+    compact_pairs = pairs if isinstance(pairs, MaterialPairs) else None
+    if uncollided_kernels.fused_kernels_usable(library, rho, phi_uncollided, compact_pairs) and \
+            library.legendre_order >= 1:
+        # one kernel: the quadrature sums and the exact moments (in float32), without forming the source
+        sums_and_moments = uncollided_kernels.first_collision_sums(library, rho, phi_uncollided, grid, geometry, angle,
+                                                                   omegas, weights, pairs=compact_pairs,
+                                                                   exact_moments=True).double()
+        sums, exact_moments = sums_and_moments[:3], sums_and_moments[3:]
+    else:
+        sums = first_collision_quadrature_sums(library, rho, phi_uncollided, grid, geometry, angle, omegas, weights,
+                                               omega_uncollided=omega_uncollided, chunk=chunk, batch=batch,
+                                               pairs=pairs)
+        exact_moments = first_collision_exact_moments(library, rho, phi_uncollided.double(), l_max=1)
     scale, beta = first_collision_correction_factors(sums, exact_moments)
     return FirstCollisionSamplingCorrection(scale=scale.to(dtype), beta=beta.to(dtype),
                                             omega_uncollided=omega_uncollided)
+
+
+def first_collision_moments_at_directions(library: MultigroupLibrary, rho: Tensor, phi_uncollided: Tensor, grid: Grid,
+                                          geometry: ConeGeometry, angle: float, omegas: Tensor,
+                                          correction: FirstCollisionSamplingCorrection, factor: int, chunk: int = 4,
+                                          pairs: PairsArgument = None, out: Optional[Tensor] = None) -> Tensor:
+    """Linear-discontinuous moments of the corrected first-collision source on the cells of a refined grid.
+
+    The source at the points of ``grid`` (``first_collision_source_at_directions``) is corrected
+    (``FirstCollisionSamplingCorrection.apply``) and restricted to the cells
+    (``restrict_to_linear_discontinuous_moments``); on float32 CUDA tensors one fused kernel does all three without
+    forming the [K, G, rows, cols, slices] source (``uncollided_kernels.first_collision_moments``).
+
+    Args:
+        library (MultigroupLibrary): cross-section library with the angular transfer table.
+        rho (Tensor): [M, rows, cols, slices] material densities on ``grid`` in g/cm^3.
+        phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence.
+        grid (Grid): the quadrature grid, ``factor`` points per axis per cell.
+        geometry (ConeGeometry or ParallelGeometry): scanner geometry.
+        angle (float): view angle in radians.
+        omegas (Tensor): [K, 3] unit directions.
+        correction (FirstCollisionSamplingCorrection): the sampling correction of the view.
+        factor (int): points per axis per cell.
+        chunk (int, optional): directions per batch of the PyTorch path of the source. Defaults to 4.
+        pairs (MaterialPairs | str | None, optional): as in ``first_collision_source_at_directions``. Defaults to None.
+        out (Tensor, optional): contiguous [K, G, 4, rows/f, cols/f, slices/f] tensor to fill. Defaults to None.
+
+    Returns:
+        Tensor: [K, G, 4, rows/f, cols/f, slices/f] moments ordered [0, x, y, z].
+    """
+    pairs = resolve_pairs(rho, pairs)
+    compact_pairs = pairs if isinstance(pairs, MaterialPairs) else None
+    if uncollided_kernels.fused_kernels_usable(library, rho, phi_uncollided, compact_pairs) and (
+            out is None or (out.is_contiguous() and out.dtype == torch.float32)):
+        return uncollided_kernels.first_collision_moments(library, rho, phi_uncollided, grid, geometry, angle, omegas,
+                                                          correction.scale, correction.beta, factor,
+                                                          pairs=compact_pairs, out=out)
+    source = first_collision_source_at_directions(library, rho, phi_uncollided, grid, geometry, angle, omegas,
+                                                  chunk=chunk, pairs=pairs)
+    moments = restrict_to_linear_discontinuous_moments(correction.apply(source, omegas), grid, factor)
+    del source
+    if out is None:
+        return moments
+    return out.copy_(moments)
 
 
 # at most this many directions are summed in the input dtype (float32 on GPU) before a float64 accumulation
@@ -471,7 +525,8 @@ def first_collision_quadrature_sums(library: MultigroupLibrary, rho: Tensor, phi
 
     ``I0 = sum_m w_m S_m``, ``I1 = sum_m w_m mu_m S_m`` and ``I2 = sum_m w_m mu_m^2 S_m`` with
     ``mu_m = omega_m . Omega_UC(r)``; float32 partial sums run over at most ``_FIRST_COLLISION_SUM_MAX_DIRECTIONS``
-    directions and are accumulated in float64.
+    directions and are accumulated in float64. On float32 CUDA tensors one fused kernel accumulates the sums in float32
+    over all directions without forming the source (``uncollided_kernels.first_collision_sums``).
 
     Args:
         library (MultigroupLibrary): cross-section library with the angular transfer table.
@@ -492,6 +547,10 @@ def first_collision_quadrature_sums(library: MultigroupLibrary, rho: Tensor, phi
         Tensor: [3, G, R, C, S] float64 sums I0, I1, I2.
     """
     pairs = resolve_pairs(rho, pairs)
+    compact_pairs = pairs if isinstance(pairs, MaterialPairs) else None
+    if uncollided_kernels.fused_kernels_usable(library, rho, phi_uncollided, compact_pairs):
+        return uncollided_kernels.first_collision_sums(library, rho, phi_uncollided, grid, geometry, angle, omegas,
+                                                       weights, pairs=compact_pairs).double()
     device, dtype = phi_uncollided.device, phi_uncollided.dtype
     omegas = omegas.to(device=device, dtype=dtype).reshape(-1, 3)
     weights = weights.to(device=device, dtype=dtype).reshape(-1)

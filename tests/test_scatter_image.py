@@ -832,6 +832,50 @@ def test_combined_scatter_image_wlab_cuda():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("footprint", [False, True])
+def test_combined_scatter_image_fused_matches_torch(footprint, monkeypatch):
+    """float32 CUDA, WLAB 2 cm: the combined pass with the fused emission kernel (first-collision source, the cell's
+    multiple-collision source, in-cell attenuation and the mean-height sums in one kernel per chunk) == the PyTorch
+    composition to 1e-5 (every key), with and without the finite-cone footprint, whose mean heights then come from the
+    kernel's sums."""
+    from citrus.utilities import wlab_phantom
+    from citrus.scatter_solver.kernels import uncollided_kernels
+    from citrus.scatter_solver.scatter_image import make_direction_context
+
+    device = torch.device("cuda")
+    if not uncollided_kernels.kernel_usable(device)[0]:
+        pytest.skip("first-collision kernels unusable on this machine")
+    geometry = wlab_setup(2.0, device=device, dtype=torch.float32)[1]
+    grid = Grid((10, 16, 20), 2.0)  # padded along x to be divisible by 2
+    rho = wlab_phantom(grid, device=device, dtype=torch.float32)
+    library = synthetic_library(num_groups=3, legendre_order=2, num_materials=7).to(device, torch.float32)
+    angle = 0.3
+    phi_uncollided = uncollided_fluence(library, rho, grid, geometry, angle, SourceModel(), PROJECTION)
+    q = panel_direction_set(geometry, angle, (8, 16), max_polar_angle=grid, device=device, dtype=torch.float32)
+    detector, grid_response = csi_response(), focused_1d_grid()
+    coarse = grid.coarsen(2)
+    mu_coarse_values = coarsen_mu_t(mu_t_volume(library, rho), grid, coarse)
+    L = 2
+    g = torch.Generator().manual_seed(3)
+    T = (torch.rand(3, num_spherical_harmonics(L), *coarse.shape, generator=g) * 0.01).to(device)
+    context = make_direction_context(q, geometry, angle, detector, grid_response, library, device, torch.float32,
+                                     chunk=8)
+
+    def image():
+        return scatter_image_module.combined_scatter_image(library, rho, phi_uncollided, grid, 2, T, L, geometry,
+                                                           angle, q, mu_coarse_values, PROJECTION, detector,
+                                                           grid_response, context, footprint=footprint)
+
+    fused = image()
+    with monkeypatch.context() as mp:
+        mp.setattr(uncollided_kernels, "fused_kernels_usable", lambda *args, **kwargs: False)
+        mp.setattr(scatter_image_module, "first_collision_source_at_directions",
+                   functools.partial(first_collision_source_at_directions, backend="torch"))
+        reference = image()
+    _assert_images_close(fused, reference, rtol=1e-5, msg=f"footprint={footprint}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_combined_scatter_image_no_sync():
     """The combined pass (one projection per chunk, with and without the finite-cone footprint) runs its whole chunk
     loop without any host-device synchronization with a prebuilt context and the fused Siddon projectors (sync debug
