@@ -9,7 +9,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Literal, Mapping, Sequence, Union
 
-from .cross_sections import COMPOUND_NAMES, MATERIAL_CATALOGUE, MATERIALS, check_material_names
+from .cross_sections import (COMPOUND_NAMES, MATERIAL_CATALOGUE, MATERIALS, Material, _canonical_material,
+                             check_material_names, material_names)
 
 # the rules of SolverConfig.group_edges_method and the node placements of SolverConfig.angular_table_grid
 GROUP_EDGES_METHODS = ("scattered_fluence", "equal_fluence", "log")
@@ -21,7 +22,7 @@ class SolverConfig:
     """Discretization parameters of the LBTE scatter solver (docs/source/method.rst).
 
     A ``grouping_medium`` given as a mapping or as pairs is stored as (name, density) pairs sorted by name, and
-    ``materials`` as a tuple.
+    ``materials`` as a tuple in which a ``Material`` that copies a catalogue entry becomes the catalogue name.
 
     Attributes:
         num_groups (int): number of energy groups G. Defaults to 6.
@@ -32,13 +33,15 @@ class SolverConfig:
         grouping_object_size_cm (float): characteristic size L in cm of the object for the "scattered_fluence"
             rule. Defaults to 20.0.
         grouping_medium (str or tuple[tuple[str, float], ...]): medium of the "scattered_fluence" rule: "auto", a
-            catalogue name or (reference material name, density in g/cm^3) pairs. Defaults to "auto".
+            catalogue or reference material name or (reference material name, density in g/cm^3) pairs. Defaults to
+            "auto".
         energy_min_kev (float): lowest group edge in keV; photons scattered below it are absorbed. Defaults to 10.0.
         legendre_order (int): Legendre order L of the scattering kernel. Defaults to 7.
         num_eta_table (int): nodes N of the tabulated transfer in ``eta = cos(scattering angle)``. Defaults to 2001.
         angular_table_grid (str): placement of the table nodes, "adaptive" or "uniform". Defaults to "adaptive".
-        materials (tuple[str, ...]): catalogue names of the reference materials of the library and the density model,
-            at least two. Defaults to the seven ``cross_sections.MATERIALS``.
+        materials (tuple[str or Material, ...]): reference materials of the library and the density model, catalogue
+            names or user-defined ``cross_sections.Material`` entries, at least two. Defaults to the seven
+            ``cross_sections.MATERIALS``.
         num_polar (int): Gauss-Legendre polar nodes of the sweep quadrature, at least L + 1. Defaults to 8.
         num_azimuthal (int): equally spaced azimuths of the sweep quadrature, at least 2 L + 1. Defaults to 16.
         transport_cell_cm (float): edge in cm of the cubic transport cells. Defaults to 1.0.
@@ -67,7 +70,7 @@ class SolverConfig:
     angular_table_grid: Literal["adaptive", "uniform"] = "adaptive"
 
     # --- materials ----------------------------------------------------------------------------
-    materials: tuple[str, ...] = MATERIALS
+    materials: tuple[Union[str, Material], ...] = MATERIALS
 
     # --- angle --------------------------------------------------------------------------------
     num_polar: int = 8
@@ -93,13 +96,18 @@ class SolverConfig:
     def __post_init__(self) -> None:
         """Store ``materials`` as a tuple and a ``grouping_medium`` mapping or pairs as sorted (name, density) pairs."""
         if not isinstance(self.materials, str) and isinstance(self.materials, Sequence):
-            object.__setattr__(self, "materials", tuple(self.materials))  # hashable, compares equal to a tuple
+            # hashable, compares equal to a tuple; a copy of a catalogue entry is its name
+            object.__setattr__(self, "materials", tuple(_canonical_material(m) for m in self.materials))
         medium = self.grouping_medium
+        if isinstance(medium, Material):
+            medium = medium.name
+            object.__setattr__(self, "grouping_medium", medium)
         if isinstance(medium, Mapping):
             medium = medium.items()
         if not isinstance(medium, str):
             try:  # a mapping or (name, density) pairs -> sorted pairs (hashable, order independent)
-                medium = tuple(sorted((str(name), float(density)) for name, density in medium))
+                medium = tuple(sorted((name.name if isinstance(name, Material) else str(name), float(density))
+                                      for name, density in medium))
             except (TypeError, ValueError):
                 pass  # left as given: validate() reports it
             object.__setattr__(self, "grouping_medium", medium)
@@ -129,7 +137,8 @@ class SolverConfig:
         return min(target, max(1, round(cell / float(fine_voxel_cm))))
 
     def _validate_grouping_medium(self) -> None:
-        """Check that ``grouping_medium`` is "auto", a catalogue name or densities of reference materials.
+        """Check that ``grouping_medium`` is "auto", a catalogue or reference material name or densities of reference
+        materials.
 
         Raises:
             ValueError: if it is not, or if its densities are negative or all zero.
@@ -148,14 +157,15 @@ class SolverConfig:
                                  f"{{reference material name: density}}, got {medium!r}") from None
             if any(not d >= 0 for d in densities) or not any(d > 0 for d in densities):
                 raise ValueError(f"grouping_medium densities must be >= 0 with at least one > 0, got {medium!r}")
-        unknown = [n for n in names if n not in MATERIAL_CATALOGUE]
+        reference = material_names(self.materials) if isinstance(self.materials, Sequence) else ()
+        unknown = [n for n in names if n not in MATERIAL_CATALOGUE and n not in reference]
         if unknown:
             raise ValueError(f"unknown grouping_medium material(s) {unknown}; the catalogue has {COMPOUND_NAMES} "
-                             f"and every element by its English name")
-        outside = [n for n in names if n not in tuple(self.materials)]
+                             f"and every element by its English name, or define it in materials")
+        outside = [n for n in names if n not in reference]
         if outside:
             raise ValueError(f"grouping_medium material(s) {outside} are not among the reference materials "
-                             f"{tuple(self.materials)}")
+                             f"{reference}")
 
     def validate(self) -> None:
         """Check every field against its allowed values.

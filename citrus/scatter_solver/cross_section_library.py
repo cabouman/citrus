@@ -1,9 +1,9 @@
 """Build the multigroup cross-section library of the scatter solver from point-wise photon interaction data.
 
 :func:`build_library` fills a :class:`~citrus.scatter_solver.cross_sections.MultigroupLibrary` for a table of
-catalogue materials from the integrated cross sections of NIST XCOM and the angular shapes of xraylib (``photon_data``)
-and caches it on disk. The module also holds the steps of the build: material formulas, the source spectrum, the group
-edges, the fine energy grid, the angular quadratures and the node placement of adaptive angular tables. The physics
+reference materials (catalogue entries or user-defined ``Material`` definitions) from the integrated cross sections of
+NIST XCOM and the angular shapes of xraylib (``photon_data``) and caches it on disk. The module also holds the steps of
+the build: material formulas, the source spectrum, the group edges, the fine energy grid, the angular quadratures and the node placement of adaptive angular tables. The physics
 and the conventions are described in the documentation pages "Design notes" (section "Cross sections") and
 "Conventions".
 """
@@ -17,14 +17,15 @@ import os
 import re
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
 
 from .config import SolverConfig
-from .cross_sections import (ANGULAR_MAP_KNOTS, ELECTRON_REST_KEV, ELEMENT_SYMBOLS, MATERIAL_CATALOGUE, MATERIALS,
-                             MultigroupLibrary, angular_table_nodes, material_table)
+from .cross_sections import (ANGULAR_MAP_KNOTS, ELECTRON_REST_KEV, MATERIAL_CATALOGUE, MATERIALS, Material,
+                             MultigroupLibrary, angular_table_nodes, material_definition, material_table,
+                             parse_formula)
 from .photon_data import XcomXraylibBackend, default_cache_dir, resolve_backend
 
 __all__ = [
@@ -67,7 +68,8 @@ ANGULAR_MAP_MATERIALS = ("water", "bone_cortical_icrp")
 # a bare formula is a stoichiometric compound) of every catalogue material, `cross_sections.MATERIAL_CATALOGUE`
 MATERIAL_FORMULAS: dict[str, str] = {name: formula for name, (_, formula) in MATERIAL_CATALOGUE.items()}
 
-MaterialTable = Sequence[tuple[str, float, str]]  # (name, nominal density g/cm^3, formula) per material
+# (name, nominal density g/cm^3, formula) per material; a catalogue name or a `Material` also stands for its entry
+MaterialTable = Sequence[tuple[str, float, str]]
 
 
 def default_material_table() -> tuple[tuple[str, float, str], ...]:
@@ -83,13 +85,16 @@ def _material_table(materials: Optional[MaterialTable]) -> tuple[tuple[str, floa
     """Check a material table, or return the default one for None.
 
     Args:
-        materials (Sequence or None): (name, nominal density in g/cm^3, formula) per material; None for the seven
-            default reference materials.
+        materials (Sequence or None): (name, nominal density in g/cm^3, formula), a catalogue name or a ``Material``
+            per material; None for the seven default reference materials.
 
     Returns:
         tuple: the table as (str, float, str) entries.
     """
-    t = default_material_table() if materials is None else tuple((str(n), float(d), str(f)) for n, d, f in materials)
+    t = default_material_table() if materials is None else tuple(
+        material_table((entry,))[0] if isinstance(entry, (str, Material)) else (str(entry[0]), float(entry[1]),
+                                                                              str(entry[2]))
+        for entry in materials)
     if not t:
         raise ValueError("empty material table")
     if len({n for n, _, _ in t}) != len(t):
@@ -102,53 +107,9 @@ _Q_BREAKPOINTS = np.array(
      0.6, 0.7, 0.8, 0.9, 1.0]
 )
 
-_SYMBOL_TO_Z = {s: i + 1 for i, s in enumerate(ELEMENT_SYMBOLS)}
-
-
 # =============================================================================================
 # Materials
 # =============================================================================================
-
-def parse_formula(formula: str, atomic_mass: Callable[[int], float]) -> dict[int, float]:
-    """Parse a material formula into element mass fractions that sum to 1.
-
-    A formula is a compound such as ``H2O`` or a mixture ``a*F1 + b*F2 + ...`` in which a, b are the relative mass
-    fractions of the compounds F1, F2, also for molecules (``78.084*N2`` weighs N2 by 78.084).
-
-    Args:
-        formula (str): the material formula.
-        atomic_mass (Callable[[int], float]): atomic weight in g/mol of an atomic number Z.
-
-    Returns:
-        dict[int, float]: mass fraction per atomic number Z, sorted by Z.
-    """
-    text = formula.replace(" ", "")
-    terms = text.split("+")
-    mass_fractions: dict[int, float] = {}
-    total_fraction = 0.0
-    parsed: list[tuple[float, str]] = []
-    for t in terms:
-        match = re.match(r"^([0-9.eE\-]*)\*?([A-Z].*)$", t)
-        if match is None:
-            raise ValueError(f"cannot parse material term {t!r} in {formula!r}")
-        fraction = float(match.group(1)) if match.group(1) else 1.0
-        if fraction <= 0:
-            raise ValueError(f"non-positive fraction in {formula!r}")
-        parsed.append((fraction, match.group(2)))
-        total_fraction += fraction
-    for fraction, compound in parsed:
-        counts: dict[int, float] = {}
-        for symbol, count in re.findall(r"([A-Z][a-z]?)([0-9.]*)", compound):
-            if symbol not in _SYMBOL_TO_Z:
-                raise ValueError(f"unknown element {symbol!r} in {formula!r}")
-            Z = _SYMBOL_TO_Z[symbol]
-            counts[Z] = counts.get(Z, 0.0) + (float(count) if count else 1.0)
-        mass = sum(n * atomic_mass(Z) for Z, n in counts.items())
-        for Z, n in counts.items():
-            mass_fractions[Z] = mass_fractions.get(Z, 0.0) + fraction / total_fraction * n * atomic_mass(Z) / mass
-    total = sum(mass_fractions.values())
-    return {Z: w / total for Z, w in sorted(mass_fractions.items())}
-
 
 def material_composition(backend: XcomXraylibBackend,
                          materials: Optional[MaterialTable] = None) -> dict[str, dict[int, float]]:
@@ -230,14 +191,15 @@ def mass_attenuation_preview(config: SolverConfig, names: Sequence[str],
                              spectrum: tuple[np.ndarray, np.ndarray] | None = None,
                              backend: XcomXraylibBackend | None = None, *, energy_kev: float | None = None,
                              fine_bin_width_kev: float | None = None) -> tuple[float, np.ndarray]:
-    """Return the total mass attenuation of catalogue materials at the effective energy without building the library.
+    """Return the total mass attenuation of reference materials at the effective energy without building the library.
 
     The effective energy is ``energy_kev`` or the spectrum-mean energy of the build of ``config``; the attenuation mixes
     the backend's elemental cross sections by mass fraction at that energy.
 
     Args:
         config (SolverConfig): solver configuration; sets the group structure and so the mean energy.
-        names (Sequence[str]): catalogue material names.
+        names (Sequence[str or Material]): catalogue names, names of the ``Material`` entries of ``config.materials``
+            or materials.
         spectrum (tuple[np.ndarray, np.ndarray] or None, optional): (energies [K] in keV, photon density per keV [K]);
             required unless ``energy_kev`` is given. Defaults to None.
         backend (XcomXraylibBackend or None, optional): photon data. Defaults to None (loaded by ``resolve_backend``).
@@ -251,7 +213,7 @@ def mass_attenuation_preview(config: SolverConfig, names: Sequence[str],
     backend = resolve_backend() if backend is None else backend
     energy = (_mean_energy(config, spectrum_arrays(spectrum), fine_bin_width_kev, backend) if energy_kev is None
               else float(energy_kev))
-    table = material_table(tuple(names))
+    table = material_table(tuple(material_definition(name, config.materials) for name in names))
     composition = material_composition(backend, table)
     point = np.array([energy])
     mass = np.array([sum(w * float(backend.sigma("total", Z, point)[0]) for Z, w in composition[name].items())
@@ -501,14 +463,16 @@ def make_group_edges(config: SolverConfig, spectrum: tuple[np.ndarray, np.ndarra
         raise ValueError(f"unknown group_edges_method {method!r}")
     backend = resolve_backend() if backend is None else backend
     medium = grouping_medium_densities(config)
+    compositions = [material_definition(name, config.materials).composition for name, _ in medium]
     key = hashlib.sha256(json.dumps([backend.name, energy_min, float(config.grouping_object_size_cm), G,
-                                     fine_bin_width_kev, [list(m) for m in medium]]).encode()
+                                     fine_bin_width_kev, [list(m) for m in medium], compositions]).encode()
                          + np.ascontiguousarray(spectrum[0], dtype=np.float64).tobytes()
                          + np.ascontiguousarray(spectrum[1], dtype=np.float64).tobytes()).hexdigest()
     if key not in _EDGES_MEMO:
         bin_edges, photons = scattered_fluence_spectrum(spectrum, backend, energy_min_kev=energy_min,
                                                         object_size_cm=float(config.grouping_object_size_cm),
-                                                        medium=medium, fine_bin_width_kev=fine_bin_width_kev)
+                                                        medium=medium, fine_bin_width_kev=fine_bin_width_kev,
+                                                        materials=config.materials)
         cumulative = np.concatenate([[0.0], np.cumsum(photons)])
         _EDGES_MEMO[key] = _equal_area_edges(bin_edges, cumulative, G, energy_min, energy_max)
     return _EDGES_MEMO[key].copy()
@@ -542,7 +506,7 @@ def _within_group_weights(config: SolverConfig, spectrum: tuple[np.ndarray, np.n
         bin_edges, photons = scattered_fluence_spectrum(
             spectrum, backend, energy_min_kev=float(config.energy_min_kev),
             object_size_cm=float(config.grouping_object_size_cm), medium=grouping_medium_densities(config),
-            fine_bin_width_kev=fine_bin_width_kev)
+            fine_bin_width_kev=fine_bin_width_kev, materials=config.materials)
         index = np.clip(np.searchsorted(bin_edges, E, side="right") - 1, 0, photons.size - 1)
         raw = photons[index] / np.diff(bin_edges)[index] * (bin_high - bin_low)
     else:
@@ -579,22 +543,23 @@ def _klein_nishina_cumulative(epsilon: np.ndarray, k: np.ndarray) -> np.ndarray:
 
 
 def grouping_medium_densities(config: SolverConfig) -> tuple[tuple[str, float], ...]:
-    """Return the medium of the "scattered_fluence" balance as (catalogue name, density) pairs, as in the cache key.
+    """Return the medium of the "scattered_fluence" balance as (material name, density) pairs, as in the cache key.
 
     The entries are sorted by name, the densities rounded to 3 significant digits and traces below 1e-3 of the largest
     density dropped, so that nearly equal media share a cache entry. ``config.grouping_medium`` "auto" (not yet replaced
-    by a measurement) gives water at 1.0 g/cm^3, and a catalogue name gives that material at its nominal density.
+    by a measurement) gives water at 1.0 g/cm^3, and a material name (of the catalogue or of a ``Material`` of
+    ``config.materials``) gives that material at its nominal density.
 
     Args:
         config (SolverConfig): solver configuration; uses grouping_medium.
 
     Returns:
-        tuple[tuple[str, float], ...]: (catalogue name, density in g/cm^3) per material.
+        tuple[tuple[str, float], ...]: (material name, density in g/cm^3) per material.
     """
     medium = config.grouping_medium
     if isinstance(medium, str):
         name = "water" if medium == "auto" else medium
-        entries = [(name, float(MATERIAL_CATALOGUE[name][0]))]
+        entries = [(name, material_definition(name, config.materials).density)]
     else:
         entries = [(str(name), float(density)) for name, density in medium]
     largest = max((density for _, density in entries), default=0.0)
@@ -609,7 +574,7 @@ def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend:
                                *, energy_min_kev: float = 10.0, object_size_cm: float = 20.0,
                                medium: Sequence[tuple[str, float]] = (("water", 1.0),),
                                fine_bin_width_kev: float | None = None,
-                               max_bins: int = 2000) -> tuple[np.ndarray, np.ndarray]:
+                               max_bins: int = 2000, materials: Sequence = ()) -> tuple[np.ndarray, np.ndarray]:
     """Estimate the total photon fluence spectrum (source plus scattered photons) inside the object for grouping.
 
     The estimate solves the slowing-down balance in energy alone by one sweep from the highest bin down:
@@ -621,12 +586,14 @@ def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend:
         energy_min_kev (float, optional): lowest energy in keV; photons below it are absorbed. Defaults to 10.0.
         object_size_cm (float, optional): characteristic size L of the object in cm (the leakage cross section is
             1/L). Defaults to 20.0.
-        medium (Sequence[tuple[str, float]], optional): (catalogue name, density in g/cm^3) per material of the medium.
-            Defaults to (("water", 1.0),).
+        medium (Sequence[tuple[str, float]], optional): (material name, density in g/cm^3) per material of the
+            medium. Defaults to (("water", 1.0),).
         fine_bin_width_kev (float or None, optional): minimum bin width in keV; None for
             ``FINE_BIN_WIDTH_FLOOR_KEV``. Defaults to None.
         max_bins (int, optional): maximum number of bins; the bins widen to ``(kVp - energy_min_kev) / max_bins`` if
             needed. Defaults to 2000.
+        materials (Sequence[str or Material], optional): materials that define the names of ``medium`` that are not
+            catalogue names (``material_definition``), e.g. ``config.materials``. Defaults to ().
 
     Returns:
         (np.ndarray, np.ndarray): bin edges [n+1] in keV, ascending, and phi integrated over each bin [n], in units of
@@ -648,10 +615,12 @@ def scattered_fluence_spectrum(spectrum: tuple[np.ndarray, np.ndarray], backend:
     source = density.cumulative_integral(high) - density.cumulative_integral(low)
     element_density: dict[int, float] = {}  # g/cm^3 of every element in the medium
     for name, material_density in medium:
-        if name not in MATERIAL_CATALOGUE:
+        try:
+            composition = material_definition(name, materials).composition
+        except ValueError:
             raise ValueError(f"unknown material {name!r} in the grouping medium (not in the catalogue, "
-                             f"cross_sections.MATERIAL_CATALOGUE)")
-        for Z, fraction in parse_formula(MATERIAL_CATALOGUE[name][1], backend.atomic_mass).items():
+                             f"cross_sections.MATERIAL_CATALOGUE, nor a Material of the reference materials)") from None
+        for Z, fraction in parse_formula(composition, backend.atomic_mass).items():
             element_density[Z] = element_density.get(Z, 0.0) + float(material_density) * fraction
 
     def mu(kind: str) -> np.ndarray:  # linear attenuation of the medium, 1/cm, at the bin centres
@@ -856,8 +825,9 @@ def compute_library(
         fine_bin_width_kev (float or None, optional): maximum fine energy bin width in keV; None for the automatic
             grid (``fine_energy_grid``). Defaults to None.
         gauss_legendre_nodes (int, optional): Gauss-Legendre nodes per angular piece. Defaults to 32.
-        materials (Sequence or None, optional): (name, nominal density in g/cm^3, formula) per material, in any order
-            (sorted by ``sort_material_table``). Defaults to None, the seven default reference materials.
+        materials (Sequence or None, optional): (name, nominal density in g/cm^3, formula), a catalogue name or a
+            ``Material`` per material, in any order (sorted by ``sort_material_table``). Defaults to None, the seven
+            default reference materials.
 
     Returns:
         (MultigroupLibrary, BuildInfo): the library with float64 CPU tensors and the build diagnostics.
@@ -1333,8 +1303,9 @@ def build_library(
         fine_bin_width_kev (float or None, optional): maximum fine energy bin width in keV; None for the automatic
             grid (``fine_energy_grid``). Defaults to None.
         gauss_legendre_nodes (int, optional): Gauss-Legendre nodes per angular piece. Defaults to 32.
-        materials (Sequence or None, optional): (name, nominal density in g/cm^3, formula) per material, in any order
-            (sorted by ``sort_material_table``). Defaults to None, the seven default reference materials.
+        materials (Sequence or None, optional): (name, nominal density in g/cm^3, formula), a catalogue name or a
+            ``Material`` per material, in any order (sorted by ``sort_material_table``). Defaults to None, the seven
+            default reference materials.
 
     Returns:
         MultigroupLibrary: the library with float64 CPU tensors in cm^2/g and cm^2/g/sr, per unit density.

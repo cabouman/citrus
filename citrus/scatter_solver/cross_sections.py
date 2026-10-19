@@ -1,6 +1,7 @@
 """Multigroup cross-section library: material catalogue, container, per-voxel coefficients and a synthetic test library.
 
-``MATERIAL_CATALOGUE`` maps every known material name to its nominal density and composition, and
+``MATERIAL_CATALOGUE`` maps every known material name to its nominal density and composition, :class:`Material`
+defines a material that is not in the catalogue, :func:`parse_formula` reads a composition, and
 :class:`MultigroupLibrary` holds the per-unit-density group constants, angular transfer tables and fine-energy
 attenuation table that :func:`~citrus.scatter_solver.cross_section_library.build_library` fills. The per-voxel
 functions turn density maps into attenuation, transfer and group-integrated transmission, and
@@ -12,9 +13,10 @@ The catalogue and the conventions are described in the documentation page "Conve
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping, Optional, Sequence, Union
+from typing import Callable, Mapping, Optional, Sequence, Union
 
 import torch
 import xraylib
@@ -22,7 +24,7 @@ from torch import Tensor
 
 # ---- material catalogue (docs/source/conventions.rst, "Materials") ----------------------------------------------
 # the material strings of XrayPhysics (the materials of citrus <= 0.6, verbatim; the air terms are read as mass
-# fractions of the compounds, `cross_section_library.parse_formula`)
+# fractions of the compounds, `parse_formula`)
 _AIR_DRY = "78.084*N2 + 20.946*O2 + 0.9340*Ar + 0.0397*CO2"
 _LUNG_ICRP = (
     "0.10132562304283013*H + 0.10235810831090612*C + 0.028663471831760927*N + 0.75742799115584314*O + "
@@ -213,60 +215,264 @@ WATER, BONE = MATERIALS.index("water"), MATERIALS.index("bone_cortical_icrp")
 ELECTRON_REST_KEV = 510.998950
 
 
-def check_material_names(names: Sequence[str], minimum: int = 2) -> tuple[str, ...]:
-    """Check reference material names and return them as a tuple.
+_SYMBOL_TO_Z = {s: i + 1 for i, s in enumerate(ELEMENT_SYMBOLS)}
+# a term of a composition: an optional mass fraction (with an optional "*") and a formula or a catalogue name
+_TERM = re.compile(r"^(?:(?P<fraction>(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?)\*?)?(?P<part>[A-Za-z].*)$")
+_CHEMICAL_FORMULA = re.compile(r"(?:[A-Z][a-z]?[0-9.]*)+")
 
-    The names must be a sequence (not a single string) of at least ``minimum`` distinct names of ``MATERIAL_CATALOGUE``.
+
+def _xraylib_atomic_mass(Z: int) -> float:
+    """Return xraylib's atomic weight in g/mol of an element (for checking a composition without the photon data)."""
+    return float(xraylib.AtomicWeight(int(Z)))
+
+
+def _unknown_symbol_message(symbol: str, formula: str) -> str:
+    """Return the error message of an element symbol without scattering data in a composition."""
+    try:
+        Z = int(xraylib.SymbolToAtomicNumber(symbol))
+    except ValueError:
+        Z = 0
+    if Z > NUM_ELEMENTS:
+        return (f"element {symbol!r} (Z = {Z}) in {formula!r} has no scattering data; the photon data cover "
+                f"Z = 1..{NUM_ELEMENTS}")
+    return f"unknown element {symbol!r} in {formula!r} (element symbols start with a capital letter, e.g. 'Ca')"
+
+
+def parse_formula(formula: str, atomic_mass: Optional[Callable[[int], float]] = None) -> dict[int, float]:
+    """Parse a material composition into element mass fractions that sum to 1.
+
+    A composition is a chemical formula such as ``H2O`` or a mixture ``a*F1 + b*F2 + ...`` in which a, b are the
+    relative mass fractions of the parts F1, F2, also for molecules (``78.084*N2`` weighs N2 by 78.084); a part that
+    starts with a lowercase letter is a ``MATERIAL_CATALOGUE`` name and stands for its composition
+    (``0.99*water + 0.01*I``).
 
     Args:
-        names (Sequence[str]): catalogue material names.
-        minimum (int, optional): smallest number of names. Defaults to 2.
+        formula (str): the composition.
+        atomic_mass (Callable[[int], float] or None, optional): atomic weight in g/mol of an atomic number Z. Defaults
+            to None, xraylib's atomic weights.
 
     Returns:
-        tuple[str, ...]: the names.
+        dict[int, float]: mass fraction per atomic number Z, sorted by Z.
+
+    Raises:
+        ValueError: for a composition that does not parse, an unknown element or catalogue name, an element without
+            scattering data (Z > 98) or a fraction that is not positive.
+    """
+    if not isinstance(formula, str) or not formula.strip():
+        raise ValueError(f"a composition must be a non-empty string such as 'H2O' or '0.9*water + 0.1*I', "
+                         f"got {formula!r}")
+    atomic_mass = _xraylib_atomic_mass if atomic_mass is None else atomic_mass
+    text = formula.replace(" ", "")
+    terms = text.split("+")
+    mass_fractions: dict[int, float] = {}
+    total_fraction = 0.0
+    parsed: list[tuple[float, str]] = []
+    for t in terms:
+        match = _TERM.match(t)
+        if match is None:
+            raise ValueError(f"cannot parse material term {t!r} in {formula!r}; a composition is a formula ('H2O') or "
+                             f"a mixture of mass fractions ('0.9*water + 0.1*I')")
+        fraction = float(match.group("fraction")) if match.group("fraction") else 1.0
+        if fraction <= 0:
+            raise ValueError(f"non-positive fraction in {formula!r}")
+        parsed.append((fraction, match.group("part")))
+        total_fraction += fraction
+    for fraction, compound in parsed:
+        if compound[0].islower():  # a catalogue material by name
+            if compound not in MATERIAL_CATALOGUE:
+                raise ValueError(f"unknown catalogue material {compound!r} in {formula!r} (a part that starts with a "
+                                 f"lowercase letter names a catalogue material; element symbols start with a capital "
+                                 f"letter)")
+            for Z, w in parse_formula(MATERIAL_CATALOGUE[compound][1], atomic_mass).items():
+                mass_fractions[Z] = mass_fractions.get(Z, 0.0) + fraction / total_fraction * w
+            continue
+        if _CHEMICAL_FORMULA.fullmatch(compound) is None:
+            raise ValueError(f"cannot parse the chemical formula {compound!r} in {formula!r} (element symbols with "
+                             f"optional counts, e.g. 'C2H4' or 'CaCO3')")
+        counts: dict[int, float] = {}
+        for symbol, count in re.findall(r"([A-Z][a-z]?)([0-9.]*)", compound):
+            if symbol not in _SYMBOL_TO_Z:
+                raise ValueError(_unknown_symbol_message(symbol, formula))
+            try:
+                number = float(count) if count else 1.0
+            except ValueError:
+                raise ValueError(f"cannot read the count {count!r} of {symbol!r} in {formula!r}") from None
+            if not number > 0:
+                raise ValueError(f"non-positive count of {symbol!r} in {formula!r}")
+            Z = _SYMBOL_TO_Z[symbol]
+            counts[Z] = counts.get(Z, 0.0) + number
+        mass = sum(n * atomic_mass(Z) for Z, n in counts.items())
+        for Z, n in counts.items():
+            mass_fractions[Z] = mass_fractions.get(Z, 0.0) + fraction / total_fraction * n * atomic_mass(Z) / mass
+    total = sum(mass_fractions.values())
+    return {Z: w / total for Z, w in sorted(mass_fractions.items())}
+
+
+@dataclass(frozen=True)
+class Material:
+    """A reference material defined by the user: name, nominal density and composition.
+
+    It stands wherever a catalogue name is accepted (``SolverConfig.materials``, ``material_table``); its cross sections
+    are built from the photon data like those of a catalogue material. The definition is checked on construction.
+
+    Attributes:
+        name (str): name of the material in the library (``library.materials``); a catalogue name only with that
+            entry's own density and composition.
+        density (float): nominal density in g/cm^3, > 0.
+        composition (str): composition in the syntax of ``parse_formula``: a chemical formula (``"C2H4"``) or mass
+            fractions of formulas, elements and catalogue materials (``"0.99*water + 0.01*I"``).
+    """
+
+    name: str
+    density: float
+    composition: str
+
+    def __post_init__(self) -> None:
+        """Store the density as a float and check the definition.
+
+        Raises:
+            ValueError: for an empty name, a density that is not positive, a composition that does not parse, or a
+                catalogue name with another density or composition.
+        """
+        if not isinstance(self.name, str) or not self.name.strip() or self.name != self.name.strip():
+            raise ValueError(f"a material name must be a non-empty string without surrounding spaces, got "
+                             f"{self.name!r}")
+        try:
+            density = float(self.density)
+        except (TypeError, ValueError):
+            raise ValueError(f"material {self.name!r}: the density must be a number in g/cm^3, got "
+                             f"{self.density!r}") from None
+        if not (math.isfinite(density) and density > 0):
+            raise ValueError(f"material {self.name!r}: the density must be > 0 g/cm^3, got {self.density!r}")
+        object.__setattr__(self, "density", density)
+        try:
+            parse_formula(self.composition)
+        except ValueError as exc:
+            raise ValueError(f"material {self.name!r}: {exc}") from None
+        if self.name in MATERIAL_CATALOGUE and not self.is_catalogue_entry():
+            density, composition = MATERIAL_CATALOGUE[self.name]
+            raise ValueError(f"material name {self.name!r} is a catalogue material ({density} g/cm^3, "
+                             f"{composition!r}); give a different definition another name")
+
+    def is_catalogue_entry(self) -> bool:
+        """Whether the definition is a catalogue entry: same name, density and composition (spaces ignored).
+
+        Returns:
+            bool: True for a copy of a ``MATERIAL_CATALOGUE`` entry.
+        """
+        if self.name not in MATERIAL_CATALOGUE:
+            return False
+        density, composition = MATERIAL_CATALOGUE[self.name]
+        return (self.density == float(density)
+                and self.composition.replace(" ", "") == composition.replace(" ", ""))
+
+
+MaterialEntry = Union[str, Material]  # a catalogue name or a user-defined material
+
+
+def _canonical_material(entry):
+    """Return a Material that copies a catalogue entry as its name, and any other entry unchanged."""
+    return entry.name if isinstance(entry, Material) and entry.is_catalogue_entry() else entry
+
+
+def material_names(materials: Sequence[MaterialEntry]) -> tuple[str, ...]:
+    """Return the names of reference materials given as catalogue names or ``Material`` definitions.
+
+    Args:
+        materials (Sequence[str or Material]): catalogue names or materials.
+
+    Returns:
+        tuple[str, ...]: the names, in the given order.
+    """
+    return tuple(m.name if isinstance(m, Material) else m for m in materials)
+
+
+def check_material_names(names: Sequence[MaterialEntry], minimum: int = 2) -> tuple[MaterialEntry, ...]:
+    """Check reference materials and return them as a tuple.
+
+    The materials must be a sequence (not a single string) of at least ``minimum`` entries with distinct names, each a
+    name of ``MATERIAL_CATALOGUE`` or a :class:`Material`; a Material that copies a catalogue entry becomes its name.
+
+    Args:
+        names (Sequence[str or Material]): catalogue material names or user-defined materials.
+        minimum (int, optional): smallest number of materials. Defaults to 2.
+
+    Returns:
+        tuple[str or Material, ...]: the materials.
 
     Raises:
         ValueError: naming the problem (and the catalogue, for an unknown name).
     """
-    if isinstance(names, str) or not isinstance(names, Sequence):
+    if isinstance(names, (str, Material)) or not isinstance(names, Sequence):
         raise ValueError(f"materials must be a sequence of material names, e.g. ('air', 'water', "
                          f"'bone_cortical_icrp'), got "
                          f"{names!r}")
-    names = tuple(names)
-    unknown = [n for n in names if not isinstance(n, str) or n not in MATERIAL_CATALOGUE]
+    names = tuple(_canonical_material(n) for n in names)
+    unknown = [n for n in names
+               if not isinstance(n, Material) and (not isinstance(n, str) or n not in MATERIAL_CATALOGUE)]
     if unknown:
         raise ValueError(f"unknown material name(s) {unknown}; the catalogue has {COMPOUND_NAMES} and every element "
-                         f"by its English name (e.g. 'lead', 'tungsten')")
-    if len(set(names)) != len(names):
-        raise ValueError(f"duplicate material names in {names}")
+                         f"by its English name (e.g. 'lead', 'tungsten'); define any other material with "
+                         f"Material(name, density, composition)")
+    plain = material_names(names)
+    if len(set(plain)) != len(plain):
+        raise ValueError(f"duplicate material names in {plain}")
     if len(names) < minimum:
-        raise ValueError(f"the density model interpolates between at least {minimum} reference materials, got {names}")
+        raise ValueError(f"the density model interpolates between at least {minimum} reference materials, got {plain}")
     return names
 
 
-def material_table(names: Sequence[str] = MATERIALS) -> tuple[tuple[str, float, str], ...]:
-    """Return (name, nominal density, composition) of catalogue materials, in the given order.
+def material_definition(material: MaterialEntry, materials: Sequence[MaterialEntry] = ()) -> Material:
+    """Return the definition of a reference material given as a ``Material``, a user material's name or a catalogue name.
 
     Args:
-        names (Sequence[str], optional): catalogue material names, checked by ``check_material_names`` with one name
-            allowed. Defaults to MATERIALS.
+        material (str or Material): the material; a name is looked up among the Material entries of ``materials``
+            first, then in ``MATERIAL_CATALOGUE``.
+        materials (Sequence[str or Material], optional): reference materials that may define the name (for example
+            ``SolverConfig.materials``). Defaults to ().
 
     Returns:
-        tuple[tuple[str, float, str], ...]: (name, nominal density in g/cm^3, composition formula) per material.
+        Material: name, nominal density and composition.
+
+    Raises:
+        ValueError: for a name that is neither defined in ``materials`` nor in the catalogue.
+    """
+    if isinstance(material, Material):
+        return material
+    for entry in materials:
+        if isinstance(entry, Material) and entry.name == material:
+            return entry
+    if isinstance(material, str) and material in MATERIAL_CATALOGUE:
+        density, composition = MATERIAL_CATALOGUE[material]
+        return Material(material, density, composition)
+    raise ValueError(f"unknown material {material!r}: not a catalogue name and not defined among the materials "
+                     f"{material_names(materials)}")
+
+
+def material_table(names: Sequence[MaterialEntry] = MATERIALS) -> tuple[tuple[str, float, str], ...]:
+    """Return (name, nominal density, composition) of reference materials, in the given order.
+
+    Args:
+        names (Sequence[str or Material], optional): catalogue material names or user-defined materials, checked by
+            ``check_material_names`` with one material allowed. Defaults to MATERIALS.
+
+    Returns:
+        tuple[tuple[str, float, str], ...]: (name, nominal density in g/cm^3, composition) per material.
 
     Raises:
         ValueError: for an unknown or repeated name.
     """
-    return tuple((n, float(MATERIAL_CATALOGUE[n][0]), MATERIAL_CATALOGUE[n][1])
-                 for n in check_material_names(names, minimum=1))
+    return tuple((m.name, m.density, m.composition) if isinstance(m, Material)
+                 else (m, float(MATERIAL_CATALOGUE[m][0]), MATERIAL_CATALOGUE[m][1])
+                 for m in check_material_names(names, minimum=1))
 
 
-def material_index(materials: Union["MultigroupLibrary", Sequence[str]], name: str) -> int:
-    """Return the row of a material in a library or in a sequence of names.
+def material_index(materials: Union["MultigroupLibrary", Sequence[MaterialEntry]], name: MaterialEntry) -> int:
+    """Return the row of a material in a library or in a sequence of materials.
 
     Args:
-        materials (MultigroupLibrary or Sequence[str]): a library (its ``materials``) or material names.
-        name (str): material name.
+        materials (MultigroupLibrary or Sequence[str or Material]): a library (its ``materials``) or materials.
+        name (str or Material): material name, or a material (its name).
 
     Returns:
         int: row index of ``name``.
@@ -274,7 +480,8 @@ def material_index(materials: Union["MultigroupLibrary", Sequence[str]], name: s
     Raises:
         ValueError: if ``name`` is absent, naming the available materials.
     """
-    names = tuple(materials.materials if isinstance(materials, MultigroupLibrary) else materials)
+    names = tuple(materials.materials) if isinstance(materials, MultigroupLibrary) else material_names(materials)
+    name = name.name if isinstance(name, Material) else name
     if name not in names:
         raise ValueError(f"material {name!r} is not among the materials {names}")
     return names.index(name)

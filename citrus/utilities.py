@@ -711,7 +711,8 @@ def _reference_attenuation(reference: Union[MultigroupLibrary, ScatterSolver],
                            energy_kev: Optional[float]) -> tuple[tuple[str, ...], np.ndarray, np.ndarray, float]:
     """Nominal densities and mass attenuations of the reference materials of a library or a solver.
 
-    A lazy solver takes the catalogue densities and ``cross_section_library.mass_attenuation_preview``, without a build.
+    A lazy solver takes the nominal densities of its materials (catalogue or ``Material`` definitions) and
+    ``cross_section_library.mass_attenuation_preview``, without a build.
 
     Args:
         reference (MultigroupLibrary or ScatterSolver): library or solver.
@@ -721,14 +722,15 @@ def _reference_attenuation(reference: Union[MultigroupLibrary, ScatterSolver],
         (names, nominal, mass, energy): the material names in library order, the [M] nominal densities in g/cm^3,
         the [M] mass attenuations in cm^2/g at the energy and the energy in keV.
     """
-    from .scatter_solver.cross_sections import MATERIAL_CATALOGUE
+    from .scatter_solver.cross_sections import material_definition
 
     if isinstance(reference, ScatterSolver) and not reference.library_built:
         from .scatter_solver.cross_section_library import mass_attenuation_preview
 
         names = reference.materials
         energy, mass = mass_attenuation_preview(reference.config, names, reference.spectrum, energy_kev=energy_kev)
-        nominal = np.array([MATERIAL_CATALOGUE[n][0] for n in names], dtype=np.float64)
+        nominal = np.array([material_definition(n, reference.config.materials).density for n in names],
+                           dtype=np.float64)
         return names, nominal, np.asarray(mass, dtype=np.float64), float(energy)
     library = reference.library if isinstance(reference, ScatterSolver) else reference
     energy = effective_energy(library) if energy_kev is None else float(energy_kev)
