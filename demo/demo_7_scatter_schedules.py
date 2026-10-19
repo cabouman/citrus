@@ -110,7 +110,7 @@ def scatter_to_primary(X, view_scatter):
 
 
 def converged(fields, angle):                                  # a converged source iteration of one view
-    return solver.solve_view_from_fields(fields, angle).scatter_signal
+    return solver.solve_view_from_fields(fields, angle, signal_only=True).scatter_signal
 
 
 def first_order(fields, angle):                                # the first-collision source projected, no sweep

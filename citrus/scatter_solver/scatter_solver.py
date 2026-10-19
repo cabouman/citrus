@@ -237,7 +237,8 @@ class ViewResult:
     Attributes:
         angle (float): view angle in radians.
         primary (dict): primary image dict.
-        scatter (dict): total scatter image dict, first order plus multiple collision.
+        scatter (dict): total scatter image dict, first order plus multiple collision, or the signal alone
+            (``solve_view(signal_only=True)``).
         scatter_signal (Tensor): [Rd, Cd] scatter signal ``scatter["signal"]`` in keV/cm^2.
         scatter_fraction (Tensor): [Rd, Cd] scatter fraction ``S / (P + S)`` of the scatter and primary signals.
         source_iteration_result (SourceIterationResult): iterations, history, norms and convergence flag; its
@@ -261,19 +262,20 @@ class ViewResult:
 
     @property
     def scatter_fluence(self) -> Tensor:
-        """Total scatter scalar fluence [G, Rd, Cd]."""
+        """Total scatter scalar fluence [G, Rd, Cd] (not in a signal-only result)."""
         return self.scatter["fluence"]
 
     @property
     def scatter_planar_fluence(self) -> Tensor:
-        """Total scatter planar fluence [G, Rd, Cd]."""
+        """Total scatter planar fluence [G, Rd, Cd] (not in a signal-only result)."""
         return self.scatter["planar_fluence"]
 
     def to_numpy_dict(self) -> dict[str, np.ndarray]:
         """Flatten the result into a dict of numpy arrays for ``np.savez``.
 
         Returns:
-            dict: ``primary_<key>``, ``scatter_<key>``, ``scatter_signal``, ``scatter_fraction``,
+            dict: ``primary_<key>``, ``scatter_<key>`` (the scatter images it holds), ``scatter_signal``,
+                ``scatter_fraction``,
                 ``source_iteration_<item>``, ``timing_<stage>``, ``peak_memory_bytes`` (-1 on the CPU), ``angle`` and
                 ``phi_total`` if kept.
         """
@@ -283,7 +285,8 @@ class ViewResult:
         out: dict[str, np.ndarray] = {"angle": np.asarray(self.angle)}
         for name, images in (("primary", self.primary), ("scatter", self.scatter)):
             for k in _IMAGE_KEYS:
-                out[f"{name}_{k}"] = to_numpy(images[k])
+                if k in images:
+                    out[f"{name}_{k}"] = to_numpy(images[k])
         out["scatter_signal"] = to_numpy(self.scatter_signal)
         out["scatter_fraction"] = to_numpy(self.scatter_fraction)
         out["source_iteration_history"] = np.asarray(self.source_iteration_result.history, dtype=np.float64)
@@ -1008,7 +1011,8 @@ class ScatterSolver:
         timings[name] = time.perf_counter() - t0
 
     # ---- public ----------------------------------------------------------------------------------
-    def solve_view(self, rho_fine: Tensor, grid_fine: Grid, angle: float, keep_phi_total: bool = False) -> ViewResult:
+    def solve_view(self, rho_fine: Tensor, grid_fine: Grid, angle: float, keep_phi_total: bool = False,
+                   signal_only: bool = False) -> ViewResult:
         """Solve one view: fields, uncollided fluence, source iteration, scatter image, primary and scatter fraction.
 
         The stages are described in docs/source/method.rst, "The LBTE scatter solver". For a fine grid that cannot hold
@@ -1019,6 +1023,8 @@ class ScatterSolver:
             grid_fine (Grid): the fine grid F, any voxel size.
             angle (float): view angle in radians.
             keep_phi_total (bool, optional): also return the collided moments. Defaults to False.
+            signal_only (bool, optional): form the scatter signal alone (:meth:`scatter_image`), without the images
+                per group. Defaults to False.
 
         Returns:
             ViewResult: images, scatter fraction, iteration history, timings and peak memory of the view.
@@ -1028,23 +1034,26 @@ class ScatterSolver:
         start_time = time.perf_counter()
         with self._stage("materials", timings, peaks):
             fields = self.material_fields(rho_fine, grid_fine)
-        return self._solve_view(fields, angle, keep_phi_total, timings, peaks, start_time)
+        return self._solve_view(fields, angle, keep_phi_total, timings, peaks, start_time, signal_only)
 
-    def solve_view_from_fields(self, fields: MaterialFields, angle: float, keep_phi_total: bool = False) -> ViewResult:
+    def solve_view_from_fields(self, fields: MaterialFields, angle: float, keep_phi_total: bool = False,
+                               signal_only: bool = False) -> ViewResult:
         """Solve one view from prebuilt :class:`MaterialFields`, which every view of a volume can share.
 
         Args:
             fields (MaterialFields): density fields of the volume.
             angle (float): view angle in radians.
             keep_phi_total (bool, optional): also return the collided moments. Defaults to False.
+            signal_only (bool, optional): form the scatter signal alone (:meth:`scatter_image`), without the images
+                per group. Defaults to False.
 
         Returns:
             ViewResult: images, scatter fraction, iteration history and timings of the view.
         """
-        return self._solve_view(fields, angle, keep_phi_total, {}, {}, time.perf_counter())
+        return self._solve_view(fields, angle, keep_phi_total, {}, {}, time.perf_counter(), signal_only)
 
     def _solve_view(self, fields: MaterialFields, angle: float, keep_phi_total: bool, timings: dict[str, float],
-                    peaks: dict[str, int], start_time: float) -> ViewResult:
+                    peaks: dict[str, int], start_time: float, signal_only: bool = False) -> ViewResult:
         """Run the stages of one view after the fields are built.
 
         Args:
@@ -1054,6 +1063,7 @@ class ScatterSolver:
             timings (dict): seconds per stage so far, updated in place.
             peaks (dict): CUDA peak bytes per stage so far, updated in place.
             start_time (float): ``time.perf_counter()`` at the start of the solve.
+            signal_only (bool, optional): form the scatter signal alone. Defaults to False.
 
         Returns:
             ViewResult: the result of the view.
@@ -1076,7 +1086,7 @@ class ScatterSolver:
             direction_context = self.direction_context(fields, angle, quadrature)  # one per view
         with self._stage("scatter_image", timings, peaks):
             scatter = self.scatter_image(fields, angle, phi_uncollided, scatter_source_moments, quadrature,
-                                         direction_context)
+                                         direction_context, signal_only=signal_only)
         del phi_uncollided, scatter_source_moments
         with self._stage("primary", timings, peaks):
             primary = self.primary(fields, angle)
@@ -1089,7 +1099,7 @@ class ScatterSolver:
                           peak_memory_bytes=max(peaks.values()) if peaks else None)
 
     def solve_views(self, rho_fine: Tensor, grid_fine: Grid, angles: Sequence[float],
-                    keep_phi_total: bool = False) -> list[ViewResult]:
+                    keep_phi_total: bool = False, signal_only: bool = False) -> list[ViewResult]:
         """Solve every view independently with :meth:`solve_view`, rebuilding the fields per view.
 
         Args:
@@ -1097,11 +1107,13 @@ class ScatterSolver:
             grid_fine (Grid): the fine grid F.
             angles (Sequence[float]): view angles in radians.
             keep_phi_total (bool, optional): also return the collided moments. Defaults to False.
+            signal_only (bool, optional): form the scatter signal alone. Defaults to False.
 
         Returns:
             list: one :class:`ViewResult` per angle.
         """
-        return [self.solve_view(rho_fine, grid_fine, float(a), keep_phi_total=keep_phi_total) for a in angles]
+        return [self.solve_view(rho_fine, grid_fine, float(a), keep_phi_total=keep_phi_total, signal_only=signal_only)
+                for a in angles]
 
 
 # =====================================================================================================

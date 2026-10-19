@@ -285,7 +285,8 @@ angles, such as no grid), the emission kernel sums the groups with them, so one 
 blurred and accumulated instead of G. When they vary along the rows only (a flat panel with a 1-D grid whose septa run
 along the channels), the rows of every group are blurred, the groups summed with the weights of each row and the
 channels of the one image blurred. The projection, the blur and the sums are linear, so the signal equals that of the
-full image to float rounding; other panels form the full image and keep its signal.
+full image to float rounding; other panels form the full image and keep its signal. A converged solve forms the
+signal alone on request (``solve_view(signal_only=True)``), as the data synthesis does.
 
 **Direction set and footprint.** The cone product set is limited to the smallest cone about the panel normal that
 contains every direction from the transport-grid box to the panel. Per-pixel scatter of a finite direction set carries

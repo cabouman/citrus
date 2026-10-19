@@ -51,8 +51,9 @@ rho = wlab_phantom(grid, materials=library.materials, device=device)
 solver = ScatterSolver(library, config, geometry, detector=csi_response(0.06), grid_response=no_grid(),
                        device=device)
 
-# Solve one view.  The solver takes the view angle in radians.
-result = solver.solve_view(rho, grid, angle=np.radians(angle_degrees))
+# Solve one view.  The solver takes the view angle in radians; signal_only skips the scatter images per energy group,
+# since this demo shows the detector signals only.
+result = solver.solve_view(rho, grid, angle=np.radians(angle_degrees), signal_only=True)
 
 # The detector signals as numpy images [detector rows, detector channels], in keV/cm^2 per source photon per sr.
 primary = result.primary["signal"].float().cpu().numpy()

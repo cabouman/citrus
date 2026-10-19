@@ -72,6 +72,18 @@ def _rel(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a - b).norm() / b.norm())
 
 
+def test_solve_view_signal_only(rho, base_result):
+    """solve_view(signal_only=True) forms the scatter signal alone: the signal and the scatter fraction of the full
+    solve to float rounding, a scatter dict with the signal only, and a numpy dict without the other scatter images."""
+    result = make_solver().solve_view(rho, GRID, 0.0, signal_only=True)
+    assert set(result.scatter) == {"signal"} and result.scatter_signal is result.scatter["signal"]
+    assert result.source_iteration_result.num_iterations == base_result.source_iteration_result.num_iterations
+    assert _rel(result.scatter_signal, base_result.scatter_signal) < 1e-5
+    assert _rel(result.scatter_fraction, base_result.scatter_fraction) < 1e-5
+    out = result.to_numpy_dict()
+    assert "scatter_signal" in out and "primary_fluence" in out and "scatter_fluence" not in out
+
+
 def _zero_multiple_collision(s: ScatterSolver, f) -> torch.Tensor:
     return s.multiple_collision_source_moments(f, torch.zeros(s.num_groups, (s.L + 1) ** 2, 4, *f.grid_coarse.shape,
                                                               device=DEVICE))

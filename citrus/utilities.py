@@ -1071,7 +1071,7 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
     fields = solver.material_fields_from_attenuation(X, grid, densities)
     for v in range(V):
         view_start = time.perf_counter()
-        result = solver.solve_view_from_fields(fields, float(angles[v]))
+        result = solver.solve_view_from_fields(fields, float(angles[v]), signal_only=True)
         solver_scatter[v] = result.scatter_signal
         source_iterations[v] = result.source_iteration_result.num_iterations
         source_iteration_converged[v] = bool(result.source_iteration_result.converged)

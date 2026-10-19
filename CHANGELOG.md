@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.21.1 - 2026-10-19
+
+- **Signal-only converged solve.** `ScatterSolver.solve_view`, `solve_view_from_fields` and `solve_views` take
+  `signal_only`: the converged solve then forms the scatter signal alone as the CITRUS step does, and its
+  `ViewResult.scatter` holds only `signal`. `synthesize_cone_beam_data`, demo 1 and the converged schedules of demo 7
+  use it; by default the solve still forms every image.
+
 ## v0.21.0 - 2026-10-19
 
 - **Signal-only scatter image.** The CITRUS step forms only the detector signal of the scatter

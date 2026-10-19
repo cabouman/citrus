@@ -458,7 +458,9 @@ voxel size), at most two nonzero per voxel. The transport runs on the grid of ``
 the fine box and the first-order quantities on q\ :sup:`3` points per cell (``quadrature_point_spacing_cm``);
 ``uncollided_trace_grid`` ("quadrature", "coarse" or "fine") sets the grid through which the uncollided fluence is
 traced (:doc:`method`, "Options and secondary components"; :doc:`conventions`, "Grids"). ``ViewResult`` also carries
-the scalar and planar fluences per group, the source-iteration history, per-stage timings and peak memory.
+the scalar and planar fluences per group, the source-iteration history, per-stage timings and peak memory;
+``solve_view(..., signal_only=True)`` forms the scatter signal alone, without the images per group, when only the
+signal is needed.
 
 Detector, grid and source
 -------------------------
