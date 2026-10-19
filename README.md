@@ -29,7 +29,7 @@ Phi_{>1}^{(k)} = G_k phi_1^{(k)} + G_k Phi_{>1}^{(k-1)}
              = G_k phi_1^{(k)} + G_k G_{k-1} phi_1^{(k-1)} + G_k G_{k-1} G_{k-2} phi_1^{(k-2)} + ...
 ```
 
-where `phi_1^{(k)}` is the uncollided fluence of reconstruction k. Expanded, the second-order scatter comes from the
+where `phi_1^{(k)}` is the first-collision source of reconstruction k (from its uncollided fluence). Expanded, the second-order scatter comes from the
 newest reconstruction, the third order from the previous one, and so on: the dominant low-order scatter is always
 refreshed from the freshest reconstruction, while stale information is relegated to the weaker and smoother
 higher orders. With fixed densities the recursion *is* source iteration and converges to the fully converged scatter
