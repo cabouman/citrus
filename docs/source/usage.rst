@@ -154,8 +154,9 @@ The entries of ``info``:
   against the corrected sinogram before and after its MBIR iterations, with the resumed error sinogram),
   ``scatter_seconds``, ``mbir_seconds`` (of all its MBIR iterations), ``total_seconds``,
   ``scatter_change_relative`` (from outer iteration 2 on: mean absolute change of the scatter-count estimate over its
-  mean absolute value), ``metal_measurement_fraction`` (with ``metal_attenuation_threshold``: the share of
-  measurements left out) and, on CUDA, ``gpu_peak_allocated_mib``; a record with a scatter stage also holds
+  mean absolute value), ``metal_measurement_fraction``, ``metal_voxels`` and ``metal_fill_scale`` (with
+  ``metal_attenuation_threshold``: the share of measurements left out, the size of the metal set and the scale of its
+  fill) and, on CUDA, ``gpu_peak_allocated_mib``; a record with a scatter stage also holds
   ``negative_fraction`` (voxels clamped by the density model), ``accumulator_change_mean`` /
   ``accumulator_change_max`` (relative accumulator change over the computed views), ``transfer_seconds``,
   ``primary_seconds`` and, at ``scatter_view_stride > 1``, ``interpolation_seconds`` (the last two are part of

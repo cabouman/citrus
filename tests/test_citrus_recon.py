@@ -515,4 +515,27 @@ def test_citrus_recon_with_a_metal_threshold(tiny, resume):
     assert bool(torch.isfinite(X).all())
     fractions = [r["metal_measurement_fraction"] for r in records]  # the FDK's bone may stay below the threshold
     assert all(0.0 <= f < 0.5 for f in fractions) and fractions[-1] > 0.0, fractions
+    assert records[-1]["metal_voxels"] > 0 and records[-1]["metal_fill_scale"] > 0.0
     assert all(0 < r["sinogram_nrmse"] < r["sinogram_nrmse_start"] < 1 for r in records)
+
+
+def test_metal_fill_keeps_the_total_of_the_reference():
+    """The first volume with metal becomes the reference; a later, tighter metal set gets the reference's values
+    scaled to the reference's total, and the other voxels are unchanged."""
+    blurred = torch.zeros(5, 5, 1)
+    blurred[1:4, 1:4] = 3.0
+    blurred[2, 2] = 9.0  # metal above 2: 9 voxels, total 33
+    record: dict = {}
+    filled, reference = citrus_module.metal_fill(blurred, 2.0, None, record)
+    assert torch.equal(filled, blurred) and float(reference[1]) == 33.0
+    assert record == {"metal_voxels": 9, "metal_fill_scale": 1.0}
+    faded = torch.full((5, 5, 1), 0.2)
+    faded[2, 2] = 4.0  # the set has shrunk to the core
+    filled, same = citrus_module.metal_fill(faded, 2.0, reference, record)
+    assert same is reference and record["metal_voxels"] == 1
+    assert float(filled[2, 2]) == pytest.approx(33.0) and record["metal_fill_scale"] == pytest.approx(33.0 / 9.0)
+    assert torch.equal(filled[faded <= 2.0], faded[faded <= 2.0])
+    empty = torch.full((5, 5, 1), 0.2)
+    unchanged, kept = citrus_module.metal_fill(empty, 2.0, reference, record)
+    assert unchanged is empty and kept is reference and record["metal_voxels"] == 0
+    assert citrus_module.metal_fill(empty, 2.0)[1] is None  # no metal, no reference

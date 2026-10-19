@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "citrus"
 dynamic = ["version"]
-description = "CITRUS: scatter-corrected cone-beam CT reconstruction with an LBTE source iteration scatter solver in the loop"
+description = "CITRUS: scatter-corrected X-ray CT reconstruction (cone and parallel beams) with an LBTE scatter solver in the loop"
 readme = "README.md"
 license = { text = "BSD-3-Clause" }
 authors = [

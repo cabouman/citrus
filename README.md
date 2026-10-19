@@ -1,7 +1,8 @@
 # citrus
 
-**CITRUS** (Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter) reconstructs cone-beam CT
-volumes from scatter-contaminated projections by iterating model-based iterative reconstruction (MBIR, via
+**CITRUS** (Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter) reconstructs X-ray CT
+volumes (cone-beam scans on flat or curved panels, circular or helical, and parallel-beam scans) from
+scatter-contaminated projections by iterating model-based iterative reconstruction (MBIR, via
 [MBIRTORCH](https://github.com/cabouman/mbirtorch)) and a deterministic scatter solver for the linear Boltzmann
 transport equation (LBTE) **jointly**: every outer iteration refreshes the scatter estimate with one source-iteration
 step of the scatter solver from the current reconstruction and runs MBIR iterations on the corrected data (as many as
@@ -136,7 +137,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Gregery T. Buzzard and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.17.0},
+  note = {Version 0.17.1},
   year = 2026
 }
 ```

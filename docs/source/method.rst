@@ -4,7 +4,9 @@ Method
 CITRUS couples model-based iterative reconstruction (MBIR) with a deterministic solver of the linear Boltzmann
 transport equation (LBTE). This page describes the coupled loop first, then the scatter solver it drives and the
 primary model, and last the options that trade accuracy for cost and memory. Units: cm, keV, g/cm^3; attenuation in
-1/cm; source strength 1 photon per steradian at the focal spot (:doc:`conventions`).
+1/cm; source strength 1 photon per steradian at the focal spot of a cone beam, unit incident fluence for a parallel
+beam (:doc:`conventions`). The equations below are written for the point source of a cone beam; "Parallel beams"
+gives the differences.
 
 The CITRUS loop
 ---------------
@@ -439,7 +441,8 @@ The interpolation is adequate for detector modelling, not for dosimetry. The tab
 Source emission profile and open field
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The focal spot is an isotropic point source; a bowtie or beam filter, the heel effect or any other non-uniform
+The source of a cone beam is an isotropic point source at the focal spot, that of a parallel beam a uniform beam over
+the panel's area; a bowtie or beam filter, the heel effect or any other non-uniform
 emission enters as the angular weight :math:`b(\boldsymbol\Omega)` of the source (``SourceModel.emission_profile``),
 given per detector pixel: :math:`b` is the profile at the point where the ray from the focal spot hits the panel,
 interpolated bilinearly between the pixel centres, constant from the outermost pixel centres to the panel edge, and
@@ -450,7 +453,8 @@ the object that a bowtie spares. The scale of :math:`b` cancels in that ratio.
 The profile comes from the measured open field :math:`F` (flat-field image) of the scanner. The solver's images are
 per source photon per steradian through the true geometry, so its own open field of a uniform source,
 :math:`F_{solver}` (``ScatterSolver.open_field_signal``, the primary signal of an empty volume), already contains the
-inverse-square and obliquity falloff of the point source and the grid and detector responses. With a per-pixel
+inverse-square and obliquity falloff of a point source (none for a parallel beam) and the grid and detector
+responses. With a per-pixel
 detector gain :math:`g` (the open field is gain times emission),
 
 .. math::
@@ -592,12 +596,21 @@ thick piece no primary photon gets through, so the corrected data of the ray res
 MBIR spreads such errors along the rays as streaks. With ``CitrusConfig.metal_attenuation_threshold`` (in 1/cm) every
 outer iteration marks the voxels of the current volume above the threshold, forward projects them and gives zero
 weight to every measurement whose ray crosses one; the residual of the adaptive rules is computed over the other
-measurements, and ``records[k]["metal_measurement_fraction"]`` holds the share left out. The scatter solver still sees the whole
-volume. The mask works on attenuation, so it applies to any material, including user-defined ones; the threshold must
-lie above every material of the object that is not metal (the nominal attenuations of the catalogue at the effective
-energy are in :doc:`conventions`, "Materials"). The metal itself is then reconstructed from the regularization and the
-rays that miss it, so its attenuation is not measured; the option is for the tissue around it. The default ``None``
-turns the mask off.
+measurements, and ``records[k]["metal_measurement_fraction"]`` holds the share left out. The mask works on
+attenuation, so it applies to any material, including user-defined ones; the threshold must lie above every material
+of the object that is not metal (the nominal attenuations of the catalogue at the effective energy are in
+:doc:`conventions`, "Materials"). Since the threshold is an attenuation at the effective energy, a threshold set for
+a kilovoltage beam does not mark metal in a megavoltage beam, which passes through it. The default ``None`` turns the
+mask off.
+
+Without data, the metal voxels fade under the regularization, and the metal set shrinks with them from the blurred
+metal of the initial volume to its core, which tightens the mask. The volume the scatter solver sees and the returned
+volume therefore get a filled metal (``metal_fill``): the current metal voxels take the values of the volume in which
+the metal was first found (usually the initial volume), scaled so that their sum equals that volume's total over its
+own metal voxels, since blur spreads the attenuation of the metal but keeps its sum. The records hold the size of the
+set and the scale (``metal_voxels``, ``metal_fill_scale``). The metal's attenuation is as good as the initial volume's
+total: the counts floor ``min_counts`` caps every measured line integral at :math:`\log(I_0 / \mathrm{min\_counts})`,
+so the data of a thick piece cannot hold its attenuation; the option is for the tissue around the metal.
 
 Scatter step on every m-th view
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -673,12 +686,12 @@ image run through the pixel centers on it, the downstream optical depth ends on 
 ray's hit on it, and the incidence angle :math:`\theta_0`, the planar fluence and the detector and grid responses use
 the local normal of each pixel, which is horizontal and points to the axis. The scatter-image weights therefore depend
 on the direction and the channel, :math:`w_k \cos\theta_{0,kc}\, D_g(\theta_{0,kc})`, and a grid transmission that
-depends on the angles is evaluated per pixel for each chunk of directions. Lamellae along the channels run along the
-arc and each column is focused along its own normal; lamellae along the rows (``septa_along="rows"``, the usual
-clinical grid) are focused along each pixel's normal. Both focus on the focal spot at the default focal distance.
-The collapsed-cone direction set keeps the axis of the normal at the panel center and covers the cylinder's edges, and the finite-cone
-footprint is computed on the plane tangent to the cylinder at the central ray (the arc length and the tangent-plane
-coordinate agree to first order in the fan angle).
+depends on the angles is evaluated per pixel for each chunk of directions. Lamellae along the channels run along the arc
+and each column is focused along its own normal; lamellae along the rows (``septa_along="rows"``, the usual clinical
+grid) are focused along each pixel's normal. Both focus on the focal spot at the default focal distance. The
+collapsed-cone direction set keeps the axis of the normal at the panel center and covers the cylinder's edges, and the
+finite-cone footprint is computed on the plane tangent to the cylinder at the central ray (the arc length and the
+tangent-plane coordinate agree to first order in the fan angle).
 
 **Helical scan.** Every view carries a z shift of the source and the panel (a table of unwrapped view angles and
 shifts in the geometry), used by the scatter solver for each view, by MBIRTORCH and by the synthetic data. The

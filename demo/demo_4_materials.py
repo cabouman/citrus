@@ -9,8 +9,9 @@ What to expect: the amalgam stops nearly every photon of the rays through it, so
 and noise (photon starvation), and the rays that graze it disagree with MBIR's linear model. In the initial FDK volume
 the filling throws dark streaks across the slice. CITRUS removes the scatter, and its metal mask
 (``metal_attenuation_threshold``) gives zero weight to every ray through a voxel above the threshold, which clears the
-streaks around the filling. The filling itself is then left to the regularization, so its attenuation is not measured
-and comes out far too low; the RMSE is therefore computed outside it. Set the threshold to None to see the streaks.
+streaks around the filling. The filling is filled from the initial volume (``metal_fill``); its attenuation comes out
+far too low because the data cannot hold it (the counts of its rays are floored at one), so the RMSE is computed
+outside it. Set the threshold to None to see the streaks.
 """
 
 import os

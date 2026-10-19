@@ -1,15 +1,18 @@
-CITRUS: scatter-corrected MBIR for cone-beam CT
-===============================================
+CITRUS: scatter-corrected MBIR for X-ray CT
+===========================================
 
-**Reconstruct cone-beam CT volumes from scatter-contaminated projections with a photon transport solver running
-inside the reconstruction loop.**
+**Reconstruct CT volumes from scatter-contaminated projections with a photon transport solver running inside the
+reconstruction loop.**
 
-Scatter is the largest source of shading, cupping and wrong CT numbers in cone-beam CT. The usual remedy estimates
+Scatter is a major source of shading, cupping and wrong CT numbers whenever the beam irradiates a large volume of the
+object at once, as in cone-beam CT on flat or curved panels, circular or helical, and in parallel-beam CT with a wide
+beam and a short air gap. The usual remedy estimates
 the scatter once, from a first reconstruction that is itself corrupted by scatter, and never revisits it. CITRUS
 (Coupled Iterative Tomographic reconstruction and Recursively-Updated Scatter) instead interleaves model-based
 iterative reconstruction (MBIR) with steps of a deterministic solver of the linear Boltzmann transport equation
 (LBTE): every outer iteration refreshes the scatter estimate of every view with one transport sweep from the current
-reconstruction, corrects the measured data with it and runs a chosen number of MBIR iterations on the result. The
+reconstruction, corrects the measured data with it and runs MBIR iterations on the result (by default as many as
+the fit of the corrected data keeps improving). The
 scatter estimate and the reconstruction converge together, for the cost of one transport sweep per view per outer
 iteration.
 

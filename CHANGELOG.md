@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.17.1 - 2026-10-19
+
+- **Metal fill.** With `metal_attenuation_threshold`, the metal voxels of the volume the scatter solver sees and of
+  the returned volume are filled from the volume in which the metal was first found (usually the initial volume), scaled
+  so that their sum keeps that volume's total attenuation of its metal (`citrus.citrus.metal_fill`). Without the fill
+  the masked metal faded under the regularization. The set is re-segmented every outer iteration, so it shrinks from the
+  blurred initial metal to the core and the mask tightens; the records hold `metal_voxels` and `metal_fill_scale`.
+
 ## v0.17.0 - 2026-10-19
 
 - **Metal mask.** `CitrusConfig.metal_attenuation_threshold` (1/cm, default None): every outer iteration marks the

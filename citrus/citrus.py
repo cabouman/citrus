@@ -666,8 +666,10 @@ class CitrusConfig:
             ``"auto"`` measures it on the initial reconstruction. Defaults to "auto".
         metal_attenuation_threshold (float or None): attenuation in 1/cm above which a voxel of the current volume
             counts as metal; the measurements whose rays cross a metal voxel get zero weight in the MBIR iterations
-            of the outer iteration and are left out of its fit (``sinogram_nrmse``). None turns the metal mask off.
-            Defaults to None.
+            of the outer iteration and are left out of its fit (``sinogram_nrmse``). The metal voxels of the volume
+            the scatter solver sees and of the returned volume are filled from the volume in which the metal was
+            first found (usually the initial one), scaled to keep its total attenuation (``metal_fill``). None turns
+            the metal mask off. Defaults to None.
     """
 
     num_outer_iterations: Union[int, Literal["adaptive"]] = "adaptive"
@@ -1128,12 +1130,18 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
     outer_label = "{}" + (f" (at most {num_outer})" if adaptive_outer else f"/{num_outer}")
     iteration = 0  # MBIR iterations so far: the seed and the schedule position of the next one
     previous_end_residual: Optional[float] = None
+    # the volume in which the metal was first found and its total attenuation of the metal (metal_fill)
+    metal_reference: Optional[tuple[Tensor, Tensor]] = None
     for k in range(num_outer):
         record: dict = {"outer_iteration": k + 1}
         _sync(device)
         t0 = time.perf_counter()
+        X_filled = X
+        if config.metal_attenuation_threshold is not None:
+            X_filled, metal_reference = metal_fill(X, float(config.metal_attenuation_threshold), metal_reference,
+                                                   record)
         if scatter_stage is not None:
-            spr = scatter_stage(k, X, record)
+            spr = scatter_stage(k, X_filled, record)
         corrected_counts = Y if spr is None else Y / (1.0 + spr)
         corrected_line_integrals = -torch.log(corrected_counts.clamp_min(config.min_counts) / I0)
         weights, fit_mask = _metal_mask(model, X, weights_of_counts, config, record)
@@ -1199,7 +1207,8 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
             torch.cuda.reset_peak_memory_stats(device)
         info["records"].append(record)
         if callback is not None:
-            callback(k + 1, X, record)
+            callback(k + 1, X if metal_reference is None else metal_fill(X, float(config.metal_attenuation_threshold),
+                                                                          metal_reference)[0], record)
         if config.verbose:
             extra = (f" dPhi {record['accumulator_change_mean']:.2e}" if "accumulator_change_mean" in record
                      else "")
@@ -1217,6 +1226,8 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
     info["mbir_iterations_total"] = iteration
     info.update(seconds=time.perf_counter() - t_start, regularization=regularization, spr=spr,
                 scatter_counts=scatter_estimate)
+    if metal_reference is not None:
+        X = metal_fill(X, float(config.metal_attenuation_threshold), metal_reference)[0]
     return X, info
 
 
@@ -1249,6 +1260,46 @@ def _relative_norm(error: Tensor, reference: Tensor, mask: Optional[Tensor] = No
     if mask is None:
         return float(error.norm() / reference.norm())
     return float(error[mask].norm() / reference[mask].norm())
+
+
+def metal_fill(X: Tensor, threshold: float, reference: Optional[tuple[Tensor, Tensor]] = None,
+               record: Optional[dict] = None) -> tuple[Tensor, Optional[tuple[Tensor, Tensor]]]:
+    """Fill the metal voxels of a volume from the volume in which the metal was first found.
+
+    The metal is the voxels of X above the threshold. Once the metal mask leaves their rays out of MBIR they have no
+    data and fade, while the set itself shrinks from the blurred metal of the initial volume to the metal's core. The
+    fill gives the current metal voxels the values of the reference volume, scaled so that their sum equals the
+    reference's total attenuation of its own metal voxels: blur spreads the attenuation of the metal but keeps its
+    sum.
+
+    Args:
+        X (Tensor): [R, C, S] volume in 1/cm.
+        threshold (float): attenuation in 1/cm above which a voxel is metal.
+        reference (tuple or None, optional): ``(volume, total)``, the volume in which the metal was first found and
+            the sum of its values over its own metal voxels; None makes X the reference when it has metal. Defaults
+            to None.
+        record (dict or None, optional): gets ``metal_voxels`` and ``metal_fill_scale``. Defaults to None.
+
+    Returns:
+        (Tensor, tuple or None): the filled volume (X itself when it has no metal or there is no reference) and the
+            reference.
+    """
+    metal = X > threshold
+    count = int(metal.sum())
+    if record is not None:
+        record["metal_voxels"] = count
+    if count == 0:
+        return X, reference
+    if reference is None:
+        reference = (X.clone(), X[metal].sum())
+    volume, total = reference
+    current = volume[metal].sum()
+    if not float(current) > 0.0:
+        return X, reference
+    scale = total / current
+    if record is not None:
+        record["metal_fill_scale"] = float(scale)
+    return torch.where(metal, volume * scale, X), reference
 
 
 def _metal_mask(model, X: Tensor, weights: Tensor, config: CitrusConfig,
