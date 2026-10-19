@@ -38,7 +38,7 @@ class Projectors(Protocol):
         Args:
             mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
             grid (Grid): the grid of ``mu``.
-            geometry (ConeGeometry): the cone-beam geometry.
+            geometry (ConeGeometry or ParallelGeometry): the scan geometry.
             angle (float): view angle in radians.
 
         Returns:
@@ -53,7 +53,7 @@ class Projectors(Protocol):
         Args:
             mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
             grid (Grid): the grid of ``mu``.
-            geometry (ConeGeometry): the cone-beam geometry.
+            geometry (ConeGeometry or ParallelGeometry): the scan geometry.
             angle (float): view angle in radians.
             points (Tensor): [N, 3] end points (recon frame, cm), inside or outside the box of ``grid``.
 
@@ -70,7 +70,7 @@ class Projectors(Protocol):
         Args:
             mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
             grid (Grid): the grid of ``mu``.
-            geometry (ConeGeometry): the cone-beam geometry.
+            geometry (ConeGeometry or ParallelGeometry): the scan geometry.
             angle (float): view angle in radians.
 
         Returns:
@@ -85,7 +85,7 @@ class Projectors(Protocol):
         Args:
             mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
             grid (Grid): the grid of ``mu``.
-            geometry (ConeGeometry): the cone-beam geometry.
+            geometry (ConeGeometry or ParallelGeometry): the scan geometry.
             angle (float): view angle in radians.
             omegas (Tensor): [K, 3] unit directions (recon frame).
 
@@ -102,7 +102,7 @@ class Projectors(Protocol):
         Args:
             field (Tensor): [K, G, rows, cols, slices], or [G, rows, cols, slices] shared by all directions.
             grid (Grid): the grid of ``field``.
-            geometry (ConeGeometry): the cone-beam geometry.
+            geometry (ConeGeometry or ParallelGeometry): the scan geometry.
             angle (float): view angle in radians.
             omegas (Tensor): [K, 3] unit directions (recon frame).
 
@@ -365,7 +365,7 @@ class SiddonProjectors:
 
         Args:
             directions (Tensor): [K, 3] unit directions (recon frame).
-            geometry (ConeGeometry): the cone-beam geometry.
+            geometry (ConeGeometry or ParallelGeometry): the scan geometry.
             angle (float): view angle in radians.
 
         Returns:
@@ -405,7 +405,7 @@ class SiddonProjectors:
         Args:
             mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
             grid (Grid): the grid of ``mu``.
-            geometry (ConeGeometry): the cone-beam geometry.
+            geometry (ConeGeometry or ParallelGeometry): the scan geometry.
             angle (float): view angle in radians.
 
         Returns:
@@ -427,7 +427,7 @@ class SiddonProjectors:
         Args:
             mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
             grid (Grid): the grid of ``mu``.
-            geometry (ConeGeometry): the cone-beam geometry.
+            geometry (ConeGeometry or ParallelGeometry): the scan geometry.
             angle (float): view angle in radians.
             points (Tensor): [N, 3] end points (recon frame, cm), inside or outside the box of ``grid``.
 
@@ -451,7 +451,7 @@ class SiddonProjectors:
         Args:
             mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
             grid (Grid): the grid of ``mu``.
-            geometry (ConeGeometry): the cone-beam geometry.
+            geometry (ConeGeometry or ParallelGeometry): the scan geometry.
             angle (float): view angle in radians.
             samples_per_pixel_axis (int, optional): sub-rays per pixel axis. Defaults to None (the instance's
                 ``samples_per_pixel_axis``).
@@ -502,7 +502,7 @@ class SiddonProjectors:
         Args:
             mu (Tensor): [G, rows, cols, slices] attenuation coefficient mu per group in cm^-1.
             grid (Grid): the grid of ``mu``.
-            geometry (ConeGeometry): the cone-beam geometry.
+            geometry (ConeGeometry or ParallelGeometry): the scan geometry.
             angle (float): view angle in radians.
             omegas (Tensor): [K, 3] unit directions (recon frame).
 
@@ -551,7 +551,7 @@ class SiddonProjectors:
         Args:
             field (Tensor): [K, G, rows, cols, slices], or [G, rows, cols, slices] shared by all directions.
             grid (Grid): the grid of ``field``.
-            geometry (ConeGeometry): the cone-beam geometry.
+            geometry (ConeGeometry or ParallelGeometry): the scan geometry.
             angle (float): view angle in radians.
             omegas (Tensor): [K, 3] directions (recon frame).
 

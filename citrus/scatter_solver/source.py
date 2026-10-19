@@ -182,7 +182,7 @@ def panel_interpolate(image: Tensor, u: Tensor, v: Tensor, geometry: ConeGeometr
         image (Tensor): [rows, channels] values at the pixel centres.
         u (Tensor): [...] panel coordinates along the channels in cm.
         v (Tensor): [...] panel coordinates along the rows in cm, the shape of ``u``.
-        geometry (ConeGeometry): the panel.
+        geometry (ConeGeometry or ParallelGeometry): the panel.
 
     Returns:
         Tensor: [...] interpolated values, in the dtype of ``image``.
@@ -211,7 +211,7 @@ def bowtie_emission_profile(geometry: ConeGeometry, edge_weight: float = 0.2) ->
     channel, the transmission at one energy of a filter whose thickness grows with the square of the channel position.
 
     Args:
-        geometry (ConeGeometry): the panel.
+        geometry (ConeGeometry or ParallelGeometry): the panel.
         edge_weight (float, optional): profile at the outermost channel, in (0, 1]. Defaults to 0.2.
 
     Returns:

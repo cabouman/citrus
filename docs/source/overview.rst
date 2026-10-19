@@ -25,7 +25,8 @@ Package layout
     ``photon_data``               the photon data: NIST XCOM cross sections (downloaded on first use), xraylib
                                   angular distributions
     ``cross_section_library``     the library builder from those data, cached on disk
-    ``source``, ``detector``      point source with emission profile; detector and anti-scatter-grid responses
+    ``source``, ``detector``      point source or parallel beam with emission profile; detector and anti-scatter-grid
+                                  responses
     ``angular_quadrature``        direction sets, real spherical harmonics, the scattering-source operator
     ``linear_discontinuous_cell`` the linear-discontinuous cell equations and their closed-form solve
     ``wavefront``                 the diagonal-plane ordering of the sweep
@@ -38,25 +39,30 @@ Package layout
     ============================= ================================================================================
 
 ``citrus.recon``
-    ``mbir_bridge``: the MBIRTORCH ``ConeBeamModel`` matching the solver's geometry, FDK (with redundancy weights for a
-    short scan or an overscan), the warm-started single-iteration recipe.
+    ``mbir_bridge``: the MBIRTORCH ``ConeBeamModel`` or ``ParallelBeamModel`` matching the solver's geometry, FDK or
+    the filtered back projection of a parallel beam (with redundancy weights for a short scan or an overscan), the
+    warm-started and resumable MBIR iterations, projections onto chunks of views.
 
 ``citrus.utilities``
-    The WLAB phantom, grid and geometry, the seven-material attenuation <-> density model, the view angles (short
-    scan by default), synthetic cone-beam data with scatter (``synthesize_cone_beam_data`` for any density volume,
-    ``synthesize_wlab_dataset``), a GPU memory cap and plotting helpers.
+    The WLAB phantom with its grid and its cone-beam and parallel-beam geometries, the interpolating attenuation <->
+    density model of the reference materials, the object size and mean composition that set the energy groups, the
+    view angles (short scan by default) and helical scans, synthetic data with scatter (``synthesize_cone_beam_data``
+    for any density model or volume, ``synthesize_wlab_dataset``), a GPU memory cap and plotting helpers.
 
 Scope of the solver
 -------------------
 
-* Photon energies from kV imaging to MV beams (default 10-125 keV in 6 groups whose edges follow the scattered
-  photons, any loaded spectrum); Compton scattering (no Doppler broadening) and Rayleigh scattering with the cross
-  sections of NIST XCOM and the angular distributions of xraylib, with an angular table whose nodes follow the forward
-  peaks; photoelectric absorption (and pair production at MV) as local deposition.
-* Reference materials chosen from a catalogue of compounds, tissues and all elements (``SolverConfig.materials``,
-  :doc:`conventions`, "Materials"); every voxel is a mixture of at most two of them, the two whose nominal
-  attenuations bracket its attenuation.
-* A point source collimated to the flat panel; detector and anti-scatter-grid responses as lookup tables.
+* Photon energies from kV imaging to MV beams: the user's spectrum, or one monoenergetic line, in 6 groups (by
+  default) from 10 keV to the spectrum maximum whose edges follow the scattered photons; Compton scattering (no
+  Doppler broadening) and Rayleigh scattering with the cross sections of NIST XCOM and the angular distributions of
+  xraylib, with an angular table whose nodes follow the forward peaks; photoelectric absorption (and pair production
+  at MV) as local deposition.
+* Reference materials chosen from a catalogue of compounds, tissues and all elements, or defined by the user
+  (``SolverConfig.materials``, :doc:`conventions`, "Materials"); every voxel is a mixture of at most two of them, the
+  two whose nominal attenuations bracket its attenuation at the effective energy.
+* A point source collimated to a flat or curved panel, with circular or helical views, or a parallel beam; an
+  optional emission profile of the source (from the measured open field); detector and anti-scatter-grid responses
+  as lookup tables, built from the photon data for any catalogue material or given as a table.
 * Float32 on CUDA (production; fused Triton kernels) and float64 / CPU (reference and tests).
 
 Repository
@@ -72,7 +78,10 @@ Repository
 ``dev_scripts/``
     Shell scripts (bash; Linux, macOS, Git Bash on Windows): ``create_conda_test_environment.sh``,
     ``clean_install_all.sh``, ``remove_build.sh``, ``deep_clean.sh``, ``run_tests.sh`` (``--slow`` for the slow tests),
-    ``build_docs.sh``, ``check_cuda.sh`` (PyTorch / CUDA / Triton availability and the kernel self-checks).
+    ``build_docs.sh``, ``check_cuda.sh`` (PyTorch / CUDA / Triton availability, the kernel self-checks and the photon
+    data), ``wsl_install_test.sh`` (an installation test from GitHub in a fresh environment).
 ``benchmarks/``
     Benchmarks of the sweep, the first-collision source kernel and the ray tracer, a per-stage profile of the CITRUS
-    step, and ``citrus_study.py``, the CITRUS study script with every setting as a flag (:doc:`usage`).
+    step, the GPU memory of the loop (``bench_citrus_memory.py``), fixed against adaptive numbers of MBIR iterations
+    (``adaptive_mbir_study.py``), and ``citrus_study.py``, the CITRUS study script with every setting as a flag
+    (:doc:`usage`).

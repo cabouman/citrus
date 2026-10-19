@@ -28,7 +28,8 @@ A reconstruction in a few lines
                               CitrusConfig(scatter_view_stride=8))   # adaptive numbers of iterations
 
 ``counts`` are the measured projections (primary plus scatter), ``grid`` and ``geometry`` describe the volume and the
-cone-beam scanner in MBIRTORCH's conventions, and the configuration sets how often the scatter is refreshed.
+scanner (a cone beam with a flat or curved panel and circular or helical views, or a parallel beam) in MBIRTORCH's
+conventions, and the configuration runs the scatter step on every 8th view only, interpolating the others in angle.
 :doc:`usage` describes the two demos and the study script that produces the figures below.
 
 What CITRUS gives you
@@ -45,9 +46,9 @@ What CITRUS gives you
 
    .. grid-item-card:: A deterministic photon transport solver
 
-      Multigroup in energy, discrete ordinates in angle, linear-discontinuous finite elements in space, Compton and
-      Rayleigh cross sections from NIST XCOM, first-collision source exact in energy, collapsed-cone projection to the
-      detector with the anti-scatter grid and detector responses.
+      Multigroup in energy, discrete ordinates in angle, linear-discontinuous finite elements in space, cross sections
+      of NIST XCOM with the Compton and Rayleigh angular distributions of xraylib, first-collision source exact in
+      energy, collapsed-cone projection to the detector with the anti-scatter grid and detector responses.
 
    .. grid-item-card:: Independent of the reconstruction grid
 
@@ -57,8 +58,8 @@ What CITRUS gives you
    .. grid-item-card:: Built for one GPU
 
       Fused Triton kernels for the ray tracer, the first-collision source and the sweep, with PyTorch reference paths
-      for the CPU and float64. The scatter can be refreshed at every n-th outer iteration and on every m-th view, and
-      the per-view state is stored compactly.
+      for the CPU and float64. The scatter step can run on every m-th view only, each outer iteration can run several
+      MBIR iterations on one correction, and the per-view state is stored compactly.
 
 How it works
 ------------
@@ -95,9 +96,10 @@ reasons behind the main implementation choices.
 Built on MBIRTORCH, NIST XCOM and xraylib
 -----------------------------------------
 
-The reconstruction side is `MBIRTORCH <https://github.com/cabouman/mbirtorch>`_: its cone-beam model provides the
-forward projections, the FDK initialization and the vectorized coordinate descent iterations, warm-started and resumed
-from their error sinogram between scatter updates. The photon cross sections come from
+The reconstruction side is `MBIRTORCH <https://github.com/cabouman/mbirtorch>`_: its cone-beam and parallel-beam
+models provide the forward projections, the initial volume (FDK, or the filtered back projection of a parallel beam)
+and the vectorized coordinate descent iterations, warm-started and resumed from their error sinogram between scatter
+updates. The photon cross sections come from
 `NIST XCOM <https://physics.nist.gov/xcom>`_ (downloaded on first use) and the Compton and Rayleigh angular
 distributions from `xraylib <https://github.com/tschoonj/xraylib>`_; from them the multigroup cross-section library of
 the chosen reference materials is built once and cached.

@@ -16,7 +16,7 @@ production, and its totals are the values of NIST's attenuation tables. Elements
 with each elemental angular shape normalized numerically, so that the scattering of every material integrates to the
 XCOM cross section whatever the integral of the shape, and every material of the catalogue is built the same way.
 
-**Spectrum, groups and energy quadrature.** The user supplies the source spectrum, (energies in keV, relative photon
+**Spectrum, groups and energy quadrature.** The user supplies the source spectrum (energies in keV, relative photon
 density per keV); there is no default, and CITRUS does not simulate tube spectra. A two-column text file is loaded with
 ``load_spectrum_txt``; the repository's ``demo/spectra`` holds two samples, a W-anode 125 kV spectrum (11 degree
 take-off, 0.89 mm Ti filter, 1 keV grid) and the Mohan et al. (1985) 6 MV linac spectrum (1 keV nodes to 6 MeV, the
@@ -52,10 +52,11 @@ the photons the group carries, and in the lowest groups at MV these are scattere
 not the flat or empty source spectrum there, whose weighting would give the group the photoelectric attenuation of its
 lowest energies and absorb the multiply scattered photons too early.
 
-The balance is discretized on equal bins of width max(``fine_bin_width_kev``, (kVp - ``energy_min_kev``) / 2000)
-from ``energy_min_kev`` to kVp, with the source photons of each bin integrated exactly from the piecewise-linear
-spectrum and the Klein-Nishina probability of landing in each bin integrated in closed form for a photon at the
-centre of the source bin (scattering within the bin is kept), and solved by one sweep from the highest bin down.
+The balance is discretized on equal bins of width max(``fine_bin_width_kev`` (0.5 keV when None, the default),
+(kVp - ``energy_min_kev``) / 2000) from ``energy_min_kev`` to kVp, with the source photons of each bin integrated
+exactly from the piecewise-linear spectrum and the Klein-Nishina probability of landing in each bin integrated in
+closed form for a photon at the centre of the source bin (scattering within the bin is kept), and solved by one sweep
+from the highest bin down.
 
 **Compton kinematics.** For each fine energy the scattering-angle boundaries of every lower group edge are computed
 analytically and each piece is integrated with Gauss-Legendre nodes in :math:`q = \sin(\theta/2)`, which resolves the
@@ -225,19 +226,20 @@ all materials. The pair form keeps the cost of a seven-material library close to
 **Direction context.** Everything of an image that depends only on the view, the direction set and the detector / grid
 responses is precomputed once per view (``make_direction_context``): the panel-facing directions and their chunking,
 the detector response per direction and the grid response per direction and detector row (exact for a flat panel with
-a 1-D grid, whose angles do not depend on the channel). The accumulation of a chunk is then one batched matrix product,
-and an LRU of contexts lets the repeated images of a view (every CITRUS outer iteration) run without host
-synchronization.
+a 1-D grid whose septa run along the channels, whose angles do not depend on the channel). The accumulation of a
+chunk is then one batched matrix product, and an LRU of contexts lets the repeated images of a view (every CITRUS
+outer iteration) run without host synchronization.
 
 The detector response depends on a direction only through :math:`\theta_0` and is stored as ``[K, G]``; the grid
 response of a flat panel with a 1-D grid is stored as ``[K, G, Rd]``, and the three accumulation weights (fluence,
 planar fluence, signal) as one ``[G Rd, 3, K]`` matrix, a factor ``Cd / 3`` smaller than per-pixel tables.
-Separability is checked numerically on probe directions when the context is built; a panel that fails it falls
-back to per-pixel weights. The responses are evaluated in float64 and stored in the image dtype. The panel-facing
-directions are selected in the image dtype, so a direction grazing the panel plane is kept or dropped exactly as
-the projectors see it, and they are stored as one contiguous tensor, so the projectors copy them to the host once
-per context. The context does not depend on the voxel grid; the tables that do (sub-cell offsets, footprint
-heights) and the spherical harmonics per order are cached in it on first use.
+Separability is checked numerically on probe directions when the context is built; a panel that fails it (a grid
+whose septa run along the rows) falls back to per-pixel weights, and a curved panel has its own context, whose
+weights depend on the direction and the channel. The responses are evaluated in float64 and stored in the image
+dtype. The panel-facing directions are selected in the image dtype, so a direction grazing the panel plane is kept or
+dropped exactly as the projectors see it, and they are stored as one contiguous tensor, so the projectors copy them
+to the host once per context. The context does not depend on the voxel grid; the tables that do (sub-cell offsets,
+footprint heights) and the spherical harmonics per order are cached in it on first use.
 
 **Direction set and footprint.** The cone product set is limited to the smallest cone about the panel normal that
 contains every direction from the transport-grid box to the panel. Per-pixel scatter of a finite direction set carries
@@ -331,7 +333,7 @@ float32 on the model device (no copy when they already are); the bridge pins eve
 it (``output_sharded=True``), never numpy. ``torch.compile`` is used on CUDA only, since on the CPU it needs a C++
 toolchain.
 
-**Projections in chunks of views.** A ``ConeBeamModel`` projects onto all its views at once. To project onto a run
+**Projections in chunks of views.** An MBIRTORCH model projects onto all its views at once. To project onto a run
 of consecutive views (the per-material path lengths of the loop's primary must not grow to ``[M', V, rows,
 channels]``), ``ViewChunkProjector`` builds a sub-model over those angles with ``make_model`` and keeps the
 last few in a least-recently-used cache. A sub-model is cheap to build; its first projection compiles, later ones

@@ -64,7 +64,7 @@ def covering_polar_angle(grid: Grid, geometry: ConeGeometry, angle: float, margi
 
     Args:
         grid (Grid): the grid whose box is covered.
-        geometry (ConeGeometry): cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
         angle (float): view angle in radians.
         margin (float, optional): added to the angle, in radians. Defaults to 1e-6.
 
@@ -105,7 +105,7 @@ def panel_direction_set(geometry: ConeGeometry, angle: float,
     footprint filled.
 
     Args:
-        geometry (ConeGeometry): cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
         angle (float): view angle in radians.
         config_or_counts (SolverConfig or tuple): a configuration (``cone_num_polar``, ``cone_num_azimuthal``) or a
             (num_polar, num_azimuthal) tuple.
@@ -143,7 +143,7 @@ class DirectionSetContext:
 
     Attributes:
         quadrature (Quadrature): the direction set the context was built from (checked on use).
-        geometry (ConeGeometry): the geometry it was built for.
+        geometry (ConeGeometry or ParallelGeometry): the geometry it was built for.
         angle (float): view angle in radians.
         detector (DetectorResponse): detector response.
         grid_response (GridResponse): anti-scatter-grid response.
@@ -237,7 +237,7 @@ class DirectionSetContext:
         """Check that the context was built for these image arguments (host-side checks only).
 
         Args:
-            geometry (ConeGeometry): cone-beam geometry of the image.
+            geometry (ConeGeometry or ParallelGeometry): scan geometry of the image.
             angle (float): view angle in radians.
             quadrature (Quadrature): direction set; must be the context's own object.
             detector (DetectorResponse): detector response; must be the context's own object.
@@ -417,7 +417,7 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
 
     Args:
         quadrature (Quadrature): direction set, omega [M, 3] and weight [M].
-        geometry (ConeGeometry): cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
         angle (float): view angle in radians.
         detector (DetectorResponse): detector response.
         grid_response (GridResponse): anti-scatter-grid response.
@@ -588,7 +588,7 @@ def _resolve_context(context: Optional[DirectionSetContext], quadrature: Quadrat
     Args:
         context (DirectionSetContext): the context to check, or None to build one.
         quadrature (Quadrature): direction set.
-        geometry (ConeGeometry): cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
         angle (float): view angle in radians.
         detector (DetectorResponse): detector response.
         grid_response (GridResponse): anti-scatter-grid response.
@@ -633,7 +633,7 @@ def scatter_image_from_source(source_function: SourceFunction, grid: Grid, geome
         source_function (callable): maps directions [k, 3] to the emission density [k, G, rows, cols, slices] at the
             voxel centers of ``grid``, in photons/(cm^3 sr) per source photon per sr.
         grid (Grid): grid of the emission and of ``mu_t``.
-        geometry (ConeGeometry): cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
         angle (float): view angle in radians.
         quadrature (Quadrature): direction set (e.g. :func:`panel_direction_set`); directions away from the panel are
             skipped.
@@ -865,7 +865,7 @@ def panel_height_field(grid: Grid, geometry: ConeGeometry, angle: float, device=
 
     Args:
         grid (Grid): the voxel grid.
-        geometry (ConeGeometry): cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
         angle (float): view angle in radians.
         device (torch.device, optional): device of the result. Defaults to None.
         dtype (torch.dtype, optional): dtype of the result. Defaults to torch.float32.
@@ -898,7 +898,7 @@ class _Footprint:
 
         Args:
             grid (Grid): grid of the emission that is projected.
-            geometry (ConeGeometry): cone-beam geometry of the context.
+            geometry (ConeGeometry or ParallelGeometry): scan geometry of the context.
             angle (float): view angle of the context in radians.
             context (DirectionSetContext): direction context with cell widths.
 
@@ -985,7 +985,7 @@ def combined_scatter_image(library: MultigroupLibrary, rho_quadrature: Tensor, p
         scatter_source_moments (Tensor): [G, (L+1)^2, Rc, Cc, Sc] cell-mean moments T of the multiple-collision source,
             or [G, (L+1)^2, 4, Rc, Cc, Sc] whose cell means are used.
         L (int): Legendre order of the moments.
-        geometry (ConeGeometry): cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
         angle (float): view angle in radians.
         quadrature (Quadrature): collapsed-cone direction set.
         mu_t_coarse (Tensor): [G, Rc, Cc, Sc] total attenuation coefficient mu_t in cm^-1 on the transport grid, or
@@ -1082,7 +1082,7 @@ def primary_subpixel_geometry(geometry: ConeGeometry, samples_per_pixel_axis: in
     Sub-pixel (i, j) of pixel (r, c) is pixel (r n + i, c n + j) of the returned geometry.
 
     Args:
-        geometry (ConeGeometry): cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
         samples_per_pixel_axis (int): sub-pixel samples n per axis, at least 1.
 
     Returns:
@@ -1125,7 +1125,7 @@ def primary_path_lengths(projectors: Projectors, rho: Tensor, grid: Grid, geomet
         projectors (Projectors): ray tracers.
         rho (Tensor): [M', R, C, S] density maps in g/cm^3 of any subset of the materials.
         grid (Grid): the grid of ``rho``.
-        geometry (ConeGeometry): cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
         angle (float): view angle in radians.
         samples_per_pixel_axis (int, optional): sub-pixel samples n per axis. Defaults to None, the projector's own
             ``samples_per_pixel_axis`` or 1.
@@ -1154,7 +1154,7 @@ def primary_from_path_lengths(library: MultigroupLibrary, path: Tensor, material
         library (MultigroupLibrary): cross-section library.
         path (Tensor): [M', Rd n, Cd n] line integrals P_m in g/cm^2 from any projector, n >= 1 inferred from the shape.
         materials (Sequence[int]): library indices of the rows of ``path``, or None for all materials in library order.
-        geometry (ConeGeometry): cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
         angle (float): view angle in radians.
         source (SourceModel): source model.
         detector (DetectorResponse): detector response.
@@ -1207,7 +1207,7 @@ def primary_image(library: MultigroupLibrary, rho: Tensor, grid: Grid, geometry:
         library (MultigroupLibrary): cross-section library.
         rho (Tensor): [M, R, C, S] densities in g/cm^3 of the library's materials on ``grid``.
         grid (Grid): the grid of ``rho``.
-        geometry (ConeGeometry): cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
         angle (float): view angle in radians.
         source (SourceModel): source model.
         projectors (Projectors): ray tracers.

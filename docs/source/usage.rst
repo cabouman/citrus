@@ -66,7 +66,10 @@ Flags:
 * ``--no-resume-error-sinogram`` (restart MBIR from the sinogram every outer iteration);
 * ``--I0`` (flat-field counts, default 1e5), ``--seed``, ``--no-noise``, ``--regenerate``, ``--truth-sweep``,
   ``--truth-cone``, ``--save-recon`` (also write the CITRUS volume as ``.npy``), ``--memory-cap-mib`` (PyTorch CUDA
-  allocator cap; default 85 percent of the device memory, 0 for none).
+  allocator cap; default 85 percent of the device memory, 0 for none), ``--input`` and ``--out`` (the folders of the
+  data sets and the outputs).
+
+The script uses the sample 125 kVp spectrum of ``demo/spectra`` and the full-field WLAB geometry.
 
 Names: the data set is ``demo/input/<tag>.npz`` (with ``<tag>.json``), the tag recording the number of views, the voxel
 pitch, the angular range (``_short`` for the default short scan), ``_nonoise``, a transport cell size other than 1 cm,
@@ -74,16 +77,18 @@ a finer truth discretization and the data-set format (``_v2``); files of other f
 are ``demo/output/citrus_<tag>[suffixes]_<figure>.png`` and ``citrus_<tag>[suffixes].json``, with the suffixes
 ``_materials-<names>`` (a set of reference materials other than the default), ``_restart``
 (``--no-resume-error-sinogram``), ``_stride<n>`` (with ``_order<k>`` for an interpolation order other than 3) and
-``_mbir<n>`` for the values other than 1.
+``_outer<N>_mbir<n>`` when either count is a number rather than ``adaptive``.
 
 The truth solver of the data always uses the seven default reference materials (the phantom is water and bone only),
 so ``--materials`` changes only the reconstruction loop and every set runs on the same data. Both reconstructions use
 the same frozen regularization (MBIRTORCH's automatic estimate on the scatter-free sinogram), the same FDK
-initialization, weights and partition sequence, so they differ only by the scatter correction.
+initialization, weights and partition sequence, so with fixed counts they differ only by the scatter correction; with
+the adaptive counts each loop stops on the fit of its own corrected sinogram.
 
 Angular range: the views are evenly spaced over ``[start, end)`` (endpoint excluded, MBIRTORCH's angle convention).
 The default end is a short scan, start + 180 degrees + the in-plane fan angle of the panel,
-``2 atan(0.5 num_det_channels delta_det_channel / SDD)``; ``--end-view-angle 360`` (with the default start 0) is a full
+``2 atan(0.5 num_det_channels delta_det_channel / SDD)`` (``utilities.fan_angle``; on a curved panel
+``num_det_channels delta_det_channel / SDD``); ``--end-view-angle 360`` (with the default start 0) is a full
 rotation. Over a range that is not whole rotations ``citrus_recon`` / ``mbir_recon`` apply redundancy weights
 before MBIRTORCH's FDK or filtered back projection (``recon.mbir_bridge.redundancy_weights``), and the sparse-view
 interpolation runs
@@ -124,17 +129,18 @@ The entries of ``info``:
 * ``records``: one dict per outer iteration (``records[0]`` for the initial volume X_0, ``records[k]`` for X_k) with
   ``outer_iteration``, ``mbir_iterations``, ``sinogram_nrmse_start`` / ``sinogram_nrmse`` (relative RMSE of A X
   against the corrected sinogram before and after its MBIR iterations, with the resumed error sinogram),
-  ``scatter_seconds``, ``mbir_seconds`` (of all its MBIR iterations),
-  ``total_seconds``, ``scatter_change_relative`` (mean absolute change of the scatter-count estimate
-  over its mean absolute value) and, on CUDA, ``gpu_peak_allocated_mib``; a record with a scatter stage also holds
+  ``scatter_seconds``, ``mbir_seconds`` (of all its MBIR iterations), ``total_seconds``,
+  ``scatter_change_relative`` (from outer iteration 2 on: mean absolute change of the scatter-count estimate over its
+  mean absolute value) and, on CUDA, ``gpu_peak_allocated_mib``; a record with a scatter stage also holds
   ``negative_fraction`` (voxels clamped by the density model), ``accumulator_change_mean`` /
   ``accumulator_change_max`` (relative accumulator change over the computed views), ``transfer_seconds``,
   ``primary_seconds`` and, at ``scatter_view_stride > 1``, ``interpolation_seconds`` (the last two are part of
   ``scatter_seconds``);
 * ``spr`` and ``scatter_counts``: the last scatter-to-primary ratio and scatter-count estimate ``Y - Y_c``,
   ``[views, rows, channels]``;
-* ``regularization`` (the frozen sigmas), ``state`` (a description of the accumulator storage, one slot per computed
-  view), ``init_recon``, ``model``, ``config``, ``seconds`` and ``fdk_seconds``;
+* ``mbir_iterations_total`` (the MBIR iterations of the whole loop), ``regularization`` (the frozen sigmas),
+  ``state`` (a description of the accumulator storage, one slot per computed view), ``init_recon``, ``model``,
+  ``config``, ``seconds`` and ``fdk_seconds`` (the time of the initial volume);
 * ``computed_views`` (``[Vc]`` views with a scatter step) and ``view_interpolated`` (``[V]`` bool, True where the
   scatter is interpolated in angle);
 * ``grouping_object_size_cm``, ``grouping_medium`` (the object size and medium of the solver's energy groups, None
@@ -279,7 +285,7 @@ descriptions. The first setting of each group names the group.
      - most MBIR iterations of an adaptive outer iteration (at least two run)
    * - ``resume_error_sinogram``
      - ``True``
-     - keep MBIRTORCH's error sinogram between MBIR iterations instead of recomputing it
+     - keep MBIRTORCH's error sinogram between outer iterations instead of recomputing it
    * - ``base_seed``
      - ``0``
      - seed of the partition sequence of MBIR iteration i, ``[base_seed, i]``
@@ -297,7 +303,8 @@ descriptions. The first setting of each group names the group.
      - effective energy of the density model; None for the spectrum mean of the library
    * - ``grouping_object_size``
      - ``"auto"``
-     - object size in cm of the solver's scattered-fluence groups; auto measures the FDK volume
+     - object size in cm of the solver's scattered-fluence groups; auto measures the initial volume (escape
+       probability)
    * - ``primary_views_per_chunk``
      - ``None``
      - views per chunk of the primary projections; None keeps one sinogram
@@ -392,12 +399,13 @@ The scatter solver
 
    import torch
    from citrus.scatter_solver import (ScatterSolver, SolverConfig, build_solver_library, csi_response,
-                                      no_grid)
+                                      load_spectrum_txt, no_grid)
    from citrus.utilities import wlab_setup
 
    grid, geometry, rho = wlab_setup(1.0, device="cuda")       # 1 cm grid, 100 x 75 panel, [7, R, C, S] densities
    config = SolverConfig()                                    # 1 cm transport cells, 0.5 cm quadrature points
-   library = build_solver_library(config)                     # the reference materials config.materials, cached
+   spectrum = load_spectrum_txt("demo/spectra/spectrum_125kvp.txt")   # or monoenergetic_spectrum(energy_kev)
+   library = build_solver_library(config, spectrum)           # the reference materials config.materials, cached
    solver = ScatterSolver(library, config, geometry, detector=csi_response(0.06), grid_response=no_grid(),
                           device="cuda", dtype=torch.float32)
    result = solver.solve_view(rho, grid, angle=0.0)
@@ -436,10 +444,11 @@ describes the models.
 ``detector_response`` takes any catalogue material (:doc:`conventions`, "Materials") with its catalogue density or
 ``density=``, ``mode`` "energy_integrating" (keV per photon) or "photon_counting", and ``deposition`` "full" or
 "local". ``anti_scatter_grid`` takes the septum material, thickness and height, ``focal_distance_cm`` (default: the
-source-detector distance), ``pitch_cm`` (default: the pixel pitch across the septa) and ``septa_along`` ("channels",
-the default, or "rows"). ``csi_response`` and ``focused_1d_grid`` remain the built-in CsI and lead models.
-``SourceModel(emission_profile=...)`` takes a ``[rows, channels]`` profile, or ``[views, rows, channels]`` with
-``emission_profile_angles``. ``citrus_recon`` sets the profile itself from an open-field image.
+source-detector distance of a cone beam, infinite, an unfocused grid, for a parallel beam), ``pitch_cm`` (default:
+the pixel pitch across the septa) and ``septa_along`` ("channels", the default, or "rows"). ``csi_response`` and
+``focused_1d_grid`` remain the built-in CsI and lead models. ``SourceModel(emission_profile=...)`` takes a
+``[rows, channels]`` profile, or ``[views, rows, channels]`` with ``emission_profile_angles``. ``citrus_recon`` sets
+the profile itself from an open-field image.
 
 Energy groups and the angular table
 -----------------------------------
@@ -453,14 +462,12 @@ Two settings of ``SolverConfig`` shape the library (:doc:`method`, "Uncollided f
   the rule.
 * ``grouping_medium``: ``"auto"`` (default: measured on the object, water until then), a reference material's name
   (``"aluminium"`` for an aluminium casting, or the name of a ``Material``) or a mapping ``{"water": 0.9,
-  "bone_cortical_icrp": 0.2}`` (g/cm^3) of
-  reference
-  materials.
+  "bone_cortical_icrp": 0.2}`` (g/cm^3) of reference materials. The medium is stored as (name, density) pairs sorted
+  by name; the library cache key and the balance use the densities rounded to 3 significant digits, with traces below
+  1e-3 of the largest density dropped (``cross_section_library.grouping_medium_densities``), so nearly equal media
+  share a cached library.
 * ``angular_table_grid``: ``"adaptive"`` (default; ``num_eta_table`` nodes placed by the curvature of the transfer) or
   ``"uniform"``.
-  The medium is stored as (name, density) pairs sorted by name; the library cache key and the balance use the
-  densities rounded to 3 significant digits, with traces below 1e-3 of the largest density dropped
-  (``cross_section_library.grouping_medium_densities``), so nearly equal media share a cached library.
 
 .. code-block:: python
 
@@ -470,9 +477,10 @@ Two settings of ``SolverConfig`` shape the library (:doc:`method`, "Uncollided f
    config = replace(SolverConfig(), num_groups=12)                       # adaptive table, scattered-fluence groups
    spectrum = load_spectrum_txt("demo/spectra/spectrum_6mv.txt")         # a 6 MV linac spectrum
    solver = wlab_solver(0.5, config=config, spectrum=spectrum, device="cuda")
-   legacy = replace(SolverConfig(), angular_table_grid="uniform", group_edges_method="equal_fluence")  # citrus 0.5
+   legacy = replace(SolverConfig(), angular_table_grid="uniform", group_edges_method="equal_fluence")  # 0.5 rules
 
-``wlab_solver`` (and ``ScatterSolver(None, config, ...)``) returns a solver whose library is built on first use, so
+``wlab_solver`` (and ``ScatterSolver(None, config, ..., spectrum=spectrum)``) returns a solver whose library is built
+on first use, so
 ``citrus_recon`` can first measure the object: with ``CitrusConfig.grouping_object_size = "auto"`` (default) it sets
 ``grouping_object_size_cm`` to the size measured from the escape probability of the FDK volume
 (``citrus.utilities.object_size_cm``) and, for
@@ -524,16 +532,20 @@ else refers to it by its name: ``library.materials``, ``material_index``, ``grou
 Synthetic data
 --------------
 
-``citrus.utilities.synthesize_cone_beam_data(rho, grid, geometry, angles, solver, I0, noise, seed)`` generates
-cone-beam counts with scatter for any density volume ``rho [M, R, C, S]`` (the solver library's materials): ``X_true``
-(attenuation at the effective energy), line integrals, ``P``, ``S``, ``Y``, ``SPR``, the solver's primary and scatter
+``citrus.utilities.synthesize_cone_beam_data(densities, grid, geometry, angles, solver, I0, noise, seed)`` generates
+counts with scatter of a cone-beam or parallel-beam scan (``geometry`` is the solver's) for any true object: a density
+volume ``rho [M, R, C, S]`` of the solver library's materials, or a density model that gives one material map at a
+time (``WlabPhantom``), so that a fine truth grid never holds the M volumes. It returns ``X_true`` (attenuation at the
+effective energy), line integrals, ``P``, ``S``, ``Y``, ``SPR``, ``open_field``, the solver's primary and scatter
 images and metadata. The primary uses MBIRTORCH's own projector, the scatter is ``S = SPR P`` with the
 scatter-to-primary ratio of one fully converged solve of ``solver`` per view, whose primary is the loop's primary
 model (``meta["data_format"]`` = 2). The truth solver may use a finer angular discretization than the solver of the
 reconstruction loop. ``synthesize_wlab_dataset(num_views, delta_voxel, I0, noise, seed, out_path, config=...,
-geometry=..., start_view_angle=0.0, end_view_angle=None)`` is the WLAB wrapper used by the demo and the study script
-(``end_view_angle`` None: the short scan start + pi + fan angle; ``2 pi`` for a full rotation); ``save_dataset`` /
-``load_dataset`` write and read ``.npz`` + ``.json``.
+geometry=..., start_view_angle=0.0, end_view_angle=None, spectrum=...)`` is the WLAB wrapper used by the demo and the
+study script (the spectrum is required unless a prebuilt ``library=`` is given; ``geometry`` defaults to
+``full_field_wlab_geometry()``; ``end_view_angle`` None: the short scan start + pi + fan angle, start + pi for a
+parallel beam; start + 2 pi for a full rotation); ``save_dataset`` / ``load_dataset`` write and read ``.npz`` +
+``.json``.
 
 The scatter-to-primary ratio of the data is that of the solver's detector signals, through the detector response and
 behind the grid, as in the CITRUS loop (with the ideal counting detector and no grid of ``wlab_solver`` the signal is
@@ -553,8 +565,9 @@ the truth solver's open-field signal :math:`f` with its emission profile, and th
    recon, info = citrus_recon(data["Y"], data["open_field"], data["angles"], grid, geometry, solver,
                               detector_gain=gain)
 
-The solver's images are in photons/cm^2 per source photon/sr; its primary carries the inverse-square and obliquity
-factors of the point source and the polychromatic transmission. MBIRTORCH's model is the flat, monochromatic line
+The solver's images are in photons/cm^2 per source photon/sr (per unit incident fluence for a parallel beam); its
+primary carries the inverse-square and obliquity factors of the point source (none for a parallel beam) and the
+polychromatic transmission. MBIRTORCH's model is the flat, monochromatic line
 integral :math:`l = AX` at the effective energy with ``I0`` the flat-field count, which absorbs the inverse-square and
 obliquity factor ``phi_air`` (the solver's primary of an empty volume, saved with the data). The data tie the two
 models through the dimensionless per-pixel ratio, ``S = SPR P``: the scatter-to-primary ratio of the data equals the

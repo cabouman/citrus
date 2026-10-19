@@ -1,8 +1,9 @@
 """Bridge between the solver's geometry (``Grid``, ``ConeGeometry``, ``ParallelGeometry``) and MBIRTORCH's models.
 
 It builds the MBIRTORCH model of a scan (``ConeBeamModel`` or ``ParallelBeamModel``), projects and back-projects with
-it, runs FDK with short-scan (Parker) weights or the filtered back projection of a parallel beam,
-runs warm-started and resumable MBIR iterations, and projects volumes onto chunks of views. MBIRTORCH is imported
+it, runs FDK or the filtered back projection of a parallel beam with the redundancy weights of a range that is not
+whole rotations (Parker weights for a short scan, ramps for an overscan), runs warm-started and resumable MBIR
+iterations, and projects volumes onto chunks of views. MBIRTORCH is imported
 lazily, and the functions return torch tensors on the model device. The coupling is described in
 docs/source/design_notes.rst, "MBIRTORCH coupling", and the shared frames in docs/source/conventions.rst.
 """
@@ -214,7 +215,7 @@ def forward_project(model, volume: Tensor) -> Tensor:
     """MBIRTORCH forward projection ``A x`` of a volume.
 
     Args:
-        model (ConeBeamModel): MBIRTORCH model.
+        model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model.
         volume (Tensor): [R, C, S] volume, e.g. attenuation in 1/cm.
 
     Returns:
@@ -227,7 +228,7 @@ def back_project(model, sinogram: Tensor) -> Tensor:
     """MBIRTORCH back projection ``A^T y`` of a sinogram.
 
     Args:
-        model (ConeBeamModel): MBIRTORCH model.
+        model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model.
         sinogram (Tensor): [V, Rd, Cd] sinogram.
 
     Returns:
@@ -488,7 +489,7 @@ def mbir_iterations(model, sinogram: Tensor, init_recon: Union[Tensor, np.ndarra
     ``hessian`` or ``return_checkpoint`` it runs MBIRTORCH's engine directly, resuming from the given error sinogram.
 
     Args:
-        model (ConeBeamModel): MBIRTORCH model.
+        model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model.
         sinogram (Tensor): [V, Rd, Cd] line integrals.
         init_recon (Tensor or ndarray): [R, C, S] initial volume in 1/cm; updated in place by the engine path (pass a
             copy).
@@ -537,7 +538,7 @@ def _vcd_recon_resumable(model, sinogram, weights, init_recon, max_iterations: i
     """MBIRTORCH's ``TomographyModel.recon`` step by step, passing the error sinogram and Hessian to its engine.
 
     Args:
-        model (ConeBeamModel): MBIRTORCH model.
+        model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model.
         sinogram (Tensor): [V, Rd, Cd] line integrals.
         weights (Tensor or None): [V, Rd, Cd] weights; None for all ones.
         init_recon (Tensor or ndarray): [R, C, S] initial volume, updated in place.
@@ -582,7 +583,7 @@ def freeze_regularization(model) -> dict[str, float]:
     """Freeze the model's current regularization for every later ``recon`` call (``auto_regularize_flag`` False).
 
     Args:
-        model (ConeBeamModel): MBIRTORCH model.
+        model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model.
 
     Returns:
         dict[str, float]: the frozen ``sigma_y``, ``sigma_x`` and ``sigma_prox``.
@@ -642,7 +643,7 @@ class ViewChunkProjector:
             stop (int): end view (excluded).
 
         Returns:
-            ConeBeamModel: ``model`` for all views, else the cached or new sub-model.
+            ConeBeamModel or ParallelBeamModel: ``model`` for all views, else the cached or new sub-model.
 
         Raises:
             ValueError: if the range is empty or outside [0, V).

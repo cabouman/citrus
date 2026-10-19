@@ -792,7 +792,7 @@ def _pixel_geometry_scalars(geometry, angle: float) -> dict:
     """Collect the scalars of ``ConeGeometry.pixel_centers`` for ``_launch_ray``.
 
     Args:
-        geometry (ConeGeometry): the cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): the scan geometry.
         angle (float): view angle in radians.
 
     Returns:
@@ -817,7 +817,7 @@ def upstream_cumulative(mu: Tensor, grid, geometry, angle: float) -> Tensor:
     Args:
         mu (Tensor): [G, rows, cols, slices] float32 CUDA attenuation coefficient in cm^-1, any strides.
         grid (Grid): the grid of ``mu``.
-        geometry (ConeGeometry): the cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): the scan geometry.
         angle (float): view angle in radians.
 
     Returns:
@@ -858,7 +858,7 @@ def primary_project(mu: Tensor, grid, geometry, angle: float, samples_per_pixel_
     Args:
         mu (Tensor): [G, rows, cols, slices] float32 CUDA attenuation coefficient in cm^-1.
         grid (Grid): the grid of ``mu``.
-        geometry (ConeGeometry): the cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): the scan geometry.
         angle (float): view angle in radians.
         samples_per_pixel_axis (int, optional): sub-rays per pixel axis. Defaults to 1.
 
@@ -910,7 +910,7 @@ def toward_flags(omegas: Tensor, geometry, angle: float) -> Tensor:
 
     Args:
         omegas (Tensor): [K, 3] directions (recon frame).
-        geometry (ConeGeometry): the cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): the scan geometry.
         angle (float): view angle in radians.
 
     Returns:
@@ -928,7 +928,7 @@ def downstream_cumulative(mu: Tensor, grid, geometry, angle: float, omegas: Tens
     Args:
         mu (Tensor): [G, rows, cols, slices] float32 CUDA attenuation coefficient in cm^-1, any strides.
         grid (Grid): the grid of ``mu``.
-        geometry (ConeGeometry): the cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): the scan geometry.
         angle (float): view angle in radians.
         omegas (Tensor): [K, 3] unit directions (recon frame).
         toward (Tensor, optional): [K] uint8 flags from ``toward_flags``, computed here when None. Defaults to None.
@@ -973,7 +973,7 @@ def oblique_project(field: Tensor, grid, geometry, angle: float, omegas: Tensor)
         field (Tensor): [K, G, rows, cols, slices], or [G, rows, cols, slices] shared by all directions; float32 CUDA,
             any strides.
         grid (Grid): the grid of ``field``.
-        geometry (ConeGeometry): the cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): the scan geometry.
         angle (float): view angle in radians.
         omegas (Tensor): [K, 3] directions (recon frame).
 
