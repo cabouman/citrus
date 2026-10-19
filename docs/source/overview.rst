@@ -63,8 +63,11 @@ Repository
 ----------
 
 ``demo/``
-    Two quick-start scripts: ``demo_1_scatter_solver.py`` (the scatter solver on one view of the WLAB phantom) and
-    ``demo_2_citrus.py`` (CITRUS vs uncorrected MBIR on synthetic data).
+    Six quick-start scripts (:doc:`usage`, "Demos"): ``demo_1_scatter_solver.py`` (the scatter solver on one view of
+    the WLAB phantom), ``demo_2_citrus.py`` (CITRUS on a circular cone-beam scan), ``demo_3_helical.py`` (a helical
+    scan on a curved detector with an anti-scatter grid), ``demo_4_materials.py`` (user-defined materials),
+    ``demo_5_parallel_beam.py`` (a monoenergetic parallel beam) and ``demo_6_callbacks.py`` (convergence curves from
+    the callbacks).
 ``tests/``
     The test suite (``python -m pytest -q``), including oracle tests: a 1-D slab linear-discontinuous solution,
     particle balance, dense Galerkin assembly, Beer's law, brute-force point-to-point scatter integrals, and the

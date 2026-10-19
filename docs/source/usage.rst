@@ -4,36 +4,59 @@ Usage and demos
 Demos
 -----
 
-Two quick-start scripts in ``demo/`` show how to write a Python script with the CITRUS API, one step per comment.
+Six quick-start scripts in ``demo/`` show how to write a Python script with the CITRUS API: every setting is a
+variable in a parameter block at the top, each step has a comment, and the figures are shown at the end. The
+reconstruction demos synthesize their data once and cache them in ``demo/input/`` under a file name built from the
+settings that change the data, so later runs load them.
 
 .. code-block:: bash
 
    python demo/demo_1_scatter_solver.py   # the scatter solver on one view of the WLAB phantom
-   python demo/demo_2_citrus.py           # CITRUS vs uncorrected MBIR on synthetic data
+   python demo/demo_2_citrus.py           # CITRUS on a short circular cone-beam scan
+   python demo/demo_3_helical.py          # a helical scan on a curved detector with an anti-scatter grid
+   python demo/demo_4_materials.py        # user-defined materials: iodine contrast and dental amalgam
+   python demo/demo_5_parallel_beam.py    # a monoenergetic parallel beam (synchrotron CT)
+   python demo/demo_6_callbacks.py        # convergence curves from the callbacks of citrus_recon
 
 ``demo_1_scatter_solver.py`` builds the cross-section library of the default reference materials (on first use it
 downloads the NIST XCOM photon data and builds the library; both are cached), rasterizes the WLAB phantom (a 30 x 20 x
 40 cm water prism with lung, air and bone inserts) on a 1 cm grid, solves one view with the default configuration and
 shows the primary signal, the scatter signal and the scatter fraction on the detector.
 
-``demo_2_citrus.py`` defines every setting in a parameter block at the top: the spectrum (loaded from a two-column
-file, energy in keV and relative photons per keV, the sample 125 kVp spectrum of ``demo/spectra``, or a monoenergetic
-line from ``monoenergetic_spectrum``), the reference materials, the
-detector panel and the source distances, the voxel pitch of the WLAB phantom, the number of views and the angular
-range, the flat field, the CITRUS loop settings (outer iterations, ``mbir_iterations_per_outer_iteration``,
-``scatter_view_stride``) and the
-solver settings (transport cell size, energy groups, Legendre order). It synthesizes scatter-contaminated cone-beam
-counts with ``synthesize_cone_beam_data`` (cached in ``demo/input/`` under a name built from the settings, so later
-runs load them), builds the scatter solver from ``SolverConfig`` and the spectrum, reconstructs with ``citrus_recon``
-and, for comparison, with ``mbir_recon`` from the same FDK volume with the same regularization, prints the relative
-RMSE of both against the true attenuation and shows the central slices and central-row profiles. With the values in
-the file (180 views over a short scan, 0.5 cm voxels, adaptive numbers of outer and MBIR iterations, the scatter
-step on every 8th view) the first run synthesizes the data and takes a few minutes on a GPU.
+``demo_2_citrus.py`` is the typical circular cone-beam scenario: a short scan of the WLAB phantom with the sample
+125 kVp spectrum of ``demo/spectra`` (the 6 MV linac spectrum is a commented-out alternative, as is a focused lead
+anti-scatter grid, ``anti_scatter_grid``, used by the solvers of the data and of the reconstruction). It synthesizes
+the counts with ``synthesize_cone_beam_data``, reconstructs them with ``citrus_recon`` (adaptive iteration counts,
+scatter step on every 8th view), prints the relative RMSE of the initial FDK volume and of CITRUS against the truth and
+shows the central slices and central-row profiles of the truth and of CITRUS.
+
+``demo_3_helical.py`` scans the WLAB prism with a helix (``helical_scan``) on a cylindrical panel
+(``ConeGeometry(use_curved_detector=True)``) behind a CT-style grid: tungsten septa parallel to the rotation axis
+(``anti_scatter_grid(..., septa_along="rows")``), each focused on the source. The pitch, the number of turns and the
+panel height are chosen so that the helix covers the whole 40 cm height of the prism; the demo also shows a coronal
+slice.
+
+``demo_4_materials.py`` defines an iodine contrast agent and a dental amalgam with ``Material``, puts them in
+``SolverConfig.materials`` next to catalogue names and builds a small head phantom (a water cylinder with a bone rod,
+a vessel of contrast and an amalgam filling) as a density volume whose rows follow ``solver.materials``. The rays
+through the amalgam are starved of primary photons; the demo explains what to expect and compares the initial volume
+and CITRUS outside the filling.
+
+``demo_5_parallel_beam.py`` reconstructs a breast-sized phantom imaged by a monoenergetic parallel beam at 32 keV
+(``ParallelGeometry.from_grid``, ``monoenergetic_spectrum``), with the air gap between the rotation axis and the panel
+as a parameter: the scatter that reaches the panel falls as the gap grows.
+
+``demo_6_callbacks.py`` runs CITRUS on the data of demo 2 with ``callback`` and ``mbir_callback``: it records the
+relative RMSE of the volume against the truth and the sinogram residual ``record["sinogram_nrmse"]`` after every MBIR
+iteration, prints per outer iteration what its record holds (MBIR iterations taken, scatter change, accumulator
+change, timings) and plots the convergence curves.
+
+On a GPU the first run of each reconstruction demo, with the synthesis of its data, takes a few minutes.
 
 CITRUS studies
 --------------
 
-``benchmarks/citrus_study.py`` runs the same comparison with every setting as a flag and writes figures (central
+``benchmarks/citrus_study.py`` compares CITRUS with MBIR without scatter correction, with every setting as a flag and writes figures (central
 slices, central-row profiles, relative RMSE per outer iteration, estimated vs true scatter-to-primary ratio of view 0),
 a summary JSON (the settings, the reference materials, the object size and medium of the energy groups, the RMSE
 history, the run times and the peak allocated GPU memory) and optionally the CITRUS volume to ``demo/output/``. The
@@ -115,7 +138,7 @@ records (timings, accumulator change, scatter change), the final scatter-to-prim
 and the frozen regularization. A ``callback(k, X_k, record)`` can track the iterates per outer iteration and an
 ``mbir_callback(i, X, record)`` per MBIR iteration, i = 0 for the FDK initialization, with
 ``record["sinogram_nrmse"]`` the relative RMSE of the forward projection of X against the corrected sinogram of its
-outer iteration, a convergence measure without ground truth (demo 2 plots it next to the error against the truth; the
+outer iteration, a convergence measure without ground truth (demo 6 plots it next to the error against the truth; the
 study script computes the RMSE
 against the truth with it).
 
