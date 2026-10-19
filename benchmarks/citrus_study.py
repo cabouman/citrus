@@ -299,7 +299,10 @@ def main() -> None:
     t0 = time.perf_counter()
     X_no_correction, no_correction_info = mbir_recon(Y, I0, angles, grid, geometry, config,
                                                      regularization=regularization, model=model,
-                                                     callback=tracker(no_correction_history))
+                                                     callback=tracker(no_correction_history),
+                                                     # the same MBIR iterations per outer iteration as CITRUS ran
+                                                     mbir_iterations_schedule=[r["mbir_iterations"] for r
+                                                                               in citrus_info["records"][1:]])
     t_none = time.perf_counter() - t0
 
     # ---- summary ---------------------------------------------------------------------------------------------

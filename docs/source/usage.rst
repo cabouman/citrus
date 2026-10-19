@@ -82,8 +82,8 @@ are ``demo/output/citrus_<tag>[suffixes]_<figure>.png`` and ``citrus_<tag>[suffi
 The truth solver of the data always uses the seven default reference materials (the phantom is water and bone only),
 so ``--materials`` changes only the reconstruction loop and every set runs on the same data. Both reconstructions use
 the same frozen regularization (MBIRTORCH's automatic estimate on the scatter-free sinogram), the same FDK
-initialization, weights and partition sequence, so with fixed counts they differ only by the scatter correction; with
-the adaptive counts each loop stops on the fit of its own corrected sinogram.
+initialization, weights and partition sequence, and the uncorrected loop runs the MBIR iterations of each CITRUS
+outer iteration (``mbir_iterations_schedule``), so the two differ only by the scatter correction.
 
 Angular range: the views are evenly spaced over ``[start, end)`` (endpoint excluded, MBIRTORCH's angle convention).
 The default end is a short scan, start + 180 degrees + the in-plane fan angle of the panel,
