@@ -1,7 +1,7 @@
 #!/bin/bash
 # Reports the GPU driver, PyTorch / CUDA and Triton availability, runs the per-device self-checks of the fused
-# Triton kernels of citrus (ray tracer on flat and curved panels with circular and helical views, first-collision
-# source, transport sweep) against their PyTorch paths, and
+# Triton kernels of citrus (ray tracer on flat and curved panels with circular and helical views and on parallel
+# beams, first-collision source of cone and parallel beams, transport sweep) against their PyTorch paths, and
 # reports xraylib and the NIST XCOM data (the photon data of the cross-section library) and the cache.
 # Usage: ./check_cuda.sh   (exit code 0 if CUDA is usable, 1 otherwise)
 

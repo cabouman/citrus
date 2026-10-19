@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.16.0 - 2026-10-19
+
+- **Parallel-beam geometry.** `ParallelGeometry(axis_detector_dist, num_det_rows, num_det_channels, delta_det_row,
+  delta_det_channel, ...)` places a flat panel at `axis_detector_dist` from the rotation axis, perpendicular to the
+  beam, with the rows on the reconstruction slices as MBIRTORCH's `ParallelBeamModel` requires
+  (`ParallelGeometry.from_grid`). The scatter solver traces the beam's rays from upstream of the grid, takes a
+  unit-fluence beam over the panel's area weighted by the emission profile, without inverse-square falloff, and keeps
+  the air gap between the object and the panel in the scatter image. The Triton ray tracer and first-collision
+  kernel have a parallel mode, covered by the kernel self-checks. Grids default to unfocused for a parallel beam
+  (`detector.default_focal_distance`; `grid_angles` accepts an infinite focal distance). `citrus_recon` and
+  `mbir_recon` reconstruct through `ParallelBeamModel` (`mbir_bridge.make_model`, `make_parallel_model`) from a
+  filtered back projection (`direct_reconstruction`); the default view range of a parallel beam is 180 degrees, and
+  the synthetic data accept the geometry (`utilities.parallel_wlab_geometry`).
+
 ## v0.15.0 - 2026-10-19
 
 - **Reference materials may cross in attenuation away from the effective energy.** The density model brackets a

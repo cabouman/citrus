@@ -86,7 +86,7 @@ The default end is a short scan, start + 180 degrees + the in-plane fan angle of
 ``2 atan(0.5 num_det_channels delta_det_channel / SDD)``; ``--end-view-angle 360`` (with the default start 0) is a full
 rotation. For a short scan ``citrus_recon`` / ``mbir_recon`` apply Parker weights before MBIRTORCH's FDK
 (``recon.mbir_bridge.fdk(..., geometry=, angles=)``, ``short_scan_weights``), and the sparse-view interpolation runs
-along the arc.
+along the arc. A parallel beam has no fan angle: its default range is 180 degrees.
 
 Ground truth: the scatter of every view is computed by the scatter solver from the TRUE densities with a fully
 converged source iteration, stored as the scatter-to-primary ratio and applied to MBIRTORCH's primary counts, then
@@ -206,6 +206,28 @@ A curved (cylindrical) panel and helical views are part of the geometry, so the 
 
 The grid must hold the whole object the helix illuminates along z. The geometry of the scan and of the solver
 must be the same object (the helical table is keyed by the view angles).
+
+A parallel beam (a synchrotron or another collimated beam) is the geometry ``ParallelGeometry``: the panel at
+``axis_detector_dist`` from the rotation axis, perpendicular to the beam, and the same calls reconstruct it with
+MBIRTORCH's ``ParallelBeamModel`` (:doc:`method`, "Parallel beams"; :doc:`conventions`, "Frames"). MBIRTORCH gives
+detector row r the slice r of the volume, so the rows are the slices of the grid:
+
+.. code-block:: python
+
+   from citrus.scatter_solver import ParallelGeometry, anti_scatter_grid
+   from citrus.utilities import parallel_wlab_geometry, view_angles
+
+   geometry = ParallelGeometry.from_grid(grid, axis_detector_dist=30.0, num_det_channels=400, delta_det_channel=0.1)
+   # the WLAB prism on wlab_grid(delta_voxel): geometry = parallel_wlab_geometry(delta_voxel, axis_detector_dist=30.0)
+   angles = view_angles(360, geometry)                              # 180 degrees, the default range of a parallel beam
+   septa = anti_scatter_grid(geometry, 0.002, 0.15)                 # unfocused (septa along the beam) by default
+   solver = wlab_solver(delta_voxel, geometry=geometry, device="cuda", spectrum=spectrum, grid_response=septa)
+   recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver)   # initial volume: filtered back projection
+
+The scatter reaching the panel depends on the air gap ``axis_detector_dist``; the primary does not (no inverse-square
+falloff). ``synthesize_cone_beam_data`` and ``synthesize_wlab_dataset(..., geometry=parallel_wlab_geometry(...))``
+generate parallel-beam data, and ``recon.mbir_bridge.make_model`` / ``direct_reconstruction`` build the MBIRTORCH
+model and the initial volume of either geometry.
 
 The per-view step is available on its own:
 

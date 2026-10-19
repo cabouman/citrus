@@ -665,6 +665,38 @@ unwrapped angle between consecutive computed views, never between views a turn a
 neighbours differ in z by :math:`m` times the table feed per view, so the stride should keep that well below the
 height of the panel at the isocenter.
 
+Parallel beams
+~~~~~~~~~~~~~~
+
+A parallel beam (``ParallelGeometry``) follows MBIRTORCH's ``ParallelBeamModel``: the rays of a view are parallel and
+perpendicular to a flat panel at the distance ``axis_detector_dist`` from the rotation axis (:doc:`conventions`,
+"Frames"). There is no focal spot, and every notion of the solver that depends on it is taken along the beam
+direction :math:`\mathbf w`:
+
+* the source is a unit fluence of parallel rays over the beam's cross-section, the panel's area (the collimation),
+  weighted per pixel by the emission profile (``SourceModel.beam_weight``): :math:`b(\mathbf r)` is the profile at the
+  panel point of the ray through :math:`\mathbf r` and 0 off the panel;
+* the uncollided fluence has no inverse-square factor and a single direction,
+  :math:`\phi_{UC,g}(\mathbf r) = b(\mathbf r) \sum_{E\in g} w_E \exp(-\sum_m P_m(\mathbf r)\, m_m(E))`,
+  :math:`\boldsymbol\Omega_{UC} = \mathbf w`, the line integrals :math:`P_m` traced along :math:`\mathbf w` from
+  upstream of the grid box; the first-collision source, its sampling correction and every collision order follow;
+* the primary rays are the beam's rays through the pixels, at normal incidence (:math:`\theta_0 = 0`), and the open
+  field is flat;
+* the anti-scatter grid of a parallel beam is unfocused: its default focal distance is infinite
+  (``detector.default_focal_distance``), the septa run along the panel normal, :math:`\theta_1` is measured from the
+  normal and the primary passes at :math:`\theta_1 = \theta_2 = 0`;
+* the collapsed-cone scatter image is unchanged: it depends only on the panel, and its direction set covers the grid
+  box as seen from the panel.
+
+The scatter that reaches the panel falls as the air gap ``axis_detector_dist`` grows (the scattered photons spread
+over a larger solid angle and leave the panel), while the primary does not depend on it. The Triton ray tracer and
+the first-collision kernel have a parallel mode (the ``PARALLEL`` constant), checked against the PyTorch path like the
+cone modes. MBIRTORCH reconstructs the parallel beam with ``ParallelBeamModel``, whose initial volume is its filtered
+back projection (``recon.mbir_bridge.direct_reconstruction``); it assumes views evenly spaced over 180 or 360
+degrees, so no short-scan weights apply, and the default range of a parallel scan (``view_angles``) is 180 degrees.
+The sparse-view interpolation runs along the arc of such a scan, as for a short cone-beam scan: the views at
+:math:`\beta` and :math:`\beta + \pi` see the object from opposite sides of the panel, so their scatter differs.
+
 MBIR resume
 ~~~~~~~~~~~
 

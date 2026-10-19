@@ -1147,7 +1147,8 @@ def primary_from_path_lengths(library: MultigroupLibrary, path: Tensor, material
     """Primary image of one view from its per-material density line integrals, exact in energy.
 
     The fine-energy transmission is averaged over the n x n sub-pixels of every pixel; the inverse-square and
-    collimation factors and the responses are evaluated at the pixel centers (docs/source/method.rst, "The primary").
+    collimation factors (the beam weight of a parallel beam) and the responses are evaluated at the pixel centers
+    (docs/source/method.rst, "The primary").
 
     Args:
         library (MultigroupLibrary): cross-section library.
@@ -1172,12 +1173,16 @@ def primary_from_path_lengths(library: MultigroupLibrary, path: Tensor, material
     if n > 1:
         transmission = transmission.reshape(-1, Rd, n, Cd, n).mean(dim=(2, 4))
     pixels = geometry.pixel_centers(angle, device, dtype)
-    r0 = torch.tensor(geometry.source_position(angle), device=device, dtype=dtype)
-    d = pixels - r0
-    distance_squared = (d * d).sum(-1)
-    b = source.angular_weight(d, geometry, angle)
-    fluence = (b / distance_squared)[None] * transmission
-    omega_p = d / distance_squared.sqrt()[..., None]
+    if geometry.is_parallel:  # unit incident fluence along the beam, no inverse-square falloff
+        fluence = source.beam_weight(pixels, geometry, angle)[None] * transmission
+        omega_p = geometry.primary_directions(angle, device, dtype)
+    else:
+        r0 = torch.tensor(geometry.source_position(angle), device=device, dtype=dtype)
+        d = pixels - r0
+        distance_squared = (d * d).sum(-1)
+        b = source.angular_weight(d, geometry, angle)
+        fluence = (b / distance_squared)[None] * transmission
+        omega_p = d / distance_squared.sqrt()[..., None]
     group_energy = library.group_energy.to(device, dtype)
     theta0 = detector_angle(omega_p, geometry, angle, pixels)  # [Rd, Cd]
     planar = fluence * torch.cos(theta0)

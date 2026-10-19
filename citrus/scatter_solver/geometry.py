@@ -1,9 +1,10 @@
-"""Voxel grids, conservative resampling between them, and the cone-beam geometry.
+"""Voxel grids, conservative resampling between them, and the cone-beam and parallel-beam geometries.
 
 The conventions are MBIRTORCH's (docs/source/conventions.rst): lengths in cm, angles in radians, volumes
 [rows, cols, slices] with columns along x, rows along y and slices along z. :class:`Grid` builds the solver's fine,
 transport and quadrature grids, :func:`resample_conservative` carries densities between them by exact cell averages,
-and :class:`ConeGeometry` places the source and the (flat or curved) panel of each (circular or helical) view.
+:class:`ConeGeometry` places the source and the (flat or curved) panel of each (circular or helical) view, and
+:class:`ParallelGeometry` the beam and the flat panel of a parallel-beam scan.
 """
 
 from __future__ import annotations
@@ -416,6 +417,11 @@ class ConeGeometry:
                           dtype=np.float64)
 
     @property
+    def is_parallel(self) -> bool:
+        """False: the rays of a view diverge from the focal spot (``ParallelGeometry`` is the parallel beam)."""
+        return False
+
+    @property
     def magnification(self) -> float:
         """Magnification at the rotation axis, ``source_detector_dist / source_iso_dist``."""
         return self.source_detector_dist / self.source_iso_dist
@@ -734,3 +740,353 @@ class ConeGeometry:
         d = points - pc
         return (d * uh).sum(-1), (d * vh).sum(-1)
 
+
+
+@dataclass(frozen=True)
+class ParallelGeometry:
+    """Parallel-beam geometry with a flat panel at a finite distance from the rotation axis, in MBIRTORCH conventions.
+
+    In the view frame the rays of every view travel along -y_view, perpendicular to the panel, which lies in the plane
+    ``y_view = -axis_detector_dist`` with u along +x_view (channels) and v along +z (rows); the beam's cross-section is
+    the panel's area (docs/source/conventions.rst, "Frames"). MBIRTORCH's ``ParallelBeamModel`` gives detector row r
+    the reconstruction slice r, so a geometry used for reconstruction has the rows of its grid (:meth:`from_grid`).
+
+    Attributes:
+        axis_detector_dist (float): distance from the rotation axis to the panel in cm, > 0.
+        num_det_rows (int): number of detector rows.
+        num_det_channels (int): number of detector channels.
+        delta_det_row (float): detector row pitch in cm.
+        delta_det_channel (float): detector channel pitch in cm.
+        det_row_offset (float): offset in cm subtracted from the v of every pixel center. Defaults to 0.0.
+        det_channel_offset (float): offset in cm subtracted from the u of every pixel center. Defaults to 0.0.
+    """
+
+    axis_detector_dist: float
+    num_det_rows: int
+    num_det_channels: int
+    delta_det_row: float
+    delta_det_channel: float
+    det_row_offset: float = 0.0
+    det_channel_offset: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Check that the panel lies downstream of the rotation axis."""
+        if not float(self.axis_detector_dist) > 0:
+            raise ValueError(f"axis_detector_dist must be > 0, got {self.axis_detector_dist}")
+
+    @classmethod
+    def from_grid(cls, grid: Grid, axis_detector_dist: float, num_det_channels: int, delta_det_channel: float,
+                  det_channel_offset: float = 0.0) -> "ParallelGeometry":
+        """Build the geometry whose detector rows are the slices of a reconstruction grid (MBIRTORCH's rows).
+
+        Args:
+            grid (Grid): reconstruction grid, with ``voxel_slice_aspect`` 1.
+            axis_detector_dist (float): distance from the rotation axis to the panel in cm.
+            num_det_channels (int): number of detector channels.
+            delta_det_channel (float): detector channel pitch in cm.
+            det_channel_offset (float, optional): channel offset in cm. Defaults to 0.0.
+
+        Returns:
+            ParallelGeometry: ``grid.num_slices`` rows of pitch ``grid.delta_voxel``, row r at the z of slice r.
+        """
+        if grid.voxel_slice_aspect != 1.0:
+            raise ValueError("a parallel-beam reconstruction needs voxel_slice_aspect 1 (MBIRTORCH's rows are slices)")
+        return cls(axis_detector_dist=float(axis_detector_dist), num_det_rows=int(grid.num_slices),
+                   num_det_channels=int(num_det_channels), delta_det_row=float(grid.delta_voxel),
+                   delta_det_channel=float(delta_det_channel), det_row_offset=0.0 - float(grid.recon_slice_offset),
+                   det_channel_offset=float(det_channel_offset))
+
+    # ---- properties shared with ConeGeometry ---------------------------------------------------
+    @property
+    def is_parallel(self) -> bool:
+        """True: the rays of a view are parallel."""
+        return True
+
+    @property
+    def use_curved_detector(self) -> bool:
+        """False: the panel of a parallel beam is flat."""
+        return False
+
+    @property
+    def is_helical(self) -> bool:
+        """False: the views of a parallel beam have no z shift."""
+        return False
+
+    @property
+    def magnification(self) -> float:
+        """Magnification of a parallel beam, 1."""
+        return 1.0
+
+    @property
+    def panel_y_view(self) -> float:
+        """y of the panel plane in the view frame in cm."""
+        return -float(self.axis_detector_dist)
+
+    @property
+    def image_shape(self) -> tuple[int, int]:
+        """Shape (num_det_rows, num_det_channels) of a detector image."""
+        return (self.num_det_rows, self.num_det_channels)
+
+    @property
+    def pixel_area(self) -> float:
+        """Area of one detector pixel in cm^2."""
+        return self.delta_det_row * self.delta_det_channel
+
+    def z_shift(self, angle: float) -> float:
+        """Return the z shift of the panel at a view angle, 0 for a parallel beam.
+
+        Args:
+            angle (float): view angle in rad.
+
+        Returns:
+            float: 0.0.
+        """
+        return 0.0
+
+    def z_shifts(self, angles) -> np.ndarray:
+        """Return the z shifts of a list of views, all 0.
+
+        Args:
+            angles (Sequence[float] or ndarray): [V] view angles in rad.
+
+        Returns:
+            np.ndarray: [V] float64 zeros.
+        """
+        return np.zeros(np.asarray(angles, dtype=np.float64).size, dtype=np.float64)
+
+    # ---- panel coordinates --------------------------------------------------------------------
+    def pixel_uv(self, device=None, dtype=torch.float32) -> tuple[Tensor, Tensor]:
+        """Return the panel coordinates of the pixel centers.
+
+        Args:
+            device (torch.device, optional): device of the tensors. Defaults to None.
+            dtype (torch.dtype, optional): dtype of the tensors. Defaults to torch.float32.
+
+        Returns:
+            (Tensor, Tensor): u [num_det_channels] and v [num_det_rows] in cm.
+        """
+        nc, nr = self.num_det_channels, self.num_det_rows
+        u = ((torch.arange(nc, device=device, dtype=dtype) - (nc - 1) / 2) * self.delta_det_channel
+             - self.det_channel_offset)
+        v = (torch.arange(nr, device=device, dtype=dtype) - (nr - 1) / 2) * self.delta_det_row - self.det_row_offset
+        return u, v
+
+    def panel_half_extent(self) -> tuple[float, float]:
+        """Return the half widths of the active panel area, edge to edge (pixel size included).
+
+        Returns:
+            (float, float): half widths along u and v in cm.
+        """
+        return (self.num_det_channels * self.delta_det_channel / 2, self.num_det_rows * self.delta_det_row / 2)
+
+    # ---- recon-frame placement for a view -----------------------------------------------------
+    def view_to_recon(self, p_view: Tensor, angle: float) -> Tensor:
+        """Rotate points from the view frame into the recon frame.
+
+        Args:
+            p_view (Tensor): [..., 3] points in the view frame.
+            angle (float): view angle in rad.
+
+        Returns:
+            Tensor: [..., 3] points in the recon frame.
+        """
+        c, s = math.cos(angle), math.sin(angle)
+        xv, yv, zv = p_view[..., 0], p_view[..., 1], p_view[..., 2]
+        return torch.stack([c * xv + s * yv, -s * xv + c * yv, zv], dim=-1)
+
+    def recon_to_view(self, p: Tensor, angle: float) -> Tensor:
+        """Rotate points from the recon frame into the view frame.
+
+        Args:
+            p (Tensor): [..., 3] points in the recon frame.
+            angle (float): view angle in rad.
+
+        Returns:
+            Tensor: [..., 3] points in the view frame.
+        """
+        c, s = math.cos(angle), math.sin(angle)
+        x, y, z = p[..., 0], p[..., 1], p[..., 2]
+        return torch.stack([c * x - s * y, s * x + c * y, z], dim=-1)
+
+    def beam_direction(self, angle: float) -> tuple[float, float, float]:
+        """Return the direction of the rays of a view in the recon frame, ``-n_hat``.
+
+        Args:
+            angle (float): view angle in rad.
+
+        Returns:
+            (float, float, float): the unit direction (x, y, z).
+        """
+        c, s = math.cos(angle), math.sin(angle)
+        return (-s, -c, 0.0)
+
+    def panel_center(self, angle: float) -> tuple[float, float, float]:
+        """Return the point where the ray through the rotation axis meets the panel (u = v = 0), in the recon frame.
+
+        Args:
+            angle (float): view angle in rad.
+
+        Returns:
+            (float, float, float): (x, y, z) of the panel center in cm.
+        """
+        c, s = math.cos(angle), math.sin(angle)
+        yv = self.panel_y_view
+        return (s * yv, c * yv, 0.0)
+
+    def panel_axes(self, angle: float) -> tuple[tuple[float, float, float], tuple[float, float, float],
+                                                tuple[float, float, float]]:
+        """Return the unit vectors of the panel in the recon frame.
+
+        Args:
+            angle (float): view angle in rad.
+
+        Returns:
+            (tuple, tuple, tuple): ``u_hat``, ``v_hat`` and ``n_hat`` as (x, y, z); ``n_hat`` points against the beam.
+        """
+        c, s = math.cos(angle), math.sin(angle)
+        return (c, -s, 0.0), (0.0, 0.0, 1.0), (s, c, 0.0)
+
+    def panel_points(self, u: Tensor, v: Tensor, angle: float) -> Tensor:
+        """Return the recon-frame positions of panel points given by their panel coordinates.
+
+        Args:
+            u (Tensor): [...] channel coordinates in cm.
+            v (Tensor): [...] row coordinates in cm, broadcastable with ``u``.
+            angle (float): view angle in rad.
+
+        Returns:
+            Tensor: [..., 3] positions in cm, on the device and in the dtype of ``u``.
+        """
+        device, dtype = u.device, u.dtype
+        u, v = torch.broadcast_tensors(u, v.to(device, dtype))
+        u_hat, v_hat, _ = (torch.tensor(a, device=device, dtype=dtype) for a in self.panel_axes(angle))
+        pc = torch.tensor(self.panel_center(angle), device=device, dtype=dtype)
+        return pc + u[..., None] * u_hat + v[..., None] * v_hat
+
+    def pixel_centers(self, angle: float, device=None, dtype=torch.float32) -> Tensor:
+        """Return the pixel-center positions in the recon frame.
+
+        Args:
+            angle (float): view angle in rad.
+            device (torch.device, optional): device of the tensors. Defaults to None.
+            dtype (torch.dtype, optional): dtype of the tensor. Defaults to torch.float32.
+
+        Returns:
+            Tensor: [num_det_rows, num_det_channels, 3] positions in cm.
+        """
+        u, v = self.pixel_uv(device, dtype)
+        return self.panel_points(u[None, :], v[:, None], angle)
+
+    def local_panel_axes(self, points: Tensor, angle: float) -> tuple[Tensor, Tensor, Tensor]:
+        """Return the unit vectors of the (flat) panel at panel points in the recon frame.
+
+        Args:
+            points (Tensor): [..., 3] points on the panel in cm.
+            angle (float): view angle in rad.
+
+        Returns:
+            (Tensor, Tensor, Tensor): ``u_hat``, ``v_hat`` and ``n_hat`` [..., 3], the axes of ``panel_axes``.
+        """
+        u_hat, v_hat, n_hat = (torch.tensor(a, device=points.device, dtype=points.dtype).expand_as(points)
+                               for a in self.panel_axes(angle))
+        return u_hat, v_hat, n_hat
+
+    def subpixel_centers(self, angle: float, samples_per_pixel_axis: int, device=None,
+                         dtype=torch.float32) -> Tensor:
+        """Return the centers of the n x n sub-pixels of every pixel (the midpoint lattice in u and v).
+
+        Args:
+            angle (float): view angle in rad.
+            samples_per_pixel_axis (int): sub-pixels n per axis, at least 1.
+            device (torch.device, optional): device of the tensor. Defaults to None.
+            dtype (torch.dtype, optional): dtype of the tensor. Defaults to torch.float32.
+
+        Returns:
+            Tensor: [num_det_rows, num_det_channels, n (along v), n (along u), 3] positions in cm.
+        """
+        n = int(samples_per_pixel_axis)
+        u, v = self.pixel_uv(device, dtype)
+        offsets = (2 * torch.arange(n, device=device, dtype=dtype) + 1) / (2 * n) - 0.5  # [n]
+        u_sub = u[None, :, None, None] + (offsets * self.delta_det_channel)[None, None, None, :]
+        v_sub = v[:, None, None, None] + (offsets * self.delta_det_row)[None, None, :, None]
+        return self.panel_points(u_sub, v_sub, angle)
+
+    def primary_directions(self, angle: float, device=None, dtype=torch.float32) -> Tensor:
+        """Return the direction of the primary ray of every pixel, the beam direction.
+
+        Args:
+            angle (float): view angle in rad.
+            device (torch.device, optional): device of the tensors. Defaults to None.
+            dtype (torch.dtype, optional): dtype of the tensor. Defaults to torch.float32.
+
+        Returns:
+            Tensor: [rows, channels, 3] unit directions.
+        """
+        beam = torch.tensor(self.beam_direction(angle), device=device, dtype=dtype)
+        return beam.expand(self.num_det_rows, self.num_det_channels, 3).clone()
+
+    def panel_distance_along(self, points: Tensor, omega: Tensor, angle: float) -> Tensor:
+        """Compute the signed distance t such that ``points + t * omega`` lies in the panel plane.
+
+        Negative or infinite values mean that the direction does not reach the panel.
+
+        Args:
+            points (Tensor): [..., 3] points in the recon frame in cm.
+            omega (Tensor): [3] or [..., 3] unit directions.
+            angle (float): view angle in rad.
+
+        Returns:
+            Tensor: [...] distances in cm.
+        """
+        _, _, n_hat = self.panel_axes(angle)
+        n = torch.tensor(n_hat, device=points.device, dtype=points.dtype)
+        pc = torch.tensor(self.panel_center(angle), device=points.device, dtype=points.dtype)
+        return ((pc - points) * n).sum(-1) / (omega * n).sum(-1)
+
+    def panel_uv_of_points(self, points: Tensor, angle: float) -> tuple[Tensor, Tensor]:
+        """Return the panel coordinates of points, which are also those of the beam's ray through each point.
+
+        Args:
+            points (Tensor): [..., 3] points in the recon frame in cm.
+            angle (float): view angle in rad.
+
+        Returns:
+            (Tensor, Tensor): u and v [...] in cm.
+        """
+        u_hat, v_hat, _ = (torch.tensor(a, device=points.device, dtype=points.dtype) for a in self.panel_axes(angle))
+        d = points - torch.tensor(self.panel_center(angle), device=points.device, dtype=points.dtype)
+        return (d * u_hat).sum(-1), (d * v_hat).sum(-1)
+
+    # ---- the primary rays ------------------------------------------------------------------------
+    @staticmethod
+    def upstream_distance(grid: Grid) -> float:
+        """Distance from the rotation axis, against the beam, of the plane where the primary rays through a grid start.
+
+        The plane lies 1 cm outside the circle about the axis that holds the grid box in every view.
+
+        Args:
+            grid (Grid): the grid the rays are traced through.
+
+        Returns:
+            float: the distance in cm.
+        """
+        extent_x, extent_y, _ = grid.extent
+        return 0.5 * math.hypot(extent_x, extent_y) + 1.0
+
+    def ray_starts(self, points: Tensor, angle: float, grid: Grid) -> Tensor:
+        """Return the start points of the primary rays that end at ``points``, upstream of the box of ``grid``.
+
+        Each point moves against the beam to the plane at :meth:`upstream_distance` from the axis:
+        ``p - (p . w + D) w`` with the beam direction w.
+
+        Args:
+            points (Tensor): [..., 3] end points in the recon frame in cm.
+            angle (float): view angle in rad.
+            grid (Grid): the grid the rays are traced through.
+
+        Returns:
+            Tensor: [..., 3] start points in cm, on the device and in the dtype of ``points``.
+        """
+        beam = torch.tensor(self.beam_direction(angle), device=points.device, dtype=points.dtype)
+        along = (points * beam).sum(-1, keepdim=True) + self.upstream_distance(grid)
+        return points - along * beam

@@ -106,7 +106,7 @@ def _self_check(device: torch.device) -> tuple[bool, str]:
             return False, f"self-check ({grid_kind} table): {deviation}"
         worst = max(worst, float(deviation))
     return True, (f"kernel matches the PyTorch path, dense (2 and 7 materials) and pair modes, uniform and adaptive "
-                  f"tables (max rel dev {worst:.1e})")
+                  f"tables, cone and parallel beams (max rel dev {worst:.1e})")
 
 
 def _self_check_table(device: torch.device, angular_table_grid: str) -> tuple[bool, object]:
@@ -120,7 +120,7 @@ def _self_check_table(device: torch.device, angular_table_grid: str) -> tuple[bo
         (bool, object): (True, largest relative deviation) or (False, reason).
     """
     from ..cross_sections import material_pairs, synthetic_library
-    from ..geometry import ConeGeometry, Grid
+    from ..geometry import ConeGeometry, Grid, ParallelGeometry
     from ..uncollided import (_first_collision_source_torch, _first_collision_source_torch_pairs,
                               primary_directions_to_voxels)
 
@@ -158,9 +158,15 @@ def _self_check_table(device: torch.device, angular_table_grid: str) -> tuple[bo
     helical = geometry.with_helical_z_shifts([0.0, 1.0], [-1.5, 2.5])
     reference_helical = _first_collision_source_torch(library, rho, phi, grid, helical, angle, directions, chunk=4)
     out_helical = first_collision_source(library, rho, phi, grid, helical, angle, directions)
+    # a parallel beam: one primary direction at every voxel
+    parallel = ParallelGeometry(axis_detector_dist=10.0, num_det_rows=8, num_det_channels=8, delta_det_row=1.0,
+                                delta_det_channel=1.0)
+    reference_parallel = _first_collision_source_torch(library, rho, phi, grid, parallel, angle, directions, chunk=4)
+    out_parallel = first_collision_source(library, rho, phi, grid, parallel, angle, directions)
     torch.cuda.synchronize(device)
     worst = 0.0
-    for o, r in ((out, reference), (out7, reference7), (out7d, reference7d), (out_helical, reference_helical)):
+    for o, r in ((out, reference), (out7, reference7), (out7d, reference7d), (out_helical, reference_helical),
+                 (out_parallel, reference_parallel)):
         if o.shape != r.shape or not bool(torch.isfinite(o).all()):
             return False, "wrong shape or non-finite output"
         worst = max(worst, float((o - r).abs().max()) / max(float(r.abs().max()), 1e-30))
@@ -180,7 +186,7 @@ if triton is not None:
                                 table_ptr, map_ptr, out_ptr,
                                 V, C, S, K, N, KM, r0x, r0y, r0z, eta_lo, eta_hi,
                                 G: tl.constexpr, GP: tl.constexpr, KB: tl.constexpr, BLOCK: tl.constexpr,
-                                MT: tl.constexpr, PAIR: tl.constexpr, MAPPED: tl.constexpr):
+                                MT: tl.constexpr, PAIR: tl.constexpr, MAPPED: tl.constexpr, PARALLEL: tl.constexpr):
         """First-collision source of BLOCK voxels (program_id 0) for KB directions (program_id 1).
 
         Args:
@@ -200,9 +206,9 @@ if triton is not None:
             K: number of directions.
             N: number of eta nodes of the table.
             KM: number of knots of the node map.
-            r0x: x of the focal spot in cm.
-            r0y: y of the focal spot in cm.
-            r0z: z of the focal spot in cm.
+            r0x: x of the focal spot in cm (the beam direction's x component when PARALLEL).
+            r0y: y of the focal spot in cm (the beam direction's y component when PARALLEL).
+            r0z: z of the focal spot in cm (the beam direction's z component when PARALLEL).
             eta_lo: first node of the eta grid.
             eta_hi: last node of the eta grid.
             G (constexpr): number of energy groups.
@@ -212,6 +218,7 @@ if triton is not None:
             MT (constexpr): number of materials of the table.
             PAIR (constexpr): pair mode (two materials per voxel by index) instead of dense mode.
             MAPPED (constexpr): adaptive table read through ``map_ptr``; else uniform in eta.
+            PARALLEL (constexpr): a parallel beam: ``Omega_UC`` is the beam direction (r0x, r0y, r0z) at every voxel.
         """
         pid_v = tl.program_id(0)
         pid_k = tl.program_id(1)
@@ -223,13 +230,18 @@ if triton is not None:
         rem = v - i * CS
         j = rem // S
         kk = rem - j * S
-        dx = tl.load(x_axis_ptr + j, mask=vm, other=0.0) - r0x
-        dy = tl.load(y_axis_ptr + i, mask=vm, other=0.0) - r0y
-        dz = tl.load(z_axis_ptr + kk, mask=vm, other=1.0) - r0z
-        nrm = tl.sqrt_rn(dx * dx + dy * dy + dz * dz)  # IEEE sqrt / division (Triton's defaults are approximate)
-        ux = tl.div_rn(dx, nrm)
-        uy = tl.div_rn(dy, nrm)
-        uz = tl.div_rn(dz, nrm)
+        if PARALLEL:
+            ux = tl.zeros([BLOCK], dtype=tl.float32) + r0x
+            uy = tl.zeros([BLOCK], dtype=tl.float32) + r0y
+            uz = tl.zeros([BLOCK], dtype=tl.float32) + r0z
+        else:
+            dx = tl.load(x_axis_ptr + j, mask=vm, other=0.0) - r0x
+            dy = tl.load(y_axis_ptr + i, mask=vm, other=0.0) - r0y
+            dz = tl.load(z_axis_ptr + kk, mask=vm, other=1.0) - r0z
+            nrm = tl.sqrt_rn(dx * dx + dy * dy + dz * dz)  # IEEE sqrt / division (Triton's defaults are approximate)
+            ux = tl.div_rn(dx, nrm)
+            uy = tl.div_rn(dy, nrm)
+            uz = tl.div_rn(dz, nrm)
         go = tl.arange(0, GP)
         gm = go < G
         smask = gm[:, None] & vm[None, :]
@@ -432,7 +444,8 @@ def first_collision_source(library, rho: Tensor, phi_uncollided: Tensor, grid, g
         return out
     table, eta_lo, eta_hi, kernel_map = prepared_table(library, device)
     x, y, z = grid.axis_coordinates(device, dtype)
-    r0 = geometry.source_position(angle)
+    parallel = bool(geometry.is_parallel)
+    r0 = geometry.beam_direction(angle) if parallel else geometry.source_position(angle)
     num_voxel_blocks = -(-V // BLOCK_V)
     directions_per_program = _directions_per_program(K, num_voxel_blocks, device)
     _first_collision_kernel[(num_voxel_blocks, -(-K // directions_per_program))](
@@ -440,7 +453,7 @@ def first_collision_source(library, rho: Tensor, phi_uncollided: Tensor, grid, g
         V, C, S, K, int(table.shape[0]), 2 if kernel_map is None else int(kernel_map.shape[0]),
         float(r0[0]), float(r0[1]), float(r0[2]), eta_lo, eta_hi,
         G=G, GP=_next_pow2(G), KB=directions_per_program, BLOCK=BLOCK_V, MT=int(table.shape[2]), PAIR=pairs is not None,
-        MAPPED=kernel_map is not None, num_warps=NUM_WARPS)
+        MAPPED=kernel_map is not None, PARALLEL=parallel, num_warps=NUM_WARPS)
     return out
 
 
