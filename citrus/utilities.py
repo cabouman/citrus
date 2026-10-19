@@ -21,7 +21,8 @@ from torch import Tensor
 
 from .scatter_solver.config import SolverConfig
 from .scatter_solver.cross_sections import MATERIALS, MultigroupLibrary, material_index
-from .scatter_solver.detector import ideal_counting_response, no_grid
+from .scatter_solver.detector import DetectorResponse, GridResponse, ideal_counting_response, no_grid
+from .scatter_solver.source import SourceModel
 from .scatter_solver.geometry import ConeGeometry, Grid
 from .scatter_solver.scatter_solver import ScatterSolver
 
@@ -615,8 +616,10 @@ def attenuation_to_density(library: MultigroupLibrary, X: Tensor, material: int,
 def wlab_solver(delta_voxel: float, *, config: Optional[SolverConfig] = None,
                 library: Optional[MultigroupLibrary] = None,
                 geometry: Optional[ConeGeometry] = None, device=None,
-                cache_dir: Optional[str] = "default", spectrum=None) -> ScatterSolver:
-    """Scatter solver for the WLAB data, with an ideal counting detector, no grid and float32.
+                cache_dir: Optional[str] = "default", spectrum=None,
+                detector: Optional[DetectorResponse] = None, grid_response: Optional[GridResponse] = None,
+                source: Optional[SourceModel] = None) -> ScatterSolver:
+    """Scatter solver for the WLAB data, by default with an ideal counting detector, no grid and float32.
 
     Without ``library`` the solver is lazy: its library (for ``config.materials`` and ``spectrum``) is built on first
     use, so ``citrus_recon`` and ``synthesize_cone_beam_data`` can still set ``config.grouping_object_size_cm`` first.
@@ -631,6 +634,9 @@ def wlab_solver(delta_voxel: float, *, config: Optional[SolverConfig] = None,
             ``~/.cache/citrus``, None no disk cache. Defaults to "default".
         spectrum (tuple[np.ndarray, np.ndarray], optional): ([K] energies in keV, [K] photons per keV) of the source,
             required for a lazy library. Defaults to None.
+        detector (DetectorResponse, optional): detector response. Defaults to None (``ideal_counting_response()``).
+        grid_response (GridResponse, optional): anti-scatter-grid response. Defaults to None (``no_grid()``).
+        source (SourceModel, optional): source model. Defaults to None (``SourceModel()``, uniform emission).
 
     Returns:
         ScatterSolver: the solver.
@@ -641,8 +647,9 @@ def wlab_solver(delta_voxel: float, *, config: Optional[SolverConfig] = None,
     device = (torch.device(device) if device is not None
               else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     solver = ScatterSolver(library, config, geometry if geometry is not None else full_field_wlab_geometry(),
-                           detector=ideal_counting_response(), grid_response=no_grid(), device=device,
-                           dtype=torch.float32, spectrum=spectrum)
+                           detector=ideal_counting_response() if detector is None else detector,
+                           grid_response=no_grid() if grid_response is None else grid_response, source=source,
+                           device=device, dtype=torch.float32, spectrum=spectrum)
     solver.library_cache_dir = cache_dir
     return solver
 
@@ -912,12 +919,15 @@ def view_angles(num_views: int, geometry: Optional[ConeGeometry] = None, start_v
 def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, angles, solver: ScatterSolver,
                               I0: float = 1.0e5, noise: bool = True, seed: int = 0, *,
                               energy_kev: Optional[float] = None, device=None,
-                              progress: Optional[Callable[[int, float], None]] = None) -> dict:
-    """Cone-beam counts with scatter, ``Y = Poisson(I0 exp(-A X_true) (1 + SPR))``, for any density volume.
+                              progress: Optional[Callable[[int, float], None]] = None,
+                              detector_gain=None) -> dict:
+    """Cone-beam counts with scatter, ``Y = Poisson(F exp(-A X_true) (1 + SPR))``, for any density volume.
 
-    The primary is MBIRTORCH's projection of the true attenuation and SPR the solver's scatter-to-primary ratio of one
-    fully converged solve per view; a lazy solver with the "scattered_fluence" group rule first takes its grouping
-    object size and medium from the true object, then builds its library.
+    The primary is MBIRTORCH's projection of the true attenuation and SPR the solver's scatter-to-primary ratio of the
+    detector signals of one fully converged solve per view; a lazy solver with the "scattered_fluence" group rule first
+    takes its grouping object size and medium from the true object, then builds its library. The open field F is the
+    number I0 for a solver with uniform emission and no gain map, else the image ``I0 g f / mean(f)`` of the gain g and
+    the solver's open-field signal f (``ScatterSolver.open_field_signal``, with the source's emission profile).
 
     Args:
         densities: true object on ``grid``: a density model with ``material(X, m)`` (e.g. ``WlabPhantom``) or a
@@ -933,11 +943,15 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
         device (torch.device, optional): device. Defaults to None, the solver's device.
         progress (Callable[[int, float], None], optional): called as ``progress(view_index, seconds)`` after every
             solved view. Defaults to None.
+        detector_gain (Tensor or ndarray, optional): [Rd, Cd] multiplicative per-pixel detector gain. Defaults to None
+            (1).
 
     Returns:
         dict: numpy arrays (float32 unless noted) X_true [R, C, S] in 1/cm, angles [V] (float64), line_integrals, P,
         S, Y, Y_mean, SPR, solver_primary, solver_scatter [V, Rd, Cd], phi_air [Rd, Cd], view_seconds [V],
-        si_iterations [V] (int), I0, energy_kev, mass_attenuation [M] in cm^2/g, and meta (setup and statistics).
+        si_iterations [V] (int), I0, open_field (the flat field of ``citrus_recon``: I0 as a 0-d array, or [Rd, Cd],
+        or [V, Rd, Cd] for a per-view emission profile), energy_kev, mass_attenuation [M] in cm^2/g, and meta (setup
+        and statistics).
     """
     from .recon.mbir_bridge import forward_project, make_cone_model, mbirtorch_version
 
@@ -971,10 +985,25 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     projection_seconds = time.perf_counter() - t0
-    P = float(I0) * torch.exp(-line_integrals)
-
-    # scatter-to-primary ratio from the solver, one converged solve per view on the fields built once from the maps
+    # the open field: the number I0 (uniform emission, no gain), else the image of the solver's open-field signal
     V, Rd, Cd = len(angles), geometry.num_det_rows, geometry.num_det_channels
+    open_field: Union[float, Tensor] = float(I0)
+    if solver.source.emission_profile is not None or detector_gain is not None:
+        per_view = solver.source.emission_profile.dim() == 3 if solver.source.emission_profile is not None else False
+        view_angles_used = angles if per_view else angles[:1]
+        relative = torch.stack([solver.open_field_signal(float(a), dtype=torch.float64) for a in view_angles_used])
+        relative = relative / relative.mean()
+        if detector_gain is not None:
+            gain = torch.as_tensor(detector_gain, dtype=torch.float64, device=relative.device)
+            if tuple(gain.shape) != (Rd, Cd) or not bool((gain > 0).all()):
+                raise ValueError(f"detector_gain must be a positive [rows, channels] = {[Rd, Cd]} map")
+            relative = relative * gain
+        open_field = (float(I0) * relative).to(device, torch.float32)
+        open_field = open_field if per_view else open_field[0]
+    P = open_field * torch.exp(-line_integrals)
+
+    # scatter-to-primary ratio of the detector signals from the solver, one converged solve per view on the fields
+    # built once from the maps
     solver_scatter = torch.empty(V, Rd, Cd, device=device, dtype=torch.float32)
     view_seconds = np.zeros(V)
     source_iterations = np.zeros(V, dtype=np.int64)
@@ -984,7 +1013,7 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
     for v in range(V):
         view_start = time.perf_counter()
         result = solver.solve_view_from_fields(fields, float(angles[v]))
-        solver_scatter[v] = result.scatter_planar_fluence.sum(0)
+        solver_scatter[v] = result.scatter_signal
         source_iterations[v] = result.source_iteration_result.num_iterations
         source_iteration_converged[v] = bool(result.source_iteration_result.converged)
         del result
@@ -994,8 +1023,7 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
     solver_seconds = time.perf_counter() - t0
     # the primary model of the CITRUS loop: MBIRTORCH's per-material line integrals through the solver's transmission
     projector = ViewChunkProjector(grid, geometry, angles, model=model, device=device)
-    solver_primary = primary_signals(solver, fields, angles, projector,
-                                     quantity="planar_fluence").to(device, torch.float32)
+    solver_primary = primary_signals(solver, fields, angles, projector).to(device, torch.float32)
     del fields, projector
     # the solver's primary of an empty volume: zero path lengths of one material (no volume is traced)
     n = int(solver.primary_samples_per_pixel_axis or getattr(solver.projectors, "samples_per_pixel_axis", 1) or 1)
@@ -1030,6 +1058,8 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
         if not isinstance(solver.config.grouping_medium, str) else solver.config.grouping_medium,
         "detector": getattr(solver.detector, "name", "detector"),
         "grid_response": getattr(solver.grid_response, "name", "grid"), "solver_dtype": str(solver.dtype),
+        "open_field": "image" if isinstance(open_field, Tensor) else "number",
+        "emission_profile": solver.source.emission_profile is not None, "detector_gain": detector_gain is not None,
         "mbirtorch_version": mbirtorch_version(), "torch_version": torch.__version__, "device": str(device),
         "seconds": {"total": time.perf_counter() - start_time, "mbirtorch_projection": projection_seconds,
                     "solver_total": solver_seconds,
@@ -1041,7 +1071,8 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
         "stats": {"SPR_min": float(spr_array.min()), "SPR_max": float(spr_array.max()),
                   "SPR_mean": float(spr_array.mean()),
                   "SPR_p01": float(np.percentile(spr_array, 1)), "SPR_p99": float(np.percentile(spr_array, 99)),
-                  "line_integral_max": float(line_integrals.max()), "P_over_I0_min": float((P / I0).min()),
+                  "line_integral_max": float(line_integrals.max()),
+                  "P_over_I0_min": float((P / open_field).min()),
                   "Y_min": float(Y.min()), "Y_max": float(Y.max())},
     }
     return {
@@ -1049,7 +1080,9 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
         "P": to_numpy(P), "S": to_numpy(S), "Y": to_numpy(Y), "Y_mean": to_numpy(Y_mean), "SPR": spr_array,
         "solver_primary": to_numpy(solver_primary), "solver_scatter": to_numpy(solver_scatter),
         "phi_air": to_numpy(phi_air), "view_seconds": view_seconds, "si_iterations": source_iterations,
-        "I0": np.asarray(float(I0)), "energy_kev": np.asarray(energy_kev), "mass_attenuation": mass_attenuation.numpy(),
+        "I0": np.asarray(float(I0)),
+        "open_field": to_numpy(open_field) if isinstance(open_field, Tensor) else np.asarray(open_field),
+        "energy_kev": np.asarray(energy_kev), "mass_attenuation": mass_attenuation.numpy(),
         "meta": meta,
     }
 
@@ -1118,7 +1151,9 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
                             library: Optional[MultigroupLibrary] = None, device=None, start_view_angle: float = 0.0,
                             end_view_angle: Optional[float] = None,
                             progress: Optional[Callable[[int, float], None]] = None,
-                            geometry: Optional[ConeGeometry] = None, spectrum=None) -> dict:
+                            geometry: Optional[ConeGeometry] = None, spectrum=None,
+                            detector: Optional[DetectorResponse] = None, grid_response: Optional[GridResponse] = None,
+                            source: Optional[SourceModel] = None, detector_gain=None) -> dict:
     """Synthetic cone-beam data of the WLAB phantom (``synthesize_cone_beam_data``), optionally written to disk.
 
     The phantom is placed on ``wlab_grid(delta_voxel)`` in the water and bone rows of the library of ``wlab_solver``;
@@ -1145,6 +1180,12 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
         geometry (ConeGeometry, optional): scan geometry. Defaults to None, ``full_field_wlab_geometry()``.
         spectrum (tuple[np.ndarray, np.ndarray], optional): source spectrum, required without ``library``. Defaults
             to None.
+        detector (DetectorResponse, optional): detector response of the truth solver. Defaults to None (ideal
+            counting).
+        grid_response (GridResponse, optional): anti-scatter grid of the truth solver. Defaults to None (no grid).
+        source (SourceModel, optional): source model (emission profile) of the truth solver. Defaults to None
+            (uniform emission).
+        detector_gain (Tensor or ndarray, optional): [Rd, Cd] per-pixel detector gain. Defaults to None (1).
 
     Returns:
         dict: the data set, as returned by ``synthesize_cone_beam_data``.
@@ -1154,12 +1195,12 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
     geometry = full_field_wlab_geometry() if geometry is None else geometry
     grid = wlab_grid(delta_voxel)
     solver = wlab_solver(delta_voxel, config=config, library=library, geometry=geometry, device=device,
-                         spectrum=spectrum)
+                         spectrum=spectrum, detector=detector, grid_response=grid_response, source=source)
     phantom = WlabPhantom(grid, solver.materials, device=device, dtype=torch.float32)
     angles = view_angles(num_views, geometry, start_view_angle, end_view_angle)
     end = float(start_view_angle) + math.pi + fan_angle(geometry) if end_view_angle is None else float(end_view_angle)
     out = synthesize_cone_beam_data(phantom, grid, geometry, angles, solver, I0, noise, seed, energy_kev=energy_kev,
-                                    device=device, progress=progress)
+                                    device=device, progress=progress, detector_gain=detector_gain)
     out["meta"].update(description="synthetic WLAB scatter dataset, citrus.utilities.synthesize_wlab_dataset",
                        delta_voxel=float(delta_voxel), start_view_angle=float(start_view_angle),
                        end_view_angle=end, short_scan=bool(end - float(start_view_angle) < 2.0 * math.pi - 1e-9))

@@ -2,14 +2,16 @@
 
 :class:`DetectorResponse` tabulates D(E, theta0), the energy deposited per incident photon, and :class:`GridResponse`
 tabulates G(E, theta1, theta2), the transmitted fraction of a 1-D anti-scatter grid; tables from a Monte Carlo
-simulation can replace the analytic builders :func:`csi_response` and :func:`focused_1d_grid`. :func:`detector_angle`
-and :func:`grid_angles` give the angles of the photons arriving at the panel.
+simulation can replace the analytic builders. :func:`detector_response` and :func:`anti_scatter_grid` build them for
+any material of the catalogue from the photon data, :func:`csi_response` and :func:`focused_1d_grid` from coarse
+built-in tables, and :func:`tabulated_detector_response` from a user table. :func:`detector_angle` and
+:func:`grid_angles` give the angles of the photons arriving at the panel.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional, Sequence, Union
 
 import numpy as np
@@ -26,11 +28,17 @@ __all__ = [
     "csi_response",
     "ideal_counting_response",
     "energy_weighted_response",
+    "material_cross_sections",
+    "detector_response",
+    "tabulated_detector_response",
     "no_grid",
     "focused_1d_grid",
+    "anti_scatter_grid",
     "grid_angles",
     "detector_angle",
 ]
+
+SEPTA_DIRECTIONS = ("channels", "rows")
 
 ArrayLike = Union[Tensor, np.ndarray, Sequence[float]]
 MassAttenuation = Callable[[np.ndarray], np.ndarray]
@@ -279,6 +287,172 @@ def energy_weighted_response() -> DetectorResponse:
     return DetectorResponse(e, th, e[:, None].expand(2, 2).clone(), name="ideal energy weighted")
 
 
+def _default_energy_nodes() -> np.ndarray:
+    """Return table energies every 0.5 keV from 10 to 150 keV, then logarithmically spaced up to 20 MeV.
+
+    Returns:
+        np.ndarray: [N] ascending energies in keV.
+    """
+    return np.unique(np.concatenate([np.linspace(10.0, 150.0, 281), np.geomspace(150.0, 20000.0, 161)]))
+
+
+def _float64_array(values: ArrayLike) -> np.ndarray:
+    """Return a tensor, array or sequence as a float64 numpy array.
+
+    Args:
+        values (ArrayLike): the values.
+
+    Returns:
+        np.ndarray: the values, float64.
+    """
+    return np.asarray(values.detach().cpu().numpy() if isinstance(values, Tensor) else values, dtype=np.float64)
+
+
+def _nodes(values: Optional[ArrayLike], default: np.ndarray) -> np.ndarray:
+    """Return table nodes as a sorted float64 array, or the default nodes for None.
+
+    Args:
+        values (ArrayLike, optional): the nodes.
+        default (np.ndarray): nodes used for None.
+
+    Returns:
+        np.ndarray: [N] ascending nodes.
+    """
+    return default if values is None else np.sort(_float64_array(values).reshape(-1))
+
+
+def material_cross_sections(material: str, energy_kev: ArrayLike, backend=None) -> dict[str, np.ndarray]:
+    """Return the mass cross sections of a catalogue material per process from the photon data (XCOM).
+
+    Args:
+        material (str): catalogue material name (``cross_sections.MATERIAL_CATALOGUE``), e.g. "cesium_iodide".
+        energy_kev (ArrayLike): [K] photon energies in keV.
+        backend (XcomXraylibBackend, optional): photon data. Defaults to None (``photon_data.resolve_backend()``).
+
+    Returns:
+        dict[str, np.ndarray]: [K] mass cross sections in cm^2/g for "photoelectric", "compton", "rayleigh",
+        "pair" and "total".
+    """
+    from .cross_section_library import parse_formula
+    from .cross_sections import material_table
+    from .photon_data import resolve_backend
+
+    backend = resolve_backend() if backend is None else backend
+    (_, _, formula), = material_table((material,))
+    composition = parse_formula(formula, backend.atomic_mass)
+    energies = _float64_array(energy_kev).reshape(-1)
+    kinds = ("photoelectric", "compton", "rayleigh", "pair", "total")
+    return {kind: sum(w * backend.sigma(kind, Z, energies) for Z, w in composition.items()) for kind in kinds}
+
+
+def _compton_energy_transfer_fraction(energy_kev: np.ndarray) -> np.ndarray:
+    """Return the mean fraction of the photon energy given to the electron in Klein-Nishina Compton scattering.
+
+    Args:
+        energy_kev (np.ndarray): [K] photon energies in keV.
+
+    Returns:
+        np.ndarray: [K] mean energy-transfer fractions in [0, 1).
+    """
+    from .cross_sections import ELECTRON_REST_KEV
+
+    cosines, weights = np.polynomial.legendre.leggauss(256)
+    k = np.asarray(energy_kev, dtype=np.float64)[:, None] / ELECTRON_REST_KEV
+    ratio = 1.0 / (1.0 + k * (1.0 - cosines[None, :]))  # scattered / incident photon energy
+    cross_section = ratio ** 2 * (ratio + 1.0 / ratio - (1.0 - cosines[None, :] ** 2))
+    return (cross_section * (1.0 - ratio)) @ weights / (cross_section @ weights)
+
+
+def detector_response(material: str = "cesium_iodide", thickness_cm: float = 0.06, *,
+                      density: Optional[float] = None, mode: str = "energy_integrating", deposition: str = "full",
+                      energies: Optional[ArrayLike] = None, thetas: Optional[ArrayLike] = None,
+                      backend=None) -> DetectorResponse:
+    """Build the response of a detector layer of any catalogue material from the photon data, at oblique incidence.
+
+    A photon at angle theta to the normal interacts with probability ``1 - exp(-mu(E) rho t / cos(theta))``; an
+    energy-integrating detector records the deposited energy and a photon-counting detector the interacting photons
+    (docs/source/method.rst, "Detector and grid responses").
+
+    Args:
+        material (str, optional): catalogue material name. Defaults to "cesium_iodide".
+        thickness_cm (float, optional): layer thickness t in cm. Defaults to 0.06.
+        density (float, optional): density rho in g/cm^3. Defaults to None (the catalogue density).
+        mode (str, optional): "energy_integrating" (keV deposited per incident photon) or "photon_counting"
+            (counts per incident photon). Defaults to "energy_integrating".
+        deposition (str, optional): "full" (every interacting photon deposits its whole energy and is counted) or
+            "local" (only the energy of the first interaction stays: scattered and annihilation photons escape, and
+            Rayleigh scattering is not counted). Defaults to "full".
+        energies (ArrayLike, optional): table energies in keV; None uses 10 to 150 keV every 0.5 keV, then 160 nodes
+            logarithmically spaced up to 20 MeV (pass the group energies to make the table exact at the groups).
+            Defaults to None.
+        thetas (ArrayLike, optional): table angles in rad; None uses 181 nodes from 0 to 89.5 degrees. Defaults to None.
+        backend (XcomXraylibBackend, optional): photon data. Defaults to None (loaded on first use).
+
+    Returns:
+        DetectorResponse: the response, float64 tables on the CPU.
+    """
+    from .cross_sections import ELECTRON_REST_KEV, MATERIAL_CATALOGUE
+
+    if thickness_cm < 0:
+        raise ValueError("thickness must be non-negative")
+    if mode not in ("energy_integrating", "photon_counting"):
+        raise ValueError(f"mode must be 'energy_integrating' or 'photon_counting', got {mode!r}")
+    if deposition not in ("full", "local"):
+        raise ValueError(f"deposition must be 'full' or 'local', got {deposition!r}")
+    energy_nodes = _nodes(energies, _default_energy_nodes())
+    thetas_rad = _nodes(thetas, _theta_nodes_detector())
+    sigma = material_cross_sections(material, energy_nodes, backend)
+    rho = float(MATERIAL_CATALOGUE[material][0]) if density is None else float(density)
+    path = thickness_cm / np.cos(np.clip(thetas_rad, 0.0, math.pi / 2 - 1e-9))  # [T]
+    interacting = -np.expm1(-sigma["total"][:, None] * rho * path[None, :])  # [E, T]
+    if deposition == "full":
+        per_interaction = np.ones_like(energy_nodes)
+    elif mode == "energy_integrating":
+        pair_kept = np.clip(1.0 - 2.0 * ELECTRON_REST_KEV / energy_nodes, 0.0, None)
+        per_interaction = (sigma["photoelectric"] + sigma["compton"] * _compton_energy_transfer_fraction(energy_nodes)
+                           + sigma["pair"] * pair_kept) / sigma["total"]
+    else:
+        per_interaction = (sigma["total"] - sigma["rayleigh"]) / sigma["total"]
+    scale = energy_nodes if mode == "energy_integrating" else np.ones_like(energy_nodes)
+    response = (scale * per_interaction)[:, None] * interacting
+    label = "energy integrating" if mode == "energy_integrating" else "photon counting"
+    return DetectorResponse(torch.as_tensor(energy_nodes), torch.as_tensor(thetas_rad), torch.as_tensor(response),
+                            name=f"{material} {thickness_cm * 10:.2f} mm, {label}, {deposition} deposition")
+
+
+def tabulated_detector_response(energy_kev: ArrayLike, response: ArrayLike, theta_rad: Optional[ArrayLike] = None,
+                                name: str = "tabulated detector") -> DetectorResponse:
+    """Build a detector response from a user table, as a function of energy and optionally of the incidence angle.
+
+    Args:
+        energy_kev (ArrayLike): [E] ascending table energies in keV.
+        response (ArrayLike): [E] response per incident photon (keV deposited, or counts), the same at every angle, or
+            [E, T] per energy and angle.
+        theta_rad (ArrayLike, optional): [T] ascending angles in rad to the panel normal, required for a [E, T] table.
+            Defaults to None.
+        name (str, optional): label of the response. Defaults to "tabulated detector".
+
+    Returns:
+        DetectorResponse: the response, float64 tables on the CPU.
+    """
+    energy = torch.as_tensor(_float64_array(energy_kev).reshape(-1))
+    table = torch.as_tensor(_float64_array(response))
+    if energy.numel() > 1 and not bool((energy[1:] > energy[:-1]).all()):
+        raise ValueError("energy_kev must be ascending")
+    if table.dim() == 1:
+        if theta_rad is not None:
+            raise ValueError("theta_rad applies to a [E, T] response table only")
+        theta = torch.tensor([0.0, math.pi / 2], dtype=torch.float64)
+        table = table[:, None].expand(-1, 2).clone()
+    else:
+        if theta_rad is None:
+            raise ValueError("a [E, T] response table needs theta_rad")
+        theta = torch.as_tensor(_float64_array(theta_rad).reshape(-1))
+        if theta.numel() > 1 and not bool((theta[1:] > theta[:-1]).all()):
+            raise ValueError("theta_rad must be ascending")
+    return DetectorResponse(energy, theta, table, name=name)
+
+
 # ---- anti-scatter grid ------------------------------------------------------------------------------
 
 @dataclass(frozen=True, eq=False)
@@ -295,6 +469,9 @@ class GridResponse:
         focal_distance_cm (float, optional): distance of the focal line from the panel in cm, which defines the
             focusing direction; None uses the source-detector distance (focused at the focal spot). Defaults to None.
         name (str): label of the response. Defaults to "grid".
+        septa_along (str): direction of the septa (lamellae) on the panel, "channels" (along u, repeating along the
+            rows) or "rows" (along v, repeating along the channels); it sets the axes of :func:`grid_angles`.
+            Defaults to "channels".
     """
 
     energy_kev: Tensor
@@ -303,12 +480,15 @@ class GridResponse:
     transmission: Tensor
     focal_distance_cm: Optional[float] = None
     name: str = "grid"
+    septa_along: str = "channels"
 
     def __post_init__(self) -> None:
-        """Check that ``transmission`` is [E, T1, T2]."""
+        """Check that ``transmission`` is [E, T1, T2] and the septa direction."""
         shape = (self.energy_kev.numel(), self.theta1_rad.numel(), self.theta2_rad.numel())
         if tuple(self.transmission.shape) != shape:
             raise ValueError(f"transmission must be [E, T1, T2] = {list(shape)}, got {tuple(self.transmission.shape)}")
+        if self.septa_along not in SEPTA_DIRECTIONS:
+            raise ValueError(f"septa_along must be one of {SEPTA_DIRECTIONS}, got {self.septa_along!r}")
 
     def at(self, group_energy: Tensor, theta1: Tensor, theta2: Tensor) -> Tensor:
         """Interpolate the table trilinearly at group energies and grid angles.
@@ -418,6 +598,66 @@ def focused_1d_grid(ratio: float = 10.0, lamella_thickness_cm: float = 0.0036, l
                              f"(geometric model)")
 
 
+def anti_scatter_grid(geometry: Optional[ConeGeometry], septum_thickness_cm: float, septum_height_cm: float, *,
+                      septum_material: str = "lead", focal_distance_cm: Optional[float] = None,
+                      pitch_cm: Optional[float] = None, septa_along: str = "channels",
+                      density: Optional[float] = None, energies: Optional[ArrayLike] = None,
+                      theta1: Optional[ArrayLike] = None, backend=None) -> GridResponse:
+    """Build a focused 1-D anti-scatter grid from its septa, with the septum attenuation from the photon data.
+
+    The transmission is the geometric septum-shadow model of :func:`focused_1d_grid` with the septum material's
+    attenuation; with the default pitch, one septum per pixel, every pixel sees the same septum shadow.
+
+    Args:
+        geometry (ConeGeometry, optional): the panel; needed for the default pitch and focal distance. None requires
+            both ``pitch_cm`` and ``focal_distance_cm``.
+        septum_thickness_cm (float): septum thickness t in cm.
+        septum_height_cm (float): septum height h in cm (along the panel normal).
+        septum_material (str, optional): catalogue material name of the septa. Defaults to "lead".
+        focal_distance_cm (float, optional): distance of the focal line from the panel in cm. Defaults to None (the
+            source-detector distance: focused at the focal spot).
+        pitch_cm (float, optional): septum pitch p in cm. Defaults to None (the detector pixel pitch across the septa).
+        septa_along (str, optional): "channels" (septa along u, repeating along the rows) or "rows" (septa along v,
+            parallel to the rotation axis, repeating along the channels). Defaults to "channels".
+        density (float, optional): septum density in g/cm^3. Defaults to None (the catalogue density).
+        energies (ArrayLike, optional): table energies in keV; None uses 10 to 150 keV every 0.5 keV, then 160 nodes
+            logarithmically spaced up to 20 MeV. Defaults to None.
+        theta1 (ArrayLike, optional): table angles theta1 in rad; None uses nodes dense up to twice the cut-off angle
+            ``atan((p - t) / h)`` and coarser up to 89.5 degrees. Defaults to None.
+        backend (XcomXraylibBackend, optional): photon data. Defaults to None (loaded on first use).
+
+    Returns:
+        GridResponse: the response, float64 tables on the CPU.
+    """
+    from .cross_sections import MATERIAL_CATALOGUE
+
+    if septa_along not in SEPTA_DIRECTIONS:
+        raise ValueError(f"septa_along must be one of {SEPTA_DIRECTIONS}, got {septa_along!r}")
+    if pitch_cm is None or focal_distance_cm is None:
+        if geometry is None:
+            raise ValueError("pass the geometry, or both pitch_cm and focal_distance_cm")
+    p = float(pitch_cm if pitch_cm is not None else
+              (geometry.delta_det_row if septa_along == "channels" else geometry.delta_det_channel))
+    f = float(focal_distance_cm if focal_distance_cm is not None else geometry.source_detector_dist)
+    t, h = float(septum_thickness_cm), float(septum_height_cm)
+    if not (0.0 <= t < p) or h < 0:
+        raise ValueError(f"need 0 <= septum thickness < pitch ({p:g} cm) and height >= 0")
+    energy_nodes = _nodes(energies, _default_energy_nodes())
+    if theta1 is None:
+        cutoff_deg = math.degrees(math.atan2(p - t, h))
+        dense = np.radians(np.linspace(0.0, min(89.5, 2.0 * cutoff_deg), 401))
+        theta1 = np.unique(np.concatenate([dense, _theta_nodes_grid()]))
+    mass_attenuation = material_cross_sections(septum_material, energy_nodes, backend)["total"]
+    rho = float(MATERIAL_CATALOGUE[septum_material][0]) if density is None else float(density)
+    grid = focused_1d_grid(lamella_thickness_cm=t, lamella_height_cm=h, pitch_cm=p, focal_distance_cm=f,
+                           mass_attenuation=lambda e: np.interp(e, energy_nodes, mass_attenuation),
+                           lead_density=rho, energies=energy_nodes, theta1=theta1)
+    ratio = h / (p - t)
+    return replace(grid, septa_along=septa_along,
+                   name=f"focused 1D grid, {septum_material} septa {t * 10:.3g} mm x {h * 10:.3g} mm at "
+                        f"{p * 10:.3g} mm pitch (ratio {ratio:.1f}), septa along the {septa_along}")
+
+
 # ---- angles -------------------------------------------------------------------------------------------
 
 def detector_angle(omega: Tensor, geometry: ConeGeometry, angle: float) -> Tensor:
@@ -438,12 +678,13 @@ def detector_angle(omega: Tensor, geometry: ConeGeometry, angle: float) -> Tenso
 
 
 def grid_angles(omega: Tensor, pixel_positions: Tensor, geometry: ConeGeometry, angle: float,
-                focal_distance: Optional[float] = None) -> tuple[Tensor, Tensor]:
+                focal_distance: Optional[float] = None, septa_along: str = "channels") -> tuple[Tensor, Tensor]:
     """Compute the grid angles (theta1, theta2) of photons arriving at pixels.
 
     The grid is 1-D, its lamellae run along u and repeat along v, focused on the line parallel to u at
     ``focal_distance`` from the panel along ``n_hat``; theta1 is the angle in the v-source plane from the focusing
-    direction and theta2 the angle in the u-source plane from the panel normal.
+    direction and theta2 the angle in the u-source plane from the panel normal. Septa along the rows swap the roles of
+    u and v.
 
     Args:
         omega (Tensor): [K, 3] or [..., 3] unit photon directions in the recon frame.
@@ -453,6 +694,8 @@ def grid_angles(omega: Tensor, pixel_positions: Tensor, geometry: ConeGeometry, 
         angle (float): view angle in rad.
         focal_distance (float, optional): distance of the focal line from the panel in cm; None uses
             ``geometry.source_detector_dist`` (focused at the focal spot). Defaults to None.
+        septa_along (str, optional): "channels" (lamellae along u) or "rows" (lamellae along v). Defaults to
+            "channels".
 
     Returns:
         (Tensor, Tensor): theta1 and theta2 in rad, [K, rows, channels] for ``omega`` [K, 3] with ``pixel_positions``
@@ -461,6 +704,10 @@ def grid_angles(omega: Tensor, pixel_positions: Tensor, geometry: ConeGeometry, 
     device, dtype = pixel_positions.device, pixel_positions.dtype
     omega = omega.to(device, dtype)
     u_hat, v_hat, n_hat = (torch.tensor(a, device=device, dtype=dtype) for a in geometry.panel_axes(angle))
+    if septa_along == "rows":
+        u_hat, v_hat = v_hat, u_hat
+    elif septa_along != "channels":
+        raise ValueError(f"septa_along must be one of {SEPTA_DIRECTIONS}, got {septa_along!r}")
     focal_distance = geometry.source_detector_dist if focal_distance is None else float(focal_distance)
     focus = torch.tensor(geometry.panel_center(angle), device=device, dtype=dtype) + focal_distance * n_hat
     if omega.dim() == 2 and pixel_positions.dim() == 3:

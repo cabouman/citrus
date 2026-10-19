@@ -42,6 +42,7 @@ __all__ = [
     "MaterialFields",
     "ViewResult",
     "ScatterSolver",
+    "emission_profile_from_open_field",
 ]
 
 DeviceLike = Union[torch.device, str, None]
@@ -870,6 +871,27 @@ class ScatterSolver:
         return primary_from_path_lengths(self.library, path.to(self.device, self.dtype), materials, self.geometry,
                                          angle, self.source, self.detector, self.grid_response)
 
+    def open_field_signal(self, angle: float, source: Optional[SourceModel] = None,
+                          dtype: Optional[torch.dtype] = None) -> Tensor:
+        """Detector signal of an empty volume (the solver's open field) for one view.
+
+        It carries the inverse-square and obliquity factors of the point source, the emission profile of ``source``
+        and the grid and detector responses.
+
+        Args:
+            angle (float): view angle in radians.
+            source (SourceModel, optional): source model. Defaults to None (the solver's own).
+            dtype (torch.dtype, optional): dtype of the computation. Defaults to None (the solver's).
+
+        Returns:
+            Tensor: [Rd, Cd] signal per source photon per steradian, on the solver's device.
+        """
+        Rd, Cd = self.geometry.num_det_rows, self.geometry.num_det_channels
+        zero_path = torch.zeros(1, Rd, Cd, device=self.device, dtype=self.dtype if dtype is None else dtype)
+        return primary_from_path_lengths(self.library, zero_path, [0], self.geometry, angle,
+                                         self.source if source is None else source, self.detector,
+                                         self.grid_response)["signal"]
+
     # ---- timing ----------------------------------------------------------------------------------
     @contextmanager
     def _stage(self, name: str, timings: dict[str, float], peaks: dict[str, int]) -> Iterator[None]:
@@ -989,3 +1011,60 @@ class ScatterSolver:
             list: one :class:`ViewResult` per angle.
         """
         return [self.solve_view(rho_fine, grid_fine, float(a), keep_phi_total=keep_phi_total) for a in angles]
+
+
+# =====================================================================================================
+# emission profile from a measured open field
+# =====================================================================================================
+
+def emission_profile_from_open_field(open_field: Union[Tensor, np.ndarray], solver: ScatterSolver,
+                                     angles: Optional[Sequence[float]] = None,
+                                     detector_gain: Optional[Union[Tensor, np.ndarray]] = None) -> Tensor:
+    """Emission profile of the source from a measured open field (flat field), for ``SourceModel.emission_profile``.
+
+    The profile is the measured open field divided by the detector gain and by the solver's own open field of a
+    uniform source (``ScatterSolver.open_field_signal``), which carries the inverse-square and obliquity falloff and
+    the responses, normalized to a mean of one per view; without a gain map the whole open field counts as emission.
+
+    Args:
+        open_field (Tensor or ndarray): [Rd, Cd] open-field signal, the same for every view, or [V, Rd, Cd] per view.
+        solver (ScatterSolver): solver of the scanner (geometry, spectrum, detector and grid responses).
+        angles (Sequence[float], optional): [V] view angles in rad of a per-view open field; for a [Rd, Cd] open field
+            the first angle (or 0) sets the view of the solver's open field. Defaults to None.
+        detector_gain (Tensor or ndarray, optional): [Rd, Cd] multiplicative per-pixel gain. Defaults to None (1).
+
+    Returns:
+        Tensor: [Rd, Cd] or [V, Rd, Cd] profile with mean 1 per view, float64 on the CPU.
+    """
+    shape = solver.geometry.image_shape
+    device = solver.device
+    field = torch.as_tensor(open_field, dtype=torch.float64, device=device)
+    if field.dim() not in (2, 3) or tuple(field.shape[-2:]) != shape:
+        raise ValueError(f"the open field must be [rows, channels] = {list(shape)} or [views, rows, channels], got "
+                         f"{tuple(field.shape)}")
+    if not bool(torch.isfinite(field).all()) or bool((field < 0).any()):
+        raise ValueError("the open field must be finite and non-negative")
+    angle_list = [] if angles is None else [float(a) for a in np.asarray(angles, dtype=np.float64).reshape(-1)]
+    if field.dim() == 3 and len(angle_list) != field.shape[0]:
+        raise ValueError(f"a per-view open field of {field.shape[0]} views needs {field.shape[0]} angles, got "
+                         f"{len(angle_list)}")
+    gain = None
+    if detector_gain is not None:
+        gain = torch.as_tensor(detector_gain, dtype=torch.float64, device=device)
+        if tuple(gain.shape) != shape or not bool(torch.isfinite(gain).all()) or bool((gain <= 0).any()):
+            raise ValueError(f"detector_gain must be a positive [rows, channels] = {list(shape)} map")
+    uniform = SourceModel()
+    tiny = torch.finfo(torch.float64).tiny
+
+    def profile_of(measured: Tensor, angle: float) -> Tensor:
+        solver_open = solver.open_field_signal(angle, uniform, dtype=torch.float64)
+        denominator = solver_open if gain is None else solver_open * gain
+        ratio = measured / denominator.clamp_min(tiny)
+        mean = float(ratio.mean())
+        return ratio / mean if mean > 0 else ratio
+
+    if field.dim() == 2:
+        profile = profile_of(field, angle_list[0] if angle_list else 0.0)
+    else:
+        profile = torch.stack([profile_of(field[v], angle_list[v]) for v in range(field.shape[0])])
+    return profile.cpu()

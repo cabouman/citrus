@@ -21,7 +21,8 @@ from .recon.mbir_bridge import ViewChunkProjector, fdk, forward_project, make_co
 from .scatter_solver.angular_quadrature import Quadrature
 from .scatter_solver.cross_sections import MultigroupLibrary
 from .scatter_solver.geometry import ConeGeometry, Grid
-from .scatter_solver.scatter_solver import MaterialFields, ScatterSolver
+from .scatter_solver.scatter_solver import MaterialFields, ScatterSolver, emission_profile_from_open_field
+from .scatter_solver.source import SourceModel
 from .scatter_solver.uncollided import present_materials
 from .utilities import (attenuation_to_densities, attenuation_to_density, effective_energy, grouping_medium_estimate,
                         object_mask, object_size_cm)
@@ -1021,7 +1022,7 @@ def _sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: ConeGeometry, config: CitrusConfig,
+def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: Grid, geometry: ConeGeometry, config: CitrusConfig,
                 scatter_stage: Optional[ScatterStage], device: torch.device, *, regularization: Optional[dict],
                 init_recon: Optional[Tensor], model, callback, label: str, mbir_callback=None,
                 schedule: Optional[Sequence[int]] = None,
@@ -1035,7 +1036,8 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
 
     Args:
         Y (Tensor): [V, Rd, Cd] measured counts.
-        I0 (float): flat-field counts per pixel.
+        I0 (float or Tensor): flat-field counts per pixel, a number or a tensor broadcastable to ``Y``
+            (``_flat_field``).
         angles (ndarray): [V] view angles in rad.
         grid (Grid): reconstruction grid.
         geometry (ConeGeometry): cone-beam geometry of the scan.
@@ -1062,8 +1064,8 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
         (Tensor, dict): reconstruction [R, C, S] in 1/cm and the info dict.
     """
     config.validate()
-    weights = Y / float(I0)
-    measured_line_integrals = -torch.log(Y.clamp_min(config.min_counts) / float(I0))
+    weights = Y / I0
+    measured_line_integrals = -torch.log(Y.clamp_min(config.min_counts) / I0)
     if model is None:
         model = make_cone_model(grid, geometry, angles, device=device)
     t0 = time.perf_counter()
@@ -1111,7 +1113,7 @@ def _outer_loop(Y: Tensor, I0: float, angles: np.ndarray, grid: Grid, geometry: 
         if scatter_stage is not None:
             spr = scatter_stage(k, X, record)
         corrected_counts = Y if spr is None else Y / (1.0 + spr)
-        corrected_line_integrals = -torch.log(corrected_counts.clamp_min(config.min_counts) / float(I0))
+        corrected_line_integrals = -torch.log(corrected_counts.clamp_min(config.min_counts) / I0)
         if regularization is None:  # estimated once on the first sinogram MBIR inverts, then frozen
             regularization = estimate_regularization(model, corrected_line_integrals, weights)
         block = max_iterations if schedule is None else int(schedule[k])
@@ -1232,6 +1234,34 @@ def _counts_and_angles(sinogram_counts, angles, device) -> tuple[Tensor, np.ndar
     return Y, angle_array
 
 
+def _flat_field(I0, Y: Tensor) -> Union[float, Tensor]:
+    """The flat field as a number, or as a float32 tensor on the counts' device for an open-field image.
+
+    Args:
+        I0 (float, Tensor or ndarray): flat-field counts: a number, [Rd, Cd] (every view) or [V, Rd, Cd].
+        Y (Tensor): [V, Rd, Cd] measured counts.
+
+    Returns:
+        float or Tensor: the number, or the [Rd, Cd] or [V, Rd, Cd] tensor.
+
+    Raises:
+        ValueError: if the flat field is not positive or its shape matches neither form.
+    """
+    field = I0.detach() if isinstance(I0, Tensor) else np.asarray(I0, dtype=np.float64)
+    if field.ndim == 0:
+        value = float(I0)
+        if not value > 0:
+            raise ValueError(f"the flat field must be positive, got {value}")
+        return value
+    field = torch.as_tensor(field, dtype=torch.float32, device=Y.device)
+    if tuple(field.shape) not in (tuple(Y.shape[1:]), tuple(Y.shape)):
+        raise ValueError(f"the flat field must be a number, [rows, channels] = {list(Y.shape[1:])} or "
+                         f"[views, rows, channels] = {list(Y.shape)}, got {tuple(field.shape)}")
+    if not bool(torch.isfinite(field).all()) or not bool((field > 0).all()):
+        raise ValueError("the flat field must be finite and positive")
+    return field.contiguous()
+
+
 def _apply_grouping_estimates(solver: ScatterSolver, X: Tensor, grid: Grid, config: CitrusConfig) -> dict:
     """Set the solver's energy-group object size and medium from the initial volume.
 
@@ -1287,19 +1317,23 @@ def _medium_text(medium) -> str:
     return " + ".join(f"{name} {density:.3g} g/cm^3" for name, density in medium)
 
 
-def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: Union[Sequence[float], np.ndarray],
+def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Tensor, np.ndarray],
+                 angles: Union[Sequence[float], np.ndarray],
                  grid: Grid, geometry: ConeGeometry, solver: ScatterSolver, config: Optional[CitrusConfig] = None,
                  *, regularization: Optional[dict] = None, init_recon: Optional[Tensor] = None, model=None,
                  callback: Optional[Callable[[int, Tensor, dict], None]] = None,
-                 mbir_callback: Optional[Callable[[int, Tensor], None]] = None) -> tuple[Tensor, dict]:
+                 mbir_callback: Optional[Callable[[int, Tensor], None]] = None,
+                 detector_gain: Optional[Union[Tensor, np.ndarray]] = None) -> tuple[Tensor, dict]:
     """CITRUS reconstruction of measured counts: MBIR with the scatter correction of the solver in the loop.
 
     The loop is described in docs/source/method.rst, "The CITRUS loop", and the info entries in docs/source/usage.rst,
-    "CITRUS".
+    "CITRUS". A flat-field image is the measured open field: it normalizes the counts pixel by pixel and gives the
+    solver's source its emission profile (``emission_profile_from_open_field``) for the duration of the call.
 
     Args:
         sinogram_counts (Tensor or ndarray): [V, Rd, Cd] measured counts Y (primary plus scatter).
-        I0 (float): flat-field counts per pixel.
+        I0 (float, Tensor or ndarray): flat-field counts per pixel: a number (uniform emission, the solver's source
+            unchanged), or the open field [Rd, Cd] for every view or [V, Rd, Cd] per view.
         angles (Sequence[float] or ndarray): [V] view angles in rad.
         grid (Grid): reconstruction grid (MBIRTORCH conventions), also the fine grid of the solver.
         geometry (ConeGeometry): cone-beam geometry of the scan.
@@ -1315,17 +1349,25 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
         mbir_callback (callable, optional): ``mbir_callback(i, X, record)``, called for the initial volume (i = 0)
             and after every MBIR iteration i = 1, ..., N n, with ``record["sinogram_nrmse"]`` the relative RMSE of
             A X against the corrected sinogram of its outer iteration (``_outer_loop``). Defaults to None.
+        detector_gain (Tensor or ndarray, optional): [Rd, Cd] multiplicative per-pixel detector gain, separated from
+            the emission profile of a flat-field image (unused with a number). Defaults to None (the whole open field
+            is emission).
 
     Returns:
         (Tensor, dict): reconstruction [R, C, S] float32 in 1/cm on the solver's device, and the info dict (``records``
             per outer iteration, ``mbir_iterations_total``, ``spr``, ``scatter_counts``, ``regularization``,
-            ``computed_views``, ...).
+            ``computed_views``, ``emission_profile``, ...).
     """
     config = CitrusConfig() if config is None else config
     config.validate()
     device = solver.device
     Y, angle_array = _counts_and_angles(sinogram_counts, angles, device)
+    flat_field = _flat_field(I0, Y)
     V = len(angle_array)
+    # an open-field image sets the solver's emission profile (in the first scatter stage, with the library) until
+    # the call returns
+    original_source = solver.source
+    emission_profile: list[Optional[Tensor]] = [None]
     # the density model needs the library: made in the first scatter stage, after the object size is set
     density_models: list[Optional[DensityModel]] = [None]
     library_seconds: list[float] = [0.0]
@@ -1364,6 +1406,12 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
             if config.verbose and not built:
                 print(f"[citrus] library built for grouping_object_size_cm = "
                       f"{solver.config.grouping_object_size_cm:g} in {library_seconds[0]:.1f} s", flush=True)
+            if isinstance(flat_field, Tensor):
+                per_view = flat_field.dim() == 3
+                emission_profile[0] = emission_profile_from_open_field(flat_field, solver, angle_array,
+                                                                       detector_gain)
+                solver.source = SourceModel(emission_profile=emission_profile[0],
+                                            emission_profile_angles=angle_array if per_view else None)
         density_model = density_models[0]
         transfer_seconds_before = state_store.transfer_seconds
         record["negative_fraction"] = density_model.negative_fraction(X)
@@ -1405,7 +1453,7 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
         return scatter / primary.clamp_min(tiny)
 
     try:
-        X, info = _outer_loop(Y, float(I0), angle_array, grid, geometry, config, scatter_stage, device,
+        X, info = _outer_loop(Y, flat_field, angle_array, grid, geometry, config, scatter_stage, device,
                               regularization=regularization, init_recon=init_recon, model=model, callback=callback,
                               label="citrus", after_initialization=after_initialization,
                               mbir_callback=mbir_callback)
@@ -1413,12 +1461,15 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: 
         info["state"] = state_store.describe()
         info["computed_views"] = computed.copy()
         info["view_interpolated"] = view_interpolated
+        info["emission_profile"] = emission_profile[0]
     finally:
         state_store.close()
+        solver.source = original_source
     return X, info
 
 
-def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: Union[Sequence[float], np.ndarray],
+def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Tensor, np.ndarray],
+               angles: Union[Sequence[float], np.ndarray],
                grid: Grid, geometry: ConeGeometry, config: Optional[CitrusConfig] = None, *,
                spr: Optional[Union[Tensor, np.ndarray]] = None, regularization: Optional[dict] = None,
                init_recon: Optional[Tensor] = None, model=None, device=None,
@@ -1429,7 +1480,8 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: Un
 
     Args:
         sinogram_counts (Tensor or ndarray): [V, Rd, Cd] measured counts Y.
-        I0 (float): flat-field counts per pixel.
+        I0 (float, Tensor or ndarray): flat-field counts per pixel: a number, or the open field [Rd, Cd] for every
+            view or [V, Rd, Cd] per view.
         angles (Sequence[float] or ndarray): [V] view angles in rad.
         grid (Grid): reconstruction grid.
         geometry (ConeGeometry): cone-beam geometry of the scan.
@@ -1465,6 +1517,6 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: float, angles: Un
     if fixed_spr is not None and fixed_spr.shape != Y.shape:
         raise ValueError(f"spr must have the sinogram shape {tuple(Y.shape)}, got {tuple(fixed_spr.shape)}")
     scatter_stage = None if fixed_spr is None else (lambda k, X, record: fixed_spr)
-    return _outer_loop(Y, float(I0), angle_array, grid, geometry, config, scatter_stage, device,
+    return _outer_loop(Y, _flat_field(I0, Y), angle_array, grid, geometry, config, scatter_stage, device,
                        regularization=regularization, init_recon=init_recon, model=model, callback=callback,
                        label="mbir", mbir_callback=mbir_callback, schedule=mbir_iterations_schedule)
