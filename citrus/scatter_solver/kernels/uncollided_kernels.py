@@ -408,7 +408,7 @@ def first_collision_source(library, rho: Tensor, phi_uncollided: Tensor, grid, g
         rho (Tensor): [M, rows, cols, slices] densities in g/cm^3.
         phi_uncollided (Tensor): [G, rows, cols, slices] float32 CUDA uncollided fluence.
         grid (Grid): the grid of ``rho`` and ``phi_uncollided``.
-        geometry (ConeGeometry): the cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): the scan geometry.
         angle (float): view angle in radians.
         omegas (Tensor): [K, 3] unit directions (recon frame).
         pairs (MaterialPairs, optional): pair representation of ``rho`` (pair mode), or None for dense mode.
@@ -467,7 +467,7 @@ def first_collision_source_or_none(library, rho: Tensor, phi_uncollided: Tensor,
         rho (Tensor): [M, rows, cols, slices] densities in g/cm^3.
         phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence.
         grid (Grid): the grid of ``rho`` and ``phi_uncollided``.
-        geometry (ConeGeometry): the cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): the scan geometry.
         angle (float): view angle in radians.
         omegas (Tensor): [K, 3] unit directions (recon frame).
         backend (str): "auto", "torch" or "triton".

@@ -604,14 +604,14 @@ def anti_scatter_grid(geometry: Optional[ConeGeometry], septum_thickness_cm: flo
                       pitch_cm: Optional[float] = None, septa_along: str = "channels",
                       density: Optional[float] = None, energies: Optional[ArrayLike] = None,
                       theta1: Optional[ArrayLike] = None, backend=None) -> GridResponse:
-    """Build a focused 1-D anti-scatter grid from its septa, with the septum attenuation from the photon data.
+    """Build a 1-D anti-scatter grid from its septa, with the septum attenuation from the photon data.
 
     The transmission is the geometric septum-shadow model of :func:`focused_1d_grid` with the septum material's
     attenuation; with the default pitch, one septum per pixel, every pixel sees the same septum shadow.
 
     Args:
-        geometry (ConeGeometry, optional): the panel; needed for the default pitch and focal distance. None requires
-            both ``pitch_cm`` and ``focal_distance_cm``.
+        geometry (ConeGeometry or ParallelGeometry, optional): the panel; needed for the default pitch and focal
+            distance. None requires both ``pitch_cm`` and ``focal_distance_cm``.
         septum_thickness_cm (float): septum thickness t in cm.
         septum_height_cm (float): septum height h in cm (along the panel normal).
         septum_material (str, optional): catalogue material name of the septa. Defaults to "lead".

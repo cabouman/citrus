@@ -12,7 +12,8 @@ The reconstruction loop and its utilities.
     The CITRUS loop, the per-view scatter step and its operators, the density model and the state storage.
 
 :doc:`api/utilities`
-    The WLAB phantom and geometry, the density model, view angles, synthetic data and plotting helpers.
+    The WLAB phantom and geometries, the density model, the object size and medium of the energy groups, view
+    angles, synthetic data and plotting helpers.
 
 .. toctree::
    :hidden:
@@ -26,8 +27,8 @@ MBIRTORCH bridge
 The interface to the reconstruction package.
 
 :doc:`api/mbir_bridge`
-    The MBIRTORCH model of the solver's geometry, FDK or the filtered back projection of a
-    parallel beam, with redundancy weights,, warm-started MBIR iterations.
+    The MBIRTORCH model of the solver's geometry, FDK or the filtered back projection of a parallel beam with
+    redundancy weights, warm-started MBIR iterations.
 
 .. toctree::
    :hidden:

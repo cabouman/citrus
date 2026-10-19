@@ -652,7 +652,8 @@ def wlab_solver(delta_voxel: float, *, config: Optional[SolverConfig] = None,
         delta_voxel (float): voxel size in cm of the fine grid the solver will be used with; the solver ignores it.
         config (SolverConfig, optional): solver configuration. Defaults to None, ``SolverConfig()``.
         library (MultigroupLibrary, optional): prebuilt library. Defaults to None, a lazy library.
-        geometry (ConeGeometry, optional): scan geometry. Defaults to None, ``full_field_wlab_geometry()``.
+        geometry (ConeGeometry or ParallelGeometry, optional): scan geometry. Defaults to None,
+            ``full_field_wlab_geometry()``.
         device (torch.device, optional): device. Defaults to None, CUDA when available, else the CPU.
         cache_dir (str, optional): disk cache of a lazy library; "default" is ``$CITRUS_CACHE_DIR`` or
             ``~/.cache/citrus``, None no disk cache. Defaults to "default".
@@ -923,7 +924,8 @@ def view_angles(num_views: int, geometry: Optional[ConeGeometry] = None, start_v
 
     Args:
         num_views (int): number of views V, at least 1.
-        geometry (ConeGeometry, optional): scan geometry, needed for the default end. Defaults to None.
+        geometry (ConeGeometry or ParallelGeometry, optional): scan geometry, needed for the default end. Defaults
+            to None.
         start_view_angle (float): first view angle in rad. Defaults to 0.0.
         end_view_angle (float, optional): end of the range in rad (excluded); ``start + 2 pi`` is a full rotation.
             Defaults to None, the short scan end ``start + pi + fan_angle(geometry)`` (``start + pi`` for a parallel

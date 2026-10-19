@@ -107,7 +107,7 @@ def uncollided_fluence(library: MultigroupLibrary, rho: Tensor, grid: Grid, geom
         library (MultigroupLibrary): cross-section library with the fine-energy weights and mass attenuation.
         rho (Tensor): [M, rows, cols, slices] material densities rho in g/cm^3 on ``grid``.
         grid (Grid): grid of the densities, traced through.
-        geometry (ConeGeometry): scanner geometry.
+        geometry (ConeGeometry or ParallelGeometry): scanner geometry.
         angle (float): view angle in radians.
         source (SourceModel): source model giving the angular weight b.
         projectors (Projectors): ray tracers of the upstream line integrals.
@@ -138,7 +138,7 @@ def uncollided_path_lengths(projectors: Projectors, rho: Tensor, grid: Grid, geo
             ``upstream_to_points``).
         rho (Tensor): [M', rows, cols, slices] density maps in g/cm^3 on ``grid``.
         grid (Grid): grid of the densities.
-        geometry (ConeGeometry): scanner geometry.
+        geometry (ConeGeometry or ParallelGeometry): scanner geometry.
         angle (float): view angle in radians.
         points (Grid, optional): grid of the end points. Defaults to None (``grid``).
 
@@ -166,7 +166,7 @@ def uncollided_from_path_lengths(library: MultigroupLibrary, path_lengths: Tenso
         materials (Sequence[int] | None): library indices of the rows of ``path_lengths``, None for all materials in
             library order.
         points (Grid): grid of the voxel centers.
-        geometry (ConeGeometry): scanner geometry.
+        geometry (ConeGeometry or ParallelGeometry): scanner geometry.
         angle (float): view angle in radians.
         source (SourceModel): source model giving the angular weight b.
 
@@ -197,7 +197,7 @@ def first_collision_source_at_directions(library: MultigroupLibrary, rho: Tensor
         rho (Tensor): [M, rows, cols, slices] material densities rho in g/cm^3.
         phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence in photons/cm^2 per source photon/sr.
         grid (Grid): grid of the points (in the solver the quadrature grid).
-        geometry (ConeGeometry): scanner geometry.
+        geometry (ConeGeometry or ParallelGeometry): scanner geometry.
         angle (float): view angle in radians.
         omegas (Tensor): [K, 3] unit directions.
         chunk (int, optional): directions per batch of the PyTorch path. Defaults to 4.
@@ -232,7 +232,7 @@ def _first_collision_source_torch(library: MultigroupLibrary, rho: Tensor, phi_u
         rho (Tensor): [M, rows, cols, slices] material densities rho in g/cm^3.
         phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence in photons/cm^2 per source photon/sr.
         grid (Grid): grid of the points (in the solver the quadrature grid).
-        geometry (ConeGeometry): scanner geometry.
+        geometry (ConeGeometry or ParallelGeometry): scanner geometry.
         angle (float): view angle in radians.
         omegas (Tensor): [K, 3] unit directions.
         chunk (int, optional): directions per batch. Defaults to 4.
@@ -271,7 +271,7 @@ def _first_collision_source_torch_pairs(library: MultigroupLibrary, pairs: Mater
         pairs (MaterialPairs): pair representation of the material densities.
         phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence in photons/cm^2 per source photon/sr.
         grid (Grid): grid of the points (in the solver the quadrature grid).
-        geometry (ConeGeometry): scanner geometry.
+        geometry (ConeGeometry or ParallelGeometry): scanner geometry.
         angle (float): view angle in radians.
         omegas (Tensor): [K, 3] unit directions.
         chunk (int, optional): directions per batch. Defaults to 4.
@@ -413,7 +413,7 @@ def first_collision_sampling_correction(library: MultigroupLibrary, rho: Tensor,
         rho (Tensor): [M, rows, cols, slices] material densities rho in g/cm^3.
         phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence in photons/cm^2 per source photon/sr.
         grid (Grid): grid of the points (in the solver the quadrature grid).
-        geometry (ConeGeometry): scanner geometry.
+        geometry (ConeGeometry or ParallelGeometry): scanner geometry.
         angle (float): view angle in radians.
         omegas (Tensor): [K, 3] unit directions of the quadrature.
         weights (Tensor): [K] quadrature weights in sr.
@@ -478,7 +478,7 @@ def first_collision_quadrature_sums(library: MultigroupLibrary, rho: Tensor, phi
         rho (Tensor): [M, rows, cols, slices] material densities rho in g/cm^3.
         phi_uncollided (Tensor): [G, rows, cols, slices] uncollided fluence in photons/cm^2 per source photon/sr.
         grid (Grid): grid of the points (in the solver the quadrature grid).
-        geometry (ConeGeometry): scanner geometry.
+        geometry (ConeGeometry or ParallelGeometry): scanner geometry.
         angle (float): view angle in radians.
         omegas (Tensor): [K, 3] unit directions of the quadrature.
         weights (Tensor): [K] quadrature weights in sr.

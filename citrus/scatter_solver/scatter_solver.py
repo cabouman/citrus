@@ -286,7 +286,7 @@ class ViewResult:
 # =====================================================================================================
 
 class ScatterSolver:
-    """Deterministic CBCT scatter solver (LBTE source iteration), one view at a time.
+    """Deterministic CT scatter solver (LBTE source iteration) of a cone or parallel beam, one view at a time.
 
     With ``library=None`` the solver is lazy: the library is built on first use (the ``library`` property), and the
     configuration may be replaced until then.

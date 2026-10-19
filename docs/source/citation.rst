@@ -15,7 +15,7 @@ referencing this package:
    }
 
 GitHub's "Cite this repository" button on the `repository page <https://github.com/cabouman/citrus>`_ generates the
-citation of the installed version from ``CITATION.cff``.
+citation of the current version from ``CITATION.cff``.
 
 Related work
 ------------

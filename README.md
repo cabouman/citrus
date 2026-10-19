@@ -4,8 +4,8 @@
 volumes from scatter-contaminated projections by iterating model-based iterative reconstruction (MBIR, via
 [MBIRTORCH](https://github.com/cabouman/mbirtorch)) and a deterministic scatter solver for the linear Boltzmann
 transport equation (LBTE) **jointly**: every outer iteration refreshes the scatter estimate with one source-iteration
-step of the scatter solver from the current reconstruction and runs a chosen number of MBIR iterations on the
-corrected data. This replaces the usual sequential
+step of the scatter solver from the current reconstruction and runs MBIR iterations on the corrected data (as many as
+the fit of the corrected data keeps improving, by default). This replaces the usual sequential
 pipeline (FDK, one scatter estimate from that volume, correction, then a reconstruction that never revisits the
 scatter), whose scatter estimate inherits the errors of the scatter-corrupted initial volume.
 
@@ -29,11 +29,11 @@ Phi_{>1}^{(k)} = G_k phi_1^{(k)} + G_k Phi_{>1}^{(k-1)}
              = G_k phi_1^{(k)} + G_k G_{k-1} phi_1^{(k-1)} + G_k G_{k-1} G_{k-2} phi_1^{(k-2)} + ...
 ```
 
-where `phi_1^{(k)}` is the uncollided fluence of reconstruction k. Expanded, the second-order scatter comes from the
+where `phi_1^{(k)}` is the first-collision source of reconstruction k (from its uncollided fluence). Expanded, the second-order scatter comes from the
 newest reconstruction, the third order from the previous one, and so on: the dominant low-order scatter is always
 refreshed from the freshest reconstruction, while stale information is relegated to the weaker and smoother
 higher orders. With fixed densities the recursion *is* source iteration and converges to the fully converged scatter
-estimate, so the scatter and the reconstruction converge together for the cost of one sweep per view per MBIR
+estimate, so the scatter and the reconstruction converge together for the cost of one sweep per view per outer
 iteration.
 
 ## The scatter solver
@@ -45,6 +45,11 @@ harmonics, linear-discontinuous finite elements on a grid of transport cells swe
 over collision order, and a collapsed-cone projection of the last-collided source onto the detector with a finite-cone
 footprint, detector and anti-scatter-grid responses. It runs in PyTorch with fused Triton kernels (ray tracing,
 first-collision source, sweep).
+
+The user supplies the source spectrum (a two-column file, or one node for a monoenergetic source) and chooses the
+reference materials of the density model from a catalogue of compounds, tissues and every element, or defines their
+own. The scan is a cone beam with a flat or curved panel and circular or helical views, or a parallel beam; the source
+may carry an emission profile measured from the open field (a bowtie filter, the heel effect).
 
 ## Installation
 
@@ -70,7 +75,8 @@ Install PyTorch first if you need a specific CUDA build. Every dependency instal
 
 Developer tools: `dev_scripts/` (conda test environment, clean install, tests, docs, CUDA check);
 `benchmarks/` (benchmarks of the sweep, the first-collision source and the ray tracer, a profile of the CITRUS
-step, and the CITRUS study script `citrus_study.py`).
+step, the GPU memory of the loop, fixed against adaptive numbers of MBIR iterations, and the CITRUS study script
+`citrus_study.py`).
 
 ## Quick start
 

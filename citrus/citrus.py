@@ -1,7 +1,7 @@
 """The CITRUS reconstruction loop: scatter-corrected MBIR with the LBTE scatter solver in the loop.
 
 Every outer iteration advances the collided fluence of every view by one transport sweep, divides the measured counts
-by one plus the scatter-to-primary ratio of the current densities and runs one warm-started MBIR iteration on the
+by one plus the scatter-to-primary ratio of the current densities and runs warm-started MBIR iterations on the
 corrected data. The module holds the loop (``citrus_recon``, ``mbir_recon``), the per-view scatter step and its
 operators, the density model, the compact per-view state storage and the angular interpolation of sparse-view scatter.
 The method is described in docs/source/method.rst, "The CITRUS loop" and "Options and secondary components".
@@ -990,7 +990,7 @@ def estimate_regularization(model, sinogram: Tensor, weights: Optional[Tensor] =
     """MBIRTORCH's automatic regularization of a sinogram, then frozen in the model.
 
     Args:
-        model (ConeBeamModel): MBIRTORCH model.
+        model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model.
         sinogram (Tensor): [V, Rd, Cd] line integrals.
         weights (Tensor, optional): [V, Rd, Cd] weights. Defaults to None.
 
@@ -1007,7 +1007,7 @@ def apply_regularization(model, regularization: dict) -> None:
     """Set a frozen regularization in the model (``auto_regularize_flag`` False).
 
     Args:
-        model (ConeBeamModel): MBIRTORCH model.
+        model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model.
         regularization (dict): ``sigma_y``, ``sigma_x`` and ``sigma_prox``.
     """
     model.set_params(no_warning=True, auto_regularize_flag=False,
@@ -1058,7 +1058,7 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
         regularization (dict or None): frozen regularization; None estimates it on the first corrected sinogram.
         init_recon (Tensor or None): [R, C, S] initial volume in 1/cm; None uses the direct reconstruction (FDK, or
             the filtered back projection of a parallel beam) of the uncorrected data.
-        model (ConeBeamModel or None): prebuilt MBIRTORCH model; None builds it.
+        model (ConeBeamModel, ParallelBeamModel or None): prebuilt MBIRTORCH model; None builds it.
         callback (callable or None): ``callback(k, X_k, record)`` for the initial volume (k = 0) and after every
             outer iteration k = 1, ..., N.
         mbir_callback (callable or None, optional): ``mbir_callback(i, X, record)`` for the initial volume (i = 0)
@@ -1081,7 +1081,7 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
         model = make_model(grid, geometry, angles, device=device)
     t0 = time.perf_counter()
     if init_recon is None:
-        # FDK (Parker-weighted for a short scan), or the filtered back projection of a parallel beam
+        # FDK, or the filtered back projection of a parallel beam, with the redundancy weights of the range
         X = direct_reconstruction(model, measured_line_integrals, geometry=geometry, angles=angles)
     else:
         X = torch.as_tensor(init_recon, dtype=torch.float32, device=device).clone()
@@ -1213,7 +1213,7 @@ def _sinogram_nrmse(model, X: Tensor, line_integrals: Tensor) -> float:
     """Relative RMSE of the forward projection of a volume against a sinogram, ``|A X - y| / |y|``.
 
     Args:
-        model (ConeBeamModel): MBIRTORCH model.
+        model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model.
         X (Tensor): [R, C, S] volume in 1/cm.
         line_integrals (Tensor): [V, Rd, Cd] sinogram y.
 
@@ -1334,7 +1334,7 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
                  grid: Grid, geometry: ConeGeometry, solver: ScatterSolver, config: Optional[CitrusConfig] = None,
                  *, regularization: Optional[dict] = None, init_recon: Optional[Tensor] = None, model=None,
                  callback: Optional[Callable[[int, Tensor, dict], None]] = None,
-                 mbir_callback: Optional[Callable[[int, Tensor], None]] = None,
+                 mbir_callback: Optional[Callable[[int, Tensor, dict], None]] = None,
                  detector_gain: Optional[Union[Tensor, np.ndarray]] = None) -> tuple[Tensor, dict]:
     """CITRUS reconstruction of measured counts: MBIR with the scatter correction of the solver in the loop.
 
@@ -1488,7 +1488,7 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Tens
                spr: Optional[Union[Tensor, np.ndarray]] = None, regularization: Optional[dict] = None,
                init_recon: Optional[Tensor] = None, model=None, device=None,
                callback: Optional[Callable[[int, Tensor, dict], None]] = None,
-               mbir_callback: Optional[Callable[[int, Tensor], None]] = None,
+               mbir_callback: Optional[Callable[[int, Tensor, dict], None]] = None,
                mbir_iterations_schedule: Optional[Sequence[int]] = None) -> tuple[Tensor, dict]:
     """The MBIR loop of ``citrus_recon`` without the scatter solver: no correction, or a fixed correction.
 

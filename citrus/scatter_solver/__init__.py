@@ -1,10 +1,10 @@
 """The LBTE source iteration scatter solver.
 
-A deterministic solver of the linear Boltzmann transport equation (LBTE) for cone-beam CT scatter: multigroup in
-energy, discrete ordinates in angle, linear-discontinuous finite elements in space, source iteration over collision
-order and a collapsed-cone projection of the last-collided source onto the detector. The package exports the main
-classes and functions of its modules; docs/source/api.rst lists the modules and docs/source/method.rst describes the
-method.
+A deterministic solver of the linear Boltzmann transport equation (LBTE) for CT scatter of cone and parallel beams:
+multigroup in energy, discrete ordinates in angle, linear-discontinuous finite elements in space, source iteration over
+collision order and a collapsed-cone projection of the last-collided source onto the detector. The package exports the
+main classes and functions of its modules; docs/source/api.rst lists the modules and docs/source/method.rst describes
+the method.
 """
 
 from .config import SolverConfig

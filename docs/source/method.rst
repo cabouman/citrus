@@ -12,10 +12,11 @@ The CITRUS loop
 Outer iteration
 ~~~~~~~~~~~~~~~
 
-MBIR reconstructs a monoenergetic attenuation map :math:`X` at an effective energy :math:`E_{eff}` (the spectrum mean)
-from the measured counts :math:`Y`, primary plus scatter, with flat field :math:`I_0` (a number, or the measured
-open-field image, below "Source emission profile and open field"). The loop starts from the FDK
-reconstruction :math:`X_0` of the uncorrected data, and outer iteration :math:`k = 1, \dots, N`
+MBIR reconstructs a monoenergetic attenuation map :math:`X` at an effective energy :math:`E_{eff}` (the spectrum
+mean, or ``CitrusConfig.energy_kev``) from the measured counts :math:`Y`, primary plus scatter, with flat field
+:math:`I_0` (a number, or the measured open-field image, below "Source emission profile and open field"). The loop
+starts from the FDK reconstruction :math:`X_0` of the uncorrected data (the filtered back projection for a parallel
+beam), and outer iteration :math:`k = 1, \dots, N`
 
 1. converts :math:`X_{k-1}` into the densities :math:`\rho_k` of the library's reference materials (the density
    model, below);
@@ -25,7 +26,8 @@ reconstruction :math:`X_0` of the uncorrected data, and outer iteration :math:`k
    corrected data (``mbir_iterations_per_outer_iteration``), which give :math:`X_k`.
 
 Steps 1 to 3 are the scatter stage, step 4 the MBIR stage; :math:`n` sets how many MBIR iterations follow each scatter
-correction ("MBIR iterations per outer iteration", below).
+correction and :math:`N` how many outer iterations run; by default both are adaptive ("MBIR iterations per outer
+iteration", below).
 
 Age-ordered source iteration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -73,8 +75,9 @@ Warm-started MBIR
 ~~~~~~~~~~~~~~~~~
 
 Each outer iteration runs :math:`n` vectorized coordinate descent (VCD) iterations of MBIRTORCH on :math:`y_c`,
-started from :math:`X_{k-1}` at position :math:`(k-1)n` of the partition schedule, with the weights :math:`W` and a
-regularization that is estimated once and then frozen. The partitions are drawn from a random generator seeded with
+started from :math:`X_{k-1}` at the position of the partition schedule after the MBIR iterations run so far (MBIR
+iterations are counted over the whole loop), with the weights :math:`W` and a regularization that is estimated once
+on the first corrected sinogram and then frozen. The partitions are drawn from a random generator seeded with
 ``[base_seed, i]`` before MBIR iteration :math:`i`, so runs with identical inputs give identical MBIR sequences.
 ``mbir_recon`` runs the same loop without the solver (no
 correction, or a fixed SPR), so a comparison can share the initialization, the weights, the partition sequence and the
@@ -371,7 +374,8 @@ per source photon per steradian.
 
 **Grid angles.** The anti-scatter grid is one-dimensional: its lamellae run along :math:`u` (channels), repeat along
 :math:`v` (rows) and are focused on the line parallel to :math:`u` at the focal distance from the panel along the
-panel normal :math:`\hat n` (by default the source-detector distance, a grid focused at the focal spot). With
+panel normal :math:`\hat n` (by default the source-detector distance, a grid focused at the focal spot; infinite, an
+unfocused grid, for a parallel beam). With
 :math:`\mathbf a = -\boldsymbol\Omega` and :math:`\mathbf f` the vector from the pixel to the focal line,
 
 .. math::
@@ -410,10 +414,11 @@ replaces both. ``csi_response`` is the full-deposition model of CsI with a coars
 **Grid model.** ``focused_1d_grid`` and ``anti_scatter_grid`` are a
 geometric lamella-shadow model for lamellae of thickness :math:`t` and height :math:`h` at pitch :math:`p`. A photon
 tilted by :math:`\theta_1` passes the interspace only with the open fraction
-:math:`o = \max(0, (p - t) - h|\tan\theta_1|)/p`; the mean lead path over all photons is
-:math:`(t/p)\,h/\cos\theta_1`, so the shadowed photons cross the mean lead path
+:math:`o = \max(0, (p - t) - h|\tan\theta_1|)/p`; the mean septum path over all photons is
+:math:`(t/p)\,h/\cos\theta_1`, so the shadowed photons cross the mean septum path
 :math:`L_s = (t/p)\,h/\cos\theta_1/(1 - o)` (:math:`h` at :math:`\theta_1 = 0`), and
-:math:`G = o + (1 - o)\,e^{-\mu_{Pb}(E)\,\rho_{Pb}\,L_s}`. A tilt along the lamellae does not change the shadow, so
+:math:`G = o + (1 - o)\,e^{-\mu_{s}(E)\,\rho_{s}\,L_s}` with the mass attenuation :math:`\mu_s` and density
+:math:`\rho_s` of the septa (lead for ``focused_1d_grid``). A tilt along the lamellae does not change the shadow, so
 :math:`G` does not depend on :math:`\theta_2`; the interspace material and the cover are ignored. The geometry is
 set by :math:`(t, h, p)` alone: the nominal ratio is only a label (with the default lamellae,
 :math:`h/(p - t) = 11.5` and :math:`h/p = 9.0` for a nominal 10:1 grid). The open fraction is the mean over one
@@ -574,10 +579,9 @@ once an outer iteration lowers the residual by less than ``stop_relative_improve
 counts run as given. With the resumed error sinogram (the default) the residual costs nothing; the records hold it at
 the start and the end of every outer iteration (``sinogram_nrmse_start``, ``sinogram_nrmse``).
 
-Measured against wall time, fixed blocks of four or more MBIR iterations and the adaptive rule follow the same
-error curve (an MBIR iteration is much cheaper than a scatter stage, so the iterations the rule saves buy little),
-so the rule is a stopping criterion rather than a speed-up: it ends the MBIR iterations when the fit has saturated
-and, with the outer rule, the reconstruction when a further scatter correction no longer changes the fit.
+The rule is a stopping criterion rather than a speed-up (an MBIR iteration is much cheaper than a scatter stage, so
+the iterations it saves buy little time): it ends the MBIR iterations when the fit has saturated and, with the outer
+rule, the reconstruction when a further scatter correction no longer changes the fit.
 
 Scatter step on every m-th view
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -701,8 +705,8 @@ over a larger solid angle and leave the panel), while the primary does not depen
 the first-collision kernel have a parallel mode (the ``PARALLEL`` constant), checked against the PyTorch path like the
 cone modes. MBIRTORCH reconstructs the parallel beam with ``ParallelBeamModel``, whose initial volume is its filtered
 back projection (``recon.mbir_bridge.direct_reconstruction``), with the redundancy weights of a range that is not
-a whole number of half rotations (fan angle 0, above); the default range of a parallel scan (``view_angles``) is 180
-degrees.
+whole rotations (fan angle 0, above; over 180 degrees they are all one); the default range of a parallel scan
+(``view_angles``) is 180 degrees.
 The sparse-view interpolation runs along the arc of such a scan, as for a short cone-beam scan: the views at
 :math:`\beta` and :math:`\beta + \pi` see the object from opposite sides of the panel, so their scatter differs.
 
