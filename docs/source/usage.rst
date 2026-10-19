@@ -31,12 +31,13 @@ the counts with ``synthesize_cone_beam_data``, reconstructs them with ``citrus_r
 scatter step on every 8th view), prints the relative RMSE of the initial FDK volume and of CITRUS against the truth and
 shows the central slices and central-row profiles of the truth and of CITRUS.
 
-``demo_3_helical_cone.py`` scans the WLAB prism with a helix (``helical_scan``) on a cylindrical panel
+``demo_3_helical_cone.py`` scans MBIRTORCH's 3-D Shepp-Logan phantom (``gen_shepp_logan_3d``), turned into
+densities of bone, soft tissue, muscle and fat, with a helix (``helical_scan``) on a cylindrical panel
 (``ConeGeometry(use_curved_detector=True)``) of energy-integrating CsI (``detector_response("cesium_iodide", ...)``)
 behind a CT-style grid: tungsten septa parallel to the rotation axis (``anti_scatter_grid(..., septa_along="rows")``),
 each focused on the source. The pitch, the number of turns and the
-panel height are chosen so that the helix covers the whole 40 cm height of the prism; the demo also shows a coronal
-slice.
+panel height are chosen so that the helix covers the whole height of the head, whose cross-section changes along z;
+the demo also shows a coronal slice.
 
 ``demo_4_materials.py`` defines an iodine contrast agent and a dental amalgam with ``Material``, puts them in
 ``SolverConfig.materials`` next to catalogue names and builds a small head phantom (a water cylinder with a bone rod,

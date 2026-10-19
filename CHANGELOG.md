@@ -7,6 +7,8 @@
   geometry=)`, used by `citrus_recon`). The shift is not magnified: the scattering object moves by that much relative
   to the panel, while the irradiated slab and the scatter's envelope stay fixed on it. The gain is largest for objects
   whose z extent is short compared with the beam.
+- **Demo 3.** The helical scan images MBIRTORCH's 3-D Shepp-Logan phantom, turned into densities of bone, soft
+  tissue, muscle and fat, instead of the WLAB prism, so the object changes along z.
 
 ## v0.21.1 - 2026-10-19
 
