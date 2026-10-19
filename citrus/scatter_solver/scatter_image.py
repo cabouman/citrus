@@ -58,8 +58,9 @@ tl = triton_utilities.tl
 def covering_polar_angle(grid: Grid, geometry: ConeGeometry, angle: float, margin: float = 1e-6) -> float:
     """Smallest polar angle about the inward panel normal that contains every direction from the grid box to the panel.
 
-    The maximum is attained at a pair of a panel corner and a box corner; the result is pi/2 when a box corner is not
-    strictly on the source side of the panel plane.
+    The maximum is attained at a pair of a panel corner and a box corner (on a curved panel, a point of its top or
+    bottom edge, sampled four times per channel); the result is pi/2 when a box corner is not strictly on the source
+    side of the panel along the normal at its center.
 
     Args:
         grid (Grid): the grid whose box is covered.
@@ -78,9 +79,14 @@ def covering_polar_angle(grid: Grid, geometry: ConeGeometry, angle: float, margi
     panel_center = torch.tensor(geometry.panel_center(angle), dtype=torch.float64)
     half_u, half_v = geometry.panel_half_extent()
     center_u, center_v = -geometry.det_channel_offset, -geometry.det_row_offset
-    panel_corners = torch.stack([panel_center + (center_u + su * half_u) * u_hat + (center_v + sv * half_v) * v_hat
-                                 for su in (-1, 1) for sv in (-1, 1)])
-    d = panel_corners[:, None, :] - corners[None, :, :]  # [4, 8, 3]
+    if geometry.use_curved_detector:  # the top and bottom edges of the cylinder, sampled four times per channel
+        edge_u = center_u + torch.linspace(-half_u, half_u, 4 * geometry.num_det_channels + 1, dtype=torch.float64)
+        edge_v = center_v + torch.tensor([-half_v, half_v], dtype=torch.float64)
+        panel_corners = geometry.panel_points(edge_u[:, None], edge_v[None, :], angle).reshape(-1, 3)
+    else:
+        panel_corners = torch.stack([panel_center + (center_u + su * half_u) * u_hat
+                                     + (center_v + sv * half_v) * v_hat for su in (-1, 1) for sv in (-1, 1)])
+    d = panel_corners[:, None, :] - corners[None, :, :]  # [P, 8, 3]
     normal_distance = (d * (-n_hat)).sum(-1)
     if bool((normal_distance <= 0).any()):
         return math.pi / 2
@@ -144,11 +150,12 @@ class DirectionSetContext:
         group_energy (Tensor): [G] group energies in keV.
         omega (Tensor): [K, 3] panel-facing directions, one contiguous tensor.
         weight (Tensor): [K] quadrature weights in sr.
-        cos_theta0 (Tensor): [K] cosine of the angle theta0 between each direction and the inward panel normal.
+        cos_theta0 (Tensor): [K] cosine of the angle theta0 between each direction and the inward panel normal (at the
+            panel center on a curved panel).
         detector_weight (Tensor): [K, G] detector response ``D_g(theta0_k)`` in keV per incident photon.
         grid_weight (Tensor): [K, G, Rd, 1] grid transmission per detector row when separable, else None.
         signal_weight (Tensor): [K, G, Rd, Cg] signal weights ``w_k cos(theta0_k) D_g G_g`` (Cg = 1 when separable,
-            else Cd).
+            else Cd); [K, G, 1, Cd] on a curved panel, without the grid when ``grid_per_pixel``.
         accumulation_weight (Tensor): [G Rd, 3, K] fused weights of :meth:`accumulate` when separable, else None.
         separable (bool): the grid response depends on the detector row only (flat panel).
         chunk (int): directions per chunk.
@@ -158,6 +165,10 @@ class DirectionSetContext:
         image_shape (tuple): (Rd, Cd).
         cell_width (Tensor): [K, 2] gnomonic cell widths of the directions for the finite-cone footprint, or None.
             Defaults to None.
+        planar_weight (Tensor): [K, Cd] weights ``w_k cos(theta0_kc)`` with the incidence angle at each channel of a
+            curved panel (zero where the direction meets the panel from behind), else None. Defaults to None.
+        grid_per_pixel (bool): a curved panel whose grid transmission depends on the angles: :meth:`accumulate`
+            evaluates it per pixel for each chunk of directions. Defaults to False.
     """
 
     quadrature: Quadrature
@@ -180,6 +191,8 @@ class DirectionSetContext:
     weight_chunks: tuple[Tensor, ...]
     image_shape: tuple[int, int]
     cell_width: Optional[Tensor] = None
+    planar_weight: Optional[Tensor] = None
+    grid_per_pixel: bool = False
     _cache: dict = field(default_factory=dict, repr=False)
 
     # ---- sizes ----------------------------------------------------------------------------------
@@ -208,7 +221,8 @@ class DirectionSetContext:
         """Bytes held by the context's tensors (distinct storages, lazily cached entries included)."""
         seen: dict[int, int] = {}
         tensors = [t for t in (self.group_energy, self.omega, self.weight, self.cos_theta0, self.detector_weight,
-                               self.grid_weight, self.signal_weight, self.accumulation_weight, self.cell_width)
+                               self.grid_weight, self.signal_weight, self.accumulation_weight, self.cell_width,
+                               self.planar_weight)
                    if t is not None]
         for v in self._cache.values():
             tensors.extend(t for t in (v if isinstance(v, tuple) else (v,)) if isinstance(t, Tensor))
@@ -324,8 +338,35 @@ class DirectionSetContext:
             return
         weights = self.weight_chunks[chunk_index]
         accumulator[0].add_(torch.einsum("kgrc,k->grc", image, weights))
+        if self.planar_weight is not None:  # curved panel: the incidence angle varies with the channel
+            accumulator[1].add_(torch.einsum("kgrc,kc->grc", image, self.planar_weight[start:stop]))
+            signal_weight = self.signal_weight[start:stop]  # [k, G, 1, Cd]
+            if self.grid_per_pixel:
+                accumulator[2].add_((image * (signal_weight * self._grid_transmission(start, stop))).sum(0))
+            else:
+                accumulator[2].add_(torch.einsum("kgrc,kgc->grc", image, signal_weight[:, :, 0]))
+            return
         accumulator[1].add_(torch.einsum("kgrc,k->grc", image, weights * self.cos_theta0[start:stop]))
         accumulator[2].add_((image * self.signal_weight[start:stop]).sum(0))
+
+    def _grid_transmission(self, start: int, stop: int) -> Tensor:
+        """Grid transmission of directions [start, stop) at every pixel of a curved panel, in float64 arithmetic.
+
+        Args:
+            start (int): first direction.
+            stop (int): end direction (excluded).
+
+        Returns:
+            Tensor: [stop - start, G, Rd, Cd] transmission in the context's dtype.
+        """
+        pixels = self._cache.get("pixels64")
+        if pixels is None:
+            pixels = self._cache["pixels64"] = self.geometry.pixel_centers(self.angle, self.device, torch.float64)
+        omega = self.omega[start:stop].to(torch.float64)
+        theta1, theta2 = grid_angles(omega, pixels, self.geometry, self.angle, self.grid_response.focal_distance_cm,
+                                     self.grid_response.septa_along)
+        energy = self.group_energy.to(torch.float64)
+        return self.grid_response.at(energy, theta1, theta2).permute(1, 0, 2, 3).to(self.dtype)
 
     def finalize(self, accumulator: Tensor) -> dict[str, Tensor]:
         """Image dict from an accumulator.
@@ -416,6 +457,9 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
     K = int(omega64.shape[0])
     pixels = geometry.pixel_centers(angle, device, float64)  # [Rd, Cd, 3]
     Rd, Cd = int(pixels.shape[0]), int(pixels.shape[1])
+    if geometry.use_curved_detector:
+        return _curved_panel_context(quadrature, geometry, angle, detector, grid_response, energy64, omega64, weight64,
+                                     cos64, kept, pixels, chunk, dtype)
     focal_distance = grid_response.focal_distance_cm
     # detector response: theta0 per direction -> [G, K]
     detector_response = (detector.at(energy64, detector_angle(omega64, geometry, angle)) if K
@@ -471,6 +515,68 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
         chunk_bounds=chunk_bounds, omega_chunks=tuple(omega[start:stop] for start, stop in chunk_bounds),
         weight_chunks=tuple(weight[start:stop] for start, stop in chunk_bounds), image_shape=(Rd, Cd),
         cell_width=cell_width)
+
+
+def _curved_panel_context(quadrature: Quadrature, geometry: ConeGeometry, angle: float, detector: DetectorResponse,
+                          grid_response: GridResponse, energy64: Tensor, omega64: Tensor, weight64: Tensor,
+                          cos64: Tensor, kept: Tensor, pixels: Tensor, chunk: int,
+                          dtype: torch.dtype) -> DirectionSetContext:
+    """Direction context of a curved panel, whose incidence angle theta0 varies with the channel.
+
+    The planar and signal weights are stored per (direction, channel); a grid transmission that depends on the angles
+    is left to :meth:`DirectionSetContext.accumulate` (``grid_per_pixel``), which evaluates it per chunk.
+
+    Args:
+        quadrature (Quadrature): direction set.
+        geometry (ConeGeometry): cone-beam geometry with a curved panel.
+        angle (float): view angle in radians.
+        detector (DetectorResponse): detector response.
+        grid_response (GridResponse): anti-scatter-grid response.
+        energy64 (Tensor): [G] float64 group energies in keV.
+        omega64 (Tensor): [K, 3] float64 panel-facing directions.
+        weight64 (Tensor): [K] float64 quadrature weights in sr.
+        cos64 (Tensor): [K] float64 cosines to the inward normal at the panel center.
+        kept (Tensor): [K] indices of the panel-facing directions in ``quadrature``.
+        pixels (Tensor): [Rd, Cd, 3] float64 pixel centers.
+        chunk (int): directions per chunk.
+        dtype (torch.dtype): dtype of the images.
+
+    Returns:
+        DirectionSetContext: the context, with ``planar_weight`` set.
+    """
+    device = omega64.device
+    G, K = int(energy64.numel()), int(omega64.shape[0])
+    Rd, Cd = int(pixels.shape[0]), int(pixels.shape[1])
+    normals = geometry.local_panel_axes(pixels[0], angle)[2]  # [Cd, 3], the same on every row
+    cos_channel = (omega64 @ normals.neg().t()).clamp(0.0, 1.0)  # [K, Cd]; 0 for a panel met from behind
+    detector_channel = detector.at(energy64, torch.arccos(cos_channel))  # [G, K, Cd]
+    planar = weight64[:, None] * cos_channel  # [K, Cd]
+    signal = planar[None] * detector_channel  # [G, K, Cd]
+    table = grid_response.transmission
+    grid_per_pixel = not bool((table == table[:, :1, :1]).all())  # the transmission depends on the angles
+    if not grid_per_pixel:
+        zero = torch.zeros(1, device=device, dtype=torch.float64)
+        signal = signal * grid_response.at(energy64, zero, zero)[:, :, None]  # [G, 1, 1]
+    detector_weight = detector.at(energy64, detector_angle(omega64, geometry, angle)).t() if K else (
+        torch.zeros(0, G, device=device, dtype=torch.float64))
+    chunk = max(1, int(chunk))
+    chunk_bounds = tuple((start, min(start + chunk, K)) for start in range(0, K, chunk))
+    omega = omega64.to(dtype).contiguous()
+    weight = weight64.to(dtype).contiguous()
+    cell_width = getattr(quadrature, "cell_width", None)
+    cell_width = None if cell_width is None else cell_width.detach().to(device, dtype)[kept].contiguous()
+    context = DirectionSetContext(
+        quadrature=quadrature, geometry=geometry, angle=float(angle), detector=detector, grid_response=grid_response,
+        group_energy=energy64.to(dtype), omega=omega, weight=weight, cos_theta0=cos64.to(dtype),
+        detector_weight=detector_weight.to(dtype).contiguous(), grid_weight=None,
+        signal_weight=signal.permute(1, 0, 2)[:, :, None, :].to(dtype).contiguous(), accumulation_weight=None,
+        separable=False, chunk=chunk, chunk_bounds=chunk_bounds,
+        omega_chunks=tuple(omega[start:stop] for start, stop in chunk_bounds),
+        weight_chunks=tuple(weight[start:stop] for start, stop in chunk_bounds), image_shape=(Rd, Cd),
+        cell_width=cell_width, planar_weight=planar.to(dtype).contiguous(), grid_per_pixel=grid_per_pixel)
+    if grid_per_pixel:
+        context._cache["pixels64"] = pixels
+    return context
 
 
 def _resolve_context(context: Optional[DirectionSetContext], quadrature: Quadrature, geometry: ConeGeometry,
@@ -1073,7 +1179,7 @@ def primary_from_path_lengths(library: MultigroupLibrary, path: Tensor, material
     fluence = (b / distance_squared)[None] * transmission
     omega_p = d / distance_squared.sqrt()[..., None]
     group_energy = library.group_energy.to(device, dtype)
-    theta0 = detector_angle(omega_p, geometry, angle)  # [Rd, Cd]
+    theta0 = detector_angle(omega_p, geometry, angle, pixels)  # [Rd, Cd]
     planar = fluence * torch.cos(theta0)
     detector_response = detector.at(group_energy, theta0)  # [G, Rd, Cd]
     theta1, theta2 = grid_angles(omega_p, pixels, geometry, angle, grid_response.focal_distance_cm,

@@ -281,7 +281,10 @@ axis follows with a zero-length segment, as the coincident sorted parameters of 
 are recomputed from the voxel index at every step with the reference's arithmetic, so no error accumulates along the
 ray. The loop runs to the largest per-ray bound of the block, :math:`1 + \sum_a (\lfloor L_a / \Delta_a \rfloor + 1)
 + 1` steps, with finished lanes masked. Each ray integral equals the PyTorch path up to float32 rounding of the
-crossing parameters and the summation order.
+crossing parameters and the summation order. The pixel modes compute each pixel center from the panel center and
+axes; with the ``CURVED`` constant they place it on the cylinder (``ConeGeometry.panel_points``, with
+:math:`1 - \cos\gamma` written as :math:`2\sin^2(\gamma/2)` to avoid cancellation), and a helical view only moves
+the focal spot and the panel center they receive.
 
 **Shared downstream crossings.** All rays of one direction start at voxel centers and are parallel, so the distance
 to the first plane of each axis is half a voxel for every ray, and the crossings
@@ -289,7 +292,8 @@ to the first plane of each axis is half a voxel for every ray, and the crossings
 ``_downstream_shared_kernel`` (one direction, a block of consecutive voxels) runs that scalar sequence once: the axis
 choice is uniform across the block, each ray only shifts its voxel index by the shared step, and the loads of a step
 are a contiguous strip of the volume. A ray stops at its box exit (per-ray index limits) or at the panel plane
-(:math:`t_{end}` = panel distance clamped to [0, box diagonal], the end point of the reference), so the result is
+(:math:`t_{end}` = panel distance clamped to [0, box diagonal], the end point of the reference; on a curved panel the
+larger root of the ray's intersection with the cylinder, in the reference's cancellation-free form), so the result is
 exact for any direction. Directions with :math:`\omega \cdot (-\hat n) \le 0` give +inf; that decision is passed in
 as flags computed with the reference's own PyTorch expression, so it agrees bit for bit for grazing directions.
 
@@ -310,8 +314,9 @@ MBIRTORCH coupling
 ------------------
 
 **Geometry.** The solver uses MBIRTORCH's frames verbatim, so ``recon.mbir_bridge.make_cone_model`` is a parameter
-copy. The region-of-reconstruction mask is off, because the WLAB grid tiles the prism and the mask would drop its
-corners.
+copy, including the panel shape (``use_curved_detector``) and the views' z shifts (``helical_z_shifts`` from the
+geometry's table at the model's angles, so a sub-model over some views gets their own shifts). The
+region-of-reconstruction mask is off, because the WLAB grid tiles the prism and the mask would drop its corners.
 
 **Units and devices.** MBIRTORCH projects in value times its arbitrary length unit; the bridge uses cm, so a volume
 in 1/cm projects to dimensionless line integrals. MBIRTORCH accepts torch tensors on any device and places them as

@@ -189,6 +189,24 @@ rounding), ``primary_views_per_chunk`` (views per chunk of the primary projectio
 lengths), ``gpu_state_budget_mib`` and ``pinned_memory_limit_gib`` (where the per-view accumulators are stored),
 ``energy_kev``, ``min_counts``, ``base_seed``, ``verbose``.
 
+A curved (cylindrical) panel and helical views are part of the geometry, so the same calls reconstruct them
+(:doc:`method`, "Curved panels and helical scans"; :doc:`conventions`, "Frames"):
+
+.. code-block:: python
+
+   from dataclasses import replace
+   from citrus.utilities import helical_scan, view_angles
+
+   panel = replace(geometry, use_curved_detector=True)              # channels are arc lengths on the cylinder
+   angles = view_angles(720, end_view_angle=4 * math.pi)            # two turns, unwrapped angles
+   helix = helical_scan(panel, angles, pitch_cm=12.0)               # 12 cm of table feed per turn
+   # or measured shifts: helix = panel.with_helical_z_shifts(angles, z_shifts), MBIRTORCH's helical_z_shifts
+   solver = wlab_solver(delta_voxel, geometry=helix, device="cuda", spectrum=spectrum)
+   recon, info = citrus_recon(Y, I0, angles, grid, helix, solver)
+
+The grid must hold the whole object the helix illuminates along z. The geometry of the scan and of the solver
+must be the same object (the helical table is keyed by the view angles).
+
 The per-view step is available on its own:
 
 .. code-block:: python

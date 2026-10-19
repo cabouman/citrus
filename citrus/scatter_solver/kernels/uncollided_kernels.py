@@ -154,9 +154,13 @@ def _self_check_table(device: torch.device, angular_table_grid: str) -> tuple[bo
     rho7d = rho7d.to(device)
     reference7d = _first_collision_source_torch(lib7, rho7d, phi, grid, geometry, angle, directions, chunk=4)
     out7d = first_collision_source(lib7, rho7d, phi, grid, geometry, angle, directions)
+    # a helical view: the focal spot off the plane z = 0
+    helical = geometry.with_helical_z_shifts([0.0, 1.0], [-1.5, 2.5])
+    reference_helical = _first_collision_source_torch(library, rho, phi, grid, helical, angle, directions, chunk=4)
+    out_helical = first_collision_source(library, rho, phi, grid, helical, angle, directions)
     torch.cuda.synchronize(device)
     worst = 0.0
-    for o, r in ((out, reference), (out7, reference7), (out7d, reference7d)):
+    for o, r in ((out, reference), (out7, reference7), (out7d, reference7d), (out_helical, reference_helical)):
         if o.shape != r.shape or not bool(torch.isfinite(o).all()):
             return False, "wrong shape or non-finite output"
         worst = max(worst, float((o - r).abs().max()) / max(float(r.abs().max()), 1e-30))

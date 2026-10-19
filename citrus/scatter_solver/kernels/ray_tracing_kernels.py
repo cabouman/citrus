@@ -95,6 +95,8 @@ def use_kernels(t: Tensor, backend: str) -> bool:
 def _self_check(device: torch.device) -> tuple[bool, str]:
     """Compare every kernel operation with the PyTorch Siddon path on a tiny random problem.
 
+    The pixel operations run on a flat panel and on a curved panel with a helical z shift.
+
     Args:
         device (torch.device): the CUDA device to check.
 
@@ -121,20 +123,25 @@ def _self_check(device: torch.device) -> tuple[bool, str]:
     b = (lo + (torch.rand(64, 3, generator=generator) * 1.6 - 0.3) * extent).to(device)
     volume_index = torch.randint(0, K, (64,), generator=generator).to(device)
     reference = SiddonProjectors(backend="torch")
-    pairs = [
-        (reference.upstream_cumulative(mu, grid, geometry, angle), upstream_cumulative(mu, grid, geometry, angle)),
-        (reference.primary_project(mu, grid, geometry, angle), primary_project(mu, grid, geometry, angle)),
-        (reference.primary_project(mu, grid, geometry, angle, samples_per_pixel_axis=2),
-         primary_project(mu, grid, geometry, angle, samples_per_pixel_axis=2)),
-        (reference.downstream_cumulative(mu, grid, geometry, angle, directions),
-         downstream_cumulative(mu, grid, geometry, angle, directions)),
-        (reference.oblique_project(field[0], grid, geometry, angle, directions),
-         oblique_project(field[0], grid, geometry, angle, directions)),
-        (reference.oblique_project(field, grid, geometry, angle, directions),
-         oblique_project(field, grid, geometry, angle, directions)),
-        (line_integrals(field, a, b, grid, volume_index=volume_index),
-         line_integrals_triton(field, a, b, grid, volume_index=volume_index)),
-    ]
+    # a curved panel close to the source (its cylinder cuts the grid box) with a helical z shift
+    curved = ConeGeometry(source_iso_dist=6.0, source_detector_dist=9.0, num_det_rows=9, num_det_channels=11,
+                          delta_det_row=1.1, delta_det_channel=1.3, det_channel_offset=0.4, use_curved_detector=True,
+                          helical_view_angles=(0.0, 1.0), helical_z_shifts=(-0.5, 1.5))
+    pairs = [(line_integrals(field, a, b, grid, volume_index=volume_index),
+              line_integrals_triton(field, a, b, grid, volume_index=volume_index))]
+    for g in (geometry, curved):
+        pairs += [
+            (reference.upstream_cumulative(mu, grid, g, angle), upstream_cumulative(mu, grid, g, angle)),
+            (reference.primary_project(mu, grid, g, angle), primary_project(mu, grid, g, angle)),
+            (reference.primary_project(mu, grid, g, angle, samples_per_pixel_axis=2),
+             primary_project(mu, grid, g, angle, samples_per_pixel_axis=2)),
+            (reference.downstream_cumulative(mu, grid, g, angle, directions),
+             downstream_cumulative(mu, grid, g, angle, directions)),
+            (reference.oblique_project(field[0], grid, g, angle, directions),
+             oblique_project(field[0], grid, g, angle, directions)),
+            (reference.oblique_project(field, grid, g, angle, directions),
+             oblique_project(field, grid, g, angle, directions)),
+        ]
     torch.cuda.synchronize(device)
     worst = 0.0
     for r, t in pairs:
@@ -320,9 +327,9 @@ if triton is not None:
                     M, sa_n, sa_c, sb_n, sb_c, sK, sG, sR, sC, sS, NX, NY, NZ, Rd, Cd,
                     lox, loy, loz, hix, hiy, hiz, ddx, ddy, ddz, zoff,
                     qx, qy, qz, ux_, uy_, uz_, vx_, vy_, vz_,
-                    rmid, cmid, drow, dch, rowoff, choff, bcx, bcy, bcz, half,
+                    rmid, cmid, drow, dch, rowoff, choff, bcx, bcy, bcz, half, nx_, ny_, nz_, rad,
                     MODE: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, HAS_VOLUME_INDEX: tl.constexpr,
-                    BLOCK: tl.constexpr):
+                    CURVED: tl.constexpr, BLOCK: tl.constexpr):
         """Trace one block of rays (program_id 0) of direction or volume index k (program_id 1) into ``out``.
 
         Writes ``out[(k G + g) M + m]``, with m the segment (MODE 0), the pixel ``r * Cd + c`` (MODE 1, 3) or the
@@ -379,10 +386,15 @@ if triton is not None:
             bcy: y of the box center (MODE 1) or of the focal spot (MODE 3) in cm.
             bcz: z of the box center (MODE 1) or of the focal spot (MODE 3) in cm.
             half: half length of the oblique segment about the box center in cm (MODE 1).
+            nx_: x component of the panel normal ``n_hat`` (CURVED).
+            ny_: y component of the panel normal ``n_hat`` (CURVED).
+            nz_: z component of the panel normal ``n_hat`` (CURVED).
+            rad: radius of the curved panel, the source-detector distance, in cm (CURVED).
             MODE (constexpr): end points: 0 given segments, 1 oblique pixel lines, 2 upstream, 3 primary.
             G (constexpr): number of energy groups.
             GP (constexpr): next power of two >= G.
             HAS_VOLUME_INDEX (constexpr): read ``volume_index_ptr`` (MODE 0).
+            CURVED (constexpr): the pixels lie on the cylinder of a curved panel (MODE 1, 3).
             BLOCK (constexpr): rays per program.
         """
         k = tl.program_id(1)
@@ -412,9 +424,20 @@ if triton is not None:
             o_idx = r * Cd + c
             u = (c.to(tl.float32) - cmid) * dch - choff
             v = (r.to(tl.float32) - rmid) * drow - rowoff
-            px = qx + u * ux_ + v * vx_
-            py = qy + u * uy_ + v * vy_
-            pz = qz + u * uz_ + v * vz_
+            if CURVED:
+                # ConeGeometry.panel_points: R sin(g) u_hat + 2 R sin^2(g / 2) n_hat + v cos(g) v_hat, g = u / R
+                gam = u / rad
+                sh = tl.sin(0.5 * gam)
+                au = rad * tl.sin(gam)
+                an = 2.0 * rad * sh * sh
+                av = v * tl.cos(gam)
+                px = qx + au * ux_ + an * nx_ + av * vx_
+                py = qy + au * uy_ + an * ny_ + av * vy_
+                pz = qz + au * uz_ + an * nz_ + av * vz_
+            else:
+                px = qx + u * ux_ + v * vx_
+                py = qy + u * uy_ + v * vy_
+                pz = qz + u * uz_ + v * vz_
             if MODE == 1:
                 ox = tl.load(direction_ptr + 3 * k)
                 oy = tl.load(direction_ptr + 3 * k + 1)
@@ -462,8 +485,8 @@ if triton is not None:
     @triton.jit(do_not_specialize=_DOWN_INTS,
                 do_not_specialize_on_alignment=["mu_ptr", "direction_ptr", "toward_ptr", "out_ptr"])
     def _downstream_shared_kernel(mu_ptr, direction_ptr, toward_ptr, out_ptr, V, sG, sR, sC, sS, NX, NY, NZ,
-                                  ddx, ddy, ddz, zoff, qx, qy, qz, nx_, ny_, nz_, diag,
-                                  G: tl.constexpr, GP: tl.constexpr, BLOCK: tl.constexpr):
+                                  ddx, ddy, ddz, zoff, qx, qy, qz, nx_, ny_, nz_, diag, sx, sy, rad,
+                                  G: tl.constexpr, GP: tl.constexpr, CURVED: tl.constexpr, BLOCK: tl.constexpr):
         """Downstream optical depth of BLOCK consecutive voxels (program_id 0) along direction k (program_id 1).
 
         All rays of the direction share one crossing sequence (docs/source/design_notes.rst, "Ray tracing and
@@ -493,8 +516,13 @@ if triton is not None:
             ny_: y component of the panel normal ``n_hat``.
             nz_: z component of the panel normal ``n_hat``.
             diag: upper bound of the path length (the box diagonal) in cm.
+            sx: x of the focal spot in cm (CURVED).
+            sy: y of the focal spot in cm (CURVED).
+            rad: radius of the curved panel, the source-detector distance, in cm (CURVED).
             G (constexpr): number of energy groups.
             GP (constexpr): next power of two >= G.
+            CURVED (constexpr): the panel is the cylinder of radius ``rad`` about the vertical axis through the focal
+                spot (``ConeGeometry.panel_distance_along``).
             BLOCK (constexpr): voxels per program.
         """
         k = tl.program_id(1)
@@ -511,8 +539,23 @@ if triton is not None:
         cx = ddx * (c.to(tl.float32) - (NX - 1) * 0.5)
         cy = ddy * (r.to(tl.float32) - (NY - 1) * 0.5)
         cz = ddz * (s.to(tl.float32) - (NZ - 1) * 0.5) + zoff
-        den = ox * nx_ + oy * ny_ + oz * nz_
-        t_end = ((qx - cx) * nx_ + (qy - cy) * ny_ + (qz - cz) * nz_) / den
+        if CURVED:
+            # larger root of |h(c + t omega - source)| = rad (h: the x, y part), as ConeGeometry computes it
+            hx = cx - sx
+            hy = cy - sy
+            qa = ox * ox + oy * oy
+            qb = hx * ox + hy * oy
+            qc = hx * hx + hy * hy - rad * rad
+            disc = qb * qb - qa * qc
+            root = tl.sqrt(tl.maximum(disc, 0.0))
+            pos = qb >= 0.0
+            qden = tl.where(pos, qb + root, tl.where(qa > 0.0, qa, 1.0))
+            qnum = tl.where(pos, -qc, root - qb)
+            ok = (qa > 0.0) & (disc >= 0.0) & (qden != 0.0)
+            t_end = tl.where(ok, qnum / tl.where(qden != 0.0, qden, 1.0), diag)
+        else:
+            den = ox * nx_ + oy * ny_ + oz * nz_
+            t_end = ((qx - cx) * nx_ + (qy - cy) * ny_ + (qz - cz) * nz_) / den
         t_end = tl.minimum(tl.maximum(t_end, 0.0), diag)
         # shared crossing geometry: plane m of axis a at t = (m + 1/2) delta_a / |omega_a|
         sgx = tl.where(ox > 0.0, 1, tl.where(ox < 0.0, -1, 0))
@@ -631,7 +674,8 @@ def _launch_ray(volume: Tensor, out: Tensor, num_rays: int, num_major: int, mode
         directions (Tensor, optional): [K, 3] float32 contiguous directions (MODE 1). Defaults to None.
         volume_stride (int, optional): element stride between volumes. Defaults to 0.
         geometry_scalars (dict, optional): mode-specific scalars with keys "q", "u", "v", "Rd", "Cd", "pixel",
-            "box_center" and "half"; missing keys are zero (1 for "Rd", "Cd"). Defaults to None.
+            "box_center", "half", "n", "radius" and "curved"; missing keys are zero (1 for "Rd", "Cd", False for
+            "curved"). Defaults to None.
     """
     geometry_scalars = geometry_scalars or {}
     sG, sR, sC, sS = (int(x) for x in volume.stride()[-4:])
@@ -655,9 +699,10 @@ def _launch_ray(volume: Tensor, out: Tensor, num_rays: int, num_major: int, mode
             lox, loy, loz, hix, hiy, hiz, dx, dy, dz, float(grid.recon_slice_offset),
             *(float(x) for x in q), *(float(x) for x in u_axis), *(float(x) for x in v_axis),
             *(float(x) for x in pixel_parameters), *(float(x) for x in box_center),
-            float(geometry_scalars.get("half", 0.0)))
+            float(geometry_scalars.get("half", 0.0)), *(float(x) for x in geometry_scalars.get("n", (0.0, 0.0, 0.0))),
+            float(geometry_scalars.get("radius", 0.0)))
     constexprs = dict(MODE=int(mode), G=int(G), GP=_next_pow2(G), HAS_VOLUME_INDEX=volume_index is not None,
-                      BLOCK=BLOCK_RAYS)
+                      CURVED=bool(geometry_scalars.get("curved", False)), BLOCK=BLOCK_RAYS)
     triton_utilities.launch(_ray_kernel, (triton.cdiv(max(num_rays, 1), BLOCK_RAYS), int(num_major), 1), args,
                             constexprs, NUM_WARPS)
 
@@ -723,14 +768,19 @@ def _pixel_geometry_scalars(geometry, angle: float) -> dict:
         angle (float): view angle in radians.
 
     Returns:
-        dict: "q" panel center, "u" and "v" panel axes, "Rd", "Cd" detector size and "pixel" (center row, center
-        channel, row spacing, channel spacing, row offset, channel offset) in cm.
+        dict: "q" panel center, "u" and "v" panel axes, "Rd", "Cd" detector size, "pixel" (center row, center
+        channel, row spacing, channel spacing, row offset, channel offset) in cm, and for a curved panel "curved"
+        True, "n" the panel normal and "radius" the source-detector distance in cm.
     """
-    u_hat, v_hat, _ = geometry.panel_axes(angle)
-    return dict(q=geometry.panel_center(angle), u=u_hat, v=v_hat, Rd=geometry.num_det_rows,
-                Cd=geometry.num_det_channels,
-                pixel=((geometry.num_det_rows - 1) / 2, (geometry.num_det_channels - 1) / 2, geometry.delta_det_row,
-                       geometry.delta_det_channel, geometry.det_row_offset, geometry.det_channel_offset))
+    u_hat, v_hat, n_hat = geometry.panel_axes(angle)
+    scalars = dict(q=geometry.panel_center(angle), u=u_hat, v=v_hat, Rd=geometry.num_det_rows,
+                   Cd=geometry.num_det_channels,
+                   pixel=((geometry.num_det_rows - 1) / 2, (geometry.num_det_channels - 1) / 2,
+                          geometry.delta_det_row, geometry.delta_det_channel, geometry.det_row_offset,
+                          geometry.det_channel_offset))
+    if geometry.use_curved_detector:
+        scalars.update(curved=True, n=n_hat, radius=geometry.source_detector_dist)
+    return scalars
 
 
 def upstream_cumulative(mu: Tensor, grid, geometry, angle: float) -> Tensor:
@@ -780,6 +830,11 @@ def primary_project(mu: Tensor, grid, geometry, angle: float, samples_per_pixel_
         geometry_scalars["box_center"] = source_position  # MODE_PRIMARY reads the focal spot from the box-center slots
         _launch_ray(mu, out, Rd * Cd, 1, MODE_PRIMARY, G, grid, geometry_scalars=geometry_scalars)
         return out
+    if geometry.use_curved_detector:  # sub-pixels on the cylinder (the reference's lattice)
+        ends = geometry.subpixel_centers(angle, samples_per_pixel_axis, device, dtype).reshape(-1, 3)
+        starts = torch.tensor(source_position, device=device, dtype=dtype).expand_as(ends)
+        tau = line_integrals_triton(mu, starts, ends, grid).reshape(G, Rd, Cd, samples_per_pixel_axis ** 2)
+        return -(torch.logsumexp(-tau, dim=-1) - math.log(samples_per_pixel_axis * samples_per_pixel_axis))
     pixels = geometry.pixel_centers(angle, device, dtype)
     u_hat, v_hat, _ = geometry.panel_axes(angle)
     u_axis = torch.tensor(u_hat, device=device, dtype=dtype)
@@ -843,11 +898,14 @@ def downstream_cumulative(mu: Tensor, grid, geometry, angle: float, omegas: Tens
     diag = math.sqrt(sum(e * e for e in grid.extent)) * (1 + 1e-9) + 1e-9
     sG, sR, sC, sS = (int(x) for x in mu.stride())
     dx, dy, dz = (float(d) for d in grid.deltas)
+    curved = bool(geometry.use_curved_detector)
+    source_position = geometry.source_position(angle)
     args = (mu, directions, toward, out, int(V), sG, sR, sC, sS, int(grid.num_cols), int(grid.num_rows),
             int(grid.num_slices), dx, dy, dz, float(grid.recon_slice_offset), *(float(x) for x in panel_center),
-            *(float(x) for x in n_hat), float(diag))
+            *(float(x) for x in n_hat), float(diag), float(source_position[0]), float(source_position[1]),
+            float(geometry.source_detector_dist))
     triton_utilities.launch(_downstream_shared_kernel, (triton.cdiv(V, BLOCK_DOWN), K, 1), args,
-                            dict(G=int(G), GP=_next_pow2(G), BLOCK=BLOCK_DOWN), NUM_WARPS)
+                            dict(G=int(G), GP=_next_pow2(G), CURVED=curved, BLOCK=BLOCK_DOWN), NUM_WARPS)
     return out
 
 

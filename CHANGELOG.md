@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.14.0 - 2026-10-19
+
+- **Curved detectors.** `ConeGeometry(use_curved_detector=True)` places the panel on MBIRTORCH's cylinder of radius
+  the source-detector distance about the vertical axis through the source: channels by arc length, rows on the
+  tangent plane. The pixels, the downstream rays, the collimation, the covering cone and the per-pixel incidence,
+  detector and grid angles follow the cylinder, in PyTorch and in the Triton kernels, and MBIRTORCH gets the same
+  panel. A grid on a curved panel focuses per pixel: septa along the channels on the central row of each column,
+  septa along the rows on each pixel's normal (the source axis for a grid focused at the source-detector distance).
+- **Helical cone beam.** A helical table (`ConeGeometry.with_helical_z_shifts`, `utilities.helical_scan`) shifts the
+  source and the panel of each view in z with MBIRTORCH's `helical_z_shifts` convention; the scatter solver, MBIRTORCH
+  and the synthetic data use it. Helical reconstructions start from MBIRTORCH's helical FDK without Parker weights,
+  and the sparse-view scatter is interpolated along the helix (`interpolation_weights(..., helical=True)`).
+- Flat circular geometries are unchanged.
+
 ## v0.13.0 - 2026-10-19
 
 - **Open-field image.** The flat field of `citrus_recon` / `mbir_recon` may be a number, a [rows, channels] image or a

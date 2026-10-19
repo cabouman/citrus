@@ -24,14 +24,35 @@ Frames and tensor layouts (MBIRTORCH conventions)
   ``dy = voxel_row_aspect * delta_voxel``, ``dz = voxel_slice_aspect * delta_voxel``.
 * View frame for view angle ``a``: ``x_v = cos(a) x - sin(a) y``, ``y_v = sin(a) x + cos(a) y``, ``z_v = z``.
   A positive angle carries +x toward +y.
-* Cone beam, in the view frame: source at ``(0, +SID, 0)``, rays travel toward -y, flat panel in the plane
-  ``y_v = SID - SDD``. Panel coordinates: ``u`` along +x_v (channels), ``v`` along +z (rows). Magnification
+* Cone beam, in the view frame: source at ``(0, +SID, 0)`` (circular views), rays travel toward -y, flat panel in the
+  plane ``y_v = SID - SDD``. Panel coordinates: ``u`` along +x_v (channels), ``v`` along +z (rows). Magnification
   ``SDD/SID``; per-point magnification ``SDD/(SID - y_v)``.
 * Panel pixel centers: ``u = (c - (num_det_channels - 1)/2) * delta_det_channel - det_channel_offset``,
   ``v = (r - (num_det_rows - 1)/2) * delta_det_row - det_row_offset``.
+* Curved panel (``ConeGeometry.use_curved_detector``, MBIRTORCH's ``use_curved_detector``): a cylinder of radius SDD
+  about the vertical axis through the source. The channel coordinate ``u`` is the arc length, positive toward
+  +x_v, so the pixel's azimuth from the central ray is ``gamma = u / SDD``; the row coordinate ``v`` is measured on
+  the plane tangent to the cylinder at the central ray, so pixel (u, v) sits at
+  ``(SDD sin(gamma), SID - SDD cos(gamma), v cos(gamma))`` in the view frame, where the ray through the tangent-plane
+  point ``(SDD tan(gamma), SID - SDD, v)`` meets the cylinder. A point projects to
+  ``u = SDD atan2(x_v, SID - y_v)`` and ``v = SDD z_v / (SID - y_v)``, exactly MBIRTORCH's projector. The panel
+  normal at a pixel is horizontal and points to the cylinder axis; ``ConeGeometry.panel_axes`` are the axes at the
+  panel center and ``local_panel_axes`` those at any panel point.
+* Helical views: the source and the panel of view angle ``a`` are shifted along +z by ``z_shift(a)``, so in the view
+  frame the source sits at ``(0, SID, z_shift)`` and ``v`` is measured from ``z = z_shift``; MBIRTORCH's
+  ``helical_z_shifts`` has this sign ("the object moves toward -z by the shift"). The geometry holds the shifts as
+  a table of (unwrapped, strictly monotone) view angles and shifts (``helical_view_angles``,
+  ``helical_z_shifts``, built with ``with_helical_z_shifts`` or ``utilities.helical_scan``), interpolated linearly
+  between its angles, so every function that takes a view angle places the view at its z. A scan is helical when
+  the shift varies over the table (``is_helical``).
 * Detector images: ``[..., num_det_rows, num_det_channels]``. Sinograms: ``(views, rows, channels)``.
 * The solver works in the recon frame per view: ``ConeGeometry`` returns the source position, panel center and panel
   axes rotated into the recon frame. Directions are unit vectors in the recon frame unless a name says ``_view``.
+* The geometry interface: the solver reaches the scan only through ``ConeGeometry`` methods of a view angle:
+  ``source_position``, ``panel_center``, ``panel_axes``, ``local_panel_axes``, ``pixel_centers``,
+  ``subpixel_centers``, ``panel_points``, ``panel_distance_along``, ``panel_uv_of_points``, ``panel_half_extent``
+  and ``z_shift``; the Triton ray tracer receives the same placement as scalars
+  (``ray_tracing_kernels._pixel_geometry_scalars``) and the panel shape as the ``CURVED`` constant.
 
 Grids
 -----

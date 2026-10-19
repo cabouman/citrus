@@ -66,8 +66,9 @@ def make_cone_model(grid: Grid, geometry: ConeGeometry, angles: Union[Sequence[f
                     verbose: int = 0, **params):
     """MBIRTORCH ``ConeBeamModel`` whose projections of a volume on ``grid`` land on the panel of ``geometry``.
 
-    The model copies the distances, pixel pitches and offsets of ``geometry`` and the shape, voxel size, aspects and
-    slice offset of ``grid``, with one view per angle, and is pinned to one device.
+    The model copies the distances, pixel pitches and offsets, the panel shape (``use_curved_detector``) and the z
+    shifts of the views (``geometry.z_shifts(angles)`` as MBIRTORCH's ``helical_z_shifts``) of ``geometry`` and the
+    shape, voxel size, aspects and slice offset of ``grid``, with one view per angle, and is pinned to one device.
 
     Args:
         grid (Grid): reconstruction grid of the volumes [R, C, S].
@@ -92,13 +93,20 @@ def make_cone_model(grid: Grid, geometry: ConeGeometry, angles: Union[Sequence[f
     if compile_mode is None:
         compile_mode = "auto" if device.type == "cuda" else "off"
     angle_array = _angles_array(angles)
+    # the constructor arguments of the panel shape and the helical views, left out for the defaults
+    view_arguments = {}
+    if geometry.use_curved_detector:
+        view_arguments["use_curved_detector"] = True
+    if geometry.helical_z_shifts:
+        view_arguments["helical_z_shifts"] = geometry.z_shifts(angle_array)
     # the constructor checks the cone angle with its default pixel pitch of 1 (a tall panel of small pixels trips
     # it); the check is repeated below with the real pitch
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Cone angle is more than 45 degrees")
         model = mbirtorch.ConeBeamModel((len(angle_array), geometry.num_det_rows, geometry.num_det_channels),
                                         angle_array, source_detector_dist=float(geometry.source_detector_dist),
-                                        source_iso_dist=float(geometry.source_iso_dist), compile_mode=compile_mode)
+                                        source_iso_dist=float(geometry.source_iso_dist), compile_mode=compile_mode,
+                                        **view_arguments)
     model.set_params(no_warning=True,
                      delta_det_channel=float(geometry.delta_det_channel),
                      delta_det_row=float(geometry.delta_det_row),
@@ -170,10 +178,11 @@ def is_short_scan(angles, tolerance: float = 1e-6) -> bool:
 
 
 def short_scan_weights(geometry: ConeGeometry, angles, device: DeviceLike = None) -> Optional[Tensor]:
-    """FDK redundancy (Parker) weights of a short scan, or None for a full rotation.
+    """FDK redundancy (Parker) weights of a short scan, or None for a full rotation or a helical scan.
 
     The weights are the overscan form of Wesarg et al. times ``Lambda / pi`` for the range Lambda of the views; a range
-    shorter than pi plus the fan angle issues a RuntimeWarning and gets no weights.
+    shorter than pi plus the fan angle issues a RuntimeWarning and gets no weights. The fan angle of a channel is
+    ``atan(u / SDD)`` on a flat panel and ``u / SDD`` on a curved one.
 
     Args:
         geometry (ConeGeometry): cone-beam geometry (panel channels and source-detector distance).
@@ -181,17 +190,19 @@ def short_scan_weights(geometry: ConeGeometry, angles, device: DeviceLike = None
         device (torch.device or str, optional): device of the weights. Defaults to None (torch's default device).
 
     Returns:
-        Tensor or None: [V, 1, Cd] float32 weights, or None for a full rotation or a range too short for the weights.
+        Tensor or None: [V, 1, Cd] float32 weights, or None for a full rotation, a helical scan or a range too short
+            for the weights.
     """
     a = _angles_array(angles)
     V = a.size
     arc = scan_range(a)
-    if V < 2 or arc >= 2.0 * np.pi - 1e-6:
+    if V < 2 or arc >= 2.0 * np.pi - 1e-6 or geometry.is_helical:
         return None
     source_detector_distance = float(geometry.source_detector_dist)
     u = ((np.arange(geometry.num_det_channels) - (geometry.num_det_channels - 1) / 2.0)
          * float(geometry.delta_det_channel) - float(geometry.det_channel_offset))
-    gamma = _PARKER_SIGN * np.arctan(u / source_detector_distance)  # [Cd]
+    fan = u / source_detector_distance if geometry.use_curved_detector else np.arctan(u / source_detector_distance)
+    gamma = _PARKER_SIGN * fan  # [Cd]
     max_fan_angle = float(np.abs(gamma).max())
     delta = 0.5 * (arc - np.pi)
     if delta < max_fan_angle - 1e-9:
@@ -224,6 +235,9 @@ _PARKER_SIGN = -1.0  # gamma = -atan(u / SDD): orientation relative to the rotat
 def fdk(model, sinogram: Tensor, filter_name: str = "ramp", *, geometry: Optional[ConeGeometry] = None,
         angles=None) -> Tensor:
     """FDK reconstruction of line integrals with MBIRTORCH, with Parker weights for a short scan.
+
+    A helical scan gets no Parker weights; MBIRTORCH's FDK then scales every slice by the inverse fraction of the
+    views that see it, an approximate reconstruction that serves as the initial volume of MBIR.
 
     Args:
         model (ConeBeamModel): MBIRTORCH model of the scan.

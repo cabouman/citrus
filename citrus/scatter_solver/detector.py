@@ -660,19 +660,25 @@ def anti_scatter_grid(geometry: Optional[ConeGeometry], septum_thickness_cm: flo
 
 # ---- angles -------------------------------------------------------------------------------------------
 
-def detector_angle(omega: Tensor, geometry: ConeGeometry, angle: float) -> Tensor:
+def detector_angle(omega: Tensor, geometry: ConeGeometry, angle: float,
+                   pixel_positions: Optional[Tensor] = None) -> Tensor:
     """Compute the angle theta0 between the photon direction and the inward panel normal ``-n_hat``.
 
     Args:
         omega (Tensor): [..., 3] photon directions in the recon frame (any length).
         geometry (ConeGeometry): the scan geometry.
         angle (float): view angle in rad.
+        pixel_positions (Tensor, optional): [..., 3] panel points broadcastable with ``omega`` whose local normal is
+            used on a curved panel (``ConeGeometry.local_panel_axes``). Defaults to None, the normal at the panel
+            center.
 
     Returns:
         Tensor: [...] angles theta0 in rad.
     """
     _, _, n_hat = geometry.panel_axes(angle)
     n = torch.tensor(n_hat, device=omega.device, dtype=omega.dtype)
+    if geometry.use_curved_detector and pixel_positions is not None:
+        n = geometry.local_panel_axes(pixel_positions.to(omega.device, omega.dtype), angle)[2]
     c = (omega * (-n)).sum(-1) / torch.linalg.norm(omega, dim=-1)
     return torch.arccos(c.clamp(-1.0, 1.0))
 
@@ -684,7 +690,10 @@ def grid_angles(omega: Tensor, pixel_positions: Tensor, geometry: ConeGeometry, 
     The grid is 1-D, its lamellae run along u and repeat along v, focused on the line parallel to u at
     ``focal_distance`` from the panel along ``n_hat``; theta1 is the angle in the v-source plane from the focusing
     direction and theta2 the angle in the u-source plane from the panel normal. Septa along the rows swap the roles of
-    u and v.
+    u and v. On a curved panel the axes are those of the surface at each pixel (``ConeGeometry.local_panel_axes``):
+    septa along the channels focus on the line at ``focal_distance`` along the normal from the central row of each
+    column, septa along the rows on the line at ``focal_distance`` along each pixel's normal (the source axis for the
+    source-detector distance).
 
     Args:
         omega (Tensor): [K, 3] or [..., 3] unit photon directions in the recon frame.
@@ -703,19 +712,27 @@ def grid_angles(omega: Tensor, pixel_positions: Tensor, geometry: ConeGeometry, 
     """
     device, dtype = pixel_positions.device, pixel_positions.dtype
     omega = omega.to(device, dtype)
-    u_hat, v_hat, n_hat = (torch.tensor(a, device=device, dtype=dtype) for a in geometry.panel_axes(angle))
-    if septa_along == "rows":
-        u_hat, v_hat = v_hat, u_hat
-    elif septa_along != "channels":
+    if septa_along not in ("channels", "rows"):
         raise ValueError(f"septa_along must be one of {SEPTA_DIRECTIONS}, got {septa_along!r}")
+    u_hat, v_hat, n_hat = (torch.tensor(a, device=device, dtype=dtype) for a in geometry.panel_axes(angle))
     focal_distance = geometry.source_detector_dist if focal_distance is None else float(focal_distance)
-    focus = torch.tensor(geometry.panel_center(angle), device=device, dtype=dtype) + focal_distance * n_hat
+    panel_center = torch.tensor(geometry.panel_center(angle), device=device, dtype=dtype)
     if omega.dim() == 2 and pixel_positions.dim() == 3:
         a = -omega[:, None, None, :]  # [K, 1, 1, 3]
         pixels = pixel_positions[None]
     else:
         a = -omega
         pixels = pixel_positions
+    if geometry.use_curved_detector:  # the axes of the cylinder at each pixel
+        u_hat, v_hat, n_hat = geometry.local_panel_axes(pixels, angle)
+        if septa_along == "channels":  # focal line at the central row of each column
+            focus = pixels - ((pixels - panel_center) * v_hat).sum(-1, keepdim=True) * v_hat + focal_distance * n_hat
+        else:  # focal line along each pixel's own normal
+            focus = pixels + focal_distance * n_hat
+    else:
+        focus = panel_center + focal_distance * n_hat
+    if septa_along == "rows":  # the septa repeat along u: theta1 in the u-normal plane
+        u_hat, v_hat = v_hat, u_hat
     f = focus - pixels
     a_normal = (a * n_hat).sum(-1)
     theta_a = torch.atan2((a * v_hat).sum(-1), a_normal)

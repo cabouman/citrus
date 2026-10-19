@@ -53,6 +53,7 @@ __all__ = [
     "grouping_medium_estimate",
     "fan_angle",
     "view_angles",
+    "helical_scan",
     "synthesize_cone_beam_data",
     "synthesize_wlab_dataset",
     "save_dataset",
@@ -876,6 +877,8 @@ def object_size_cm(X: Tensor, grid: Grid, *, cell_cm: float = 1.0, num_rays: int
 def fan_angle(geometry: ConeGeometry) -> float:
     """In-plane fan angle ``2 atan(0.5 num_det_channels delta_det_channel / SDD)`` of the panel (offset ignored).
 
+    A curved panel has the fan angle ``num_det_channels delta_det_channel / SDD`` (its channels are arc lengths).
+
     Args:
         geometry (ConeGeometry): scan geometry.
 
@@ -883,6 +886,8 @@ def fan_angle(geometry: ConeGeometry) -> float:
         float: fan angle in rad.
     """
     half = 0.5 * float(geometry.num_det_channels) * float(geometry.delta_det_channel)
+    if geometry.use_curved_detector:
+        return 2.0 * half / float(geometry.source_detector_dist)
     return 2.0 * math.atan(half / float(geometry.source_detector_dist))
 
 
@@ -916,6 +921,29 @@ def view_angles(num_views: int, geometry: Optional[ConeGeometry] = None, start_v
     if not end > start:
         raise ValueError(f"end_view_angle {end} must be larger than start_view_angle {start}")
     return start + (end - start) * np.arange(n, dtype=np.float64) / n
+
+
+def helical_scan(geometry: ConeGeometry, angles, pitch_cm: float, center_cm: float = 0.0) -> ConeGeometry:
+    """Geometry of a helical scan with a constant pitch: the z shift grows by ``pitch_cm`` per turn of the angle.
+
+    The z shift of view angle a is ``center_cm + pitch_cm (a - a_mid) / (2 pi)``, with ``a_mid`` the middle of the
+    angular range, so that the travel is centred on ``center_cm`` (``ConeGeometry.with_helical_z_shifts``).
+
+    Args:
+        geometry (ConeGeometry): the scan geometry without helical views.
+        angles (Sequence[float] or ndarray): [V] unwrapped view angles in rad, strictly monotone (e.g.
+            ``view_angles(V, end_view_angle=2 pi turns)``).
+        pitch_cm (float): table feed per turn in cm; positive moves the source and the panel toward +z as the angle
+            grows.
+        center_cm (float, optional): z in cm of the middle of the travel. Defaults to 0.0.
+
+    Returns:
+        ConeGeometry: the helical geometry.
+    """
+    a = np.asarray(angles.detach().cpu().numpy() if isinstance(angles, Tensor) else angles,
+                   dtype=np.float64).reshape(-1)
+    middle = 0.5 * (float(a.min()) + float(a.max())) if a.size else 0.0
+    return geometry.with_helical_z_shifts(a, float(center_cm) + float(pitch_cm) * (a - middle) / (2.0 * math.pi))
 
 
 def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, angles, solver: ScatterSolver,
