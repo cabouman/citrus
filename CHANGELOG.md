@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.12.0 - 2026-10-19
+
+- **User-defined reference materials.** `citrus.scatter_solver.Material(name, density, composition)` stands wherever
+  a catalogue name is accepted (`SolverConfig.materials`, `grouping_medium` by name, `material_table`,
+  `material_index`, `build_library(materials=...)`, `mass_attenuation_preview`); its cross sections are built from the
+  XCOM + xraylib data like a catalogue material's. Compositions may name catalogue materials
+  (`"0.99*water + 0.01*I"`; a part that starts with a lowercase letter is a catalogue name). Definitions are checked
+  on construction (parse, elements Z <= 98, density > 0, no clash with a catalogue entry unless identical), names must
+  be distinct, and the cache key holds each definition; the default set's cache key is unchanged. `parse_formula`
+  moved to `cross_sections` (still importable from `cross_section_library`); new `material_definition` and
+  `material_names`. `benchmarks/citrus_study.py --materials` accepts `name:density:composition`.
+
 ## v0.11.0 - 2026-10-18
 
 - **The grouping object size comes from the escape probability.** `utilities.object_size_cm` no longer takes the
