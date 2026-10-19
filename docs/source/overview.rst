@@ -19,7 +19,7 @@ Package layout
 
     ============================= ================================================================================
     ``config``                    ``SolverConfig``: every discretization parameter
-    ``geometry``                  ``Grid``, ``ConeGeometry`` (MBIRTORCH conventions)
+    ``geometry``                  ``Grid``, ``ConeGeometry``, ``ParallelGeometry`` (MBIRTORCH conventions)
     ``cross_sections``            the material catalogue, the multigroup library container, per-voxel coefficients,
                                   a synthetic test library
     ``photon_data``               the photon data: NIST XCOM cross sections (downloaded on first use), xraylib

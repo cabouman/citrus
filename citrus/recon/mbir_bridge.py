@@ -263,7 +263,7 @@ def is_short_scan(angles, tolerance: float = 1e-6) -> bool:
 
 
 def short_scan_weights(geometry: ConeGeometry, angles, device: DeviceLike = None) -> Optional[Tensor]:
-    """FDK redundancy (Parker) weights of a short scan, or None for a full rotation or a helical scan.
+    """FDK redundancy (Parker) weights of a short scan, or None for a full rotation, a helical scan or a parallel beam.
 
     The weights are the overscan form of Wesarg et al. times ``Lambda / pi`` for the range Lambda of the views; a range
     shorter than pi plus the fan angle issues a RuntimeWarning and gets no weights. The fan angle of a channel is
@@ -281,7 +281,7 @@ def short_scan_weights(geometry: ConeGeometry, angles, device: DeviceLike = None
     a = _angles_array(angles)
     V = a.size
     arc = scan_range(a)
-    if V < 2 or arc >= 2.0 * np.pi - 1e-6 or geometry.is_helical:
+    if V < 2 or arc >= 2.0 * np.pi - 1e-6 or geometry.is_parallel or geometry.is_helical:
         return None
     source_detector_distance = float(geometry.source_detector_dist)
     u = ((np.arange(geometry.num_det_channels) - (geometry.num_det_channels - 1) / 2.0)

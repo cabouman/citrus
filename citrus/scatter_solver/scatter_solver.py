@@ -295,7 +295,7 @@ class ScatterSolver:
         library (MultigroupLibrary): library with ``legendre_order >= config.legendre_order``
             (:func:`build_solver_library`), or None for a lazy solver.
         config (SolverConfig): solver configuration, validated here.
-        geometry (ConeGeometry): cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
         projectors (Projectors, optional): ray tracers. Defaults to None, ``SiddonProjectors()``.
         detector (DetectorResponse): detector response; required, pass it by keyword.
         grid_response (GridResponse): anti-scatter-grid response; required, pass it by keyword.
@@ -319,7 +319,7 @@ class ScatterSolver:
         spectrum (tuple): source spectrum of a lazy library, or None.
         library_cache_dir (str): cache directory of a lazy library (:func:`build_solver_library`). Defaults to
             "default".
-        geometry (ConeGeometry): cone-beam geometry.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
         projectors (Projectors): ray tracers.
         detector (DetectorResponse): detector response.
         grid_response (GridResponse): anti-scatter-grid response.
@@ -875,8 +875,8 @@ class ScatterSolver:
                           dtype: Optional[torch.dtype] = None) -> Tensor:
         """Detector signal of an empty volume (the solver's open field) for one view.
 
-        It carries the inverse-square and obliquity factors of the point source, the emission profile of ``source``
-        and the grid and detector responses.
+        It carries the inverse-square and obliquity factors of the point source (none for a parallel beam), the
+        emission profile of ``source`` and the grid and detector responses.
 
         Args:
             angle (float): view angle in radians.

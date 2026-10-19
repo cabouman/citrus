@@ -2,8 +2,9 @@
 
 ``_ray_kernel`` traces one ray per lane in registers and accumulates all groups at once; its ``MODE`` selects the
 segment end points (given segments, oblique lines through the pixel centers, focal spot to voxel centers, focal spot
-to pixel centers) and ``PARALLEL`` replaces the focal spot by the upstream start of a parallel beam's ray. ``_downstream_shared_kernel`` computes the downstream optical depth with one crossing sequence
-shared by all rays of a direction. The public wrappers mirror the ``SiddonProjectors`` operations on float32 CUDA
+to pixel centers) and ``PARALLEL`` replaces the focal spot by the upstream start of a parallel beam's ray.
+``_downstream_shared_kernel`` computes the downstream optical depth with one crossing sequence shared by all rays of a
+direction. The public wrappers mirror the ``SiddonProjectors`` operations on float32 CUDA
 tensors, and ``kernels_usable`` checks them against the PyTorch path once per device.
 """
 

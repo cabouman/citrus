@@ -9,7 +9,8 @@ Units
 * Length: cm. Energy: keV. Attenuation: 1/cm. Mass coefficients: cm^2/g. Density: g/cm^3.
 * Angles: radians everywhere inside the package (degrees only in the options of the study script); scattering
   angles enter the cross sections as :math:`\eta = \cos\theta`.
-* Source strength: 1 photon per steradian at the focal spot (spectrum fractions sum to 1).
+* Source strength: 1 photon per steradian at the focal spot (spectrum fractions sum to 1); a parallel beam carries
+  a fluence of 1 photon per cm^2 over its cross-section, and its images are per unit incident fluence.
 * Angular fluence: photons / (cm^2 sr) per source photon/sr. Scatter and primary images are reported both as photon
   fluence at the panel (photons/cm^2) and as detector signal (keV deposited per cm^2) after the detector / grid
   response.
@@ -45,6 +46,15 @@ Frames and tensor layouts (MBIRTORCH conventions)
   ``helical_z_shifts``, built with ``with_helical_z_shifts`` or ``utilities.helical_scan``), interpolated linearly
   between its angles, so every function that takes a view angle places the view at its z. A scan is helical when
   the shift varies over the table (``is_helical``).
+* Parallel beam (``ParallelGeometry``, MBIRTORCH's ``ParallelBeamModel``): in the view frame every ray travels along
+  -y_v and the flat panel lies in the plane ``y_v = -axis_detector_dist``, with ``u`` along +x_v and ``v`` along +z as
+  above, so a point projects to ``u = x_v``, ``v = z``. The beam direction is ``-n_hat``
+  (``ParallelGeometry.beam_direction``) and its cross-section is the panel's area. MBIRTORCH gives detector row r the
+  reconstruction slice r, so a scan to be reconstructed has the rows of its grid (``ParallelGeometry.from_grid``): as
+  many rows as slices, ``delta_det_row = delta_voxel``, ``voxel_slice_aspect = 1`` and ``det_row_offset =
+  -recon_slice_offset``, which puts row r at the z of slice r (``recon.mbir_bridge.make_parallel_model`` checks it).
+  The primary ray of a point starts upstream of the traced grid's box, ``p - (p . w + D) w`` with the beam direction w
+  and D the radius of the box's circle about the axis plus 1 cm (``ParallelGeometry.ray_starts``).
 * Detector images: ``[..., num_det_rows, num_det_channels]``. Sinograms: ``(views, rows, channels)``.
 * The solver works in the recon frame per view: ``ConeGeometry`` returns the source position, panel center and panel
   axes rotated into the recon frame. Directions are unit vectors in the recon frame unless a name says ``_view``.
@@ -53,6 +63,10 @@ Frames and tensor layouts (MBIRTORCH conventions)
   ``subpixel_centers``, ``panel_points``, ``panel_distance_along``, ``panel_uv_of_points``, ``panel_half_extent``
   and ``z_shift``; the Triton ray tracer receives the same placement as scalars
   (``ray_tracing_kernels._pixel_geometry_scalars``) and the panel shape as the ``CURVED`` constant.
+  ``ParallelGeometry`` has the same methods except ``source_position``, whose roles ``beam_direction`` and
+  ``ray_starts`` take (``is_parallel`` tells the two apart); the kernels receive the beam direction and the distance
+  of the start plane as scalars and the ``PARALLEL`` constant. Every function that takes a ``ConeGeometry`` accepts a
+  ``ParallelGeometry``.
 
 Grids
 -----

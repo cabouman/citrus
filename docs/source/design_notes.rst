@@ -284,7 +284,10 @@ ray. The loop runs to the largest per-ray bound of the block, :math:`1 + \sum_a 
 crossing parameters and the summation order. The pixel modes compute each pixel center from the panel center and
 axes; with the ``CURVED`` constant they place it on the cylinder (``ConeGeometry.panel_points``, with
 :math:`1 - \cos\gamma` written as :math:`2\sin^2(\gamma/2)` to avoid cancellation), and a helical view only moves
-the focal spot and the panel center they receive.
+the focal spot and the panel center they receive. With the ``PARALLEL`` constant the upstream and primary modes start
+each ray at ``p - (p . w + D) w`` from its end point p, the beam direction w and the start-plane distance D, as
+``ParallelGeometry.ray_starts`` does; the first-collision kernel then takes the beam direction as the primary
+direction of every point.
 
 **Shared downstream crossings.** All rays of one direction start at voxel centers and are parallel, so the distance
 to the first plane of each axis is half a voxel for every ray, and the crossings
@@ -315,7 +318,10 @@ MBIRTORCH coupling
 
 **Geometry.** The solver uses MBIRTORCH's frames verbatim, so ``recon.mbir_bridge.make_cone_model`` is a parameter
 copy, including the panel shape (``use_curved_detector``) and the views' z shifts (``helical_z_shifts`` from the
-geometry's table at the model's angles, so a sub-model over some views gets their own shifts). The
+geometry's table at the model's angles, so a sub-model over some views gets their own shifts).
+``make_parallel_model`` builds MBIRTORCH's ``ParallelBeamModel`` of a ``ParallelGeometry``, which has no row pitch,
+row offset or slice offset of its own (row r is slice r): it checks that the geometry's rows are the grid's slices
+instead of copying them, and ``make_model`` chooses the model of the geometry. The
 region-of-reconstruction mask is off, because the WLAB grid tiles the prism and the mask would drop its corners.
 
 **Units and devices.** MBIRTORCH projects in value times its arbitrary length unit; the bridge uses cm, so a volume
@@ -327,7 +333,7 @@ toolchain.
 
 **Projections in chunks of views.** A ``ConeBeamModel`` projects onto all its views at once. To project onto a run
 of consecutive views (the per-material path lengths of the loop's primary must not grow to ``[M', V, rows,
-channels]``), ``ViewChunkProjector`` builds a sub-model over those angles with ``make_cone_model`` and keeps the
+channels]``), ``ViewChunkProjector`` builds a sub-model over those angles with ``make_model`` and keeps the
 last few in a least-recently-used cache. A sub-model is cheap to build; its first projection compiles, later ones
 cost the same per view as the full model, and its projections equal the matching views of the full model to float
 rounding.
