@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.16.2 - 2026-10-19
+
+- **Demos.** Six demos: the scatter solver (1), a circular cone-beam scan of the WLAB phantom with the 6 MV spectrum
+  and an anti-scatter grid as commented-out lines (2), a helical scan on a curved panel with a focused grid (3),
+  user-defined materials, an iodine contrast agent and a dental amalgam (4), a monoenergetic parallel beam as in
+  synchrotron CT (5), and the per-iteration callbacks (6). The reconstruction demos no longer run an MBIR without
+  scatter correction for comparison.
+- **Docs.** The README and the Read the Docs pages were checked against the code and brought up to date (loop
+  vocabulary, adaptive counts, user spectra and materials, scan types, settings tables, examples); docstrings name
+  the parallel geometry and model wherever the code accepts them.
+- **Study script.** `benchmarks/citrus_study.py` runs the uncorrected MBIR with the MBIR iterations of each CITRUS
+  outer iteration (`mbir_iterations_schedule`), so the two reconstructions differ only by the scatter correction.
+
 ## v0.16.1 - 2026-10-19
 
 - **Redundancy weights for every range.** The FDK of a circular cone-beam scan and the filtered back projection of a
