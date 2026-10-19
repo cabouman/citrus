@@ -76,7 +76,7 @@ for material, density, mask in ((contrast, contrast.density, inside(vessel_cente
     rho[:, mask] = 0.0  # the insert replaces the water
     rho[row(material)][mask] = density
 
-# ---- Data: loaded when a file of this name exists in demo/input, else synthesized once (a few minutes on a GPU) ---
+# ---- Data: loaded when a file of this name exists in demo/input, else synthesized once (about a minute on a GPU) ---
 name = (f"head_{num_views}v_{delta_voxel:g}cm_{num_det_rows}x{num_det_channels}px{pixel_pitch:g}cm_I0{I0:.0e}_"
         f"iodine{iodine_mg_per_ml:g}_amalgam{amalgam_size:g}cm_125kvp").replace(".", "p").replace("+", "")
 path = os.path.join(demo_dir, "input", name)
