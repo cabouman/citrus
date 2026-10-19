@@ -345,3 +345,22 @@ def test_helical_interpolation_runs_along_the_helix(order):
     # the circular rule would mix the turns
     circular = interpolation_weights(angles, computed, order)
     assert not np.allclose((circular @ values[computed])[inside], values[inside])
+
+
+def test_short_scan_weights_of_curved_and_helical_scans():
+    from citrus.recon.mbir_bridge import short_scan_weights
+    from citrus.utilities import fan_angle
+
+    flat = replace(FLAT, num_det_channels=101, delta_det_channel=1.0, det_channel_offset=0.0)
+    curved = replace(flat, use_curved_detector=True)
+    assert fan_angle(curved) == pytest.approx(101 / 150.0) and fan_angle(flat) == pytest.approx(
+        2 * math.atan(50.5 / 150.0))
+    angles = view_angles(200, curved)  # the short scan of the curved panel's fan angle
+    weights_curved = short_scan_weights(curved, angles)
+    weights_flat = short_scan_weights(flat, angles)
+    assert weights_curved is not None and weights_flat is not None
+    # the central channel has the same fan angle (0) on both panels; the others do not
+    assert torch.allclose(weights_curved[:, 0, 50], weights_flat[:, 0, 50])
+    assert not torch.allclose(weights_curved, weights_flat)
+    # no Parker weights for a helical scan, even over less than a turn
+    assert short_scan_weights(helical_scan(curved, angles, pitch_cm=5.0), angles) is None
