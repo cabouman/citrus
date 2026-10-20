@@ -355,91 +355,54 @@ def test_citrus_recon_on_short_scan(tiny):
     assert seen[-1] < seen[0] and bool(torch.isfinite(X).all())
 
 
-# ---- adaptive MBIR iterations per outer iteration (version 0.10.0) ---------------------------------------------
+# ---- iteration counts, MBIR partitions and the residual --------------------------------------------------------
 
 
 def test_settings_are_validated():
     config = CitrusConfig()
-    assert config.num_outer_iterations == "adaptive" and config.mbir_iterations_per_outer_iteration == "adaptive"
+    assert config.num_outer_iterations == 14 and config.mbir_iterations_per_outer_iteration == 8
     config.validate()
     CitrusConfig(num_outer_iterations=3, mbir_iterations_per_outer_iteration=np.int64(2)).validate()
-    CitrusConfig(mbir_stop_relative_improvement=0.01, stop_relative_improvement=0.5).validate()
-    for bad in (0.0, 1.0, -0.1, True, "0.01", None):
-        with pytest.raises(ValueError, match="mbir_stop_relative_improvement"):
-            CitrusConfig(mbir_stop_relative_improvement=bad).validate()
-        with pytest.raises(ValueError, match="stop_relative_improvement"):
-            CitrusConfig(stop_relative_improvement=bad).validate()
-    for bad in (0, -1, 1.5, True, "adaptiv", None):
-        for name in ("num_outer_iterations", "mbir_iterations_per_outer_iteration", "max_outer_iterations",
-                     "max_mbir_iterations_per_outer_iteration"):
+    for bad in (0, -1, 1.5, True, "adaptive", None):
+        for name in ("num_outer_iterations", "mbir_iterations_per_outer_iteration"):
             with pytest.raises(ValueError, match=name):
                 CitrusConfig(**{name: bad}).validate()
-    with pytest.raises(ValueError, match="max_outer_iterations"):
-        CitrusConfig(max_outer_iterations="adaptive").validate()
+    for good in ("auto", None, 1, np.int64(32)):
+        CitrusConfig(mbir_subsets_per_iteration=good).validate()
+    for bad in (0, -4, 2.0, True, "fast"):
+        with pytest.raises(ValueError, match="mbir_subsets_per_iteration"):
+            CitrusConfig(mbir_subsets_per_iteration=bad).validate()
 
 
 @cuda
-def test_residual_is_recorded_and_the_fixed_count_is_unchanged(tiny):
-    """Without thresholds every outer iteration runs its n MBIR iterations; with the resumed error sinogram the
-    records hold the residual at the start and the end of each outer iteration, decreasing within it."""
+def test_the_loop_sets_the_subsets_per_iteration(tiny):
+    """The loop gives the model the partitions of ``mbir_subsets_per_iteration``; None, and "auto" on a grid this
+    narrow, keep the model's own."""
+    from citrus.recon.mbir_bridge import make_cone_model
+
+    data, grid, geometry, solver, regularization = tiny
+    own = list(make_cone_model(grid, geometry, data["angles"], device=DEVICE).get_params("granularity"))
+    for subsets, granularity in ((8, [4, 8]), ("auto", own), (None, own)):
+        config = CitrusConfig(num_outer_iterations=1, mbir_iterations_per_outer_iteration=3,
+                              mbir_subsets_per_iteration=subsets)
+        X, info = mbir_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, config, regularization=regularization)
+        assert list(info["model"].get_params("granularity")) == granularity, subsets
+        assert bool(torch.isfinite(X).all())
+
+
+@cuda
+def test_every_outer_iteration_runs_its_count_and_records_the_residual(tiny):
+    """Every outer iteration runs its n MBIR iterations, each reported to the MBIR callback; with the resumed error
+    sinogram the records hold the residual at the start and the end of each outer iteration, decreasing within it."""
     data, grid, geometry, solver, regularization = tiny
     config = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration=3)
+    seen = []
     X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
-                           regularization=regularization)
+                           regularization=regularization, mbir_callback=lambda i, X, r: seen.append(i))
     records = info["records"][1:]
     assert [r["mbir_iterations"] for r in records] == [3, 3] and info["mbir_iterations_total"] == 6
+    assert seen == list(range(7))  # the initial volume, then every MBIR iteration
     assert all(0 < r["sinogram_nrmse"] < r["sinogram_nrmse_start"] < 1 for r in records)
-
-
-@cuda
-def test_mbir_iterations_stop_on_a_small_improvement(tiny):
-    """A loose threshold stops every outer iteration after the minimum of two MBIR iterations, a tight one never
-    before the maximum; the loop records what it took and mbir_recon can follow the same schedule."""
-    data, grid, geometry, solver, regularization = tiny
-    loose = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration="adaptive",
-                         max_mbir_iterations_per_outer_iteration=6, mbir_stop_relative_improvement=0.9)
-    X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, loose,
-                           regularization=regularization)
-    assert [r["mbir_iterations"] for r in info["records"][1:]] == [2, 2] and info["mbir_iterations_total"] == 4
-    tight = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration="adaptive",
-                         max_mbir_iterations_per_outer_iteration=3, mbir_stop_relative_improvement=1e-9)
-    X_tight, info_tight = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, tight,
-                                       regularization=regularization)
-    assert [r["mbir_iterations"] for r in info_tight["records"][1:]] == [3, 3]
-    fixed = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration=3)
-    X_fixed, _ = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, fixed,
-                              regularization=regularization)
-    assert float((X_tight - X_fixed).norm() / X_fixed.norm()) < 1e-6  # the same iterations and seeds
-    # mbir_recon follows a schedule: the MBIR iterations per outer iteration, overriding the config
-    schedule = [r["mbir_iterations"] for r in info["records"][1:]]
-    seen = []
-    X_mbir, info_mbir = mbir_recon(data["Y"], 1.0e5, data["angles"], grid, geometry,
-                                   CitrusConfig(num_outer_iterations=7, mbir_iterations_per_outer_iteration=1),
-                                   regularization=regularization, mbir_iterations_schedule=schedule,
-                                   mbir_callback=lambda i, X, r: seen.append(i))
-    assert [r["mbir_iterations"] for r in info_mbir["records"][1:]] == schedule == [2, 2]
-    assert seen == [0, 1, 2, 3, 4] and info_mbir["mbir_iterations_total"] == 4
-    # the schedule also overrides the adaptive defaults (demo 2 passes it with the CITRUS config)
-    _, info_mbir = mbir_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, CitrusConfig(),
-                              regularization=regularization, mbir_iterations_schedule=[1, 3])
-    assert [r["mbir_iterations"] for r in info_mbir["records"][1:]] == [1, 3]
-
-
-@cuda
-def test_outer_loop_stops_on_a_small_improvement(tiny):
-    """A threshold of 0.99 on the outer improvement stops the loop after its second outer iteration (the first
-    comparison); a tiny threshold lets all outer iterations run."""
-    data, grid, geometry, solver, regularization = tiny
-    config = CitrusConfig(num_outer_iterations="adaptive", max_outer_iterations=5,
-                          mbir_iterations_per_outer_iteration=2, stop_relative_improvement=0.99)
-    X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
-                           regularization=regularization)
-    assert len(info["records"]) == 3 and bool(torch.isfinite(X).all())  # the FDK and two outer iterations
-    config = CitrusConfig(num_outer_iterations="adaptive", max_outer_iterations=3,
-                          mbir_iterations_per_outer_iteration=2, stop_relative_improvement=1e-12)
-    X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
-                           regularization=regularization)
-    assert len(info["records"]) == 4
 
 
 @cuda

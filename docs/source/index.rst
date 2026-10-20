@@ -27,7 +27,7 @@ A reconstruction in a few lines
    spectrum = load_spectrum_txt("spectrum.txt")           # the source spectrum, two columns: keV, photons per keV
    solver = wlab_solver(delta_voxel, geometry=geometry, spectrum=spectrum)   # LBTE solver, library cached on disk
    recon, info = citrus_recon(counts, flat_field, angles, grid, geometry, solver,
-                              CitrusConfig(scatter_view_stride=8))   # adaptive numbers of iterations
+                              CitrusConfig(scatter_view_stride=8))   # the default numbers of iterations
 
 ``counts`` are the measured projections (primary plus scatter), ``grid`` and ``geometry`` describe the volume and the
 scanner (a cone beam with a flat or curved panel and circular or helical views, or a parallel beam) in MBIRTORCH's

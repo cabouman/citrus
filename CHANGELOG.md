@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.23.0 - 2026-10-20
+
+- **Fewer subsets per MBIR iteration.** The loop sets MBIRTORCH's partitions itself
+  (`CitrusConfig.mbir_subsets_per_iteration`, default `"auto"`; `recon.mbir_bridge.vcd_partitions`): every MBIR
+  iteration updates the pixel columns in a number of random subsets near a quarter of the volume's largest in-plane
+  extent in voxels (16, 32 or 64) instead of MBIRTORCH's 128, after the coarser first iterations of MBIRTORCH's
+  schedule (4 and 16 subsets, those fewer than the count). On such volumes the engine's fixed cost per subset
+  dominated the iteration, while the extra subsets did not speed up the convergence per iteration, so an MBIR
+  iteration now costs a fraction of its former time for the same progress. Volumes narrower than about 46 voxels or
+  wider than about 360 keep MBIRTORCH's own schedule, and `None` always keeps the model's.
+- **Fixed iteration counts.** The adaptive numbers of outer and MBIR iterations of v0.10.0 are removed, with
+  `stop_relative_improvement`, `mbir_stop_relative_improvement`, `max_outer_iterations`,
+  `max_mbir_iterations_per_outer_iteration` and `mbir_recon(..., mbir_iterations_schedule=)`:
+  `num_outer_iterations` and `mbir_iterations_per_outer_iteration` are integers, by default 14 and 8. The fit-based
+  rules ended the loop before the scatter correction had converged, and with fewer subsets an MBIR iteration costs a
+  small fraction of a scatter stage, so longer blocks pay. The records keep the residual (`sinogram_nrmse_start`,
+  `sinogram_nrmse`); demos 2, 6 and 7 and `benchmarks/citrus_study.py` run fixed counts, and
+  `benchmarks/adaptive_mbir_study.py` is removed.
+
 ## v0.22.0 - 2026-10-19
 
 - **Helical scatter interpolation.** On a helical scan the scatter of a skipped view is interpolated from its computed

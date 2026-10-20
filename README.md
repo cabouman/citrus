@@ -18,9 +18,7 @@ The loop starts from the direct reconstruction X_0 of the uncorrected data (FDK,
 parallel beam). Outer iteration k = 1, ..., N converts
 X_{k-1} into material densities, takes one scatter step per view, corrects the measured counts with the estimated
 scatter-to-primary ratio, `Y_c = Y / (1 + SPR)`, and runs warm-started MBIR iterations on the corrected data,
-which give X_k. By default both counts are adaptive: the MBIR iterations stop once the fit of the corrected sinogram
-improves by less than a threshold per iteration, and the loop stops once an outer iteration improves it by less than
-another; fixed counts can be given instead.
+which give X_k; both counts are settings, and stronger scatter needs more outer iterations.
 
 The scatter step is **age-ordered source iteration**. Per view the solver keeps an accumulator of the collided
 fluence, `Phi_{>1}`, and updates it with one transport sweep `G_k` (scattering plus transport through the densities of
@@ -80,8 +78,8 @@ Install PyTorch first if you need a specific CUDA build. Every dependency instal
 
 Developer tools: `dev_scripts/` (conda test environment, clean install, tests, docs, CUDA check);
 `benchmarks/` (benchmarks of the sweep, the first-collision source, the ray tracer and the scatter image, profiles of
-the CITRUS step per stage and per kernel, the GPU memory of the loop, fixed against adaptive numbers of MBIR
-iterations, and the CITRUS study script `citrus_study.py`).
+the CITRUS step per stage and per kernel, the GPU memory of the loop, and the CITRUS study script
+`citrus_study.py`).
 
 ## Quick start
 
@@ -104,8 +102,8 @@ statistics), `benchmarks/citrus_study.py` takes the settings as flags and writes
 `demo/output/`:
 
 ```bash
-python benchmarks/citrus_study.py          # 180 views over a short scan, 0.5 cm grid, adaptive numbers of outer
-                                           # and MBIR iterations, scatter step on every 8th view
+python benchmarks/citrus_study.py          # 180 views over a short scan, 0.5 cm grid, the default numbers of
+                                           # outer and MBIR iterations, scatter step on every 8th view
 python benchmarks/citrus_study.py --full   # 180 views over a full rotation, 0.5 cm grid, 20 outer iterations
                                            # of 1 MBIR iteration, scatter step on every view
 python benchmarks/citrus_study.py --help   # every flag
@@ -127,7 +125,7 @@ from citrus.utilities import wlab_solver
 
 spectrum = load_spectrum_txt("spectrum.txt")               # the source spectrum, two columns: keV, photons per keV
 solver = wlab_solver(delta_voxel, geometry=geometry, spectrum=spectrum)   # ScatterSolver, library cached on disk
-recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, CitrusConfig())   # adaptive numbers of iterations
+recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, CitrusConfig())   # 14 outer x 8 MBIR iterations
 ```
 
 Tests: `dev_scripts/run_tests.sh` or `python -m pytest -q` (GPU, Triton and MBIRTORCH tests, and those that need the
@@ -144,7 +142,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Gregery T. Buzzard and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.22.0},
+  note = {Version 0.23.0},
   year = 2026
 }
 ```

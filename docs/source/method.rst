@@ -29,7 +29,7 @@ beam), and outer iteration :math:`k = 1, \dots, N`
    measurements through metal get zero weight ("Metal", below).
 
 Steps 1 to 3 are the scatter stage, step 4 the MBIR stage; :math:`n` sets how many MBIR iterations follow each scatter
-correction and :math:`N` how many outer iterations run; by default both are adaptive ("MBIR iterations per outer
+correction and :math:`N` how many outer iterations run (``num_outer_iterations``; "MBIR iterations per outer
 iteration", below).
 
 Age-ordered source iteration
@@ -578,21 +578,29 @@ towards each correction; the recursion of the accumulators is unchanged, it is a
 At a fixed total number of MBIR iterations the trade-off reverses: a larger :math:`n` leaves fewer scatter stages, and
 between two of them MBIR converges towards a correction that is no longer refreshed.
 
-The residual :math:`\|A X - y_c\| / \|y_c\|` of the corrected sinogram shows this without a ground truth: within an
-outer iteration it falls quickly for the first MBIR iterations and then flattens, because MBIR has reached the volume
-that best fits the current correction under the prior, and only a new correction can lower it further. The default
-``mbir_iterations_per_outer_iteration = "adaptive"`` stops the MBIR iterations of an outer iteration once the residual
-improves by less than ``mbir_stop_relative_improvement`` per iteration (the mean over the last two iterations, so that
-the random partitions of the coordinate descent do not trigger it on one flat step; at least two iterations run, at
-most ``max_mbir_iterations_per_outer_iteration``). The default ``num_outer_iterations = "adaptive"`` stops the loop
-once an outer iteration lowers the residual by less than ``stop_relative_improvement`` relative to the previous one
-(at most ``max_outer_iterations``), a convergence criterion of the whole reconstruction that needs no truth. Fixed
-counts run as given. With the resumed error sinogram (the default) the residual costs nothing; the records hold it at
+Both counts are fixed. Each scatter correction changes the corrected sinogram by a fraction of the change before it,
+and that fraction grows with the scatter-to-primary ratio, so strong scatter (a large object, no grid, a low energy)
+needs more outer iterations than weak scatter; the records' ``scatter_change_relative`` shows how much the scatter
+estimate still moves. The residual :math:`\|A X - y_c\| / \|y_c\|` of the corrected sinogram shows the MBIR side
+without a ground truth: within an outer iteration it falls quickly for the first MBIR iterations and then flattens,
+because MBIR has reached the volume that best fits the current correction under the prior, and only a new correction
+can lower it further. With the resumed error sinogram (the default) the residual costs nothing; the records hold it at
 the start and the end of every outer iteration (``sinogram_nrmse_start``, ``sinogram_nrmse``).
 
-The rule is a stopping criterion rather than a speed-up (an MBIR iteration is much cheaper than a scatter stage, so
-the iterations it saves buy little time): it ends the MBIR iterations when the fit has saturated and, with the outer
-rule, the reconstruction when a further scatter correction no longer changes the fit.
+Subsets per MBIR iteration
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An MBIR iteration updates the pixel columns of the volume one random subset at a time: the columns of a subset are
+updated together from the same error sinogram, which is then updated before the next subset. Columns of a subset that
+lie on a common ray interact, so the subsets must be sparse enough that a ray crosses only a few columns of each;
+past that, more subsets no longer speed up the convergence per iteration, while every subset costs the engine a fixed
+overhead. ``mbir_subsets_per_iteration = "auto"`` (the default) therefore takes the power of 2 nearest a quarter of the
+largest in-plane extent of the volume in voxels when that is 16 to 64 (``recon.mbir_bridge.vcd_partitions``); as in
+MBIRTORCH's default schedule, the first MBIR iterations of the loop use 4 and 16 subsets (those fewer than the count),
+which take up the large change from the initial volume more evenly. Outside that range it keeps MBIRTORCH's own
+schedule, which ends at 128 subsets per iteration: volumes narrower than about 46 voxels converge best per iteration
+with many subsets of few columns, and on volumes wider than about 360 voxels 128 is the count the rule asks for. An
+integer sets the count, and ``None`` always keeps the model's own partition schedule.
 
 Metal
 ~~~~~
@@ -602,7 +610,7 @@ integral changes steeply across the pixel (the exponential edge-gradient effect)
 thick piece no primary photon gets through, so the corrected data of the ray rest on the solver's scatter estimate.
 MBIR spreads such errors along the rays as streaks. With ``CitrusConfig.metal_attenuation_threshold`` (in 1/cm) every
 outer iteration marks the voxels of the current volume above the threshold, forward projects them and gives zero
-weight to every measurement whose ray crosses one; the residual of the adaptive rules is computed over the other
+weight to every measurement whose ray crosses one; the residual (``sinogram_nrmse``) is computed over the other
 measurements, and ``records[k]["metal_measurement_fraction"]`` holds the share left out. The mask works on
 attenuation, so it applies to any material, including user-defined ones; the threshold must lie above every material
 of the object that is not metal (the nominal attenuations of the catalogue at the effective energy are in

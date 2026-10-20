@@ -74,13 +74,14 @@ def mbir_callback(i, X, record):
 # callback(k, X_k, record): called for the initial volume (k = 0) and after every outer iteration k; the record is
 # info["records"][k]: the MBIR iterations taken, the residual, the relative change of the scatter estimate (from
 # k = 2 on), the mean relative change of the scatter accumulators and the stage timings, among others.
-per_outer_iteration = {"mbir_iterations": [], "scatter_change": []}
+per_outer_iteration = {"scatter_seconds": [], "mbir_seconds": [], "scatter_change": []}
 
 
 def callback(k, X, record):
     if k == 0:
         return
-    per_outer_iteration["mbir_iterations"].append(record["mbir_iterations"])
+    per_outer_iteration["scatter_seconds"].append(record["scatter_seconds"])
+    per_outer_iteration["mbir_seconds"].append(record["mbir_seconds"])
     per_outer_iteration["scatter_change"].append(record.get("scatter_change_relative", np.nan))  # none at k = 1
     print(f"outer iteration {k}: {record['mbir_iterations']} MBIR iterations, sinogram residual "
           f"{record['sinogram_nrmse']:.4f}, scatter change {per_outer_iteration['scatter_change'][-1]:.4f}, "
@@ -88,7 +89,7 @@ def callback(k, X, record):
           f"MBIR {record['mbir_seconds']:.1f} s")
 
 
-# ---- CITRUS with the default adaptive iteration counts ------------------------------------------------------------
+# ---- CITRUS with the default iteration counts ---------------------------------------------------------------------
 X_citrus, info = citrus_recon(Y, I0, angles, grid, geometry, make_solver(),
                               CitrusConfig(scatter_view_stride=scatter_view_stride),
                               callback=callback, mbir_callback=mbir_callback)
@@ -104,12 +105,14 @@ for ax, key, title in ((axes[0], "volume_rmse", "Relative RMSE of the volume aga
     for i in np.flatnonzero(np.diff(outer)):
         ax.axvline(i + 0.5, color="gray", ls=":", lw=0.8)
     ax.set(xlabel="MBIR iteration (0 = initial volume)", title=title)
-k = np.arange(1, len(per_outer_iteration["mbir_iterations"]) + 1)
-bars = axes[2].bar(k, per_outer_iteration["mbir_iterations"], color="lightgray", label="MBIR iterations taken")
-axes[2].set(xlabel="outer iteration", ylabel="MBIR iterations", title="Per outer iteration")
+k = np.arange(1, len(per_outer_iteration["scatter_seconds"]) + 1)
+scatter_bars = axes[2].bar(k, per_outer_iteration["scatter_seconds"], color="lightgray", label="scatter stage")
+mbir_bars = axes[2].bar(k, per_outer_iteration["mbir_seconds"], bottom=per_outer_iteration["scatter_seconds"],
+                        color="darkgray", label="MBIR iterations")
+axes[2].set(xlabel="outer iteration", ylabel="seconds", title="Per outer iteration")
 twin = axes[2].twinx()
 line, = twin.semilogy(k, per_outer_iteration["scatter_change"], "o-", color="tab:red", label="scatter change")
 twin.set_ylabel("relative change of the scatter estimate")
-axes[2].legend(handles=[bars, line], loc="upper right", fontsize=8)
+axes[2].legend(handles=[scatter_bars, mbir_bars, line], loc="upper right", fontsize=8)
 fig.tight_layout()
 plt.show()

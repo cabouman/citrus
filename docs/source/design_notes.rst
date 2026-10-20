@@ -411,14 +411,30 @@ cost the same per view as the full model, and its projections equal the matching
 rounding.
 
 **One warm-started iteration.** ``model.recon(sino, weights=W, init_recon=X, max_iterations=k + 1,
-first_iteration=k, stop_threshold_change_pct=0)`` runs exactly the k-th iteration of the default VCD schedule
+first_iteration=k, stop_threshold_change_pct=0)`` runs exactly the k-th iteration of the model's VCD schedule
 (``mbir_iterations``): ``recon`` builds the partition sequence of length ``max_iterations`` and drops its first
 ``first_iteration`` entries, so ``max_iterations`` is the end position. The partitions and the subset order are drawn
 from numpy's global RNG, which CITRUS seeds with ``[base_seed, k]`` before every iteration. The regularization is
 frozen (``auto_regularize_flag=False``) after one automatic estimate, so that the correction, not a drifting prior,
 changes between outer iterations.
-Each call draws its partitions anew, so the granularity of iteration k is that of the default schedule, while the
-random subsets differ from those of one continuous ``recon`` run.
+Each call draws its partitions anew, so the granularity of iteration k is that of the schedule, while the random
+subsets differ from those of one continuous ``recon`` run.
+
+**Subsets per iteration.** The loop sets the model's schedule with ``vcd_partitions``
+(``mbir_subsets_per_iteration``). For every subset the engine computes the prior's gradient at the subset's columns,
+back-projects the weighted error, forms the direction, forward-projects it, line-searches and updates the error
+sinogram: many small kernel launches, per-call geometry of the projector and a few host synchronizations,
+whose cost hardly depends on the subset's size. On the volumes of a scatter-correction loop (tens to a few hundred
+voxels across) the fixed part dominates at MBIRTORCH's default of 128 subsets, and the GPU idles much of the
+iteration. The convergence per iteration, measured as the distance to MBIR's own converged volume, does not improve
+once a ray crosses only a few columns of a subset (a subset count of about a quarter of the in-plane extent in
+voxels); fewer subsets than that let the columns along a ray share each update and slow the convergence down. The
+argument fails on very small grids (a few tens of voxels across, as in the tests), where a few iterations converge
+best with many subsets of few columns, so ``"auto"`` changes the schedule only where it asks for 16 to 64 subsets.
+The
+slowest component in every setting is a slice-to-slice offset near the top and bottom of a volume scanned on a
+circle: the scan does not measure structure that varies quickly along z and slowly in the plane there, so only the
+prior settles it, at a rate the partitions do not change.
 
 **FDK and FBP.** MBIRTORCH 0.1.2's ``recon_fdk`` and ``recon_fbp`` weight every view by pi / V. Over a range
 that is not whole rotations ``mbir_bridge.fdk`` and ``direct_reconstruction`` multiply the line integrals by

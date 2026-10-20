@@ -89,7 +89,6 @@ Repository
 ``benchmarks/``
     Benchmarks of the sweep, the first-collision source kernel, the ray tracer and the scatter image per direction
     chunk (``bench_scatter_image.py``), profiles of the CITRUS step per stage (``profile_citrus_step.py``) and per
-    kernel (``kernel_profile_step.py``), the GPU memory of the loop (``bench_citrus_memory.py``), fixed against
-    adaptive numbers of MBIR iterations (``adaptive_mbir_study.py``), demo 2's data at another voxel pitch
-    (``make_demo_data.py``), and ``citrus_study.py``, the CITRUS study script with every setting as a flag
+    kernel (``kernel_profile_step.py``), the GPU memory of the loop (``bench_citrus_memory.py``), demo 2's data at
+    another voxel pitch (``make_demo_data.py``), and ``citrus_study.py``, the CITRUS study script with every setting as a flag
     (:doc:`usage`).

@@ -19,7 +19,7 @@ import torch
 from torch import Tensor
 
 from .recon.mbir_bridge import (ViewChunkProjector, direct_reconstruction, forward_project, make_model,
-                                mbir_iterations)
+                                mbir_iterations, vcd_partitions)
 from .scatter_solver.angular_quadrature import Quadrature
 from .scatter_solver.cross_sections import MultigroupLibrary
 from .scatter_solver.geometry import ConeGeometry, Grid
@@ -637,19 +637,15 @@ class CitrusConfig:
     The options are described in docs/source/method.rst, "Options and secondary components".
 
     Attributes:
-        num_outer_iterations (int or "adaptive"): number N of outer iterations, each one a scatter correction
-            followed by MBIR iterations; "adaptive" runs until an outer iteration lowers the relative RMSE of A X
-            against the corrected sinogram by less than ``stop_relative_improvement``, at most
-            ``max_outer_iterations``. Defaults to "adaptive".
-        mbir_iterations_per_outer_iteration (int or "adaptive"): number n of warm-started MBIR iterations on the
-            corrected counts of each outer iteration; "adaptive" stops them once that residual improves by less than
-            ``mbir_stop_relative_improvement`` per iteration (averaged over the last two; at least two run), at most
-            ``max_mbir_iterations_per_outer_iteration``. Defaults to "adaptive".
-        stop_relative_improvement (float): threshold of the adaptive outer loop. Defaults to 0.005.
-        mbir_stop_relative_improvement (float): threshold of the adaptive MBIR iterations. Defaults to 0.02.
-        max_outer_iterations (int): most outer iterations of the adaptive loop. Defaults to 40.
-        max_mbir_iterations_per_outer_iteration (int): most MBIR iterations of an adaptive outer iteration. Defaults
-            to 8.
+        num_outer_iterations (int): number N of outer iterations, each one a scatter correction followed by MBIR
+            iterations. Defaults to 14.
+        mbir_iterations_per_outer_iteration (int): number n of warm-started MBIR iterations on the corrected counts
+            of each outer iteration. Defaults to 8.
+        mbir_subsets_per_iteration (int, "auto" or None): number of subsets of pixel columns that an MBIR iteration
+            updates one after the other (``recon.mbir_bridge.vcd_partitions``; the first iterations of the loop use
+            4, 16 and 64, those fewer than the count); "auto" scales it with the largest in-plane extent of the volume
+            where that saves time (16 to 64 subsets) and keeps the model's own schedule (MBIRTORCH's default ends at
+            128) on narrower and wider volumes; None always keeps the model's schedule. Defaults to "auto".
         energy_kev (float or None): effective energy E_eff in keV of the density model; None uses the spectrum mean of
             the solver's library. Defaults to None.
         min_counts (float): lower clamp of the (corrected) counts before the log. Defaults to 1.0.
@@ -677,12 +673,9 @@ class CitrusConfig:
             the metal mask off. Defaults to None.
     """
 
-    num_outer_iterations: Union[int, Literal["adaptive"]] = "adaptive"
-    mbir_iterations_per_outer_iteration: Union[int, Literal["adaptive"]] = "adaptive"
-    stop_relative_improvement: float = 0.005
-    mbir_stop_relative_improvement: float = 0.02
-    max_outer_iterations: int = 40
-    max_mbir_iterations_per_outer_iteration: int = 8
+    num_outer_iterations: int = 14
+    mbir_iterations_per_outer_iteration: int = 8
+    mbir_subsets_per_iteration: Union[int, Literal["auto"], None] = "auto"
     energy_kev: Optional[float] = None
     min_counts: float = 1.0
     base_seed: int = 0
@@ -702,19 +695,14 @@ class CitrusConfig:
         Raises:
             ValueError: if a setting is out of range or of the wrong type.
         """
-        for name in ("num_outer_iterations", "mbir_iterations_per_outer_iteration", "max_outer_iterations",
-                     "max_mbir_iterations_per_outer_iteration"):
+        for name in ("num_outer_iterations", "mbir_iterations_per_outer_iteration"):
             count = getattr(self, name)
-            adaptive_allowed = not name.startswith("max_")
-            if count == "adaptive" and adaptive_allowed:
-                continue
             if isinstance(count, bool) or not isinstance(count, (int, np.integer)) or count < 1:
-                raise ValueError(f"{name} must be an integer >= 1" + (' or "adaptive"' if adaptive_allowed else "")
-                                 + f", got {count!r}")
-        for name in ("mbir_stop_relative_improvement", "stop_relative_improvement"):
-            threshold = getattr(self, name)
-            if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not 0 < float(threshold) < 1:
-                raise ValueError(f"{name} must be a number in (0, 1), got {threshold!r}")
+                raise ValueError(f"{name} must be an integer >= 1, got {count!r}")
+        subsets = self.mbir_subsets_per_iteration
+        if not (subsets is None or (isinstance(subsets, str) and subsets == "auto")
+                or (isinstance(subsets, (int, np.integer)) and not isinstance(subsets, bool) and subsets >= 1)):
+            raise ValueError(f'mbir_subsets_per_iteration must be "auto", None or an integer >= 1, got {subsets!r}')
         if self.min_counts <= 0:
             raise ValueError("min_counts must be > 0")
         stride = self.scatter_view_stride
@@ -1093,14 +1081,11 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
                 config: CitrusConfig, scatter_stage: Optional[ScatterStage], device: torch.device, *,
                 regularization: Optional[dict], init_recon: Optional[Tensor], model, callback, label: str,
                 mbir_callback=None,
-                schedule: Optional[Sequence[int]] = None,
                 after_initialization: Optional[Callable[[Tensor, dict], None]] = None) -> tuple[Tensor, dict]:
     """Outer loop of ``citrus_recon`` and ``mbir_recon``: a scatter stage, then n MBIR iterations, per outer iteration.
 
     X_0 is the initial volume; outer iteration k = 1, ..., N corrects the counts with the scatter of X_{k-1} and runs
-    warm-started MBIR iterations on them, which give X_k. With the "adaptive" counts the relative RMSE of A X against
-    the corrected sinogram stops the MBIR iterations (``mbir_stop_relative_improvement``) and the loop
-    (``stop_relative_improvement``); fixed counts run as given.
+    n warm-started MBIR iterations on them, which give X_k.
 
     Args:
         Y (Tensor): [V, Rd, Cd] measured counts.
@@ -1123,8 +1108,6 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
             and after every MBIR iteration i = 1, ..., N n; the record holds ``outer_iteration``, ``mbir_iteration``
             and ``sinogram_nrmse``, the relative RMSE of A X against the corrected sinogram of the outer iteration
             (a forward projection per call unless the error sinogram is resumed). Defaults to None.
-        schedule (Sequence[int] or None, optional): MBIR iterations of each outer iteration, overriding the count,
-            the number of outer iterations and the stop rules of ``config``. Defaults to None.
         label (str): prefix of the verbose lines.
         after_initialization (callable, optional): ``after_initialization(X_0, info)``, called once after the initial
             volume. Defaults to None.
@@ -1137,6 +1120,10 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
     measured_line_integrals = -torch.log(Y.clamp_min(config.min_counts) / I0)
     if model is None:
         model = make_model(grid, geometry, angles, device=device)
+    partitions = (None if config.mbir_subsets_per_iteration is None
+                  else vcd_partitions(model.get_params("recon_shape"), config.mbir_subsets_per_iteration))
+    if partitions is not None:
+        model.set_params(no_warning=True, **partitions)
     t0 = time.perf_counter()
     if init_recon is None:
         # FDK, or the filtered back projection of a parallel beam, with the redundancy weights of the range
@@ -1162,20 +1149,11 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
     # resume: MBIRTORCH's error sinogram minus the corrected data, -A X (one sinogram)
     negative_projection: Optional[Tensor] = None
     t_start = time.perf_counter()
-    adaptive_mbir = config.mbir_iterations_per_outer_iteration == "adaptive" and schedule is None
-    adaptive_outer = config.num_outer_iterations == "adaptive" and schedule is None
-    max_iterations = (0 if schedule is not None  # the schedule sets every block
-                      else int(config.max_mbir_iterations_per_outer_iteration if adaptive_mbir
-                               else config.mbir_iterations_per_outer_iteration))
-    stop_mbir = float(config.mbir_stop_relative_improvement) if adaptive_mbir else None
-    stop_outer = float(config.stop_relative_improvement) if adaptive_outer else None
-    # the residual |A X - y_c| / |y_c| is tracked when it is free (resumed error sinogram) or needed
-    track_residual = resume or mbir_callback is not None or stop_mbir is not None or stop_outer is not None
-    num_outer = (len(schedule) if schedule is not None
-                 else int(config.max_outer_iterations if adaptive_outer else config.num_outer_iterations))
-    outer_label = "{}" + (f" (at most {num_outer})" if adaptive_outer else f"/{num_outer}")
+    block = int(config.mbir_iterations_per_outer_iteration)
+    # the residual |A X - y_c| / |y_c| is tracked when it is free (resumed error sinogram) or asked for
+    track_residual = resume or mbir_callback is not None
+    num_outer = int(config.num_outer_iterations)
     iteration = 0  # MBIR iterations so far: the seed and the schedule position of the next one
-    previous_end_residual: Optional[float] = None
     # the volume in which the metal was first found and its total attenuation of the metal (metal_fill)
     metal_reference: Optional[tuple[Tensor, Tensor]] = None
     for k in range(num_outer):
@@ -1193,7 +1171,6 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
         weights, fit_mask = _metal_mask(model, X, weights_of_counts, config, record)
         if regularization is None:  # estimated once on the first sinogram MBIR inverts, then frozen
             regularization = estimate_regularization(model, corrected_line_integrals, weights)
-        block = max_iterations if schedule is None else int(schedule[k])
         # resume: e = y_c - A X from the kept -A X and the current corrected data (A X is unchanged by the scatter
         # stage); MBIRTORCH updates e and its init volume in place, so it gets a copy of X
         error_sinogram = None
@@ -1206,7 +1183,6 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
             record["sinogram_nrmse_start"] = residual
         if mbir_callback is not None and k == 0:  # the initial volume against the first corrected sinogram
             mbir_callback(0, X, {"outer_iteration": 0, "mbir_iteration": 0, "sinogram_nrmse": residual})
-        residuals = [residual]
         _sync(device)
         t1 = time.perf_counter()
         j = 0
@@ -1225,15 +1201,9 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
                 residual = _sinogram_nrmse(model, X, corrected_line_integrals, fit_mask) if track_residual else None
             iteration += 1
             j += 1
-            residuals.append(residual)
             if mbir_callback is not None:
                 mbir_callback(iteration, X, {"outer_iteration": k + 1, "mbir_iteration": j,
                                              "sinogram_nrmse": residual})
-            if stop_mbir is not None and j >= 2 and j < block:
-                # mean relative improvement per iteration over the last two iterations
-                before, now = residuals[-3], residuals[-1]
-                if before > 0 and 0.5 * (before - now) / before < float(stop_mbir):
-                    break
         if resume:
             negative_projection, error_sinogram = error_sinogram.sub_(corrected_line_integrals), None
         record["mbir_iterations"] = j
@@ -1259,16 +1229,9 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
             extra = (f" dPhi {record['accumulator_change_mean']:.2e}" if "accumulator_change_mean" in record
                      else "")
             fit = f", fit {residual:.2e}" if residual is not None else ""
-            print(f"[{label}] outer iteration {outer_label.format(k + 1)}: scatter {record['scatter_seconds']:.1f} s, "
+            print(f"[{label}] outer iteration {k + 1}/{num_outer}: scatter {record['scatter_seconds']:.1f} s, "
                   f"MBIR ({j} iteration{'s' if j > 1 else ''}) {record['mbir_seconds']:.1f} s{fit}{extra}",
                   flush=True)
-        if (stop_outer is not None and previous_end_residual is not None and k + 1 < num_outer
-                and previous_end_residual > 0
-                and (previous_end_residual - residual) / previous_end_residual < float(stop_outer)):
-            if config.verbose:
-                print(f"[{label}] stopped: the outer iteration improved the fit by less than {stop_outer}", flush=True)
-            break
-        previous_end_residual = residual
     info["mbir_iterations_total"] = iteration
     info.update(seconds=time.perf_counter() - t_start, regularization=regularization, spr=spr,
                 scatter_counts=scatter_estimate)
@@ -1642,8 +1605,7 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Tens
                spr: Optional[Union[Tensor, np.ndarray]] = None, regularization: Optional[dict] = None,
                init_recon: Optional[Tensor] = None, model=None, device=None,
                callback: Optional[Callable[[int, Tensor, dict], None]] = None,
-               mbir_callback: Optional[Callable[[int, Tensor, dict], None]] = None,
-               mbir_iterations_schedule: Optional[Sequence[int]] = None) -> tuple[Tensor, dict]:
+               mbir_callback: Optional[Callable[[int, Tensor, dict], None]] = None) -> tuple[Tensor, dict]:
     """The MBIR loop of ``citrus_recon`` without the scatter solver: no correction, or a fixed correction.
 
     Args:
@@ -1665,9 +1627,6 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Tens
             else CUDA if available).
         callback (callable, optional): ``callback(k, X_k, record)`` as in ``citrus_recon``. Defaults to None.
         mbir_callback (callable, optional): ``mbir_callback(i, X, record)`` as in ``citrus_recon``. Defaults to None.
-        mbir_iterations_schedule (Sequence[int], optional): MBIR iterations of each outer iteration, e.g. those a
-            CITRUS run took (``[r["mbir_iterations"] for r in info["records"][1:]]``), overriding the count, the
-            number of outer iterations and the stop rules of ``config``. Defaults to None.
 
     Returns:
         (Tensor, dict): reconstruction [R, C, S] float32 in 1/cm and the info dict of ``citrus_recon`` without the
@@ -1688,4 +1647,4 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Tens
     scatter_stage = None if fixed_spr is None else (lambda k, X, record: fixed_spr)
     return _outer_loop(Y, _flat_field(I0, Y), angle_array, grid, geometry, config, scatter_stage, device,
                        regularization=regularization, init_recon=init_recon, model=model, callback=callback,
-                       label="mbir", mbir_callback=mbir_callback, schedule=mbir_iterations_schedule)
+                       label="mbir", mbir_callback=mbir_callback)

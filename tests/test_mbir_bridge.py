@@ -17,7 +17,7 @@ from citrus.utilities import wlab_grid, wlab_phantom  # noqa: E402
 from citrus.scatter_solver.cross_sections import BONE, WATER  # noqa: E402
 from citrus.scatter_solver.ray_tracing import SiddonProjectors  # noqa: E402
 from citrus.recon.mbir_bridge import (fdk, forward_project, freeze_regularization,  # noqa: E402
-                                               make_cone_model, mbir_iterations)
+                                               make_cone_model, mbir_iterations, vcd_partitions)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="MBIRTORCH bridge tests run on CUDA")
 
@@ -137,6 +137,19 @@ def test_fdk_and_single_iteration_recipe():
     sig = freeze_regularization(model)
     xk, _ = mbir_iterations(model, 2.0 * sinogram, xk, first_iteration=4)  # a different sinogram: sigmas stay frozen
     assert model.get_params("sigma_y") == sig["sigma_y"] and model.get_params("sigma_x") == sig["sigma_x"]
+
+
+def test_vcd_partitions_scale_with_the_in_plane_extent():
+    """"auto" takes the power of 2 nearest a quarter of the largest in-plane extent when that is 16 to 64, after
+    iterations of 4 and 16 subsets below it, and otherwise keeps the model's schedule (None); a given count is kept."""
+    assert vcd_partitions((40, 60, 80)) == {"granularity": [4, 16], "partition_sequence": [0, 1]}
+    assert vcd_partitions((80, 120, 160))["granularity"] == [4, 16, 32]
+    assert vcd_partitions((256, 200, 8))["granularity"] == [4, 16, 64]
+    for narrow_or_wide in ((10, 15, 20), (40, 44, 8), (400, 512, 8), (2000, 10, 8)):
+        assert vcd_partitions(narrow_or_wide) is None, narrow_or_wide
+    assert vcd_partitions((10, 15, 20), 128) == {"granularity": [4, 16, 64, 128], "partition_sequence": [0, 1, 2, 3]}
+    assert vcd_partitions((40, 60, 80), 2) == {"granularity": [2], "partition_sequence": [0]}
+    assert vcd_partitions((40, 60, 80), np.int64(64))["partition_sequence"] == [0, 1, 2]
 
 
 def test_resume_from_error_sinogram_equals_restart():

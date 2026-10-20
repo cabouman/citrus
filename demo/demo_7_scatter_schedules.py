@@ -12,9 +12,8 @@ measured counts and seeded partitions; only the scatter estimate that corrects t
 
 The first four run the loop of citrus_recon written out with the functions it is made of (the solver's converged
 solve, the scatter operators, the primary and the angular interpolation of the scatter). Every reconstruction runs
-the adaptive numbers of citrus_recon's defaults, which stop the MBIR iterations and the loop once the fit of the
-corrected sinogram stops improving. The demo uses demo 2's data file in demo/input and synthesizes it when demo 2 has
-not run yet.
+citrus_recon's default numbers of outer and MBIR iterations. The demo uses demo 2's data file in demo/input and
+synthesizes it when demo 2 has not run yet.
 
 What to expect: the scatter of the FDK volume is wrong where the FDK volume is (cupping, too low inserts), so the
 sequential correction leaves shading; first-order scatter misses the multiple scatter, so the volume stays cupped.
@@ -36,7 +35,7 @@ import torch
 from citrus import CitrusConfig, citrus_recon
 from citrus.citrus import (DensityModel, interpolate_scatter, multiple_collision_operator, primary_signals,
                            project_scatter, scatter_view_indices, uncollided_operator)
-from citrus.recon.mbir_bridge import ViewChunkProjector, forward_project, mbir_iterations
+from citrus.recon.mbir_bridge import ViewChunkProjector, mbir_iterations
 from citrus.scatter_solver import (ConeGeometry, ScatterSolver, SolverConfig, ideal_counting_response,
                                    load_spectrum_txt, no_grid)
 from citrus.utilities import (WlabPhantom, central_slice, load_dataset, save_dataset, synthesize_cone_beam_data,
@@ -84,7 +83,7 @@ relative_error = lambda X: float((X - X_true_gpu).norm() / X_true_gpu.norm())  #
 
 # ---- CITRUS; its run also sets the initial volume, the frozen regularization and the model every schedule shares ---
 solver = make_solver()
-loop = CitrusConfig(scatter_view_stride=scatter_view_stride)  # adaptive numbers of iterations
+loop = CitrusConfig(scatter_view_stride=scatter_view_stride)  # the default numbers of iterations
 history = []                                                  # relative RMSE after MBIR iteration 0 (FDK), 1, ...
 X_citrus, info = citrus_recon(data["Y"], I0, angles, grid, geometry, solver, loop,
                               mbir_callback=lambda i, X, record: history.append(relative_error(X)))
@@ -119,37 +118,22 @@ def first_order(fields, angle):                                # the first-colli
     return project_scatter(solver, None, grid, angle, uncollided, no_collided, fields, signal_only=True)["signal"]
 
 
-def fit(X, corrected):                                        # the residual |A X - y_c| / |y_c| of the stop rules
-    return float((forward_project(model, X) - corrected).norm() / corrected.norm())
-
-
 def reconstruct(ratio_of_volume):
-    """The outer loop of citrus_recon with the scatter-to-primary ratio ratio_of_volume(k, X) of outer iteration k,
-    stopped by its adaptive rules (``loop``'s thresholds and maxima)."""
+    """The outer loop of citrus_recon with the scatter-to-primary ratio ratio_of_volume(k, X) of outer iteration k."""
     X, i, scatter_seconds, start = X_initial.clone(), 0, 0.0, time.perf_counter()
-    history, solves, previous_fit = [relative_error(X)], [], None
-    max_mbir = loop.max_mbir_iterations_per_outer_iteration
-    for k in range(loop.max_outer_iterations):
+    history, solves = [relative_error(X)], []
+    for k in range(loop.num_outer_iterations):
         t0 = time.perf_counter()
         solves.append(i)                                       # the scatter of outer iteration k uses X after i
         ratio = ratio_of_volume(k, X)
         torch.cuda.synchronize()
         scatter_seconds += time.perf_counter() - t0
         corrected = -torch.log((Y / (1.0 + ratio)).clamp_min(loop.min_counts) / I0)
-        fits = [fit(X, corrected)]
-        for j in range(1, max_mbir + 1):
+        for _ in range(loop.mbir_iterations_per_outer_iteration):
             np.random.seed([loop.base_seed, i])                # the partitions citrus_recon draws for iteration i
             X, _ = mbir_iterations(model, corrected, X, first_iteration=i, weights=Y / I0)
             i += 1
             history.append(relative_error(X))
-            fits.append(fit(X, corrected))                     # stop once the mean improvement per iteration of
-            if j >= 2 and j < max_mbir:                        # the last two is too small
-                if 0.5 * (fits[-3] - fits[-1]) / fits[-3] < loop.mbir_stop_relative_improvement:
-                    break
-        # stop once an outer iteration barely improves the fit
-        if previous_fit is not None and (previous_fit - fits[-1]) / previous_fit < loop.stop_relative_improvement:
-            break
-        previous_fit = fits[-1]
     torch.cuda.synchronize()
     return X, scatter_seconds, time.perf_counter() - start, history, solves
 

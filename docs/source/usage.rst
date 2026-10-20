@@ -27,7 +27,7 @@ shows the primary signal, the scatter signal and the scatter fraction on the det
 ``demo_2_basic_cone.py`` is the typical circular cone-beam scenario: a short scan of the WLAB phantom with the sample
 125 kVp spectrum of ``demo/spectra`` (the 6 MV linac spectrum is a commented-out alternative, as is a focused lead
 anti-scatter grid, ``anti_scatter_grid``, used by the solvers of the data and of the reconstruction). It synthesizes
-the counts with ``synthesize_cone_beam_data``, reconstructs them with ``citrus_recon`` (adaptive iteration counts,
+the counts with ``synthesize_cone_beam_data``, reconstructs them with ``citrus_recon`` (the default iteration counts,
 scatter step on every 8th view), prints the relative RMSE of the initial FDK volume and of CITRUS against the truth and
 shows the central slices and central-row profiles of the truth and of CITRUS.
 
@@ -61,7 +61,8 @@ scatter of the current volume every outer iteration); decoupled (a fresh fully c
 iteration); and CITRUS. The first four run the loop of ``citrus_recon`` written out with its public parts
 (``ScatterSolver.solve_view_from_fields``, the scatter operators of ``citrus.citrus``, ``primary_signals``,
 ``interpolate_scatter`` and ``recon.mbir_bridge.mbir_iterations`` with the seeds of the loop), so the script is also an
-example of a custom scatter schedule. Every reconstruction stops by the adaptive rules. It shows the central slices with
+example of a custom scatter schedule. Every reconstruction runs the default iteration counts. It shows the central
+slices with
 the relative RMSE and run time of each, and the relative RMSE after every MBIR iteration with the scatter solves marked;
 the decoupled reconstruction takes the longest.
 
@@ -78,7 +79,7 @@ volume to ``demo/output/``. The data sets are cached in ``demo/input/``.
 
 .. code-block:: bash
 
-   python benchmarks/citrus_study.py                      # 180 views over a short scan, 0.5 cm grid, adaptive
+   python benchmarks/citrus_study.py                      # 180 views over a short scan, 0.5 cm grid, the default
                                                           # numbers of outer and MBIR iterations, scatter step on
                                                           # every 8th view (the setting of demo 2)
    python benchmarks/citrus_study.py --end-view-angle 360 # the same over a full rotation
@@ -92,7 +93,7 @@ Flags:
 
 * ``--views`` (default 180), ``--delta-voxel`` (default 0.5), ``--transport-cell-cm`` (default 1, any ratio to the
   voxel pitch; used by the loop's and the truth's solver), ``--outer-iterations`` and ``--mbir-iterations`` per
-  outer iteration (a number each, or ``adaptive``, the default);
+  outer iteration (by default those of ``CitrusConfig``);
 * ``--start-view-angle`` / ``--end-view-angle`` (degrees; the default end is a short scan), ``--full`` (the full
   rotation configuration above);
 * ``--scatter-view-stride`` (default 8), ``--scatter-view-interpolation-order`` (``0``-``3`` or ``none``, default
@@ -114,13 +115,12 @@ a finer truth discretization and the data-set format (``_v2``); files of other f
 are ``demo/output/citrus_<tag>[suffixes]_<figure>.png`` and ``citrus_<tag>[suffixes].json``, with the suffixes
 ``_materials-<names>`` (a set of reference materials other than the default), ``_restart``
 (``--no-resume-error-sinogram``), ``_stride<n>`` (with ``_order<k>`` for an interpolation order other than 3) and
-``_outer<N>_mbir<n>`` when either count is a number rather than ``adaptive``.
+``_outer<N>_mbir<n>`` when either count differs from the default.
 
 The truth solver of the data always uses the seven default reference materials (the phantom is water and bone only),
 so ``--materials`` changes only the reconstruction loop and every set runs on the same data. Both reconstructions use
 the same frozen regularization (MBIRTORCH's automatic estimate on the scatter-free sinogram), the same FDK
-initialization, weights and partition sequence, and the uncorrected loop runs the MBIR iterations of each CITRUS
-outer iteration (``mbir_iterations_schedule``), so the two differ only by the scatter correction.
+initialization, weights, partition sequence and iteration counts, so the two differ only by the scatter correction.
 
 Angular range: the views are evenly spaced over ``[start, end)`` (endpoint excluded, MBIRTORCH's angle convention).
 The default end is a short scan, start + 180 degrees + the in-plane fan angle of the panel,
@@ -206,7 +206,7 @@ on every m-th view"):
 
 .. code-block:: python
 
-   config = CitrusConfig()                                               # adaptive numbers of iterations
+   config = CitrusConfig()                                               # 14 outer iterations of 8 MBIR iterations
    # 20 outer iterations of 2 MBIR iterations: 20 scatter steps, 40 MBIR iterations
    config = CitrusConfig(num_outer_iterations=20, mbir_iterations_per_outer_iteration=2)
    # scatter step on every 4th view, the others interpolated in angle (Catmull-Rom, order 3, by default)
@@ -214,15 +214,10 @@ on every m-th view"):
    recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, config)
    info["computed_views"], info["view_interpolated"]                    # [Vc] indices, [V] bool
 
-By default both counts are ``"adaptive"``: the MBIR iterations of an outer iteration stop once the fit of the
-corrected sinogram improves by less than ``mbir_stop_relative_improvement`` per iteration (at most
-``max_mbir_iterations_per_outer_iteration``), and the loop stops once an outer iteration improves the fit by less
-than ``stop_relative_improvement`` (at most ``max_outer_iterations``); see :doc:`method`, "MBIR iterations per outer
-iteration". ``mbir_iterations_per_outer_iteration=n`` runs n MBIR iterations in every outer iteration and
-``num_outer_iterations=N`` runs N outer iterations instead. ``info["mbir_iterations_total"]`` and the records'
-``mbir_iterations`` say what was run, and
-``mbir_recon(..., mbir_iterations_schedule=[r["mbir_iterations"] for r in info["records"][1:]])`` repeats the same
-schedule without the correction. ``scatter_view_interpolation_order``: 3 cubic Catmull-Rom on 4 neighbors
+``num_outer_iterations=N`` runs N outer iterations and ``mbir_iterations_per_outer_iteration=n`` runs n MBIR
+iterations in each; stronger scatter needs more outer iterations (:doc:`method`, "MBIR iterations per outer
+iteration"). ``mbir_recon`` with the same config runs the same MBIR iterations without the correction.
+``scatter_view_interpolation_order``: 3 cubic Catmull-Rom on 4 neighbors
 (default), 2 quadratic (3-point
 Lagrange), 1 linear, 0 nearest computed view; ``None`` leaves the skipped views uncorrected (diagnostics only); ignored
 at ``scatter_view_stride=1``. ``scatter_view_indices``, ``angular_neighbors``, ``interpolation_weights`` and
@@ -232,8 +227,10 @@ Other settings of ``CitrusConfig``: ``resume_error_sinogram`` (default ``True``:
 between outer iterations instead of recomputing it with a forward projection; the same reconstruction to float
 rounding), ``primary_views_per_chunk`` (views per chunk of the primary projections; default: one sinogram of path
 lengths), ``gpu_state_budget_mib`` and ``pinned_memory_limit_gib`` (where the per-view accumulators are stored),
-``energy_kev``, ``min_counts``, ``base_seed``, ``verbose``, and ``metal_attenuation_threshold`` (the metal mask,
-:doc:`method`, "Metal").
+``mbir_subsets_per_iteration`` (subsets of pixel columns that an MBIR iteration updates in turn; ``"auto"`` scales
+them with the in-plane size of the volume, :doc:`method`, "Subsets per MBIR iteration"), ``energy_kev``,
+``min_counts``, ``base_seed``, ``verbose``, and ``metal_attenuation_threshold`` (the metal mask, :doc:`method`,
+"Metal").
 
 A curved (cylindrical) panel and helical views are part of the geometry, so the same calls reconstruct them
 (:doc:`method`, "Curved panels and helical scans"; :doc:`conventions`, "Frames"):
@@ -305,23 +302,15 @@ descriptions. The first setting of each group names the group.
      - default
      - meaning
    * - ``num_outer_iterations`` (loop)
-     - ``"adaptive"``
-     - outer iterations (one scatter correction each): a number, or adaptive on the fit of the corrected sinogram
+     - ``14``
+     - outer iterations, one scatter correction each
    * - ``mbir_iterations_per_outer_iteration``
-     - ``"adaptive"``
-     - MBIR iterations per outer iteration: a number, or adaptive on the same fit
-   * - ``stop_relative_improvement``
-     - ``0.005``
-     - adaptive loop: stop once an outer iteration improves the fit by less than this
-   * - ``mbir_stop_relative_improvement``
-     - ``0.02``
-     - adaptive MBIR: stop once the fit improves by less than this per iteration (mean of the last two)
-   * - ``max_outer_iterations``
-     - ``40``
-     - most outer iterations of the adaptive loop
-   * - ``max_mbir_iterations_per_outer_iteration``
      - ``8``
-     - most MBIR iterations of an adaptive outer iteration (at least two run)
+     - MBIR iterations per outer iteration
+   * - ``mbir_subsets_per_iteration``
+     - ``"auto"``
+     - subsets of pixel columns an MBIR iteration updates in turn: a number, ``"auto"`` (16 to 64 from the in-plane
+       size of the volume, else the model's own schedule), or ``None`` (the model's own schedule)
    * - ``resume_error_sinogram``
      - ``True``
      - keep MBIRTORCH's error sinogram between outer iterations instead of recomputing it

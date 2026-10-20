@@ -3,7 +3,7 @@
 It builds the MBIRTORCH model of a scan (``ConeBeamModel`` or ``ParallelBeamModel``), projects and back-projects with
 it, runs FDK or the filtered back projection of a parallel beam with the redundancy weights of a range that is not
 whole rotations (Parker weights for a short scan, ramps for an overscan), runs warm-started and resumable MBIR
-iterations, and projects volumes onto chunks of views. MBIRTORCH is imported
+iterations with partitions sized to the volume, and projects volumes onto chunks of views. MBIRTORCH is imported
 lazily, and the functions return torch tensors on the model device. The coupling is described in
 docs/source/design_notes.rst, "MBIRTORCH coupling", and the shared frames in docs/source/conventions.rst.
 """
@@ -35,6 +35,7 @@ __all__ = [
     "redundancy_weight_function",
     "short_scan_weights",
     "mbir_iterations",
+    "vcd_partitions",
     "freeze_regularization",
     "ViewChunkProjector",
     "mbirtorch_version",
@@ -531,6 +532,34 @@ def mbir_iterations(model, sinogram: Tensor, init_recon: Union[Tensor, np.ndarra
     if return_checkpoint:
         return recon, recon_dict, checkpoint
     return recon, recon_dict
+
+
+def vcd_partitions(recon_shape: Sequence[int], subsets: Union[int, str] = "auto") -> Optional[dict]:
+    """MBIRTORCH partition settings under which every MBIR iteration updates the pixel columns ``subsets`` at a time.
+
+    The columns of a subset are updated together, which converges as well as updating them one by one while a ray
+    crosses only a few columns of the subset, and the engine pays a fixed overhead per subset; "auto" takes the power
+    of 2 nearest a quarter of the largest in-plane extent in voxels when that is 16 to 64, and otherwise keeps
+    MBIRTORCH's own schedule (None): narrower volumes converge best per iteration with many subsets of few columns,
+    and on wider ones 128 is the count the rule asks for. The first
+    iterations use 4, 16 and 64 subsets, those fewer than ``subsets``, as MBIRTORCH's default schedule does.
+
+    Args:
+        recon_shape (Sequence[int]): (rows, cols, slices) of the volume.
+        subsets (int or "auto", optional): subsets per iteration after the first ones. Defaults to "auto".
+
+    Returns:
+        dict or None: ``granularity`` and ``partition_sequence`` for the model's ``set_params``; None keeps the
+            model's schedule.
+    """
+    if isinstance(subsets, str) and subsets == "auto":
+        extent = max(int(recon_shape[0]), int(recon_shape[1]), 1)
+        subsets = 2 ** round(np.log2(extent / 4)) if extent >= 4 else 1
+        if not 16 <= subsets <= 64:
+            return None
+    subsets = int(subsets)
+    granularity = [g for g in (4, 16, 64) if g < subsets] + [subsets]
+    return {"granularity": granularity, "partition_sequence": list(range(len(granularity)))}
 
 
 def _vcd_recon_resumable(model, sinogram, weights, init_recon, max_iterations: int, first_iteration: int,

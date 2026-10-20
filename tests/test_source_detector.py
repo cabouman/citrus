@@ -307,10 +307,11 @@ def test_bowtie_open_field_end_to_end(real_library):
     assert error_open < 0.85 * error_uniform
     # mbir_recon: a per-view open field equals the same open field for every view
     views = np.broadcast_to(data["open_field"], data["Y"].shape)
-    X2, _ = mbir_recon(data["Y"], data["open_field"], data["angles"], grid, geometry, loop,
-                       regularization=regularization, model=model, mbir_iterations_schedule=[2])
-    X3, _ = mbir_recon(data["Y"], views, data["angles"], grid, geometry, loop, regularization=regularization,
-                       model=model, mbir_iterations_schedule=[2])
+    once = CitrusConfig(num_outer_iterations=1, mbir_iterations_per_outer_iteration=2)
+    X2, _ = mbir_recon(data["Y"], data["open_field"], data["angles"], grid, geometry, once,
+                       regularization=regularization, model=model)
+    X3, _ = mbir_recon(data["Y"], views, data["angles"], grid, geometry, once, regularization=regularization,
+                       model=model)
     torch.testing.assert_close(X2, X3, rtol=1e-5, atol=1e-6)
 
 
