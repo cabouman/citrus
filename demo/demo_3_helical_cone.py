@@ -33,7 +33,7 @@ source_detector_dist = 105.0               # source to detector distance in cm, 
 num_det_rows, num_det_channels = 80, 168   # panel size in pixels: 18.3 cm along z at the axis, a 37.7 cm field
 pixel_pitch = 0.4                          # pixel pitch in cm (channels: arc length on the cylinder)
 scintillator_thickness = 0.06              # CsI scintillator thickness in cm (energy integrating)
-septum_thickness, septum_height, septum_pitch = 0.01, 2.0, 0.1  # tungsten septa in cm, one per mm of arc
+septum_thickness, septum_height, septum_pitch = 0.01, 2.0, 0.4  # tungsten septa in cm, one per pixel
 delta_voxel = 0.5                          # voxel pitch in cm of the reconstruction grid (a 30 x 20 x 40 cm box)
 num_turns = 3                              # turns of the helix
 views_per_turn = 90                        # views per turn
@@ -75,7 +75,8 @@ for material, density, mask in (("bone_cortical_icrp", 1.85, values > 0.7),
 
 # ---- Data: loaded when a file of this name exists in demo/input, else synthesized once (a few minutes on a GPU) ---
 name = (f"shepp_logan_helical_{num_turns}x{views_per_turn}v_{pitch_cm:g}cm_{delta_voxel:g}cm_{num_det_rows}x"
-        f"{num_det_channels}px{pixel_pitch:g}cm_curved_septa{septum_height:g}cm_csi{scintillator_thickness:g}cm_125kvp"
+        f"{num_det_channels}px{pixel_pitch:g}cm_curved_septa{septum_height:g}x{septum_pitch:g}cm_"
+        f"csi{scintillator_thickness:g}cm_125kvp"
         ).replace(".", "p")
 path = os.path.join(demo_dir, "input", name)
 if os.path.exists(path + ".npz"):

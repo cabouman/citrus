@@ -50,6 +50,8 @@ pixel_pitch = 0.4                          # detector pixel pitch in cm
 source_detector_dist, source_iso_dist = 150.0, 100.0  # source to detector and to rotation axis distances in cm
 num_views = 180                            # number of views over a short scan
 I0 = 1.0e6                                 # flat-field counts per pixel
+num_outer_iterations = 20                  # outer iterations, one scatter correction each
+mbir_iterations_per_outer_iteration = 8    # MBIR iterations per outer iteration
 scatter_view_stride = 8                    # scatter step on every 8th view, the others interpolated in angle
 metal_attenuation_threshold = 2.0          # 1/cm: voxels above are metal (cortical bone is about 0.5 1/cm here)
 
@@ -93,7 +95,9 @@ print(f"Scatter-to-primary ratio of the data: median {np.median(data['SPR']):.2f
 
 # ---- CITRUS -------------------------------------------------------------------------------------------------------
 X_citrus, info = citrus_recon(Y, I0, angles, grid, geometry, solver,
-                              CitrusConfig(scatter_view_stride=scatter_view_stride, verbose=True,
+                              CitrusConfig(num_outer_iterations=num_outer_iterations,
+                                           mbir_iterations_per_outer_iteration=mbir_iterations_per_outer_iteration,
+                                           scatter_view_stride=scatter_view_stride, verbose=True,
                                            metal_attenuation_threshold=metal_attenuation_threshold))
 
 # ---- Results: the RMSE outside the filling, the images on a scale that saturates it -------------------------------
