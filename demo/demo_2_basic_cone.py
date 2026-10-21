@@ -89,7 +89,7 @@ relative_rmse = lambda X: np.linalg.norm(X - X_true) / np.linalg.norm(X_true)  #
 print(f"Relative RMSE against the truth: initial FDK volume {relative_rmse(X_initial):.4f}, CITRUS "
       f"{relative_rmse(X_citrus):.4f} after {info['mbir_iterations_total']} MBIR iterations in "
       f"{len(info['records']) - 1} outer iterations ({info['seconds']:.0f} s)")
-volumes = [("Truth", X_true), ("CITRUS", X_citrus)]
+volumes = [("Truth", X_true), ("Initial FDK volume", X_initial), ("CITRUS", X_citrus)]
 plot_slices(volumes, grid, title="Central slice z = 0", vmax=np.max(X_true))
 plot_profiles(volumes, grid, title="Central row y = 0 (lung -8..-2 cm, air 2..4 cm, bone 6..8 cm)")
 plt.show()

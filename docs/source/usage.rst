@@ -29,7 +29,7 @@ shows the primary signal, the scatter signal and the scatter fraction on the det
 anti-scatter grid, ``anti_scatter_grid``, used by the solvers of the data and of the reconstruction). It synthesizes
 the counts with ``synthesize_cone_beam_data``, reconstructs them with ``citrus_recon`` (the default iteration counts,
 scatter step on every 8th view), prints the relative RMSE of the initial FDK volume and of CITRUS against the truth and
-shows the central slices and central-row profiles of the truth and of CITRUS.
+shows the central slices and central-row profiles of the truth, the initial FDK volume and CITRUS.
 
 ``demo_3_helical_cone.py`` scans MBIRTORCH's 3-D Shepp-Logan phantom (``gen_shepp_logan_3d``), turned into
 densities of bone, soft tissue, muscle and fat, with a helix (``helical_scan``) on a cylindrical panel
@@ -37,7 +37,7 @@ densities of bone, soft tissue, muscle and fat, with a helix (``helical_scan``) 
 behind a CT-style grid: tungsten septa parallel to the rotation axis (``anti_scatter_grid(..., septa_along="rows")``),
 each focused on the source. The pitch, the number of turns and the
 panel height are chosen so that the helix covers the whole height of the head, whose cross-section changes along z;
-the demo also shows a coronal slice.
+the demo also shows a coronal slice. Its figures show the truth, the initial FDK volume and CITRUS.
 
 ``demo_4_materials.py`` defines an iodine contrast agent and a dental amalgam with ``Material``, puts them in
 ``SolverConfig.materials`` next to catalogue names and builds a small head phantom (a water cylinder with a bone rod,
@@ -47,7 +47,8 @@ of the MBIR iterations, and the demo compares the initial volume and CITRUS outs
 
 ``demo_5_parallel_monoenergetic.py`` reconstructs a breast-sized phantom imaged by a monoenergetic parallel beam at
 32 keV (``ParallelGeometry.from_grid``, ``monoenergetic_spectrum``), with the air gap between the rotation axis and the
-panel as a parameter: the scatter that reaches the panel falls as the gap grows.
+panel as a parameter: the scatter that reaches the panel falls as the gap grows. Its figures show the truth, the
+initial filtered-backprojection volume and CITRUS.
 
 ``demo_6_callbacks.py`` runs CITRUS on the data of demo 2 with ``callback`` and ``mbir_callback``: it records the
 relative RMSE of the volume against the truth and the sinogram residual ``record["sinogram_nrmse"]`` after every MBIR

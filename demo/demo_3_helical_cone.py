@@ -97,14 +97,15 @@ relative_rmse = lambda X: np.linalg.norm(X - X_true) / np.linalg.norm(X_true)  #
 print(f"Relative RMSE against the truth: initial helical FDK volume {relative_rmse(X_initial):.4f}, CITRUS "
       f"{relative_rmse(X_citrus):.4f} after {info['mbir_iterations_total']} MBIR iterations in "
       f"{len(info['records']) - 1} outer iterations ({info['seconds']:.0f} s)")
-volumes = [("Truth", X_true), ("CITRUS", X_citrus)]
+volumes = [("Truth", X_true), ("Initial FDK volume", X_initial), ("CITRUS", X_citrus)]
 plot_slices(volumes, grid, title="Central slice z = 0", vmax=np.max(X_true))
 plot_profiles(volumes, grid, title="Central row y = 0 (skull, fat ellipsoids, soft tissue)")
 # The coronal slice y = 0 over the whole height of the head, which the helix covers.
-fig, axes = plt.subplots(1, 2, figsize=(7, 5))
+fig, axes = plt.subplots(1, 3, figsize=(10.5, 5))
 for ax, (label, X) in zip(axes, volumes):
     ax.imshow(X[X.shape[0] // 2].T, cmap="gray", vmin=0, vmax=np.max(X_true), origin="lower",
               extent=[-15, 15, -20, 20])
-    ax.set(title=f"{label}, coronal slice y = 0", xlabel="x (cm)", ylabel="z (cm)")
+    ax.set(title=label, xlabel="x (cm)", ylabel="z (cm)")
+fig.suptitle("Coronal slice y = 0")
 fig.tight_layout()
 plt.show()
