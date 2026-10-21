@@ -22,7 +22,7 @@ from torch import Tensor
 from .angular_quadrature import Quadrature, hemisphere_quadrature, real_spherical_harmonics
 from .config import SolverConfig
 from .cross_sections import MultigroupLibrary, group_transmission, mu_t_volume
-from .detector import DetectorResponse, GridResponse, detector_angle, grid_angles
+from .detector import DetectorResponse, GridResponse, _bracket, detector_angle, grid_angles
 from .geometry import ConeGeometry, Grid, device_tensor, resample_conservative
 from .kernels import triton_utilities, uncollided_kernels
 from .ray_tracing import Projectors
@@ -155,11 +155,12 @@ class DirectionSetContext:
             panel center on a curved panel).
         detector_weight (Tensor): [K, G] detector response ``D_g(theta0_k)`` in keV per incident photon.
         grid_weight (Tensor): [K, G, Rd, 1] grid transmission per detector row when separable, else None.
-        signal_weight (Tensor): [K, G, Rd, Cg] signal weights ``w_k cos(theta0_k) D_g G_g`` (Cg = 1 when separable,
-            else Cd); [K, G, 1, Cd] on a curved panel, without the grid when ``grid_per_pixel``.
+        signal_weight (Tensor): signal weights ``w_k cos(theta0) D_g G_g``, or the factor of them that depends on the
+            direction and the channel: [K, G, Rd, 1] when separable, else [K, G, 1, Cd] (Cd = 1 when the weights do not
+            vary along the channels). The full weights are :meth:`pixel_signal_weight`.
         accumulation_weight (Tensor): [Rd G, 3, K] fused weights of :meth:`accumulate` (rows outer) when separable,
             else None.
-        separable (bool): the grid response depends on the detector row only (flat panel).
+        separable (bool): the signal weights vary along the detector rows only (flat panel).
         chunk (int): directions per chunk.
         chunk_bounds (tuple): (start, stop) of every chunk.
         omega_chunks (tuple): [k, 3] views of ``omega`` per chunk.
@@ -172,8 +173,11 @@ class DirectionSetContext:
         signal_group_weight (Tensor): [K, G] signal weights of the directions when they are the same at every pixel (a
             flat panel and a grid response that does not depend on the angles, such as no grid), else None; the signal
             is then the projection of the emission summed over the groups with them.
-        grid_per_pixel (bool): a curved panel whose grid transmission depends on the angles: :meth:`accumulate`
-            evaluates it per pixel for each chunk of directions. Defaults to False.
+        signal_row_weight (Tensor): [K, G, Rd, 1] factor of the signal weights that varies along the rows when
+            ``signal_weight`` varies along the channels (a flat panel with septa in both directions), else None.
+            Defaults to None.
+        pixel_grids (tuple): :class:`_PixelGrid` septa whose transmission varies along the rows and the channels
+            together (a curved panel with septa along the channels), evaluated per chunk of directions. Defaults to ().
     """
 
     quadrature: Quadrature
@@ -197,9 +201,15 @@ class DirectionSetContext:
     image_shape: tuple[int, int]
     cell_width: Optional[Tensor] = None
     planar_weight: Optional[Tensor] = None
-    grid_per_pixel: bool = False
     signal_group_weight: Optional[Tensor] = None
+    signal_row_weight: Optional[Tensor] = None
+    pixel_grids: tuple = ()
     _cache: dict = field(default_factory=dict, repr=False)
+
+    @property
+    def grid_per_pixel(self) -> bool:
+        """True when some septa have a transmission that varies along the rows and the channels together."""
+        return bool(self.pixel_grids)
 
     # ---- sizes ----------------------------------------------------------------------------------
     @property
@@ -228,8 +238,11 @@ class DirectionSetContext:
         seen: dict[int, int] = {}
         tensors = [t for t in (self.group_energy, self.omega, self.weight, self.cos_theta0, self.detector_weight,
                                self.grid_weight, self.signal_weight, self.accumulation_weight, self.cell_width,
-                               self.planar_weight)
+                               self.planar_weight, self.signal_group_weight, self.signal_row_weight)
                    if t is not None]
+        for pixel_grid in self.pixel_grids:
+            tensors.extend(t for t in (pixel_grid.theta_channels, pixel_grid.theta_pixels, pixel_grid.omega64)
+                           if t is not None)
         for v in self._cache.values():
             tensors.extend(t for t in (v if isinstance(v, tuple) else (v,)) if isinstance(t, Tensor))
         for t in tensors:
@@ -349,32 +362,31 @@ class DirectionSetContext:
         accumulator[0].add_(torch.einsum("kgrc,k->grc", image, weights))
         if self.planar_weight is not None:  # curved panel: the incidence angle varies with the channel
             accumulator[1].add_(torch.einsum("kgrc,kc->grc", image, self.planar_weight[start:stop]))
-            signal_weight = self.signal_weight[start:stop]  # [k, G, 1, Cd]
-            if self.grid_per_pixel:
-                accumulator[2].add_((image * (signal_weight * self._grid_transmission(start, stop))).sum(0))
-            else:
-                accumulator[2].add_(torch.einsum("kgrc,kgc->grc", image, signal_weight[:, :, 0]))
-            return
-        accumulator[1].add_(torch.einsum("kgrc,k->grc", image, weights * self.cos_theta0[start:stop]))
-        accumulator[2].add_((image * self.signal_weight[start:stop]).sum(0))
+        else:
+            accumulator[1].add_(torch.einsum("kgrc,k->grc", image, weights * self.cos_theta0[start:stop]))
+        if self.signal_row_weight is None and not self.pixel_grids:  # [k, G, 1, Cd]: one product
+            signal_weight = self.signal_weight[start:stop, :, 0].expand(k, G, Cd)
+            accumulator[2].add_(torch.einsum("kgrc,kgc->grc", image, signal_weight))
+        else:
+            accumulator[2].add_((image * self.pixel_signal_weight(start, stop)).sum(0))
 
-    def _grid_transmission(self, start: int, stop: int) -> Tensor:
-        """Grid transmission of directions [start, stop) at every pixel of a curved panel, in float64 arithmetic.
+    def pixel_signal_weight(self, start: int, stop: int) -> Tensor:
+        """Signal weights of directions [start, stop) at the pixels, the product of the context's factors.
 
         Args:
             start (int): first direction.
             stop (int): end direction (excluded).
 
         Returns:
-            Tensor: [stop - start, G, Rd, Cd] transmission in the context's dtype.
+            Tensor: [stop - start, G, Rd, Cd] weights, or a shape that broadcasts to it when they do not vary along
+            the rows or the channels.
         """
-        pixels = self._cache.get("pixels64")
-        if pixels is None:
-            pixels = self._cache["pixels64"] = self.geometry.pixel_centers(self.angle, self.device, torch.float64)
-        omega = self.omega[start:stop].to(torch.float64)
-        energy = self.group_energy.to(torch.float64)
-        return self.grid_response.transmission_at(energy, omega, pixels, self.geometry, self.angle).permute(
-            1, 0, 2, 3).to(self.dtype)
+        weight = self.signal_weight[start:stop]
+        if self.signal_row_weight is not None:
+            weight = weight * self.signal_row_weight[start:stop]
+        for pixel_grid in self.pixel_grids:
+            weight = weight * pixel_grid.transmission(start, stop, self.geometry, self.angle)
+        return weight
 
     def finalize(self, accumulator: Tensor) -> dict[str, Tensor]:
         """Image dict from an accumulator.
@@ -413,9 +425,118 @@ def _subcell_offsets(omega: Tensor, grid_quadrature: Grid, f: int) -> Tensor:
             + directions[:, 2, None, None, None] * (dz * centered_index)[None, None, None, :])
 
 
-# the panel-facing directions and the separability of a view, kept with its direction set: quadrature -> {(angle,
-# device, dtype, id(geometry), id(grid response), factorize): [kept, separable]}, dropped with the set
+# the panel-facing directions and how the septa vary over the panel, kept with the direction set: quadrature ->
+# {(angle, device, dtype, id(geometry), id(grid response), factorize): [kept, dependence]}, dropped with the set
 _SELECTIONS: "weakref.WeakKeyDictionary[Quadrature, dict]" = weakref.WeakKeyDictionary()
+# the two septa sets of a crossed grid, each without crossed septa: grid response -> (septa, septa)
+_SEPTA_SETS: "weakref.WeakKeyDictionary[GridResponse, tuple]" = weakref.WeakKeyDictionary()
+_ANGLE_TOLERANCE = 1e-10  # rad; float64 rounding of the grid angles is ~1e-16
+
+
+@dataclass(eq=False)
+class _PixelGrid:
+    """Septa whose transmission varies along the detector rows and the channels together, evaluated per direction chunk.
+
+    The grid angles of such septa (a curved panel with septa along the channels) are the sum of a part per direction
+    and channel, from the incidence on the local panel axes, and a part per pixel, from the focusing direction of the
+    septa; the context keeps both and a chunk adds them and interpolates the table in the dtype of the images. Septa
+    whose angles are not of that form keep the directions and the pixels and are evaluated from them in float64.
+
+    Attributes:
+        septa (GridResponse): one set of septa, without crossed septa.
+        group_energy (Tensor): [G] group energies in keV.
+        theta_channels (Tensor): [2, K, 1, Cd] grid angles (theta1, theta2) along the first row, or None.
+        theta_pixels (Tensor): [2, 1, Rd, Cd] their change from the first row, the same for every direction, or None.
+        omega64 (Tensor): [K, 3] float64 directions when the angles are not such a sum, else None.
+        pixels64 (Tensor): [Rd, Cd, 3] float64 pixel centers when the angles are not such a sum, else None.
+        theta1_nodes (Tensor): [T1] table angles theta1 when the table does not depend on theta2, else None.
+        table_theta1 (Tensor): [T1, G] the table at the group energies on those nodes, else None.
+    """
+
+    septa: GridResponse
+    group_energy: Tensor
+    theta_channels: Optional[Tensor] = None
+    theta_pixels: Optional[Tensor] = None
+    omega64: Optional[Tensor] = None
+    pixels64: Optional[Tensor] = None
+    theta1_nodes: Optional[Tensor] = None
+    table_theta1: Optional[Tensor] = None
+
+    def transmission(self, start: int, stop: int, geometry: ConeGeometry, angle: float) -> Tensor:
+        """Transmission of directions [start, stop) at every pixel.
+
+        Args:
+            start (int): first direction.
+            stop (int): end direction (excluded).
+            geometry (ConeGeometry): the scan geometry.
+            angle (float): view angle in radians.
+
+        Returns:
+            Tensor: [stop - start, G, Rd, Cd] transmission in the dtype of ``group_energy``.
+        """
+        if self.table_theta1 is not None:  # a 1-D table in theta1: two gathers of all groups per pixel
+            theta1 = self.theta_channels[0, start:stop] + self.theta_pixels[0]  # [k, Rd, Cd]
+            i0, i1, w1 = _bracket(self.theta1_nodes, theta1.abs())
+            a0 = self.table_theta1[i0]  # [k, Rd, Cd, G]
+            return (a0 + (self.table_theta1[i1] - a0) * w1[..., None]).permute(0, 3, 1, 2)
+        if self.theta_channels is not None:
+            theta = self.theta_channels[:, start:stop] + self.theta_pixels  # [2, k, Rd, Cd]
+            return self.septa.at(self.group_energy, theta[0], theta[1]).transpose(0, 1)
+        return self.septa.transmission_at(self.group_energy.to(torch.float64), self.omega64[start:stop],
+                                          self.pixels64, geometry, angle).transpose(0, 1).to(self.group_energy.dtype)
+
+
+def _septa_sets(grid_response: GridResponse) -> tuple[GridResponse, ...]:
+    """The sets of septa of a grid response, each without crossed septa (cached per response).
+
+    Args:
+        grid_response (GridResponse): the grid response.
+
+    Returns:
+        tuple: one GridResponse, or two for crossed septa.
+    """
+    if grid_response.crossed is None:
+        return (grid_response,)
+    sets = _SEPTA_SETS.get(grid_response)
+    if sets is None:
+        sets = _SEPTA_SETS[grid_response] = (replace(grid_response, crossed=None), grid_response.crossed)
+    return sets
+
+
+def _septa_dependence(septa: GridResponse, probe: Tensor, pixels: Tensor, geometry: ConeGeometry,
+                      angle: float) -> str:
+    """How the transmission of one set of septa varies over the panel, from the grid angles of probe directions.
+
+    The angles are tested for the form ``a(direction, channel) + b(row, channel)``, the incidence on the local panel
+    axes plus the focusing direction of the septa at the pixel; this needs host synchronizations, so the caller keeps
+    the result.
+
+    Args:
+        septa (GridResponse): one set of septa, without crossed septa.
+        probe (Tensor): [P, 3] float64 directions.
+        pixels (Tensor): [Rd, Cd, 3] float64 pixel centers.
+        geometry (ConeGeometry): the scan geometry.
+        angle (float): view angle in radians.
+
+    Returns:
+        str: "none" (a table that does not depend on the angles), "direction", "rows", "channels", "sum" (a part per
+        direction and channel plus a part per pixel) or "general".
+    """
+    if not septa.depends_on_angles:
+        return "none"
+    theta = torch.stack(grid_angles(probe, pixels, geometry, angle, septa.focal_distance_cm,
+                                    septa.septa_along))  # [2, P, Rd, Cd]
+    first_row = theta[:, :, :1]  # [2, P, 1, Cd]
+    pixel_part = theta - first_row  # the same for every direction when the form holds
+    if float((pixel_part - pixel_part[:, :1]).abs().max()) > _ANGLE_TOLERANCE:
+        return "general"
+    pixel_part = pixel_part[:, :1]
+    no_pixel_part = float(pixel_part.abs().max()) <= _ANGLE_TOLERANCE
+    rows_only = float((pixel_part - pixel_part[..., :1]).abs().max()) <= _ANGLE_TOLERANCE
+    same_channels = float((first_row - first_row[..., :1]).abs().max()) <= _ANGLE_TOLERANCE
+    if no_pixel_part:
+        return "direction" if same_channels else "channels"
+    return "rows" if rows_only and same_channels else "sum"
 
 
 def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle: float, detector: DetectorResponse,
@@ -425,8 +546,12 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
                            factorize: bool = True) -> DirectionSetContext:
     """Precompute the emission-independent part of the collapsed-cone images of one view and direction set.
 
-    Only the panel-facing directions are kept (the only host synchronization of the context); the context does not
-    depend on the voxel grid, so it serves every image of the view.
+    Only the panel-facing directions are kept. The signal weights are stored as factors: one per direction (the
+    quadrature weight, the incidence and the detector response on a flat panel), one per direction and channel (the
+    incidence and the detector response on a curved panel, septa along the rows), one per direction and row (septa
+    along the channels on a flat panel) and the septa that vary along both (:class:`_PixelGrid`). How each set of septa
+    varies is decided once per direction set and view from probe directions (the only host synchronizations of the
+    context). The context does not depend on the voxel grid, so it serves every image of the view.
 
     Args:
         quadrature (Quadrature): direction set, omega [M, 3] and weight [M].
@@ -441,8 +566,8 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
             it is not a float type).
         group_energy (Tensor, optional): [G] group energies in keV; takes precedence over ``library``. Defaults to None.
         chunk (int, optional): directions per chunk of the image loop. Defaults to 8.
-        factorize (bool, optional): store the grid response per detector row when the panel is separable (checked
-            numerically) and accumulate with one batched matrix product, else per-pixel weights. Defaults to True.
+        factorize (bool, optional): when the signal weights vary along the rows only, store them per detector row
+            and accumulate with one batched matrix product, else per-pixel products. Defaults to True.
 
     Returns:
         DirectionSetContext: the context of the view (:class:`DirectionSetContext` lists the shapes).
@@ -461,7 +586,7 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
     weight64 = quadrature.weight.detach().to(device, float64)
     _, _, n_hat = geometry.panel_axes(angle)
     cos64 = (omega64 * (-device_tensor(n_hat, device, float64))).sum(-1)
-    # the selection and the separability need host synchronizations; they are kept with the direction set
+    # the selection and the dependence of the septa need host synchronizations; they are kept with the direction set
     known = _SELECTIONS.setdefault(quadrature, {})
     selection_key = (float(angle), str(device), dtype, id(geometry), id(grid_response), bool(factorize))
     if selection_key not in known:
@@ -476,52 +601,83 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
     K = int(omega64.shape[0])
     pixels = geometry.pixel_centers(angle, device, float64)  # [Rd, Cd, 3]
     Rd, Cd = int(pixels.shape[0]), int(pixels.shape[1])
-    if geometry.use_curved_detector:
-        return _curved_panel_context(quadrature, geometry, angle, detector, grid_response, energy64, omega64, weight64,
-                                     cos64, kept, pixels, chunk, dtype)
-    focal_distance = grid_response.focal_distance_cm
-    # detector response: theta0 per direction -> [G, K]
-    detector_response = (detector.at(energy64, detector_angle(omega64, geometry, angle)) if K
-                         else torch.zeros(G, 0, device=device, dtype=float64))
-    # grid response: the grid angles of one probe direction over the full panel decide separability
-    separable = False
-    if selection[1] is not None:
-        separable = selection[1]
-    elif factorize and grid_response.crossed is None:  # septa along the rows vary along the channels
+    curved = bool(getattr(geometry, "use_curved_detector", False))
+    septa_sets = _septa_sets(grid_response)
+    if selection[1] is None:
         probe = device_tensor(n_hat, device, float64)[None].neg()
         if K:
-            probe = torch.cat([probe, omega64[:1]])
-        probe_theta1, probe_theta2 = grid_angles(probe, pixels, geometry, angle, focal_distance,
-                                                 grid_response.septa_along)  # [P, Rd, Cd]
-        max_deviation = torch.maximum((probe_theta1 - probe_theta1[..., :1]).abs().max(),
-                                      (probe_theta2 - probe_theta2[..., :1]).abs().max())
-        separable = bool(max_deviation <= 1e-10)  # rad; float64 rounding of the pixel positions is ~1e-17
-    selection[1] = separable
-    pixel_columns = pixels[:, Cd // 2:Cd // 2 + 1] if separable else pixels  # [Rd, Cg, 3]
-    Cg = int(pixel_columns.shape[1])
-    detector_weight = detector_response.transpose(0, 1)  # [K, G]
-    c = cos64
-    # grid response and signal weights, evaluated in float64 over blocks of directions (bounded temporaries),
-    # stored in the image dtype
-    grid_weight = torch.empty(K, G, Rd, Cg, device=device, dtype=dtype) if separable else None
-    signal_weight = torch.empty(K, G, Rd, Cg, device=device, dtype=dtype)
-    block = max(1, (1 << 22) // max(1, G * Rd * Cg))
-    for start in range(0, K, block):
-        stop = min(start + block, K)
-        grid_block = grid_response.transmission_at(energy64, omega64[start:stop], pixel_columns, geometry,
-                                                   angle).permute(1, 0, 2, 3)  # [b, G, Rd, Cg]
-        if grid_weight is not None:
-            grid_weight[start:stop] = grid_block
-        signal_weight[start:stop] = ((weight64[start:stop] * c[start:stop])[:, None, None, None]
-                                     * detector_weight[start:stop, :, None, None] * grid_block)
-        del grid_block
-    accumulation_weight = None
+            probe = torch.cat([probe, omega64[torch.tensor([0, K // 2, K - 1], device=device)]])
+        selection[1] = tuple(_septa_dependence(septa, probe, pixels, geometry, angle) for septa in septa_sets)
+    dependence = selection[1]
+    # detector response at theta0 to the normal at the panel center -> [G, K]
+    detector_response = (detector.at(energy64, detector_angle(omega64, geometry, angle)) if K
+                         else torch.zeros(G, 0, device=device, dtype=float64))
+    planar64 = None
+    if curved:  # the incidence angle varies with the channel
+        normals = geometry.local_panel_axes(pixels[0], angle)[2]  # [Cd, 3], the same on every row
+        cos_channel = (omega64 @ normals.neg().t()).clamp(0.0, 1.0)  # [K, Cd]; 0 for a panel met from behind
+        planar64 = weight64[:, None] * cos_channel
+        direction_factor = torch.ones(G, K, device=device, dtype=float64)
+        channel_factor = planar64[None] * detector.at(energy64, torch.arccos(cos_channel))  # [G, K, Cd]
+    else:
+        direction_factor = (weight64 * cos64)[None] * detector_response  # [G, K]
+        channel_factor = None
+    # the septa: factors per direction, per row, per channel, or per pixel
+    grid_direction = torch.ones(G, K, device=device, dtype=float64)
+    row_factor = None
+    pixel_grids = []
+    zero = torch.zeros(1, device=device, dtype=float64)
+    for septa, kind in zip(septa_sets, dependence):
+        if kind == "none":
+            grid_direction = grid_direction * septa.at(energy64, zero, zero)  # [G, 1]
+        elif kind == "direction":
+            grid_direction = grid_direction * septa.transmission_at(energy64, omega64, pixels[:1, :1], geometry,
+                                                                    angle)[:, :, 0, 0]
+        elif kind == "rows":
+            transmission = septa.transmission_at(energy64, omega64, pixels[:, :1], geometry, angle)[..., 0]
+            row_factor = transmission if row_factor is None else row_factor * transmission  # [G, K, Rd]
+        elif kind == "channels":
+            transmission = septa.transmission_at(energy64, omega64, pixels[:1], geometry, angle)[:, :, 0]
+            channel_factor = transmission if channel_factor is None else channel_factor * transmission  # [G, K, Cd]
+        elif kind == "sum":
+            first_row = torch.stack(grid_angles(omega64, pixels[:1], geometry, angle, septa.focal_distance_cm,
+                                                septa.septa_along))  # [2, K, 1, Cd]
+            one_direction = torch.stack(grid_angles(omega64[:1], pixels, geometry, angle, septa.focal_distance_cm,
+                                                    septa.septa_along))  # [2, 1, Rd, Cd]
+            theta1_nodes = table_theta1 = None
+            table = septa.transmission
+            if bool((table == table[:, :, :1]).all()):  # host tables: no device synchronization
+                theta1_nodes = septa.theta1_rad.to(device, dtype)
+                table_theta1 = septa.at(energy64, septa.theta1_rad.to(device, float64),
+                                        torch.zeros(1, device=device, dtype=float64)).t().to(dtype).contiguous()
+            pixel_grids.append(_PixelGrid(septa, energy64.to(dtype), theta_channels=first_row.to(dtype).contiguous(),
+                                          theta_pixels=(one_direction - one_direction[:, :, :1]).to(dtype)
+                                          .contiguous(), theta1_nodes=theta1_nodes, table_theta1=table_theta1))
+        else:
+            pixel_grids.append(_PixelGrid(septa, energy64.to(dtype), omega64=omega64, pixels64=pixels))
+    separable = bool(factorize and not curved and channel_factor is None and not pixel_grids)
+    grid_weight = signal_weight = accumulation_weight = signal_row_weight = signal_group_weight = None
     if separable:
+        grid_rows = grid_direction[..., None] * (row_factor if row_factor is not None else 1.0)  # [G, K, Rd or 1]
+        grid_rows = grid_rows.expand(G, K, Rd)
+        grid_weight = grid_rows.permute(1, 0, 2)[..., None].to(dtype).contiguous()  # [K, G, Rd, 1]
+        signal_weight = (direction_factor[..., None] * grid_rows).permute(1, 0, 2)[..., None].to(dtype).contiguous()
         accumulation_weight = torch.empty(Rd, G, 3, K, device=device, dtype=dtype)  # rows outer
         accumulation_weight[:, :, 0] = weight64.to(dtype)
         accumulation_weight[:, :, 1] = (weight64 * cos64).to(dtype)
         accumulation_weight[:, :, 2] = signal_weight[..., 0].permute(2, 1, 0)
         accumulation_weight = accumulation_weight.reshape(Rd * G, 3, K)
+    else:
+        direction_factor = direction_factor * grid_direction  # [G, K]
+        channel_weight = (direction_factor[..., None] if channel_factor is None
+                          else direction_factor[..., None] * channel_factor)  # [G, K, Cd or 1]
+        signal_weight = channel_weight.permute(1, 0, 2)[:, :, None].to(dtype).contiguous()  # [K, G, 1, Cd or 1]
+        if row_factor is not None:
+            signal_row_weight = row_factor.permute(1, 0, 2)[..., None].to(dtype).contiguous()  # [K, G, Rd, 1]
+    if not curved and channel_factor is None and row_factor is None and not pixel_grids:
+        # the same weight at every pixel: the signal can be projected from the emission summed over the groups
+        signal_group_weight = (direction_factor * grid_direction if separable
+                               else direction_factor).t().to(dtype).contiguous()  # [K, G]
     chunk = max(1, int(chunk))
     chunk_bounds = tuple((start, min(start + chunk, K)) for start in range(0, K, chunk))
     omega = omega64.to(dtype).contiguous()
@@ -531,74 +687,13 @@ def make_direction_context(quadrature: Quadrature, geometry: ConeGeometry, angle
     return DirectionSetContext(
         quadrature=quadrature, geometry=geometry, angle=float(angle), detector=detector, grid_response=grid_response,
         group_energy=energy64.to(dtype), omega=omega, weight=weight,
-        cos_theta0=cos64.to(dtype), detector_weight=detector_weight.to(dtype).contiguous(), grid_weight=grid_weight,
-        signal_weight=signal_weight, accumulation_weight=accumulation_weight, separable=separable, chunk=chunk,
-        chunk_bounds=chunk_bounds, omega_chunks=tuple(omega[start:stop] for start, stop in chunk_bounds),
-        weight_chunks=tuple(weight[start:stop] for start, stop in chunk_bounds), image_shape=(Rd, Cd),
-        cell_width=cell_width,
-        # the same weight at every pixel: a grid response that does not depend on the angles
-        signal_group_weight=None if grid_response.depends_on_angles else signal_weight[:, :, 0, 0].contiguous())
-
-
-def _curved_panel_context(quadrature: Quadrature, geometry: ConeGeometry, angle: float, detector: DetectorResponse,
-                          grid_response: GridResponse, energy64: Tensor, omega64: Tensor, weight64: Tensor,
-                          cos64: Tensor, kept: Tensor, pixels: Tensor, chunk: int,
-                          dtype: torch.dtype) -> DirectionSetContext:
-    """Direction context of a curved panel, whose incidence angle theta0 varies with the channel.
-
-    The planar and signal weights are stored per (direction, channel); a grid transmission that depends on the angles
-    is left to :meth:`DirectionSetContext.accumulate` (``grid_per_pixel``), which evaluates it per chunk.
-
-    Args:
-        quadrature (Quadrature): direction set.
-        geometry (ConeGeometry): cone-beam geometry with a curved panel.
-        angle (float): view angle in radians.
-        detector (DetectorResponse): detector response.
-        grid_response (GridResponse): anti-scatter-grid response.
-        energy64 (Tensor): [G] float64 group energies in keV.
-        omega64 (Tensor): [K, 3] float64 panel-facing directions.
-        weight64 (Tensor): [K] float64 quadrature weights in sr.
-        cos64 (Tensor): [K] float64 cosines to the inward normal at the panel center.
-        kept (Tensor): [K] indices of the panel-facing directions in ``quadrature``.
-        pixels (Tensor): [Rd, Cd, 3] float64 pixel centers.
-        chunk (int): directions per chunk.
-        dtype (torch.dtype): dtype of the images.
-
-    Returns:
-        DirectionSetContext: the context, with ``planar_weight`` set.
-    """
-    device = omega64.device
-    G, K = int(energy64.numel()), int(omega64.shape[0])
-    Rd, Cd = int(pixels.shape[0]), int(pixels.shape[1])
-    normals = geometry.local_panel_axes(pixels[0], angle)[2]  # [Cd, 3], the same on every row
-    cos_channel = (omega64 @ normals.neg().t()).clamp(0.0, 1.0)  # [K, Cd]; 0 for a panel met from behind
-    detector_channel = detector.at(energy64, torch.arccos(cos_channel))  # [G, K, Cd]
-    planar = weight64[:, None] * cos_channel  # [K, Cd]
-    signal = planar[None] * detector_channel  # [G, K, Cd]
-    grid_per_pixel = grid_response.depends_on_angles
-    if not grid_per_pixel:
-        zero = torch.zeros(1, device=device, dtype=torch.float64)
-        signal = signal * grid_response.at(energy64, zero, zero)[:, :, None]  # [G, 1, 1]
-    detector_weight = detector.at(energy64, detector_angle(omega64, geometry, angle)).t() if K else (
-        torch.zeros(0, G, device=device, dtype=torch.float64))
-    chunk = max(1, int(chunk))
-    chunk_bounds = tuple((start, min(start + chunk, K)) for start in range(0, K, chunk))
-    omega = omega64.to(dtype).contiguous()
-    weight = weight64.to(dtype).contiguous()
-    cell_width = getattr(quadrature, "cell_width", None)
-    cell_width = None if cell_width is None else cell_width.detach().to(device, dtype)[kept].contiguous()
-    context = DirectionSetContext(
-        quadrature=quadrature, geometry=geometry, angle=float(angle), detector=detector, grid_response=grid_response,
-        group_energy=energy64.to(dtype), omega=omega, weight=weight, cos_theta0=cos64.to(dtype),
-        detector_weight=detector_weight.to(dtype).contiguous(), grid_weight=None,
-        signal_weight=signal.permute(1, 0, 2)[:, :, None, :].to(dtype).contiguous(), accumulation_weight=None,
-        separable=False, chunk=chunk, chunk_bounds=chunk_bounds,
+        cos_theta0=cos64.to(dtype), detector_weight=detector_response.t().to(dtype).contiguous(),
+        grid_weight=grid_weight, signal_weight=signal_weight, accumulation_weight=accumulation_weight,
+        separable=separable, chunk=chunk, chunk_bounds=chunk_bounds,
         omega_chunks=tuple(omega[start:stop] for start, stop in chunk_bounds),
         weight_chunks=tuple(weight[start:stop] for start, stop in chunk_bounds), image_shape=(Rd, Cd),
-        cell_width=cell_width, planar_weight=planar.to(dtype).contiguous(), grid_per_pixel=grid_per_pixel)
-    if grid_per_pixel:
-        context._cache["pixels64"] = pixels
-    return context
+        cell_width=cell_width, planar_weight=None if planar64 is None else planar64.to(dtype).contiguous(),
+        signal_group_weight=signal_group_weight, signal_row_weight=signal_row_weight, pixel_grids=tuple(pixel_grids))
 
 
 def _resolve_context(context: Optional[DirectionSetContext], quadrature: Quadrature, geometry: ConeGeometry,
@@ -1058,9 +1153,9 @@ def combined_scatter_image(library: MultigroupLibrary, rho_quadrature: Tensor, p
     footprint-blurred and accumulated (docs/source/method.rst, "Collapsed-cone scatter image"). On float32 CUDA tensors
     one fused kernel per chunk forms the attenuated emission and the sums of its mean height
     (``uncollided_kernels.attenuated_emission``). With ``signal_only`` the groups are summed with the signal weights
-    in that kernel when the weights are the same at every pixel, or between the blurs along the rows and the channels
-    when they vary along the rows only, which gives the signal of the full image to float rounding
-    (docs/source/design_notes.rst, "The signal alone").
+    in that kernel when the weights are the same at every pixel, between the blurs along the rows and the channels
+    when they vary along the rows or the channels only, or after the blur with the weights of each pixel, which gives
+    the signal of the full image to float rounding (docs/source/design_notes.rst, "The signal alone").
 
     Args:
         library (MultigroupLibrary): cross-section library.
@@ -1133,15 +1228,15 @@ def combined_scatter_image(library: MultigroupLibrary, rho_quadrature: Tensor, p
     # one fused kernel per chunk on float32 CUDA: source, attenuation and mean-height sums without temporaries
     compact_pairs = pairs if not isinstance(pairs, str) else None
     fused = uncollided_kernels.fused_kernels_usable(library, rho, phi_uncollided, compact_pairs)
-    # the signal alone: from the emission summed over the groups with the signal weights of each direction, or from
-    # the groups summed with the weights of each detector row between the blur of the rows and of the channels
+    # the signal alone: from the emission summed over the groups with the signal weights of each direction, from the
+    # groups summed with the weights of each detector row between the blur of the rows and of the channels (or of each
+    # channel between the blur of the channels and of the rows), or from the blurred images weighted per pixel
     group_weight = context.signal_group_weight if signal_only and fused else None
-    row_weight = (context.signal_weight if signal_only and group_weight is None and context.separable
-                  and context.planar_weight is None else None)  # [K, G, Rd, 1]
-    if group_weight is not None or row_weight is not None:
-        accumulator = torch.zeros(context.image_shape, device=device, dtype=dtype)
-    else:
-        accumulator = context.new_accumulator()
+    factored = signal_only and group_weight is None and not context.pixel_grids
+    row_weight = context.signal_weight if factored and context.separable else None  # [K, G, Rd, 1]
+    channel_weight = context.signal_weight if factored and not context.separable else None  # [K, G, 1, Cd or 1]
+    accumulator = (torch.zeros(context.image_shape, device=device, dtype=dtype) if signal_only
+                   else context.new_accumulator())
     for i, directions in enumerate(context.omega_chunks):
         k = int(directions.shape[0])
         start, stop = context.chunk_bounds[i]
@@ -1192,18 +1287,40 @@ def combined_scatter_image(library: MultigroupLibrary, rho_quadrature: Tensor, p
             if widths is not None:
                 image = box_blur_channels(image, widths[:, 0])
             accumulator.add_(image.sum(dim=(0, 1)))
+        elif channel_weight is not None:
+            widths = None if footprint_blur is None else footprint_blur.widths(i, mean_heights)
+            weights = channel_weight[start:stop, :, 0].expand(k, G, Cd)  # [k, G, Cd]
+            row_factor = context.signal_row_weight
+            if row_factor is not None:  # the rows blurred and weighted per group, then the channels
+                if widths is not None:
+                    rows_outer = torch.bmm(box_matrix(Rd, widths[:, 1], dtype),
+                                           rows_outer.view(k, Rd, G * Cd)).view(k, Rd, G, Cd)
+                rows_outer = rows_outer * row_factor[start:stop].permute(0, 2, 1, 3)  # [k, Rd, G, 1]
+                if widths is not None:
+                    rows_outer = torch.bmm(rows_outer.reshape(k, Rd * G, Cd),
+                                           box_matrix(Cd, widths[:, 0], dtype).transpose(1, 2)).view(k, Rd, G, Cd)
+                accumulator.add_(torch.einsum("krgc,kgc->rc", rows_outer, weights))
+            else:  # the channels blurred per group, the groups summed per channel, then the rows of one image
+                if widths is not None:
+                    rows_outer = torch.bmm(rows_outer.view(k, Rd * G, Cd),
+                                           box_matrix(Cd, widths[:, 0], dtype).transpose(1, 2)).view(k, Rd, G, Cd)
+                single = torch.einsum("krgc,kgc->krc", rows_outer, weights)  # [k, Rd, Cd]
+                if widths is not None:
+                    single = torch.bmm(box_matrix(Rd, widths[:, 1], dtype), single)
+                accumulator.add_(single.sum(0))
         else:
             if footprint_blur is not None:
                 image = footprint_blur.blur(image, i, mean_heights)
             if group_weight is not None:
                 accumulator.add_(image.sum(dim=(0, 1)))
+            elif signal_only:  # septa that vary along the rows and the channels together: weights per pixel
+                accumulator.add_((image * context.pixel_signal_weight(start, stop)).sum(dim=(0, 1)))
             else:
                 context.accumulate(accumulator, image, i)
         del image
-    if group_weight is not None or row_weight is not None:
+    if signal_only:
         return {"signal": accumulator}
-    image = context.finalize(accumulator)
-    return {"signal": image["signal"]} if signal_only else image
+    return context.finalize(accumulator)
 
 
 # =====================================================================================================

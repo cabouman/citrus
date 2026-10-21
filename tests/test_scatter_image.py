@@ -882,13 +882,16 @@ def test_combined_scatter_image_fused_matches_torch(footprint, narrow_band, monk
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("route", ["groups in the emission", "rows", "full image", "unfused"])
+@pytest.mark.parametrize("route", ["groups in the emission", "rows", "channels", "rows and channels", "unfused",
+                                   "curved", "curved rows", "curved per pixel", "curved crossed"])
 def test_signal_only_matches_full_signal(route, monkeypatch):
     """combined_scatter_image(signal_only=True) returns the signal of the full image to float rounding on each of its
     routes: the groups summed with the signal weights in the emission kernel (no grid on a flat panel), the groups
     summed per detector row between the blurs along the rows and the channels (a 1-D grid with septa along the
-    channels), the full image (septa along the rows) and the PyTorch emission (then the row route); with and without
-    the footprint."""
+    channels), per channel between the blurs along the channels and the rows (septa along the rows, a curved panel
+    without a grid or with septa along the rows), rows and channels weighted in turn (crossed septa on a flat panel),
+    the blurred images weighted per pixel (a curved panel with septa along the channels, alone or crossed) and the
+    PyTorch emission (then the row route); with and without the footprint."""
     from citrus.utilities import wlab_phantom
     from citrus.scatter_solver.kernels import uncollided_kernels
     from citrus.scatter_solver.scatter_image import make_direction_context
@@ -897,6 +900,8 @@ def test_signal_only_matches_full_signal(route, monkeypatch):
     if not uncollided_kernels.kernel_usable(device)[0]:
         pytest.skip("first-collision kernels unusable on this machine")
     geometry = wlab_setup(2.0, device=device, dtype=torch.float32)[1]
+    if route.startswith("curved"):
+        geometry = replace(geometry, use_curved_detector=True)
     grid = Grid((10, 16, 20), 2.0)  # padded along x to be divisible by 2
     rho = wlab_phantom(grid, device=device, dtype=torch.float32)
     library = synthetic_library(num_groups=3, legendre_order=2, num_materials=7).to(device, torch.float32)
@@ -904,8 +909,12 @@ def test_signal_only_matches_full_signal(route, monkeypatch):
     phi_uncollided = uncollided_fluence(library, rho, grid, geometry, angle, SourceModel(), PROJECTION)
     q = panel_direction_set(geometry, angle, (8, 16), max_polar_angle=grid, device=device, dtype=torch.float32)
     detector = csi_response()
+    along_rows = replace(focused_1d_grid(), septa_along="rows")
+    crossed = replace(focused_1d_grid(), crossed=along_rows)
     grid_response = {"groups in the emission": no_grid(), "unfused": no_grid(), "rows": focused_1d_grid(),
-                     "full image": replace(focused_1d_grid(), septa_along="rows")}[route]
+                     "channels": along_rows, "rows and channels": crossed, "curved": no_grid(),
+                     "curved rows": along_rows, "curved per pixel": focused_1d_grid(),
+                     "curved crossed": crossed}[route]
     coarse = grid.coarsen(2)
     mu_coarse_values = coarsen_mu_t(mu_t_volume(library, rho), grid, coarse)
     L = 2
@@ -914,7 +923,9 @@ def test_signal_only_matches_full_signal(route, monkeypatch):
     context = make_direction_context(q, geometry, angle, detector, grid_response, library, device, torch.float32,
                                      chunk=8)
     assert (context.signal_group_weight is not None) == (route in ("groups in the emission", "unfused"))
-    assert context.separable == (route != "full image")
+    assert context.separable == (route in ("groups in the emission", "unfused", "rows"))
+    assert (context.signal_row_weight is not None) == (route == "rows and channels")
+    assert context.grid_per_pixel == (route in ("curved per pixel", "curved crossed"))
     if route == "unfused":
         monkeypatch.setattr(uncollided_kernels, "fused_kernels_usable", lambda *args, **kwargs: False)
         monkeypatch.setattr(scatter_image_module, "first_collision_source_at_directions",

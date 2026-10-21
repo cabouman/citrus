@@ -279,14 +279,21 @@ launch fewer kernels and keep the GPU busy; the PyTorch path, whose temporaries 
 ``[k, G, Rd, Cd]``: the footprint blur along the rows is then one matrix product per direction for all groups at once
 instead of one per group, and the accumulation reads the images in place.
 
-**The signal alone.** A CITRUS step needs only the detector signal of the scatter (``signal_only``). When the signal
-weights of a direction are the same at every pixel (a flat panel with a grid response that does not depend on the
-angles, such as no grid), the emission kernel sums the groups with them, so one image per direction is projected,
-blurred and accumulated instead of G. When they vary along the rows only (a flat panel with a 1-D grid whose septa run
-along the channels), the rows of every group are blurred, the groups summed with the weights of each row and the
-channels of the one image blurred. The projection, the blur and the sums are linear, so the signal equals that of the
-full image to float rounding; other panels form the full image and keep its signal. A converged solve forms the
-signal alone on request (``solve_view(signal_only=True)``), as the data synthesis does.
+**The signal alone.** A CITRUS step needs only the detector signal of the scatter (``signal_only``). The direction
+context stores the signal weights as factors, one per direction, one per direction and row, one per direction and
+channel, and the septa whose transmission varies along the rows and the channels together, and each set of septa is
+classified once per view from the grid angles of a few directions. When the weights of a direction are the same at
+every pixel (a flat panel without a grid), the emission kernel sums the groups with them, so one image per direction is
+projected, blurred and accumulated instead of G. When they vary along the rows only (a flat panel with septa along the
+channels), the rows of every group are blurred, the groups summed with the weights of each row and the channels of the
+one image blurred. When they vary along the channels only (a flat panel with septa along the rows, a curved panel
+without a grid or with septa along the rows), the channels are blurred first, the groups summed per channel and the
+rows of the one image blurred. With crossed septa on a flat panel the rows are blurred and weighted per group, then
+the channels. Only a curved panel with septa along the channels needs weights at every pixel; its grid angle is a part
+per direction and channel plus a part per pixel, kept by the context, and a 1-D grid table is looked up in the grid
+angle alone, so each chunk evaluates its transmission with a few elementwise operations. The projection, the blur and
+the sums are linear, so the signal equals that of the full image to float rounding. A converged solve forms the signal
+alone on request (``solve_view(signal_only=True)``), as the data synthesis does.
 
 **Direction set and footprint.** The cone product set is limited to the smallest cone about the panel normal that
 contains every direction from the transport-grid box to the panel. Per-pixel scatter of a finite direction set carries

@@ -9,8 +9,8 @@ authors:
     given-names: Gregery T.
   - family-names: Bouman
     given-names: Charles A.
-version: 0.23.0
-date-released: 2026-10-20
+version: 0.24.0
+date-released: 2026-10-21
 url: "https://purduecitrus.readthedocs.io"
 repository-code: "https://github.com/cabouman/citrus"
 license: BSD-3-Clause

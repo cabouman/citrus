@@ -295,6 +295,57 @@ def test_curved_direction_context(focused_grid):
     assert torch.allclose(images["signal_per_group"], expected, rtol=1e-10, atol=0.0)
 
 
+def _crossed_grid():
+    """A focused grid with septa along the channels and crossed septa along the rows."""
+    return replace(focused_1d_grid(), crossed=replace(focused_1d_grid(), septa_along="rows"))
+
+
+@pytest.mark.parametrize("panel", ["flat", "curved"])
+@pytest.mark.parametrize("septa", ["none", "channels", "rows", "both", "channels theta2", "channels general"])
+def test_context_signal_weights_per_pixel(panel, septa, monkeypatch):
+    """The factored signal weights of the direction context (per direction, row, channel and per-pixel septa) equal a
+    direct evaluation at every pixel, ``w_k cos(theta0) D_g(theta0) G_g`` with the incidence at each pixel and the
+    grid angles of each pixel; each septa set is stored in its cheapest form. Also a table that depends on theta2
+    (bilinear lookup per chunk) and the float64 fallback for septa whose angles are not of the stored form."""
+    from citrus.scatter_solver import scatter_image as scatter_image_module
+    from citrus.scatter_solver.scatter_image import make_direction_context, panel_direction_set
+
+    geometry = replace(FLAT if panel == "flat" else CURVED, num_det_rows=7, num_det_channels=9,
+                       delta_det_channel=6.0, delta_det_row=3.0)
+    angle = 0.3
+    library = synthetic_library(3, 1)
+    one_d = focused_1d_grid()
+    with_theta2 = replace(one_d, transmission=one_d.transmission
+                          * (1.0 - 0.1 * torch.sin(one_d.theta2_rad))[None, None, :])
+    grid_response = {"none": no_grid(), "channels": one_d, "rows": replace(one_d, septa_along="rows"),
+                     "both": _crossed_grid(), "channels theta2": with_theta2, "channels general": one_d}[septa]
+    if septa == "channels general":
+        monkeypatch.setattr(scatter_image_module, "_septa_dependence", lambda *args: "general")
+    quadrature = panel_direction_set(geometry, angle, (4, 8), max_polar_angle=0.6, dtype=F64)
+    detector = csi_response()
+    context = make_direction_context(quadrature, geometry, angle, detector, grid_response, library, "cpu", F64,
+                                     chunk=5)
+    # only a curved panel with septa along the channels needs the per-pixel transmission
+    general = septa == "channels general"
+    assert context.grid_per_pixel == (general or (panel == "curved" and septa != "none" and septa != "rows"))
+    assert context.separable == (panel == "flat" and septa in ("none", "channels", "channels theta2"))
+    # the per-pixel septa are a part per direction and channel plus a part per pixel, not the float64 fallback
+    assert all((pixel_grid.theta_channels is None) == general for pixel_grid in context.pixel_grids)
+    assert all((pixel_grid.table_theta1 is None) == (general or septa == "channels theta2")
+               for pixel_grid in context.pixel_grids)
+    pixels = geometry.pixel_centers(angle, dtype=F64)
+    normals = geometry.local_panel_axes(pixels, angle)[2]  # [Rd, Cd, 3]
+    cos = torch.einsum("kd,rcd->krc", context.omega, -normals).clamp(0.0, 1.0)  # [K, Rd, Cd]
+    energy = library.group_energy.to(F64)
+    response = detector.at(energy, torch.arccos(cos))  # [G, K, Rd, Cd]
+    transmission = grid_response.transmission_at(energy, context.omega, pixels, geometry, angle)
+    expected = (context.weight[None, :, None, None] * cos[None] * response * transmission).transpose(0, 1)
+    Rd, Cd = context.image_shape
+    for start, stop in context.chunk_bounds:
+        got = context.pixel_signal_weight(start, stop).expand(stop - start, library.num_groups, Rd, Cd)
+        torch.testing.assert_close(got, expected[start:stop], rtol=1e-10, atol=0.0)
+
+
 # ---- the scatter solve -------------------------------------------------------------------------------------
 
 def test_curved_scatter_solve_is_close_to_flat_for_a_small_cone():

@@ -700,14 +700,16 @@ everything the solver does at the panel follows the cylinder: the primary rays a
 image run through the pixel centers on it, the downstream optical depth ends on it, the source collimation tests the
 ray's hit on it, and the incidence angle :math:`\theta_0`, the planar fluence and the detector and grid responses use
 the local normal of each pixel, which is horizontal and points to the axis. The scatter-image weights therefore depend
-on the direction and the channel, :math:`w_k \cos\theta_{0,kc}\, D_g(\theta_{0,kc})`, and a grid transmission that
-depends on the angles is evaluated per pixel for each chunk of directions. Lamellae along the channels run along the arc
-and each column is focused along its own normal; lamellae along the rows (``septa_along="rows"``, the usual clinical
-grid) are focused along each pixel's normal; a crossed grid has both. Both focus on the focal spot at the default
-focal distance. The
-collapsed-cone direction set keeps the axis of the normal at the panel center and covers the cylinder's edges, and the
-finite-cone footprint is computed on the plane tangent to the cylinder at the central ray (the arc length and the
-tangent-plane coordinate agree to first order in the fan angle).
+on the direction and the channel, :math:`w_k \cos\theta_{0,kc}\, D_g(\theta_{0,kc})`. So does the transmission of
+lamellae along the rows. The transmission of lamellae along the channels varies with the row as well, because the rows
+of the cylinder are at the height :math:`v\cos\gamma`; their grid angle is the incidence angle on the local axes, which
+depends on the direction and the channel, minus the focusing angle of the pixel, which does not depend on the direction,
+so it is evaluated per pixel for each chunk of directions from these two parts. Lamellae along the channels run along
+the arc and each column is focused along its own normal; lamellae along the rows (``septa_along="rows"``, the usual
+clinical grid) are focused along each pixel's normal; a crossed grid has both. Both focus on the focal spot at the
+default focal distance. The collapsed-cone direction set keeps the axis of the normal at the panel center and covers
+the cylinder's edges, and the finite-cone footprint is computed on the plane tangent to the cylinder at the central ray
+(the arc length and the tangent-plane coordinate agree to first order in the fan angle).
 
 **Helical scan.** Every view carries a z shift of the source and the panel (a table of unwrapped view angles and shifts
 in the geometry), used by the scatter solver for each view, by MBIRTORCH and by the synthetic data. The reconstruction

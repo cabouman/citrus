@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.24.0 - 2026-10-21
+
+- **Faster scatter signal on curved panels and with grids.** The direction context stores the signal weights as
+  factors per direction, per row and per channel, and classifies each set of septa once per view from the grid angles
+  of a few directions. The signal alone (every CITRUS step and the signal-only converged solves) now has a route
+  without per-pixel weights for a flat panel with septa along the rows or crossed septa and for a curved panel without
+  a grid or with septa along the rows: the groups are summed per channel between the blurs. A curved panel with septa
+  along the channels keeps per-pixel weights, whose grid angle is stored as a part per direction and channel plus a
+  part per pixel, with a 1-D table lookup instead of the float64 grid angles of every pixel in every image. Flat panels
+  with septa along the rows no longer build a float64 weight table of every direction, group and pixel per view. The
+  signal is unchanged to float rounding (tests over every panel and septa combination).
+
 ## v0.23.0 - 2026-10-20
 
 - **Fewer subsets per MBIR iteration.** The loop sets MBIRTORCH's partitions itself
