@@ -84,17 +84,17 @@ the CITRUS step per stage and per kernel, the GPU memory of the loop, and the CI
 ## Quick start
 
 ```bash
-python demo/demo_1_scatter_solver.py          # the scatter solver on one view of the WLAB phantom
-python demo/demo_2_basic_cone.py              # a short circular cone-beam scan, 125 kVp (6 MV and a grid as options)
-python demo/demo_3_helical_cone.py            # a helical scan on a curved detector behind a CT-style anti-scatter grid
-python demo/demo_4_materials.py               # user-defined materials: iodine contrast and a dental amalgam filling
-python demo/demo_5_parallel_monoenergetic.py  # a monoenergetic parallel beam (synchrotron CT), air gap option
-python demo/demo_6_callbacks.py               # convergence curves recorded with the callbacks of citrus_recon
-python demo/demo_7_scatter_schedules.py       # CITRUS against no correction, sequential, first-order, decoupled
+python demo/basic/demo_basic_1_scatter_solver.py         # the scatter solver on one view of the WLAB phantom
+python demo/basic/demo_basic_2_parallel_beam.py          # a monoenergetic parallel beam (synchrotron CT), air gap
+python demo/basic/demo_basic_3_cone_beam.py              # a short circular cone-beam scan, 125 kVp (6 MV, grid options)
+python demo/basic/demo_basic_4_custom_materials.py       # user-defined materials: iodine contrast, dental amalgam
+python demo/advanced/demo_advanced_1_custom_callbacks.py # convergence curves recorded with the callbacks
+python demo/advanced/demo_advanced_2_helical_cone.py     # a helical scan on a curved detector behind a CT-style grid
+python demo/advanced/demo_advanced_3_custom_schedules.py # CITRUS against other scatter schedules, built step by step
 ```
 
 The demos are short scripts that show the API step by step, with every setting (spectrum, reference materials,
-panel, voxel pitch, views, loop and solver settings) a variable at the top. The first run of demo 1 downloads the
+panel, voxel pitch, views, loop and solver settings) a variable at the top. The first run of demo_basic_1 downloads the
 photon data and builds the cross-section library (both cached); the reconstruction demos synthesize their data once
 and cache it in `demo/input/` (a few minutes on a GPU for the first run).
 For studies (other iteration counts and sparse-view scatter schedules, a finer ground truth, the RMSE history and run
@@ -142,7 +142,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Gregery T. Buzzard and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.24.0},
+  note = {Version 0.25.0},
   year = 2026
 }
 ```

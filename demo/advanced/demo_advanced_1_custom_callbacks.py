@@ -1,9 +1,9 @@
-"""Demo 6: follow the CITRUS iterations with callbacks.
+"""Demo advanced 1: follow the CITRUS iterations with callbacks.
 
-Reconstruct the scan of demo 2 (the WLAB phantom, 125 kVp, a short circular cone-beam scan) with CITRUS and follow
-its convergence with the two callbacks of citrus_recon: ``mbir_callback`` after every MBIR iteration and ``callback``
-after every outer iteration (one scatter correction followed by its MBIR iterations). The demo uses demo 2's data
-file in demo/input and synthesizes it when demo 2 has not run yet.
+Reconstruct the scan of demo_basic_3_cone_beam (the WLAB phantom, 125 kVp, a short circular cone-beam scan) with
+CITRUS and follow its convergence with the two callbacks of citrus_recon: ``mbir_callback`` after every MBIR iteration
+and ``callback`` after every outer iteration (one scatter correction followed by its MBIR iterations). The demo uses
+the data file of demo_basic_3_cone_beam in demo/input and synthesizes it when that demo has not run yet.
 
 The relative RMSE against the truth needs the true volume; the sinogram residual of the records does not, so it is
 the measure to watch on measured data.
@@ -20,8 +20,8 @@ from citrus.scatter_solver import (ConeGeometry, ScatterSolver, SolverConfig, id
                                    load_spectrum_txt, no_grid)
 from citrus.utilities import WlabPhantom, load_dataset, save_dataset, synthesize_cone_beam_data, wlab_grid
 
-# ---- Parameters (those of demo 2, so that the data file is shared) ------------------------------------------------
-demo_dir = os.path.dirname(os.path.abspath(__file__))
+# ---- Parameters (those of demo_basic_3_cone_beam, so that the data file is shared) --------------------------------
+demo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # demo/, with spectra/ and input/
 spectrum, spectrum_name = load_spectrum_txt(os.path.join(demo_dir, "spectra", "spectrum_125kvp.txt")), "125kvp"
 materials = ["air", "lung_icrp", "adipose_icrp", "water", "muscle_icru44", "soft_tissue_icru44",
              "bone_cortical_icrp"]  # reference materials of the density model

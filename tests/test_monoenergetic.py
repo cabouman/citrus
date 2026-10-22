@@ -119,7 +119,7 @@ def test_solver_with_a_line_runs(library_module):
 def test_attenuation_model_and_synthetic_data_of_a_line(library_module):
     """The library of a line has one fine energy; the mass attenuation at the effective energy is its tabulated
     value (no interpolation), so the attenuation volume, the primary and the synthetic counts are finite (the
-    first run of demo 2 with a monoenergetic source hit NaN here)."""
+    first run of demo_basic_3_cone_beam with a monoenergetic source hit NaN here)."""
     import numpy as np
     from citrus.utilities import (WlabPhantom, effective_energy, mass_attenuation_at, synthesize_cone_beam_data,
                                   wlab_geometry, wlab_grid)

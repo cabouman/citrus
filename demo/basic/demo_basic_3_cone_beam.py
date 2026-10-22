@@ -1,4 +1,4 @@
-"""Demo 2: scatter-corrected circular cone-beam CT with CITRUS.
+"""Demo basic 3: scatter-corrected circular cone-beam CT with CITRUS.
 
 Reconstruct a short-scan circular cone-beam CT of the WLAB phantom (a water prism with lung, air and bone inserts)
 with CITRUS, which alternates scatter steps of the LBTE scatter solver with MBIR iterations (MBIRTORCH) on the
@@ -24,7 +24,7 @@ from citrus.utilities import (WlabPhantom, load_dataset, plot_profiles, plot_sli
 # ---- Parameters -----------------------------------------------------------------------------------------------
 # Source spectrum, (energies in keV, relative photons per keV), with a short name for the data file: a text file of
 # two columns ('#' starts a comment); demo/spectra has a 125 kVp tube and a 6 MV linac spectrum.
-demo_dir = os.path.dirname(os.path.abspath(__file__))
+demo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # demo/, with spectra/ and input/
 spectrum, spectrum_name = load_spectrum_txt(os.path.join(demo_dir, "spectra", "spectrum_125kvp.txt")), "125kvp"
 # spectrum, spectrum_name = load_spectrum_txt(os.path.join(demo_dir, "spectra", "spectrum_6mv.txt")), "6mv"
 materials = ["air", "lung_icrp", "adipose_icrp", "water", "muscle_icru44", "soft_tissue_icru44",

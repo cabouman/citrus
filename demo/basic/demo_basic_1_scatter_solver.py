@@ -1,4 +1,4 @@
-"""Demo 1: the scatter solver on one view.
+"""Demo basic 1: the scatter solver on one view.
 
 Build the deterministic scatter solver for the WLAB phantom (a water prism with lung, air and bone inserts), solve
 one cone-beam view, and show the primary signal, the scatter signal and the scatter fraction on the detector.
@@ -20,7 +20,8 @@ from citrus.utilities import wlab_grid, wlab_phantom
 # ---- Parameters -----------------------------------------------------------------------------------------------
 # Source spectrum: the path of a text file of two columns, photon energy in keV and relative photons per keV.
 # demo/spectra has a 125 kVp tube spectrum and a 6 MV linac spectrum (spectrum_6mv.txt).
-spectrum_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spectra", "spectrum_125kvp.txt")
+demo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # demo/, with spectra/ and input/
+spectrum_file = os.path.join(demo_dir, "spectra", "spectrum_125kvp.txt")
 materials = ["air", "lung_icrp", "adipose_icrp", "water", "muscle_icru44", "soft_tissue_icru44",
              "bone_cortical_icrp"]  # reference materials of the density model
 num_det_rows, num_det_channels = 75, 100   # detector panel size in pixels

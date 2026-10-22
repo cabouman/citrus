@@ -1,4 +1,4 @@
-"""Synthesize the data set of demo 2 at another voxel pitch (the same scan, panel, spectrum and materials).
+"""Synthesize the data set of demo_basic_3_cone_beam at another voxel pitch (the same scan, panel, spectrum and materials).
 
 Usage::
 
@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("--views", type=int, default=180)
     parser.add_argument("--I0", type=float, default=1.0e5)
     args = parser.parse_args()
-    # the parameters of demo 2
+    # the parameters of demo_basic_3_cone_beam
     num_det_rows, num_det_channels, pixel_pitch = 184, 150, 0.4
     geometry = ConeGeometry(source_iso_dist=100.0, source_detector_dist=150.0, num_det_rows=num_det_rows,
                             num_det_channels=num_det_channels, delta_det_row=pixel_pitch,

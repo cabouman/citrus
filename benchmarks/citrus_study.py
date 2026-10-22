@@ -36,7 +36,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
-from citrus import CitrusConfig, citrus_recon, mbir_recon  # noqa: E402
+from citrus import CitrusConfig, Schedule, citrus_recon, mbir_recon  # noqa: E402
 from citrus.citrus import estimate_regularization  # noqa: E402
 from citrus.recon.mbir_bridge import is_short_scan, make_cone_model, scan_range  # noqa: E402
 from citrus.scatter_solver.config import SolverConfig  # noqa: E402
@@ -98,9 +98,9 @@ def main() -> None:
     parser.add_argument("--transport-cell-cm", type=float, default=1.0,
                         help="transport cell edge length in cm, for the loop's and the truth's solver (default 1; any "
                              "ratio to --delta-voxel)")
-    parser.add_argument("--outer-iterations", type=int, default=CitrusConfig().num_outer_iterations,
+    parser.add_argument("--outer-iterations", type=int, default=Schedule().num_outer_iterations,
                         help="outer iterations, one scatter correction each (default: CitrusConfig's)")
-    parser.add_argument("--mbir-iterations", type=int, default=CitrusConfig().mbir_iterations_per_outer_iteration,
+    parser.add_argument("--mbir-iterations", type=int, default=Schedule().mbir_iterations_per_outer_iteration,
                         help="MBIR iterations per outer iteration (default: CitrusConfig's)")
     parser.add_argument("--full", action="store_true",
                         help="the report study: 180 views over a FULL rotation (end view angle = start + 360 degrees, "
@@ -270,8 +270,8 @@ def main() -> None:
                                                            else f"_order{interpolation_order}")
         print(f"sparse-view scatter: scatter step on {len(range(0, len(angles), args.scatter_view_stride))} of "
               f"{len(angles)} views (stride {args.scatter_view_stride}), interpolation order {interpolation_order}")
-    if (args.outer_iterations, args.mbir_iterations) != (CitrusConfig().num_outer_iterations,
-                                                         CitrusConfig().mbir_iterations_per_outer_iteration):
+    if (args.outer_iterations, args.mbir_iterations) != (Schedule().num_outer_iterations,
+                                                         Schedule().mbir_iterations_per_outer_iteration):
         out_tag += f"_outer{args.outer_iterations}_mbir{args.mbir_iterations}"
 
     # ---- 2. CITRUS ------------------------------------------------------------------------------------------

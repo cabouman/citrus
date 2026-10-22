@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.25.0 - 2026-10-22
+
+- **Schedules.** A `Schedule` (`citrus_recon(..., schedule=)`, `mbir_recon(..., schedule=)`) holds the number of
+  outer iterations and an optional threshold on the relative change of the volume that stops them earlier
+  (`outer_change_threshold`), the MBIR iterations per outer iteration, the scatter sweeps per computed view in each
+  outer iteration (or `"converged"`, a fresh source iteration per view to `scatter_change_threshold`), and the number
+  of outer iterations that update the scatter (`num_scatter_updates`). CITRUS is one sweep per outer iteration and
+  the default; the decoupled, sequential, first-order and uncorrected schedules are other settings of the same
+  object. `CitrusConfig.num_outer_iterations` and `mbir_iterations_per_outer_iteration` now default to None and,
+  when set, overwrite the counts of the schedule. The records gain `volume_change_relative` (and
+  `converged_sweeps_mean` with `"converged"`); `info` gains `schedule` and `outer_iterations_total`.
+- **Several sweeps per step.** `accumulator_update_operator(..., sweeps=)` and `citrus_view_step(..., sweeps=)`:
+  every sweep after the first transports the scattering source of the last change of the accumulator, which carries
+  the recursion one more collision order for one sweep and no new first-collision source. `converged_view_scatter` and
+  `first_order_view_scatter` give the scatter of one view for the other schedules.
+- **Demo phantoms in the utilities.** `shepp_logan_head_phantom`, `dental_head_phantom`, `breast_phantom` and
+  `pelvis_phantom` return the densities of the demos' phantoms (and of a pelvis-sized body) in a given library order.
+- **Demos reorganized.** `demo/basic/` holds `demo_basic_1_scatter_solver.py`, `demo_basic_2_parallel_beam.py`,
+  `demo_basic_3_cone_beam.py` and `demo_basic_4_custom_materials.py`; `demo/advanced/` holds
+  `demo_advanced_1_custom_callbacks.py`, `demo_advanced_2_helical_cone.py` and `demo_advanced_3_custom_schedules.py`
+  (formerly demos 1, 5, 2, 4, 6, 3 and 7). The schedules demo builds every schedule in its own section as a
+  `Schedule` and runs it with `citrus_recon`, and adds CITRUS with two sweeps per outer iteration. The spectra and
+  the data stay in `demo/spectra/` and `demo/input/`.
+
 ## v0.24.0 - 2026-10-21
 
 - **Faster scatter signal on curved panels and with grids.** The direction context stores the signal weights as

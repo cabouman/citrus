@@ -1,7 +1,8 @@
 """Common utilities of CITRUS.
 
 The module holds the WLAB phantom (a water prism with lung, air and bone inserts) with its grid and scan geometries,
-the interpolating attenuation <-> density model between the library's reference materials, the object size and mean
+the phantoms of the demos (a Shepp-Logan head, a head with contrast and a dental filling, a breast and a pelvis), the
+interpolating attenuation <-> density model between the library's reference materials, the object size and mean
 composition that set the energy groups, view angles and helical scans, synthetic cone-beam and parallel-beam data with
 scatter, a GPU memory cap and small plotting helpers.
 """
@@ -20,7 +21,7 @@ import torch
 from torch import Tensor
 
 from .scatter_solver.config import SolverConfig
-from .scatter_solver.cross_sections import MATERIALS, MultigroupLibrary, material_index
+from .scatter_solver.cross_sections import MATERIALS, Material, MultigroupLibrary, material_index
 from .scatter_solver.detector import DetectorResponse, GridResponse, ideal_counting_response, no_grid
 from .scatter_solver.source import SourceModel
 from .scatter_solver.geometry import ConeGeometry, Grid, ParallelGeometry, device_tensor
@@ -33,6 +34,10 @@ __all__ = [
     "RHO_AIR",
     "RHO_BONE",
     "wlab_phantom",
+    "shepp_logan_head_phantom",
+    "dental_head_phantom",
+    "breast_phantom",
+    "pelvis_phantom",
     "wlab_grid",
     "wlab_geometry",
     "full_field_wlab_geometry",
@@ -294,6 +299,175 @@ class StackedDensities:
             Tensor: [R, C, S] density ``rho[m]`` in g/cm^3.
         """
         return self.rho[m]
+
+
+# =====================================================================================================
+# Phantoms of the demos
+# =====================================================================================================
+
+def _paint(materials: Sequence, grid: Grid, regions, device) -> Tensor:
+    """Densities of a phantom painted region by region, each region replacing the regions painted before it.
+
+    Args:
+        materials (Sequence[str or Material]): reference materials in library order (``ScatterSolver.materials``).
+        grid (Grid): grid of the phantom.
+        regions (Iterable[tuple]): (material, density in g/cm^3, boolean mask [R, C, S]) of every region, in order.
+        device (torch.device or str): device of the result.
+
+    Returns:
+        Tensor: [M, R, C, S] densities in g/cm^3, M = len(materials).
+    """
+    rho = torch.zeros(len(materials), *grid.shape, device=device)
+    for material, density, mask in regions:
+        rho[:, mask] = 0.0
+        rho[material_index(materials, material)][mask] = density
+    return rho
+
+
+def _plane_coordinates(grid: Grid, device) -> tuple[Tensor, Tensor, Tensor]:
+    """Voxel-center coordinates broadcast to [R, C, S].
+
+    Args:
+        grid (Grid): the grid.
+        device (torch.device or str): device of the tensors.
+
+    Returns:
+        (Tensor, Tensor, Tensor): x [1, C, 1], y [R, 1, 1] and z [1, 1, S] in cm.
+    """
+    x, y, z = grid.axis_coordinates(device)
+    return x[None, :, None], y[:, None, None], z[None, None, :]
+
+
+def shepp_logan_head_phantom(grid: Grid, materials: Sequence, device=None) -> Tensor:
+    """MBIRTORCH's 3-D Shepp-Logan phantom as densities of a head stretched to the grid (demo advanced 2).
+
+    The values of the phantom map to tissues: the skull (values above 0.7) to cortical bone at 1.85 g/cm^3, the brain
+    (0.15 to 0.25) to soft tissue at 1.03, the bright ellipsoids (0.25 to 0.7) to muscle at 1.05 and the dark ones
+    inside the head to adipose tissue at 0.95. The cross-section of the head changes along z.
+
+    Args:
+        grid (Grid): grid that the head fills (a 30 x 20 x 40 cm box in the demo).
+        materials (Sequence[str or Material]): reference materials in library order, with bone_cortical_icrp,
+            soft_tissue_icru44, muscle_icru44 and adipose_icrp.
+        device (torch.device or str, optional): device of the result. Defaults to None.
+
+    Returns:
+        Tensor: [M, R, C, S] densities in g/cm^3.
+    """
+    from mbirtorch import gen_shepp_logan_3d
+
+    values = torch.as_tensor(gen_shepp_logan_3d(grid.shape), device=device)
+    r, c, z = (torch.linspace(-1, 1, n, device=device) for n in grid.shape)  # the phantom's coordinates
+    head = (r[:, None, None] / 0.69) ** 2 + (c[None, :, None] / 0.92) ** 2 + (z[None, None, :] / 0.9) ** 2 <= 1
+    return _paint(materials, grid, (("bone_cortical_icrp", 1.85, values > 0.7),
+                                    ("soft_tissue_icru44", 1.03, (values > 0.15) & (values < 0.25)),
+                                    ("muscle_icru44", 1.05, (values > 0.25) & (values < 0.7)),
+                                    ("adipose_icrp", 0.95, head & (values < 0.15))), device)
+
+
+def dental_head_phantom(grid: Grid, materials: Sequence, contrast: Material, amalgam: Material, *,
+                        head_radius: float = 9.0, bone_center: float = -5.0, bone_radius: float = 1.0,
+                        vessel_center: float = 2.0, vessel_radius: float = 0.5, amalgam_center: float = 6.0,
+                        amalgam_size: float = 0.5, device=None) -> Tensor:
+    """A water cylinder with a bone rod, a vessel of contrast agent and a metal filling (demo basic 4).
+
+    The cylinder, the rod and the vessel run along z; the filling is a cube at the center slice. Each insert sits on
+    the x axis and replaces the water, and the contrast and the filling take the densities of their materials.
+
+    Args:
+        grid (Grid): grid that covers the cylinder.
+        materials (Sequence[str or Material]): reference materials in library order, with water, bone_cortical_icrp,
+            ``contrast`` and ``amalgam``.
+        contrast (Material): material of the vessel.
+        amalgam (Material): material of the filling.
+        head_radius (float, optional): radius of the water cylinder in cm. Defaults to 9.0.
+        bone_center (float, optional): x of the bone rod in cm. Defaults to -5.0.
+        bone_radius (float, optional): radius of the bone rod in cm. Defaults to 1.0.
+        vessel_center (float, optional): x of the vessel in cm. Defaults to 2.0.
+        vessel_radius (float, optional): radius of the vessel in cm. Defaults to 0.5.
+        amalgam_center (float, optional): x of the filling in cm. Defaults to 6.0.
+        amalgam_size (float, optional): edge of the filling in cm. Defaults to 0.5.
+        device (torch.device or str, optional): device of the result. Defaults to None.
+
+    Returns:
+        Tensor: [M, R, C, S] densities in g/cm^3.
+    """
+    xx, yy, zz = _plane_coordinates(grid, device)
+    inside = lambda center, radius: ((xx - center) ** 2 + yy ** 2 < radius ** 2).expand(*grid.shape)  # noqa: E731
+    half = amalgam_size / 2
+    cube = ((xx - amalgam_center).abs() < half) & (yy.abs() < half) & (zz.abs() < half)
+    return _paint(materials, grid, (("water", 1.0, inside(0.0, head_radius)),
+                                    (contrast, contrast.density, inside(vessel_center, vessel_radius)),
+                                    ("bone_cortical_icrp", 1.85, inside(bone_center, bone_radius)),
+                                    (amalgam, amalgam.density, cube)), device)
+
+
+def breast_phantom(grid: Grid, materials: Sequence, *, breast_radius: float = 5.0, gland_center: float = -1.0,
+                   gland_radius: float = 2.5, lesion_center: float = 2.5, lesion_radius: float = 0.5,
+                   calcification_center: float = -2.5, calcification_size: float = 0.2, device=None) -> Tensor:
+    """A cylinder of adipose tissue with a fibroglandular region, a lesion and a calcification (demo basic 2).
+
+    Every region runs along z with its center on the x axis. The gland is soft tissue at 1.06 g/cm^3, the lesion soft
+    tissue at 1.10 and the calcification a square rod of cortical bone at 1.85.
+
+    Args:
+        grid (Grid): grid that covers the cylinder.
+        materials (Sequence[str or Material]): reference materials in library order, with adipose_icrp,
+            soft_tissue_icru44 and bone_cortical_icrp.
+        breast_radius (float, optional): radius of the adipose cylinder in cm. Defaults to 5.0.
+        gland_center (float, optional): x of the fibroglandular region in cm. Defaults to -1.0.
+        gland_radius (float, optional): radius of the fibroglandular region in cm. Defaults to 2.5.
+        lesion_center (float, optional): x of the lesion in cm. Defaults to 2.5.
+        lesion_radius (float, optional): radius of the lesion in cm. Defaults to 0.5.
+        calcification_center (float, optional): x of the calcification in cm. Defaults to -2.5.
+        calcification_size (float, optional): width of the calcification in cm. Defaults to 0.2.
+        device (torch.device or str, optional): device of the result. Defaults to None.
+
+    Returns:
+        Tensor: [M, R, C, S] densities in g/cm^3.
+    """
+    xx, yy, _ = _plane_coordinates(grid, device)
+    inside = lambda center, radius: ((xx - center) ** 2 + yy ** 2 < radius ** 2).expand(*grid.shape)  # noqa: E731
+    half = calcification_size / 2
+    speck = ((xx - calcification_center).abs() < half) & (yy.abs() < half)
+    return _paint(materials, grid, (("adipose_icrp", 0.95, inside(0.0, breast_radius)),
+                                    ("soft_tissue_icru44", 1.06, inside(gland_center, gland_radius)),
+                                    ("soft_tissue_icru44", 1.10, inside(lesion_center, lesion_radius)),
+                                    ("bone_cortical_icrp", 1.85, speck.expand(*grid.shape))), device)
+
+
+def pelvis_phantom(grid: Grid, materials: Sequence, *, semi_axes: tuple[float, float] = (20.0, 15.0),
+                   fat_thickness: float = 2.0, femoral_head_x: float = 11.0, femoral_head_radius: float = 2.5,
+                   muscle_center_y: float = 6.0, muscle_radius: float = 3.0, device=None) -> Tensor:
+    """An elliptical water body with an adipose shell, two femoral heads and a muscle insert, the size of a pelvis.
+
+    Every region runs along z. The femoral heads are cortical-bone rods at x = +-``femoral_head_x``, and the muscle
+    insert sits on the y axis. A 44 x 34 cm grid covers the default 40 x 30 cm body.
+
+    Args:
+        grid (Grid): grid that covers the body.
+        materials (Sequence[str or Material]): reference materials in library order, with water, adipose_icrp,
+            muscle_icru44 and bone_cortical_icrp.
+        semi_axes (tuple[float, float], optional): (x, y) semi-axes of the body in cm. Defaults to (20.0, 15.0).
+        fat_thickness (float, optional): thickness of the adipose shell in cm. Defaults to 2.0.
+        femoral_head_x (float, optional): distance of each femoral head from x = 0 in cm. Defaults to 11.0.
+        femoral_head_radius (float, optional): radius of the femoral heads in cm. Defaults to 2.5.
+        muscle_center_y (float, optional): y of the muscle insert in cm. Defaults to 6.0.
+        muscle_radius (float, optional): radius of the muscle insert in cm. Defaults to 3.0.
+        device (torch.device or str, optional): device of the result. Defaults to None.
+
+    Returns:
+        Tensor: [M, R, C, S] densities in g/cm^3.
+    """
+    xx, yy, _ = _plane_coordinates(grid, device)
+    ellipse = lambda a, b: ((xx / a) ** 2 + (yy / b) ** 2 < 1).expand(*grid.shape)  # noqa: E731
+    disk = lambda cx, cy, r: ((xx - cx) ** 2 + (yy - cy) ** 2 < r ** 2).expand(*grid.shape)  # noqa: E731
+    a, b = semi_axes
+    return _paint(materials, grid, (("adipose_icrp", 0.95, ellipse(a, b)),
+                                    ("water", 1.0, ellipse(a - fat_thickness, b - fat_thickness)),
+                                    ("bone_cortical_icrp", 1.85, disk(-femoral_head_x, 0.0, femoral_head_radius)),
+                                    ("bone_cortical_icrp", 1.85, disk(femoral_head_x, 0.0, femoral_head_radius)),
+                                    ("muscle_icru44", 1.05, disk(0.0, muscle_center_y, muscle_radius))), device)
 
 
 def _phantom_row(materials: Sequence[str], name: str) -> int:

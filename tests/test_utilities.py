@@ -312,3 +312,45 @@ def test_wlab_phantom_model_matches_the_stacked_volume():
                                             noise=False)
     for key in ("X_true", "Y", "SPR", "solver_primary", "solver_scatter", "phi_air"):
         assert np.allclose(from_model[key], from_volume[key], rtol=1e-4, atol=0), key  # projector atomics
+
+
+# ---- phantoms of the demos ------------------------------------------------------------------------------
+
+def test_demo_phantoms_paint_their_materials():
+    """Each phantom fills the rows of its materials (in the given library order) and nothing else; a region
+    replaces the regions painted before it, so every voxel holds at most one material."""
+    from citrus.scatter_solver import Material
+    from citrus.utilities import breast_phantom, dental_head_phantom, pelvis_phantom
+
+    materials = ("air", "adipose_icrp", "water", "muscle_icru44", "soft_tissue_icru44", "bone_cortical_icrp")
+    contrast = Material("iodine_contrast", 1.01, "0.99*water + 0.01*I")
+    amalgam = Material("dental_amalgam", 11.0, "0.5*Hg + 0.3*Ag + 0.13*Sn + 0.07*Cu")
+    dental = ("water", contrast, "bone_cortical_icrp", amalgam)
+    cases = [
+        (pelvis_phantom(Grid((34, 44, 4), 1.0), materials), materials,
+         {"adipose_icrp": 0.95, "water": 1.0, "muscle_icru44": 1.05, "bone_cortical_icrp": 1.85}),
+        (breast_phantom(Grid((110, 110, 2), 0.1), materials), materials,
+         {"adipose_icrp": 0.95, "soft_tissue_icru44": 1.10, "bone_cortical_icrp": 1.85}),
+        (dental_head_phantom(Grid((80, 80, 4), 0.25), dental, contrast, amalgam),
+         ("water", "iodine_contrast", "bone_cortical_icrp", "dental_amalgam"),
+         {"water": 1.0, "iodine_contrast": 1.01, "bone_cortical_icrp": 1.85, "dental_amalgam": 11.0}),
+    ]
+    for rho, names, densities in cases:
+        assert int((rho > 0).sum(dim=0).max()) == 1
+        for m, name in enumerate(names):
+            if name in densities:
+                assert math.isclose(float(rho[m].max()), densities[name], rel_tol=1e-6), name
+            else:
+                assert float(rho[m].abs().max()) == 0.0, name
+    pelvis = cases[0][0]
+    assert torch.equal(pelvis, pelvis.flip(2))  # symmetric about x = 0 (the femoral heads)
+
+
+def test_shepp_logan_head_phantom():
+    pytest.importorskip("mbirtorch")
+    from citrus.utilities import shepp_logan_head_phantom
+
+    rho = shepp_logan_head_phantom(wlab_grid(2.0), MATERIALS)
+    assert rho.shape == (len(MATERIALS), *wlab_grid(2.0).shape) and int((rho > 0).sum(dim=0).max()) == 1
+    assert float(rho[MATERIALS.index("bone_cortical_icrp")].max()) == pytest.approx(1.85)
+    assert float(rho[MATERIALS.index("water")].abs().max()) == 0.0

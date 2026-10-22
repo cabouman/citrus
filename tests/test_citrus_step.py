@@ -6,8 +6,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from citrus.citrus import (CitrusState, accumulator_update_operator, citrus_step, first_collision_operator,
-                           multiple_collision_operator, project_scatter, uncollided_operator)
+from citrus.citrus import (CitrusState, accumulator_update_operator, citrus_step, citrus_view_step,
+                           first_collision_operator, multiple_collision_operator, project_scatter, uncollided_operator)
 from citrus.scatter_solver.config import SolverConfig
 from citrus.scatter_solver.cross_sections import synthetic_library
 from citrus.scatter_solver.detector import csi_response, no_grid
@@ -130,3 +130,23 @@ def test_individual_operators(rho):
     s_a, p_a, st_a = citrus_step(solver, CitrusState(), rho, GRID, ANGLE)
     s_b, p_b, st_b = citrus_step(solver, CitrusState(), rho, GRID, ANGLE, fields=f)
     assert _rel(s_b, s_a) < 1e-6 and torch.equal(p_b, p_a) and _rel(st_b.collided_moments, st_a.collided_moments) < 1e-6
+
+
+def test_more_sweeps_advance_more_collision_orders(rho):
+    """With fixed densities a step of s sweeps is s steps of the recursion: every further sweep applies K to the last
+    change and reuses the first-collision source."""
+    solver = _solver()
+    f = solver.material_fields(rho, GRID)
+    phi_uncollided = uncollided_operator(solver, rho, GRID, ANGLE, f)
+    steps = [None]
+    for _ in range(3):
+        steps.append(accumulator_update_operator(solver, rho, GRID, ANGLE, phi_uncollided, steps[-1], f))
+    assert _rel(accumulator_update_operator(solver, rho, GRID, ANGLE, phi_uncollided, None, f, sweeps=2),
+                steps[2]) < 1e-5
+    assert _rel(accumulator_update_operator(solver, rho, GRID, ANGLE, phi_uncollided, steps[1], f, sweeps=2),
+                steps[3]) < 1e-5
+    _, _, state = citrus_view_step(solver, CitrusState(), f, ANGLE, primary=False, sweeps=3)
+    assert state.num_steps == 1 and _rel(state.collided_moments, steps[3]) < 1e-5
+    for bad in (0, 1.5, True):
+        with pytest.raises(ValueError, match="sweeps"):
+            accumulator_update_operator(solver, rho, GRID, ANGLE, phi_uncollided, None, f, sweeps=bad)

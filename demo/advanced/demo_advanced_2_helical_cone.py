@@ -1,4 +1,4 @@
-"""Demo 3: a helical scan on a curved detector with an anti-scatter grid.
+"""Demo advanced 2: a helical scan on a curved detector with an anti-scatter grid.
 
 Reconstruct a helical scan of MBIRTORCH's 3-D Shepp-Logan phantom, stretched to a 30 x 20 x 40 cm box (an
 ellipsoidal head with a bone skull and soft-tissue, fat and muscle ellipsoids, whose cross-section changes along z), by
@@ -14,17 +14,15 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
-from mbirtorch import gen_shepp_logan_3d
 
 from citrus import CitrusConfig, citrus_recon
 from citrus.scatter_solver import (ConeGeometry, ScatterSolver, SolverConfig, anti_scatter_grid,
                                    detector_response, load_spectrum_txt)
 from citrus.utilities import (helical_scan, load_dataset, plot_profiles, plot_slices, save_dataset,
-                              synthesize_cone_beam_data, view_angles, wlab_grid)
+                              shepp_logan_head_phantom, synthesize_cone_beam_data, view_angles, wlab_grid)
 
 # ---- Parameters -----------------------------------------------------------------------------------------------
-demo_dir = os.path.dirname(os.path.abspath(__file__))
+demo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # demo/, with spectra/ and input/
 spectrum = load_spectrum_txt(os.path.join(demo_dir, "spectra", "spectrum_125kvp.txt"))  # keV, photons per keV
 materials = ["air", "lung_icrp", "adipose_icrp", "water", "muscle_icru44", "soft_tissue_icru44",
              "bone_cortical_icrp"]  # reference materials of the density model
@@ -61,17 +59,9 @@ detector = detector_response("cesium_iodide", scintillator_thickness, mode="ener
 make_solver = lambda: ScatterSolver(None, config, geometry, detector=detector, grid_response=septa,  # noqa: E731
                                     device="cuda", spectrum=spectrum)
 
-# ---- Phantom: densities [materials, rows, cols, slices] in g/cm^3 from the values of the Shepp-Logan phantom ------
-values = torch.as_tensor(gen_shepp_logan_3d(grid.shape), device="cuda")  # skull 1, brain 0.2, ellipsoids 0 to 0.4
-r, c, z = (torch.linspace(-1, 1, n, device="cuda") for n in grid.shape)  # the phantom's coordinates
-head = (r[:, None, None] / 0.69) ** 2 + (c[None, :, None] / 0.92) ** 2 + (z[None, None, :] / 0.9) ** 2 <= 1
-row = make_solver().materials.index  # rows of rho in the library's order of the materials
-rho = torch.zeros(len(materials), *grid.shape, device="cuda")
-for material, density, mask in (("bone_cortical_icrp", 1.85, values > 0.7),
-                                ("soft_tissue_icru44", 1.03, (values > 0.15) & (values < 0.25)),
-                                ("muscle_icru44", 1.05, (values > 0.25) & (values < 0.7)),
-                                ("adipose_icrp", 0.95, head & (values < 0.15))):
-    rho[row(material)][mask] = density
+# ---- Phantom: densities [materials, rows, cols, slices] in g/cm^3, rows in the library's order of the materials ---
+# Skull, brain and ellipsoids of the Shepp-Logan values as bone, soft tissue, muscle and fat (citrus.utilities).
+rho = shepp_logan_head_phantom(grid, make_solver().materials, device="cuda")
 
 # ---- Data: loaded when a file of this name exists in demo/input, else synthesized once (a few minutes on a GPU) ---
 name = (f"shepp_logan_helical_{num_turns}x{views_per_turn}v_{pitch_cm:g}cm_{delta_voxel:g}cm_{num_det_rows}x"

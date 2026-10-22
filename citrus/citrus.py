@@ -2,9 +2,9 @@
 
 Every outer iteration advances the collided fluence of every view by one transport sweep, divides the measured counts
 by one plus the scatter-to-primary ratio of the current densities and runs warm-started MBIR iterations on the
-corrected data. The module holds the loop (``citrus_recon``, ``mbir_recon``), the per-view scatter step and its
-operators, the density model, the metal mask and fill, the compact per-view state storage and the angular
-interpolation of sparse-view scatter.
+corrected data. The module holds the loop (``citrus_recon``, ``mbir_recon``) and its schedule (``Schedule``), the
+per-view scatter step and its operators, the density model, the metal mask and fill, the compact per-view state
+storage and the angular interpolation of sparse-view scatter.
 The method is described in docs/source/method.rst, "The CITRUS loop" and "Options and secondary components".
 """
 
@@ -25,6 +25,7 @@ from .scatter_solver.cross_sections import MultigroupLibrary
 from .scatter_solver.geometry import ConeGeometry, Grid
 from .scatter_solver.scatter_solver import MaterialFields, ScatterSolver, emission_profile_from_open_field
 from .scatter_solver.source import SourceModel
+from .scatter_solver.source_iteration import source_iteration
 from .scatter_solver.uncollided import present_materials
 from .utilities import (attenuation_to_densities, attenuation_to_density, effective_energy, grouping_medium_estimate,
                         object_mask, object_size_cm)
@@ -42,6 +43,9 @@ __all__ = [
     "DensityModel",
     "StateStore",
     "CitrusConfig",
+    "Schedule",
+    "converged_view_scatter",
+    "first_order_view_scatter",
     "SCATTER_VIEW_INTERPOLATION_ORDERS",
     "scatter_view_indices",
     "angular_neighbors",
@@ -184,8 +188,13 @@ def multiple_collision_operator(solver: ScatterSolver, rho: Tensor, grid: Grid, 
 
 
 def accumulator_update_operator(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float, phi_uncollided: Tensor,
-                                collided_moments: Optional[Tensor], fields: Optional[MaterialFields] = None) -> Tensor:
+                                collided_moments: Optional[Tensor], fields: Optional[MaterialFields] = None, *,
+                                sweeps: int = 1) -> Tensor:
     """New accumulator ``phi^(1) + K Phi``: first-collision and scattering sources transported in one sweep.
+
+    With more than one sweep, every further sweep adds K applied to the last change of the accumulator,
+    ``Phi_new <- Phi_new + K (Phi_new - Phi_old)``, which carries the recursion one more collision order for one sweep
+    and no new first-collision source.
 
     Args:
         solver (ScatterSolver): the scatter solver.
@@ -198,28 +207,56 @@ def accumulator_update_operator(solver: ScatterSolver, rho: Tensor, grid: Grid, 
         collided_moments (Tensor or None): [G, (L+1)^2, 4, Rc, Cc, Sc] previous accumulator Phi;
             None gives phi^(1) alone.
         fields (MaterialFields, optional): prebuilt material fields of ``rho``. Defaults to None (built here).
+        sweeps (int, optional): number of transport sweeps (>= 1). Defaults to 1.
 
     Returns:
         Tensor: [G, (L+1)^2, 4, Rc, Cc, Sc] new accumulator.
 
     Raises:
-        ValueError: if ``collided_moments`` has the wrong shape.
+        ValueError: if ``collided_moments`` has the wrong shape or ``sweeps`` is below 1.
     """
+    _check_count("sweeps", sweeps)
     fields = _material_fields_or_build(solver, rho, grid, fields)
     sweep_context = solver.sweep_context(fields.grid_coarse)
     first_collision_source = solver.first_collision_moment_source(fields, angle, phi_uncollided, sweep_context)
     if collided_moments is None:
-        return solver.transport_sweep(fields, first_collision_source)
-    _check_accumulator(solver, fields, collided_moments)
-    scatter_source = solver.scatter_moment_source(fields, collided_moments.to(solver.device, solver.dtype),
-                                                  sweep_context)
+        previous = None
+        collided = solver.transport_sweep(fields, first_collision_source)
+    else:
+        _check_accumulator(solver, fields, collided_moments)
+        previous = collided_moments.to(solver.device, solver.dtype)
+        scatter_source = solver.scatter_moment_source(fields, previous, sweep_context)
 
-    def summed_source(direction_index: Tensor, out: Optional[Tensor] = None) -> Tensor:
-        source = first_collision_source(direction_index, out)  # cell-major, into the sweep's buffer
-        return scatter_source(direction_index, out=source, accumulate=True)  # one accumulating matrix product
+        def summed_source(direction_index: Tensor, out: Optional[Tensor] = None) -> Tensor:
+            source = first_collision_source(direction_index, out)  # cell-major, into the sweep's buffer
+            return scatter_source(direction_index, out=source, accumulate=True)  # one accumulating matrix product
 
-    summed_source.cell_major = True  # type: ignore[attr-defined]
-    return solver.transport_sweep(fields, summed_source)
+        summed_source.cell_major = True  # type: ignore[attr-defined]
+        collided = solver.transport_sweep(fields, summed_source)
+        del summed_source, scatter_source
+    first_collision_source = None  # released before the extra sweeps
+    for _ in range(int(sweeps) - 1):  # the recursion is linear: K (Phi_new - Phi_old) is the next change
+        # the source keeps the scattering moments of the change, so the change itself is not kept during the sweep
+        source = solver.scatter_moment_source(fields, collided if previous is None else collided - previous,
+                                              sweep_context)
+        previous = collided
+        collided = solver.transport_sweep(fields, source).add_(previous)
+        del source
+    return collided
+
+
+def _check_count(name: str, count) -> None:
+    """Check that a count is an integer >= 1.
+
+    Args:
+        name (str): name of the count in the message.
+        count: the value to check.
+
+    Raises:
+        ValueError: if ``count`` is not an integer >= 1.
+    """
+    if isinstance(count, bool) or not isinstance(count, (int, np.integer)) or count < 1:
+        raise ValueError(f"{name} must be an integer >= 1, got {count!r}")
 
 
 def project_scatter(solver: ScatterSolver, rho: Tensor, grid: Grid, angle: float, phi_uncollided: Tensor,
@@ -279,7 +316,7 @@ def citrus_step(solver: ScatterSolver, state: CitrusState, rho: Tensor, grid: Gr
 
 
 def citrus_view_step(solver: ScatterSolver, state: CitrusState, fields: MaterialFields, angle: float, *,
-                     primary: bool = True) -> tuple[Tensor, Optional[Tensor], CitrusState]:
+                     primary: bool = True, sweeps: int = 1) -> tuple[Tensor, Optional[Tensor], CitrusState]:
     """CITRUS scatter step of one view from prebuilt material fields, optionally without the primary.
 
     Args:
@@ -290,6 +327,7 @@ def citrus_view_step(solver: ScatterSolver, state: CitrusState, fields: Material
         angle (float): view angle in rad; must equal ``state.angle`` once that is set.
         primary (bool, optional): also trace the view's primary with the solver (``ScatterSolver.primary``, Siddon).
             Defaults to True.
+        sweeps (int, optional): transport sweeps of the step (``accumulator_update_operator``). Defaults to 1.
 
     Returns:
         (Tensor, Tensor or None, CitrusState): scatter signal [Rd, Cd], primary signal [Rd, Cd] (None when
@@ -304,9 +342,9 @@ def citrus_view_step(solver: ScatterSolver, state: CitrusState, fields: Material
     cone_quadrature = (state.cone_quadrature if state.cone_quadrature is not None
                        else solver.cone_quadrature(grid, angle))
     phi_uncollided = uncollided_operator(solver, None, grid, angle, fields)
-    # phi^(1) + K Phi in one sweep
+    # phi^(1) + K Phi in one sweep (and K applied to the last change in every further sweep)
     new_collided_moments = accumulator_update_operator(solver, None, grid, angle, phi_uncollided,
-                                                       state.collided_moments, fields)
+                                                       state.collided_moments, fields, sweeps=sweeps)
     scatter = project_scatter(solver, None, grid, angle, phi_uncollided, new_collided_moments, fields,
                               cone_quadrature, signal_only=True)["signal"]
     del phi_uncollided
@@ -636,11 +674,14 @@ class CitrusConfig:
 
     The options are described in docs/source/method.rst, "Options and secondary components".
 
+    The numbers of iterations and the scatter updates are set by a ``Schedule``; the two counts here overwrite those
+    of the schedule when they are set.
+
     Attributes:
-        num_outer_iterations (int): number N of outer iterations, each one a scatter correction followed by MBIR
-            iterations. Defaults to 14.
-        mbir_iterations_per_outer_iteration (int): number n of warm-started MBIR iterations on the corrected counts
-            of each outer iteration. Defaults to 8.
+        num_outer_iterations (int or None): number N of outer iterations, which overwrites that of the schedule; None
+            keeps the schedule's (14 for the default, CITRUS). Defaults to None.
+        mbir_iterations_per_outer_iteration (int or None): number n of MBIR iterations per outer iteration, which
+            overwrites that of the schedule; None keeps the schedule's (8 for the default). Defaults to None.
         mbir_subsets_per_iteration (int, "auto" or None): number of subsets of pixel columns that an MBIR iteration
             updates one after the other (``recon.mbir_bridge.vcd_partitions``; the first iterations of the loop use
             4, 16 and 64, those fewer than the count); "auto" scales it with the largest in-plane extent of the volume
@@ -673,8 +714,8 @@ class CitrusConfig:
             the metal mask off. Defaults to None.
     """
 
-    num_outer_iterations: int = 14
-    mbir_iterations_per_outer_iteration: int = 8
+    num_outer_iterations: Optional[int] = None
+    mbir_iterations_per_outer_iteration: Optional[int] = None
     mbir_subsets_per_iteration: Union[int, Literal["auto"], None] = "auto"
     energy_kev: Optional[float] = None
     min_counts: float = 1.0
@@ -696,9 +737,8 @@ class CitrusConfig:
             ValueError: if a setting is out of range or of the wrong type.
         """
         for name in ("num_outer_iterations", "mbir_iterations_per_outer_iteration"):
-            count = getattr(self, name)
-            if isinstance(count, bool) or not isinstance(count, (int, np.integer)) or count < 1:
-                raise ValueError(f"{name} must be an integer >= 1, got {count!r}")
+            if getattr(self, name) is not None:
+                _check_count(name, getattr(self, name))
         subsets = self.mbir_subsets_per_iteration
         if not (subsets is None or (isinstance(subsets, str) and subsets == "auto")
                 or (isinstance(subsets, (int, np.integer)) and not isinstance(subsets, bool) and subsets >= 1)):
@@ -723,6 +763,138 @@ class CitrusConfig:
                                       or not isinstance(threshold, (int, float, np.floating, np.integer))
                                       or not float(threshold) > 0):
             raise ValueError(f"metal_attenuation_threshold must be None or a positive number (1/cm), got {threshold!r}")
+
+
+@dataclass
+class Schedule:
+    """When the loop updates the scatter estimate, how far each update goes and when the loop stops.
+
+    Every outer iteration corrects the counts with the scatter of the current volume and runs MBIR iterations on them.
+    With a number of sweeps, each computed view carries its collided fluence over from the last outer iteration and
+    advances it by that many transport sweeps. CITRUS is one sweep per outer iteration, the default. With
+    ``"converged"`` each view is solved anew by source iteration in every outer iteration (the decoupled schedule).
+    The counts of a ``CitrusConfig`` overwrite those of the schedule when they are set.
+
+    Attributes:
+        num_outer_iterations (int): number N of outer iterations, the most with ``outer_change_threshold``. Defaults
+            to 14.
+        outer_change_threshold (float or None): stop after the first outer iteration whose relative change of the
+            volume, ``|X_k - X_{k-1}| / |X_k|``, falls below it; None runs all N. Defaults to None.
+        mbir_iterations_per_outer_iteration (int): number n of warm-started MBIR iterations on the corrected counts
+            of each outer iteration. Defaults to 8.
+        scatter_sweeps_per_outer_iteration (int or "converged"): transport sweeps per computed view in each outer
+            iteration (0 gives the first-order scatter alone), or ``"converged"`` for a converged solve per view.
+            Defaults to 1.
+        scatter_change_threshold (float or None): with ``"converged"``, the source iteration of a view stops when the
+            relative change of its collided fluence falls below it; None uses the solver's
+            ``source_iteration_tolerance``. Defaults to None.
+        num_scatter_updates (int or None): number of outer iterations, from the first, that make a new scatter
+            estimate; the later ones keep the last one (1 with ``"converged"`` is the sequential schedule, 0 no
+            correction). None updates it in every outer iteration. Defaults to None.
+    """
+
+    num_outer_iterations: int = 14
+    outer_change_threshold: Optional[float] = None
+    mbir_iterations_per_outer_iteration: int = 8
+    scatter_sweeps_per_outer_iteration: Union[int, Literal["converged"]] = 1
+    scatter_change_threshold: Optional[float] = None
+    num_scatter_updates: Optional[int] = None
+
+    def updates_scatter(self, outer_iteration: int) -> bool:
+        """Whether an outer iteration makes a new scatter estimate.
+
+        Args:
+            outer_iteration (int): outer iteration k = 1, ..., N.
+
+        Returns:
+            bool: True when ``num_scatter_updates`` is None or at least k.
+        """
+        return self.num_scatter_updates is None or int(outer_iteration) <= int(self.num_scatter_updates)
+
+    def validate(self) -> None:
+        """Check the settings.
+
+        Raises:
+            ValueError: if a setting is out of range or of the wrong type.
+        """
+        _check_count("num_outer_iterations", self.num_outer_iterations)
+        _check_count("mbir_iterations_per_outer_iteration", self.mbir_iterations_per_outer_iteration)
+        sweeps = self.scatter_sweeps_per_outer_iteration
+        if not (sweeps == "converged" or (isinstance(sweeps, (int, np.integer)) and not isinstance(sweeps, bool)
+                                          and sweeps >= 0)):
+            raise ValueError(f'scatter_sweeps_per_outer_iteration must be "converged" or an integer >= 0, '
+                             f'got {sweeps!r}')
+        updates = self.num_scatter_updates
+        if updates is not None and (isinstance(updates, bool) or not isinstance(updates, (int, np.integer))
+                                    or updates < 0):
+            raise ValueError(f"num_scatter_updates must be None or an integer >= 0, got {updates!r}")
+        for name in ("outer_change_threshold", "scatter_change_threshold"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float, np.floating))
+                                      or not float(value) > 0):
+                raise ValueError(f"{name} must be None or a positive number, got {value!r}")
+
+
+def _schedule_of(config: CitrusConfig, schedule: Optional[Schedule]) -> Schedule:
+    """The schedule of a run: the given one (default ``Schedule()``, CITRUS) with the counts the config sets.
+
+    Args:
+        config (CitrusConfig): loop settings.
+        schedule (Schedule or None): the schedule.
+
+    Returns:
+        Schedule: the schedule with ``num_outer_iterations`` and ``mbir_iterations_per_outer_iteration`` of the
+            config where they are not None.
+    """
+    schedule = Schedule() if schedule is None else schedule
+    counts = {name: getattr(config, name) for name in ("num_outer_iterations", "mbir_iterations_per_outer_iteration")
+              if getattr(config, name) is not None}
+    return replace(schedule, **counts)
+
+
+def converged_view_scatter(solver: ScatterSolver, fields: MaterialFields, angle: float,
+                           tolerance: Optional[float] = None) -> tuple[Tensor, int]:
+    """Scatter signal of one view from a converged source iteration, from zero collided fluence.
+
+    Args:
+        solver (ScatterSolver): the scatter solver.
+        fields (MaterialFields): material fields of the volume.
+        angle (float): view angle in rad.
+        tolerance (float, optional): relative change of the collided fluence at which the source iteration stops.
+            Defaults to None (the solver's ``source_iteration_tolerance``).
+
+    Returns:
+        (Tensor, int): scatter signal [Rd, Cd] and the number of sweeps run.
+    """
+    grid = fields.grid_fine
+    phi_uncollided = uncollided_operator(solver, None, grid, angle, fields)
+    result = source_iteration(solver.sweep_context(fields.grid_coarse), fields.mu_t_coarse, fields.mu_s_l_coarse,
+                              solver.first_collision_moment_source(fields, angle, phi_uncollided),
+                              tolerance=solver.config.source_iteration_tolerance if tolerance is None
+                              else float(tolerance),
+                              max_iterations=solver.config.max_source_iterations,
+                              direction_chunk=solver.sweep_direction_chunk(fields))
+    scatter = project_scatter(solver, None, grid, angle, phi_uncollided, result.phi_total, fields,
+                              signal_only=True)["signal"]
+    return scatter, int(result.num_iterations)
+
+
+def first_order_view_scatter(solver: ScatterSolver, fields: MaterialFields, angle: float) -> Tensor:
+    """First-order scatter signal of one view: the first-collision source projected, no collided fluence.
+
+    Args:
+        solver (ScatterSolver): the scatter solver.
+        fields (MaterialFields): material fields of the volume.
+        angle (float): view angle in rad.
+
+    Returns:
+        Tensor: scatter signal [Rd, Cd].
+    """
+    grid = fields.grid_fine
+    phi_uncollided = uncollided_operator(solver, None, grid, angle, fields)
+    no_collided = multiple_collision_operator(solver, None, grid, angle, None, fields)
+    return project_scatter(solver, None, grid, angle, phi_uncollided, no_collided, fields,
+                           signal_only=True)["signal"]
 
 
 # =====================================================================================================
@@ -1078,7 +1250,8 @@ def _sync(device: torch.device) -> None:
 
 
 def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: Grid, geometry: ConeGeometry,
-                config: CitrusConfig, scatter_stage: Optional[ScatterStage], device: torch.device, *,
+                config: CitrusConfig, schedule: Schedule, scatter_stage: Optional[ScatterStage],
+                device: torch.device, *,
                 regularization: Optional[dict], init_recon: Optional[Tensor], model, callback, label: str,
                 mbir_callback=None,
                 after_initialization: Optional[Callable[[Tensor, dict], None]] = None) -> tuple[Tensor, dict]:
@@ -1095,6 +1268,8 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
         grid (Grid): reconstruction grid.
         geometry (ConeGeometry or ParallelGeometry): geometry of the scan.
         config (CitrusConfig): loop settings.
+        schedule (Schedule): numbers of iterations and the stopping rule, with the config's counts applied (the
+            scatter updates are the stage's).
         scatter_stage (callable or None): ``scatter_stage(k, X, record)`` returns the scatter-to-primary ratio
             [V, Rd, Cd] of the volume X at the start of outer iteration k + 1 (k = 0, 1, ...); None for no correction.
         device (torch.device): device of the loop.
@@ -1116,6 +1291,7 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
         (Tensor, dict): reconstruction [R, C, S] in 1/cm and the info dict.
     """
     config.validate()
+    schedule.validate()
     weights_of_counts = Y / I0
     measured_line_integrals = -torch.log(Y.clamp_min(config.min_counts) / I0)
     if model is None:
@@ -1132,7 +1308,7 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
         X = torch.as_tensor(init_recon, dtype=torch.float32, device=device).clone()
     _sync(device)
     info: dict = {"records": [], "fdk_seconds": time.perf_counter() - t0, "init_recon": X.clone(), "model": model,
-                  "config": asdict(config)}
+                  "config": asdict(config), "schedule": asdict(schedule)}
     if after_initialization is not None:
         after_initialization(X, info)
     regularization = dict(regularization) if regularization is not None else None
@@ -1149,10 +1325,11 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
     # resume: MBIRTORCH's error sinogram minus the corrected data, -A X (one sinogram)
     negative_projection: Optional[Tensor] = None
     t_start = time.perf_counter()
-    block = int(config.mbir_iterations_per_outer_iteration)
+    block = int(schedule.mbir_iterations_per_outer_iteration)
     # the residual |A X - y_c| / |y_c| is tracked when it is free (resumed error sinogram) or asked for
     track_residual = resume or mbir_callback is not None
-    num_outer = int(config.num_outer_iterations)
+    num_outer = int(schedule.num_outer_iterations)
+    threshold = schedule.outer_change_threshold
     iteration = 0  # MBIR iterations so far: the seed and the schedule position of the next one
     # the volume in which the metal was first found and its total attenuation of the metal (metal_fill)
     metal_reference: Optional[tuple[Tensor, Tensor]] = None
@@ -1185,6 +1362,7 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
             mbir_callback(0, X, {"outer_iteration": 0, "mbir_iteration": 0, "sinogram_nrmse": residual})
         _sync(device)
         t1 = time.perf_counter()
+        X_start = X.clone()
         j = 0
         while j < block:
             np.random.seed([int(config.base_seed), int(iteration)])
@@ -1207,6 +1385,9 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
         if resume:
             negative_projection, error_sinogram = error_sinogram.sub_(corrected_line_integrals), None
         record["mbir_iterations"] = j
+        X_norm = float(X.norm())
+        record["volume_change_relative"] = float((X - X_start).norm()) / X_norm if X_norm > 0 else 0.0
+        del X_start
         if track_residual:
             record["sinogram_nrmse"] = residual
         _sync(device)
@@ -1232,7 +1413,10 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
             print(f"[{label}] outer iteration {k + 1}/{num_outer}: scatter {record['scatter_seconds']:.1f} s, "
                   f"MBIR ({j} iteration{'s' if j > 1 else ''}) {record['mbir_seconds']:.1f} s{fit}{extra}",
                   flush=True)
+        if threshold is not None and record["volume_change_relative"] < float(threshold):
+            break
     info["mbir_iterations_total"] = iteration
+    info["outer_iterations_total"] = len(info["records"]) - 1
     info.update(seconds=time.perf_counter() - t_start, regularization=regularization, spr=spr,
                 scatter_counts=scatter_estimate)
     if metal_reference is not None:
@@ -1449,7 +1633,8 @@ def _medium_text(medium) -> str:
 def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Tensor, np.ndarray],
                  angles: Union[Sequence[float], np.ndarray],
                  grid: Grid, geometry: ConeGeometry, solver: ScatterSolver, config: Optional[CitrusConfig] = None,
-                 *, regularization: Optional[dict] = None, init_recon: Optional[Tensor] = None, model=None,
+                 *, schedule: Optional[Schedule] = None, regularization: Optional[dict] = None,
+                 init_recon: Optional[Tensor] = None, model=None,
                  callback: Optional[Callable[[int, Tensor, dict], None]] = None,
                  mbir_callback: Optional[Callable[[int, Tensor, dict], None]] = None,
                  detector_gain: Optional[Union[Tensor, np.ndarray]] = None) -> tuple[Tensor, dict]:
@@ -1468,6 +1653,8 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
         geometry (ConeGeometry or ParallelGeometry): geometry of the scan.
         solver (ScatterSolver): scatter solver of the scanner; its device is used for everything.
         config (CitrusConfig, optional): loop settings. Defaults to None (``CitrusConfig()``).
+        schedule (Schedule, optional): numbers of iterations and scatter updates; the counts of ``config`` overwrite
+            its own when set. Defaults to None (``Schedule()``, CITRUS).
         regularization (dict, optional): frozen ``sigma_y``, ``sigma_x`` and ``sigma_prox``. Defaults to None
             (estimated once on the first corrected sinogram).
         init_recon (Tensor, optional): [R, C, S] initial volume in 1/cm. Defaults to None (FDK of the uncorrected data,
@@ -1490,6 +1677,9 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
     """
     config = CitrusConfig() if config is None else config
     config.validate()
+    schedule = _schedule_of(config, schedule)
+    schedule.validate()
+    sweeps = schedule.scatter_sweeps_per_outer_iteration
     device = solver.device
     Y, angle_array = _counts_and_angles(sinogram_counts, angles, device)
     flat_field = _flat_field(I0, Y)
@@ -1524,11 +1714,14 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
     tiny = torch.finfo(torch.float32).tiny
     # every view's last scatter estimate (interpolation order None keeps it on the skipped views)
     last_scatter: list[Optional[Tensor]] = [None]
+    last_ratio: list[Optional[Tensor]] = [None]  # the scatter-to-primary ratio of the last scatter update
 
     def after_initialization(X: Tensor, info: dict) -> None:
         info.update(_apply_grouping_estimates(solver, X, grid, config))
 
-    def scatter_stage(k: int, X: Tensor, record: dict) -> Tensor:
+    def scatter_stage(k: int, X: Tensor, record: dict) -> Optional[Tensor]:
+        if not schedule.updates_scatter(k + 1):
+            return last_ratio[0]
         if density_models[0] is None:
             built = solver.library_built
             t0 = time.perf_counter()
@@ -1550,17 +1743,28 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
         fields = solver.material_fields_from_attenuation(X, grid, density_model)
         computed_scatter = torch.empty((len(computed), Rd, Cd), device=device, dtype=torch.float32)
         primary = torch.empty((V, Rd, Cd), device=device, dtype=torch.float32)
-        changes = []
+        changes, converged_sweeps = [], []
         for j, v in enumerate(computed):
-            state = replace(view_states[j], collided_moments=state_store.get(j))
-            computed_scatter[j], _, new_state = citrus_view_step(solver, state, fields, float(angle_array[v]),
-                                                                 primary=False)
-            state_store.put(j, new_state.collided_moments)
-            view_states[j] = replace(new_state, collided_moments=None)
-            changes.append(new_state.history[-1])
-            del state, new_state
-        record["accumulator_change_mean"] = float(np.mean(changes))
-        record["accumulator_change_max"] = float(np.max(changes))
+            angle = float(angle_array[v])
+            if sweeps == "converged":  # a fresh solve, nothing carried over
+                computed_scatter[j], n = converged_view_scatter(solver, fields, angle,
+                                                                schedule.scatter_change_threshold)
+                converged_sweeps.append(n)
+            elif sweeps == 0:
+                computed_scatter[j] = first_order_view_scatter(solver, fields, angle)
+            else:  # the age-ordered recursion: the view's collided fluence carried over
+                state = replace(view_states[j], collided_moments=state_store.get(j))
+                computed_scatter[j], _, new_state = citrus_view_step(solver, state, fields, angle, primary=False,
+                                                                     sweeps=int(sweeps))
+                state_store.put(j, new_state.collided_moments)
+                view_states[j] = replace(new_state, collided_moments=None)
+                changes.append(new_state.history[-1])
+                del state, new_state
+        if changes:
+            record["accumulator_change_mean"] = float(np.mean(changes))
+            record["accumulator_change_max"] = float(np.max(changes))
+        if converged_sweeps:
+            record["converged_sweeps_mean"] = float(np.mean(converged_sweeps))
         record["transfer_seconds"] = state_store.transfer_seconds - transfer_seconds_before
         _sync(device)
         t0 = time.perf_counter()
@@ -1581,10 +1785,12 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
         if sparse and interpolation_order is None:
             last_scatter[0] = scatter
         del fields
-        return scatter / primary.clamp_min(tiny)
+        last_ratio[0] = scatter / primary.clamp_min(tiny)
+        return last_ratio[0]
 
     try:
-        X, info = _outer_loop(Y, flat_field, angle_array, grid, geometry, config, scatter_stage, device,
+        X, info = _outer_loop(Y, flat_field, angle_array, grid, geometry, config, schedule, scatter_stage,
+                              device,
                               regularization=regularization, init_recon=init_recon, model=model, callback=callback,
                               label="citrus", after_initialization=after_initialization,
                               mbir_callback=mbir_callback)
@@ -1602,7 +1808,8 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
 def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Tensor, np.ndarray],
                angles: Union[Sequence[float], np.ndarray],
                grid: Grid, geometry: ConeGeometry, config: Optional[CitrusConfig] = None, *,
-               spr: Optional[Union[Tensor, np.ndarray]] = None, regularization: Optional[dict] = None,
+               schedule: Optional[Schedule] = None, spr: Optional[Union[Tensor, np.ndarray]] = None,
+               regularization: Optional[dict] = None,
                init_recon: Optional[Tensor] = None, model=None, device=None,
                callback: Optional[Callable[[int, Tensor, dict], None]] = None,
                mbir_callback: Optional[Callable[[int, Tensor, dict], None]] = None) -> tuple[Tensor, dict]:
@@ -1616,6 +1823,8 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Tens
         grid (Grid): reconstruction grid.
         geometry (ConeGeometry or ParallelGeometry): geometry of the scan.
         config (CitrusConfig, optional): loop settings. Defaults to None (``CitrusConfig()``).
+        schedule (Schedule, optional): numbers of iterations and the stopping rule (its scatter settings are unused);
+            the counts of ``config`` overwrite its own when set. Defaults to None (``Schedule()``).
         spr (Tensor or ndarray, optional): [V, Rd, Cd] fixed scatter-to-primary ratio, applied as ``Y / (1 + spr)``.
             Defaults to None (no correction).
         regularization (dict, optional): frozen ``sigma_y``, ``sigma_x`` and ``sigma_prox``. Defaults to None
@@ -1645,6 +1854,7 @@ def mbir_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Tens
     if fixed_spr is not None and fixed_spr.shape != Y.shape:
         raise ValueError(f"spr must have the sinogram shape {tuple(Y.shape)}, got {tuple(fixed_spr.shape)}")
     scatter_stage = None if fixed_spr is None else (lambda k, X, record: fixed_spr)
-    return _outer_loop(Y, _flat_field(I0, Y), angle_array, grid, geometry, config, scatter_stage, device,
+    schedule = _schedule_of(config, schedule)
+    return _outer_loop(Y, _flat_field(I0, Y), angle_array, grid, geometry, config, schedule, scatter_stage, device,
                        regularization=regularization, init_recon=init_recon, model=model, callback=callback,
                        label="mbir", mbir_callback=mbir_callback)

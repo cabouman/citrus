@@ -71,12 +71,15 @@ Repository
 ----------
 
 ``demo/``
-    Seven quick-start scripts (:doc:`usage`, "Demos"): ``demo_1_scatter_solver.py`` (the scatter solver on one view
-    of the WLAB phantom), ``demo_2_basic_cone.py`` (CITRUS on a circular cone-beam scan), ``demo_3_helical_cone.py``
-    (a helical scan on a curved CsI detector with an anti-scatter grid), ``demo_4_materials.py`` (user-defined
-    materials), ``demo_5_parallel_monoenergetic.py`` (a monoenergetic parallel beam), ``demo_6_callbacks.py``
-    (convergence curves from the callbacks) and ``demo_7_scatter_schedules.py`` (CITRUS against other ways of
-    updating the scatter).
+    Seven quick-start scripts (:doc:`usage`, "Demos"). ``demo/basic/``: ``demo_basic_1_scatter_solver.py``
+    (the scatter solver on one view of the WLAB phantom), ``demo_basic_2_parallel_beam.py`` (a monoenergetic parallel
+    beam), ``demo_basic_3_cone_beam.py`` (CITRUS on a circular cone-beam scan) and
+    ``demo_basic_4_custom_materials.py`` (user-defined materials). ``demo/advanced/``:
+    ``demo_advanced_1_custom_callbacks.py`` (convergence curves from the callbacks),
+    ``demo_advanced_2_helical_cone.py`` (a helical scan on a curved CsI detector with an anti-scatter grid) and
+    ``demo_advanced_3_custom_schedules.py`` (CITRUS against other scatter schedules, each built from a view
+    function). The spectra, the cached data and the outputs are in ``demo/spectra/``, ``demo/input/`` and
+    ``demo/output/``.
 ``tests/``
     The test suite (``python -m pytest -q``), including oracle tests: a 1-D slab linear-discontinuous solution,
     particle balance, dense Galerkin assembly, Beer's law, brute-force point-to-point scatter integrals, and the
@@ -89,6 +92,6 @@ Repository
 ``benchmarks/``
     Benchmarks of the sweep, the first-collision source kernel, the ray tracer and the scatter image per direction
     chunk (``bench_scatter_image.py``), profiles of the CITRUS step per stage (``profile_citrus_step.py``) and per
-    kernel (``kernel_profile_step.py``), the GPU memory of the loop (``bench_citrus_memory.py``), demo 2's data at
-    another voxel pitch (``make_demo_data.py``), and ``citrus_study.py``, the CITRUS study script with every setting as a flag
-    (:doc:`usage`).
+    kernel (``kernel_profile_step.py``), the GPU memory of the loop (``bench_citrus_memory.py``), the data of
+    ``demo_basic_3_cone_beam.py`` at another voxel pitch (``make_demo_data.py``), and ``citrus_study.py``, the CITRUS
+    study script with every setting as a flag (:doc:`usage`).

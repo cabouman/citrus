@@ -5,67 +5,68 @@ Demos
 -----
 
 Seven quick-start scripts in ``demo/`` show how to write a Python script with the CITRUS API: every setting is a
-variable in a parameter block at the top, each step has a comment, and the figures are shown at the end. The
-reconstruction demos synthesize their data once and cache them in ``demo/input/`` under a file name built from the
-settings that change the data, so later runs load them.
+variable in a parameter block at the top, each step has a comment, and the figures are shown at the end. The basic
+demos in ``demo/basic/`` cover the solver and one scanner each; the advanced demos in ``demo/advanced/`` follow the
+iterations, scan a helix and build custom scatter schedules. The reconstruction demos synthesize their data once and
+cache them in ``demo/input/`` under a file name built from the settings that change the data, so later runs load them.
 
 .. code-block:: bash
 
-   python demo/demo_1_scatter_solver.py          # the scatter solver on one view of the WLAB phantom
-   python demo/demo_2_basic_cone.py              # CITRUS on a short circular cone-beam scan
-   python demo/demo_3_helical_cone.py            # a helical scan on a curved detector with an anti-scatter grid
-   python demo/demo_4_materials.py               # user-defined materials: iodine contrast and dental amalgam
-   python demo/demo_5_parallel_monoenergetic.py  # a monoenergetic parallel beam (synchrotron CT)
-   python demo/demo_6_callbacks.py               # convergence curves from the callbacks of citrus_recon
-   python demo/demo_7_scatter_schedules.py       # CITRUS against no correction, sequential, first-order, decoupled
+   python demo/basic/demo_basic_1_scatter_solver.py         # the scatter solver on one view of the WLAB phantom
+   python demo/basic/demo_basic_2_parallel_beam.py          # a monoenergetic parallel beam (synchrotron CT)
+   python demo/basic/demo_basic_3_cone_beam.py              # CITRUS on a short circular cone-beam scan
+   python demo/basic/demo_basic_4_custom_materials.py       # user-defined materials: iodine contrast, dental amalgam
+   python demo/advanced/demo_advanced_1_custom_callbacks.py # convergence curves from the callbacks of citrus_recon
+   python demo/advanced/demo_advanced_2_helical_cone.py     # a helical scan on a curved detector with a grid
+   python demo/advanced/demo_advanced_3_custom_schedules.py # CITRUS against other scatter schedules
 
-``demo_1_scatter_solver.py`` builds the cross-section library of the default reference materials (on first use it
-downloads the NIST XCOM photon data and builds the library; both are cached), rasterizes the WLAB phantom (a 30 x 20 x
-40 cm water prism with lung, air and bone inserts) on a 1 cm grid, solves one view with the default configuration and
+``demo_basic_1_scatter_solver.py`` builds the cross-section library of the default reference materials (on first use
+it downloads the NIST XCOM photon data and builds the library; both are cached), rasterizes the WLAB phantom (a 30 x 20
+x 40 cm water prism with lung, air and bone inserts) on a 1 cm grid, solves one view with the default configuration and
 shows the primary signal, the scatter signal and the scatter fraction on the detector.
 
-``demo_2_basic_cone.py`` is the typical circular cone-beam scenario: a short scan of the WLAB phantom with the sample
-125 kVp spectrum of ``demo/spectra`` (the 6 MV linac spectrum is a commented-out alternative, as is a focused lead
-anti-scatter grid, ``anti_scatter_grid``, used by the solvers of the data and of the reconstruction). It synthesizes
-the counts with ``synthesize_cone_beam_data``, reconstructs them with ``citrus_recon`` (the default iteration counts,
-scatter step on every 8th view), prints the relative RMSE of the initial FDK volume and of CITRUS against the truth and
-shows the central slices and central-row profiles of the truth, the initial FDK volume and CITRUS.
+``demo_basic_2_parallel_beam.py`` reconstructs a breast-sized phantom (``breast_phantom``) imaged by a monoenergetic
+parallel beam at 32 keV (``ParallelGeometry.from_grid``, ``monoenergetic_spectrum``), with the air gap between the
+rotation axis and the panel as a parameter: the scatter that reaches the panel falls as the gap grows. Its figures show
+the truth, the initial filtered-backprojection volume and CITRUS.
 
-``demo_3_helical_cone.py`` scans MBIRTORCH's 3-D Shepp-Logan phantom (``gen_shepp_logan_3d``), turned into
-densities of bone, soft tissue, muscle and fat, with a helix (``helical_scan``) on a cylindrical panel
+``demo_basic_3_cone_beam.py`` is the typical circular cone-beam scenario: a short scan of the WLAB phantom with the
+sample 125 kVp spectrum of ``demo/spectra`` (the 6 MV linac spectrum is a commented-out alternative, as is a focused
+lead anti-scatter grid, ``anti_scatter_grid``, used by the solvers of the data and of the reconstruction). It
+synthesizes the counts with ``synthesize_cone_beam_data``, reconstructs them with ``citrus_recon`` (the default
+iteration counts, scatter step on every 8th view), prints the relative RMSE of the initial FDK volume and of CITRUS
+against the truth and shows the central slices and central-row profiles of the truth, the initial FDK volume and
+CITRUS.
+
+``demo_basic_4_custom_materials.py`` defines an iodine contrast agent and a dental amalgam with ``Material``, puts them
+in ``SolverConfig.materials`` next to catalogue names and builds a small head phantom (``dental_head_phantom``: a water
+cylinder with a bone rod, a vessel of contrast and an amalgam filling) as a density volume whose rows follow
+``solver.materials``. The rays through the amalgam are starved of primary photons; the metal mask
+(``metal_attenuation_threshold``) leaves them out of the MBIR iterations, and the demo compares the initial volume and
+CITRUS outside the filling.
+
+``demo_advanced_1_custom_callbacks.py`` runs CITRUS on the data of ``demo_basic_3_cone_beam.py`` with ``callback`` and
+``mbir_callback``: it records the relative RMSE of the volume against the truth and the sinogram residual
+``record["sinogram_nrmse"]`` after every MBIR iteration, prints per outer iteration what its record holds (MBIR
+iterations taken, scatter change, accumulator change, timings) and plots the convergence curves.
+
+``demo_advanced_2_helical_cone.py`` scans MBIRTORCH's 3-D Shepp-Logan phantom, turned into densities of bone, soft
+tissue, muscle and fat (``shepp_logan_head_phantom``), with a helix (``helical_scan``) on a cylindrical panel
 (``ConeGeometry(use_curved_detector=True)``) of energy-integrating CsI (``detector_response("cesium_iodide", ...)``)
 behind a CT-style grid: tungsten septa parallel to the rotation axis (``anti_scatter_grid(..., septa_along="rows")``),
-each focused on the source. The pitch, the number of turns and the
-panel height are chosen so that the helix covers the whole height of the head, whose cross-section changes along z;
-the demo also shows a coronal slice. Its figures show the truth, the initial FDK volume and CITRUS.
+each focused on the source. The pitch, the number of turns and the panel height are chosen so that the helix covers the
+whole height of the head, whose cross-section changes along z; the demo also shows a coronal slice. Its figures show
+the truth, the initial FDK volume and CITRUS.
 
-``demo_4_materials.py`` defines an iodine contrast agent and a dental amalgam with ``Material``, puts them in
-``SolverConfig.materials`` next to catalogue names and builds a small head phantom (a water cylinder with a bone rod,
-a vessel of contrast and an amalgam filling) as a density volume whose rows follow ``solver.materials``. The rays
-through the amalgam are starved of primary photons; the metal mask (``metal_attenuation_threshold``) leaves them out
-of the MBIR iterations, and the demo compares the initial volume and CITRUS outside the filling.
-
-``demo_5_parallel_monoenergetic.py`` reconstructs a breast-sized phantom imaged by a monoenergetic parallel beam at
-32 keV (``ParallelGeometry.from_grid``, ``monoenergetic_spectrum``), with the air gap between the rotation axis and the
-panel as a parameter: the scatter that reaches the panel falls as the gap grows. Its figures show the truth, the
-initial filtered-backprojection volume and CITRUS.
-
-``demo_6_callbacks.py`` runs CITRUS on the data of demo 2 with ``callback`` and ``mbir_callback``: it records the
-relative RMSE of the volume against the truth and the sinogram residual ``record["sinogram_nrmse"]`` after every MBIR
-iteration, prints per outer iteration what its record holds (MBIR iterations taken, scatter change, accumulator
-change, timings) and plots the convergence curves.
-
-``demo_7_scatter_schedules.py`` reconstructs the data of demo 2 five times from the same FDK volume with the same frozen
-regularization, weights and partition seeds, and only the scatter estimate differs: no correction; sequential (one
-converged solve per view from the FDK volume, then frozen, the legacy approach); first order only (the first-order
-scatter of the current volume every outer iteration); decoupled (a fresh fully converged solve per view every outer
-iteration); and CITRUS. The first four run the loop of ``citrus_recon`` written out with its public parts
-(``ScatterSolver.solve_view_from_fields``, the scatter operators of ``citrus.citrus``, ``primary_signals``,
-``interpolate_scatter`` and ``recon.mbir_bridge.mbir_iterations`` with the seeds of the loop), so the script is also an
-example of a custom scatter schedule. Every reconstruction runs the default iteration counts. It shows the central
-slices with
-the relative RMSE and run time of each, and the relative RMSE after every MBIR iteration with the scatter solves marked;
-the decoupled reconstruction takes the longest.
+``demo_advanced_3_custom_schedules.py`` reconstructs the data of ``demo_basic_3_cone_beam.py`` six times with
+``citrus_recon`` from the same FDK volume with the same frozen regularization, weights and partition seeds, and only
+the ``Schedule`` (:doc:`method`, "Schedules") differs: MBIR only (no scatter updates); sequential (one converged
+solve per view from the FDK volume, then frozen, the legacy approach); first-order only (zero sweeps); decoupled (a
+fresh converged solve per view every outer iteration); CITRUS (the default); and CITRUS with two scatter sweeps per
+outer iteration. Each schedule is built in its own section of the script, after a short warm-up run that builds the
+library and compiles the kernels. It shows the central slices of the truth, the FDK volume and each reconstruction
+with its relative RMSE and run time, and the relative RMSE after every MBIR iteration with the scatter estimates
+marked; the decoupled reconstruction takes the longest.
 
 On a GPU the first run of each reconstruction demo, with the synthesis of its data, takes a few minutes.
 
@@ -82,7 +83,7 @@ volume to ``demo/output/``. The data sets are cached in ``demo/input/``.
 
    python benchmarks/citrus_study.py                      # 180 views over a short scan, 0.5 cm grid, the default
                                                           # numbers of outer and MBIR iterations, scatter step on
-                                                          # every 8th view (the setting of demo 2)
+                                                          # every 8th view (the setting of demo_basic_3)
    python benchmarks/citrus_study.py --end-view-angle 360 # the same over a full rotation
    python benchmarks/citrus_study.py --full               # 180 views over a full rotation, 0.5 cm grid, 20 outer
                                                           # iterations of 1 MBIR iteration, scatter step on every view
@@ -158,7 +159,8 @@ records (timings, accumulator change, scatter change), the final scatter-to-prim
 and the frozen regularization. A ``callback(k, X_k, record)`` can track the iterates per outer iteration and an
 ``mbir_callback(i, X, record)`` per MBIR iteration, i = 0 for the FDK initialization, with
 ``record["sinogram_nrmse"]`` the relative RMSE of the forward projection of X against the corrected sinogram of its
-outer iteration, a convergence measure without ground truth (demo 6 plots it next to the error against the truth; the
+outer iteration, a convergence measure without ground truth (demo_advanced_1 plots it next to the error against
+the truth; the
 study script records the error against the truth with it).
 
 The entries of ``info``:
@@ -167,19 +169,22 @@ The entries of ``info``:
   ``outer_iteration``, ``mbir_iterations``, ``sinogram_nrmse_start`` / ``sinogram_nrmse`` (relative RMSE of A X
   against the corrected sinogram before and after its MBIR iterations, with the resumed error sinogram),
   ``scatter_seconds``, ``mbir_seconds`` (of all its MBIR iterations), ``total_seconds``,
+  ``volume_change_relative`` (``|X_k - X_{k-1}| / |X_k|``),
   ``scatter_change_relative`` (from outer iteration 2 on: mean absolute change of the scatter-count estimate over its
   mean absolute value), ``metal_measurement_fraction``, ``metal_voxels`` and ``metal_fill_scale`` (with
   ``metal_attenuation_threshold``: the share of measurements left out, the size of the metal set and the scale of its
   fill) and, on CUDA, ``gpu_peak_allocated_mib``; a record with a scatter stage also holds
   ``negative_fraction`` (voxels clamped by the density model), ``accumulator_change_mean`` /
-  ``accumulator_change_max`` (relative accumulator change over the computed views), ``transfer_seconds``,
+  ``accumulator_change_max`` (relative accumulator change over the computed views; ``converged_sweeps_mean`` instead
+  with ``"converged"``), ``transfer_seconds``,
   ``primary_seconds`` and, at ``scatter_view_stride > 1``, ``interpolation_seconds`` (the last two are part of
   ``scatter_seconds``);
 * ``spr`` and ``scatter_counts``: the last scatter-to-primary ratio and scatter-count estimate ``Y - Y_c``,
   ``[views, rows, channels]``;
-* ``mbir_iterations_total`` (the MBIR iterations of the whole loop), ``regularization`` (the frozen sigmas),
-  ``state`` (a description of the accumulator storage, one slot per computed view), ``init_recon``, ``model``,
-  ``config``, ``seconds`` and ``fdk_seconds`` (the time of the initial volume);
+* ``mbir_iterations_total`` and ``outer_iterations_total`` (the iterations of the whole loop), ``regularization``
+  (the frozen sigmas), ``state`` (a description of the accumulator storage, one slot per computed view),
+  ``init_recon``, ``model``, ``config``, ``schedule`` (the schedule run, with the counts of the config),
+  ``seconds`` and ``fdk_seconds`` (the time of the initial volume);
 * ``computed_views`` (``[Vc]`` views with a scatter step) and ``view_interpolated`` (``[V]`` bool, True where the
   scatter is interpolated in angle);
 * ``grouping_object_size_cm``, ``grouping_medium`` (the object size and medium of the solver's energy groups, None
@@ -207,7 +212,7 @@ on every m-th view"):
 
 .. code-block:: python
 
-   config = CitrusConfig()                                               # 14 outer iterations of 8 MBIR iterations
+   config = CitrusConfig()                    # the schedule's counts: 14 outer iterations of 8 MBIR iterations
    # 20 outer iterations of 2 MBIR iterations: 20 scatter steps, 40 MBIR iterations
    config = CitrusConfig(num_outer_iterations=20, mbir_iterations_per_outer_iteration=2)
    # scatter step on every 4th view, the others interpolated in angle (Catmull-Rom, order 3, by default)
@@ -217,7 +222,20 @@ on every m-th view"):
 
 ``num_outer_iterations=N`` runs N outer iterations and ``mbir_iterations_per_outer_iteration=n`` runs n MBIR
 iterations in each; stronger scatter needs more outer iterations (:doc:`method`, "MBIR iterations per outer
-iteration"). ``mbir_recon`` with the same config runs the same MBIR iterations without the correction.
+iteration"). Set in the config, the two counts overwrite those of the schedule. ``mbir_recon`` with the same config
+runs the same MBIR iterations without the correction.
+
+The schedule (:doc:`method`, "Schedules") sets the counts, a stopping threshold, the scatter sweeps per outer
+iteration and the scatter updates; CITRUS, one sweep per outer iteration, is the default:
+
+.. code-block:: python
+
+   schedule = Schedule(scatter_sweeps_per_outer_iteration=2)                 # CITRUS with two sweeps per step
+   schedule = Schedule(num_outer_iterations=30, outer_change_threshold=1e-3)  # stop when the volume settles
+   schedule = Schedule(scatter_sweeps_per_outer_iteration="converged")        # decoupled: a converged solve per view
+   schedule = Schedule(scatter_sweeps_per_outer_iteration="converged", num_scatter_updates=1)  # sequential
+   recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, schedule=schedule)
+   info["schedule"], info["outer_iterations_total"]
 ``scatter_view_interpolation_order``: 3 cubic Catmull-Rom on 4 neighbors
 (default), 2 quadratic (3-point
 Lagrange), 1 linear, 0 nearest computed view; ``None`` leaves the skipped views uncorrected (diagnostics only); ignored

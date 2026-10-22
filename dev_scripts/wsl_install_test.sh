@@ -42,13 +42,13 @@ step "pytest (CITRUS_SLOW_TESTS=1 builds the real cross-section library)"
 CITRUS_SLOW_TESTS=1 python -m pytest -q -ra tests 2>&1 | tail -25
 echo "pytest exit: ${PIPESTATUS[0]}"
 
-step "demo/demo_1_scatter_solver.py"
-MPLBACKEND=Agg python demo/demo_1_scatter_solver.py 2>&1 | tail -15
-echo "demo_1_scatter_solver exit: ${PIPESTATUS[0]}"
+step "demo/basic/demo_basic_1_scatter_solver.py"
+MPLBACKEND=Agg python demo/basic/demo_basic_1_scatter_solver.py 2>&1 | tail -15
+echo "demo_basic_1_scatter_solver exit: ${PIPESTATUS[0]}"
 
-step "demo/demo_2_basic_cone.py (180 views over a short scan, 0.5 cm, 80 outer iterations)"
-MPLBACKEND=Agg python demo/demo_2_basic_cone.py 2>&1 | tail -20
-echo "demo_2_basic_cone exit: ${PIPESTATUS[0]}"
+step "demo/basic/demo_basic_3_cone_beam.py (180 views over a short scan, 0.5 cm, 14 outer iterations of 8)"
+MPLBACKEND=Agg python demo/basic/demo_basic_3_cone_beam.py 2>&1 | tail -20
+echo "demo_basic_3_cone_beam exit: ${PIPESTATUS[0]}"
 
 step "benchmarks/citrus_study.py --help"
 python benchmarks/citrus_study.py --help > /dev/null

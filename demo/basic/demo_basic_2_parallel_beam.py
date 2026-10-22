@@ -1,4 +1,4 @@
-"""Demo 5: a monoenergetic parallel beam, as in synchrotron CT.
+"""Demo basic 2: a monoenergetic parallel beam, as in synchrotron CT.
 
 Reconstruct a parallel-beam CT at one photon energy, the setting of a synchrotron beamline with a monochromator, of a
 breast-sized phantom: a 10 cm cylinder of adipose tissue with a fibroglandular region, a lesion and a small
@@ -14,14 +14,12 @@ import os
 
 import numpy as np
 import matplotlib.pyplot as plt
-import torch
 
 from citrus import CitrusConfig, citrus_recon
 from citrus.scatter_solver import (Grid, ParallelGeometry, ScatterSolver, SolverConfig, ideal_counting_response,
                                    monoenergetic_spectrum, no_grid)
-from citrus.scatter_solver.cross_sections import material_index
-from citrus.utilities import (load_dataset, plot_profiles, plot_slices, save_dataset, synthesize_cone_beam_data,
-                              view_angles)
+from citrus.utilities import (breast_phantom, load_dataset, plot_profiles, plot_slices, save_dataset,
+                              synthesize_cone_beam_data, view_angles)
 
 # ---- Parameters -----------------------------------------------------------------------------------------------
 energy_kev = 32.0                          # photon energy of the monochromatic beam in keV
@@ -51,22 +49,15 @@ make_solver = lambda: ScatterSolver(None, config, geometry, detector=ideal_count
 
 # ---- Phantom: densities [materials, rows, cols, slices] in g/cm^3, rows in library order -------------------------
 solver = make_solver()
-x, y, _ = grid.axis_coordinates("cuda")
-xx, yy = x[None, :, None], y[:, None, None]
-inside = lambda center, radius: ((xx - center) ** 2 + yy ** 2 < radius ** 2).expand(*grid.shape)  # noqa: E731
-rho = torch.zeros(len(materials), *grid.shape, device="cuda")
-speck = ((xx - calcification_center).abs() < calcification_size / 2) & (yy.abs() < calcification_size / 2)
-for material, density, mask in (("adipose_icrp", 0.95, inside(0.0, breast_radius)),
-                                ("soft_tissue_icru44", 1.06, inside(gland_center, gland_radius)),
-                                ("soft_tissue_icru44", 1.10, inside(lesion_center, lesion_radius)),
-                                ("bone_cortical_icrp", 1.85, speck.expand(*grid.shape))):
-    rho[:, mask] = 0.0  # each region replaces the regions before it
-    rho[material_index(solver.materials, material)][mask] = density
+# Adipose tissue, gland, lesion and calcification, each region replacing the regions before it (citrus.utilities).
+rho = breast_phantom(grid, solver.materials, breast_radius=breast_radius, gland_center=gland_center,
+                     gland_radius=gland_radius, lesion_center=lesion_center, lesion_radius=lesion_radius,
+                     calcification_center=calcification_center, calcification_size=calcification_size, device="cuda")
 
 # ---- Data: loaded when a file of this name exists in demo/input, else synthesized once (about a minute on a GPU) ---
 name = (f"breast_parallel_{num_views}v_{delta_voxel:g}cm_{num_det_channels}ch_gap{air_gap:g}cm_"
         f"{energy_kev:g}kev").replace(".", "p")
-path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input", name)
+path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "input", name)  # demo/input
 if os.path.exists(path + ".npz"):
     data = load_dataset(path)
 else:

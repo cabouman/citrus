@@ -12,7 +12,7 @@ import torch
 
 from conftest import SPECTRUM_125KVP
 from citrus import citrus as citrus_module
-from citrus.citrus import (CitrusConfig, CitrusState, StateStore, citrus_recon, estimate_regularization,
+from citrus.citrus import (CitrusConfig, CitrusState, Schedule, StateStore, citrus_recon, estimate_regularization,
                            mbir_recon)
 from citrus.scatter_solver.config import SolverConfig
 
@@ -158,7 +158,7 @@ def test_citrus_with_true_scatter_is_fixed_spr_mbir(tiny, monkeypatch):
     coarse = solver.transport_grid(grid)
     shape = (solver.num_groups, (solver.L + 1) ** 2, 4) + tuple(coarse.shape)
 
-    def fake_step(solver_, state, fields, angle, *, primary=True):
+    def fake_step(solver_, state, fields, angle, *, primary=True, sweeps=1):
         v = view_of[float(angle)]
         assert not primary and fields.rho_fine is None and fields.attenuation is not None  # the loop's X path
         if state.collided_moments is not None:  # the stored accumulator comes back (cell mean only)
@@ -182,6 +182,88 @@ def test_citrus_with_true_scatter_is_fixed_spr_mbir(tiny, monkeypatch):
     assert info["records"][3]["accumulator_change_mean"] == 0.25
     rel = float((X_citrus - X_o).norm() / X_o.norm())
     assert rel < 1e-4, rel  # MBIRTORCH's float32 atomics
+
+
+# ---- schedules ------------------------------------------------------------------------------------------
+
+def test_schedule_settings_are_validated():
+    schedule = Schedule()
+    assert (schedule.num_outer_iterations, schedule.mbir_iterations_per_outer_iteration,
+            schedule.scatter_sweeps_per_outer_iteration) == (14, 8, 1)
+    schedule.validate()
+    Schedule(num_outer_iterations=3, mbir_iterations_per_outer_iteration=np.int64(2)).validate()
+    for good in (0, 2, "converged"):
+        Schedule(scatter_sweeps_per_outer_iteration=good).validate()
+    for name, bad in [("num_outer_iterations", 0), ("num_outer_iterations", 1.5), ("num_outer_iterations", True),
+                      ("mbir_iterations_per_outer_iteration", 0), ("mbir_iterations_per_outer_iteration", None),
+                      ("scatter_sweeps_per_outer_iteration", -1), ("scatter_sweeps_per_outer_iteration", "auto"),
+                      ("scatter_sweeps_per_outer_iteration", 1.0), ("num_scatter_updates", -1),
+                      ("outer_change_threshold", 0.0), ("scatter_change_threshold", -1e-3)]:
+        with pytest.raises(ValueError, match=name):
+            Schedule(**{name: bad}).validate()
+    sequential = Schedule(scatter_sweeps_per_outer_iteration="converged", num_scatter_updates=1)
+    assert sequential.updates_scatter(1) and not sequential.updates_scatter(2)
+    assert Schedule().updates_scatter(100) and not Schedule(num_scatter_updates=0).updates_scatter(1)
+
+
+@cuda
+def test_two_sweeps_per_outer_iteration(tiny):
+    """Two sweeps per step carry the recursion further along, so its last change is smaller than with one."""
+    data, grid, geometry, solver, regularization = tiny
+    changes = []
+    for sweeps in (1, 2):
+        _, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver,
+                               schedule=Schedule(num_outer_iterations=3, mbir_iterations_per_outer_iteration=1,
+                                                 scatter_sweeps_per_outer_iteration=sweeps),
+                               regularization=regularization)
+        assert info["schedule"]["scatter_sweeps_per_outer_iteration"] == sweeps
+        changes.append(info["records"][3]["accumulator_change_mean"])
+    assert changes[1] < changes[0]
+
+
+@cuda
+def test_converged_first_order_and_sequential_schedules(tiny):
+    """A converged solve per view (decoupled) records its sweeps and no accumulator; the first-order scatter is below
+    it on the same volume; the sequential schedule estimates once and keeps the ratio; no updates is no correction."""
+    data, grid, geometry, solver, regularization = tiny
+    run = lambda **settings: citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver,  # noqa: E731
+                                          schedule=Schedule(mbir_iterations_per_outer_iteration=1, **settings),
+                                          regularization=regularization)[1]
+    full = run(num_outer_iterations=1, scatter_sweeps_per_outer_iteration="converged")
+    first = run(num_outer_iterations=1, scatter_sweeps_per_outer_iteration=0)
+    assert full["records"][1]["converged_sweeps_mean"] > 2 and "accumulator_change_mean" not in full["records"][1]
+    assert float(first["spr"].mean()) < float(full["spr"].mean())
+    loose = run(num_outer_iterations=1, scatter_sweeps_per_outer_iteration="converged", scatter_change_threshold=0.1)
+    assert loose["records"][1]["converged_sweeps_mean"] < full["records"][1]["converged_sweeps_mean"]
+    sequential = run(num_outer_iterations=3, scatter_sweeps_per_outer_iteration="converged", num_scatter_updates=1)
+    records = sequential["records"]
+    assert "converged_sweeps_mean" in records[1] and "converged_sweeps_mean" not in records[2]
+    assert records[2]["scatter_change_relative"] == 0.0 and records[3]["scatter_change_relative"] == 0.0
+    none = run(num_outer_iterations=2, num_scatter_updates=0)
+    assert none["spr"] is None and float(none["scatter_counts"].abs().max()) == 0.0
+
+
+@cuda
+def test_outer_change_threshold_stops_the_loop(tiny):
+    data, grid, geometry, solver, regularization = tiny
+    _, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver,
+                           schedule=Schedule(num_outer_iterations=6, mbir_iterations_per_outer_iteration=1),
+                           regularization=regularization)
+    changes = [r["volume_change_relative"] for r in info["records"][1:]]
+    threshold = changes[2] * 1.0001  # stops after outer iteration 3, the first below it (the changes decrease)
+    assert all(changes[i + 1] < changes[i] for i in range(2))
+    _, stopped = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver,
+                              schedule=Schedule(num_outer_iterations=6, mbir_iterations_per_outer_iteration=1,
+                                                outer_change_threshold=threshold),
+                              regularization=regularization)
+    assert stopped["outer_iterations_total"] == 3 and stopped["mbir_iterations_total"] == 3
+    # the counts of the config overwrite those of the schedule
+    _, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver,
+                           CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration=1),
+                           schedule=Schedule(num_outer_iterations=6, scatter_sweeps_per_outer_iteration=2),
+                           regularization=regularization)
+    assert info["outer_iterations_total"] == 2 and info["mbir_iterations_total"] == 2
+    assert info["schedule"]["num_outer_iterations"] == 2 and info["schedule"]["scatter_sweeps_per_outer_iteration"] == 2
 
 
 # ---- several MBIR iterations per outer iteration ------------------------------------------------------------
@@ -273,7 +355,7 @@ def test_sparse_views_interpolate_the_scatter_signal(tiny, monkeypatch):
     skipped = np.setdiff1d(np.arange(16), computed)
     calls = []
 
-    def fake_step(solver_, state, fields, angle, *, primary=True):
+    def fake_step(solver_, state, fields, angle, *, primary=True, sweeps=1):
         assert not primary  # the loop never traces the primary inside the step
         v = view_of[float(angle)]
         new = CitrusState(angle=float(angle), collided_moments=None, num_steps=state.num_steps + 1,
@@ -360,10 +442,10 @@ def test_citrus_recon_on_short_scan(tiny):
 
 def test_settings_are_validated():
     config = CitrusConfig()
-    assert config.num_outer_iterations == 14 and config.mbir_iterations_per_outer_iteration == 8
+    assert config.num_outer_iterations is None and config.mbir_iterations_per_outer_iteration is None  # the schedule's
     config.validate()
     CitrusConfig(num_outer_iterations=3, mbir_iterations_per_outer_iteration=np.int64(2)).validate()
-    for bad in (0, -1, 1.5, True, "adaptive", None):
+    for bad in (0, -1, 1.5, True, "adaptive"):
         for name in ("num_outer_iterations", "mbir_iterations_per_outer_iteration"):
             with pytest.raises(ValueError, match=name):
                 CitrusConfig(**{name: bad}).validate()

@@ -1,4 +1,4 @@
-"""Demo 4: user-defined reference materials, an iodine contrast agent and a dental amalgam.
+"""Demo basic 4: user-defined reference materials, an iodine contrast agent and a dental amalgam.
 
 Define two materials that are not in the catalogue with ``Material(name, density, composition)``, put them in
 ``SolverConfig.materials`` next to catalogue names, build a small head phantom from the reference materials (a water
@@ -18,17 +18,15 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 
 from citrus import CitrusConfig, citrus_recon
 from citrus.scatter_solver import (ConeGeometry, Grid, Material, ScatterSolver, SolverConfig,
                                    ideal_counting_response, load_spectrum_txt, no_grid)
-from citrus.scatter_solver.cross_sections import material_index
-from citrus.utilities import (load_dataset, plot_profiles, plot_slices, save_dataset, synthesize_cone_beam_data,
-                              view_angles)
+from citrus.utilities import (dental_head_phantom, load_dataset, plot_profiles, plot_slices, save_dataset,
+                              synthesize_cone_beam_data, view_angles)
 
 # ---- Parameters -----------------------------------------------------------------------------------------------
-demo_dir = os.path.dirname(os.path.abspath(__file__))
+demo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # demo/, with spectra/ and input/
 spectrum = load_spectrum_txt(os.path.join(demo_dir, "spectra", "spectrum_125kvp.txt"))  # keV, photons per keV
 # Iodine contrast agent: 10 mg of iodine per mL of water (1 % by mass at 1.01 g/cm^3), about the concentration in the
 # arteries during a contrast-enhanced CT.
@@ -68,18 +66,10 @@ solver = make_solver()
 print("Reference materials in library order:", solver.materials)
 
 # ---- Phantom: densities [materials, rows, cols, slices] in g/cm^3, one row per reference material -----------------
-x, y, z = grid.axis_coordinates("cuda")
-xx, yy, zz = x[None, :, None], y[:, None, None], z[None, None, :]
-row = lambda material: material_index(solver.materials, material)  # noqa: E731
-rho = torch.zeros(len(materials), *grid.shape, device="cuda")
-inside = lambda center, radius: ((xx - center) ** 2 + yy ** 2 < radius ** 2).expand(*grid.shape)  # noqa: E731
-rho[row("water")][inside(0.0, head_radius)] = 1.0
-cube = ((xx - amalgam_center).abs() < amalgam_size / 2) & (yy.abs() < amalgam_size / 2) & (zz.abs() < amalgam_size / 2)
-for material, density, mask in ((contrast, contrast.density, inside(vessel_center, vessel_radius)),
-                                ("bone_cortical_icrp", 1.85, inside(bone_center, bone_radius)),
-                                (amalgam, amalgam.density, cube)):
-    rho[:, mask] = 0.0  # the insert replaces the water
-    rho[row(material)][mask] = density
+# The water cylinder and its inserts (citrus.utilities); the contrast and the filling take their materials' densities.
+rho = dental_head_phantom(grid, solver.materials, contrast, amalgam, head_radius=head_radius, bone_center=bone_center,
+                          bone_radius=bone_radius, vessel_center=vessel_center, vessel_radius=vessel_radius,
+                          amalgam_center=amalgam_center, amalgam_size=amalgam_size, device="cuda")
 
 # ---- Data: loaded when a file of this name exists in demo/input, else synthesized once (about a minute on a GPU) ---
 name = (f"head_{num_views}v_{delta_voxel:g}cm_{num_det_rows}x{num_det_channels}px{pixel_pitch:g}cm_I0{I0:.0e}_"

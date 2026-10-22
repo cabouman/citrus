@@ -86,6 +86,28 @@ on the first corrected sinogram and then frozen. The partitions are drawn from a
 correction, or a fixed SPR), so a comparison can share the initialization, the weights, the partition sequence and the
 regularization with CITRUS.
 
+Schedules
+~~~~~~~~~
+
+A ``Schedule`` sets when the scatter estimate is updated, how far each update goes and when the loop stops:
+
+* ``num_outer_iterations`` (N) and ``outer_change_threshold``: the loop stops after N outer iterations, or after the
+  first outer iteration whose relative change of the volume, :math:`\|X_k - X_{k-1}\| / \|X_k\|`, falls below
+  the threshold;
+* ``mbir_iterations_per_outer_iteration`` (n);
+* ``scatter_sweeps_per_outer_iteration``: the transport sweeps per computed view in each outer iteration, the collided
+  fluence of the view carried over from the last one, or ``"converged"`` for a fresh source iteration per view that
+  stops when the relative change of the collided fluence falls below ``scatter_change_threshold``;
+* ``num_scatter_updates``: the number of outer iterations, from the first, that make a new scatter estimate (the later
+  ones keep the last one).
+
+CITRUS is one sweep per outer iteration and the default, ``Schedule()``; the counts of ``CitrusConfig`` overwrite those
+of the schedule when they are set. With more sweeps, every sweep after the first transports the scattering source of
+the change of the accumulator, :math:`\Phi_v \leftarrow \Phi_v + G_k(\Phi_v - \Phi_v^{\text{old}})`, which advances
+the recursion one more collision order for one sweep and no new first-collision source, so the estimate follows the
+volume more closely. Zero sweeps give the first-order scatter alone, ``"converged"`` the decoupled schedule, and
+``"converged"`` with one scatter update the sequential schedule (the scatter of :math:`X_0`, then frozen).
+
 The LBTE scatter solver
 -----------------------
 
