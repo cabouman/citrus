@@ -4,9 +4,10 @@
 tabulates G(E, theta1, theta2), the transmitted fraction of one set of anti-scatter-grid septa (a crossed grid
 holds a second set, ``GridResponse.crossed``); tables from a Monte Carlo
 simulation can replace the analytic builders. :func:`detector_response` and :func:`anti_scatter_grid` build them for
-any material of the catalogue from the photon data, :func:`csi_response` and :func:`focused_1d_grid` from coarse
-built-in tables, and :func:`tabulated_detector_response` from a user table. :func:`detector_angle` and
-:func:`grid_angles` give the angles of the photons arriving at the panel.
+any material of the catalogue from the photon data (the analytic grid of ``grid_model`` by default),
+:func:`csi_response` and :func:`focused_1d_grid` from coarse built-in tables, and :func:`tabulated_detector_response`
+from a user table. :func:`group_averaged_responses` averages a pair of responses over each energy group of a library.
+:func:`detector_angle` and :func:`grid_angles` give the angles of the photons arriving at the panel.
 """
 
 from __future__ import annotations
@@ -36,11 +37,14 @@ __all__ = [
     "no_grid",
     "focused_1d_grid",
     "anti_scatter_grid",
+    "group_averaged_responses",
     "grid_angles",
     "detector_angle",
 ]
 
 SEPTA_DIRECTIONS = ("channels", "rows")
+DEPOSITION_MODELS = ("full", "local", "fluorescence_escape")
+GRID_MODELS = ("analytic", "septum_shadow")
 
 ArrayLike = Union[Tensor, np.ndarray, Sequence[float]]
 MassAttenuation = Callable[[np.ndarray], np.ndarray]
@@ -369,6 +373,166 @@ def material_cross_sections(material: str, energy_kev: ArrayLike, backend=None) 
     return {kind: sum(w * backend.sigma(kind, Z, energies) for Z, w in composition.items()) for kind in kinds}
 
 
+def material_entry(material, density: Optional[float] = None, backend=None) -> tuple[str, float, dict[int, float]]:
+    """Return the name, density and element mass fractions of a catalogue material or a ``Material`` definition.
+
+    Args:
+        material (str or cross_sections.Material): catalogue material name or user-defined material.
+        density (float, optional): density in g/cm^3. Defaults to None (the nominal density).
+        backend (photon_data.XcomXraylibBackend, optional): photon data (atomic weights). Defaults to None (loaded on
+            first use).
+
+    Returns:
+        (str, float, dict[int, float]): name, density in g/cm^3 and mass fraction per atomic number Z.
+    """
+    from .cross_section_library import parse_formula
+    from .cross_sections import material_table
+    from .photon_data import resolve_backend
+
+    backend = resolve_backend() if backend is None else backend
+    (name, nominal, formula), = material_table((material,))
+    return name, float(nominal if density is None else density), parse_formula(formula, backend.atomic_mass)
+
+
+# K x-ray lines of xraylib whose escape a detector layer loses (the K-L and K-M lines; the rest are rarer)
+K_LINES = ("KA1_LINE", "KA2_LINE", "KA3_LINE", "KB1_LINE", "KB2_LINE", "KB3_LINE", "KB4_LINE", "KB5_LINE")
+
+
+def k_shell_edge(Z: int, backend) -> Optional[float]:
+    """Return the K edge of an element in keV from the photon data, or None when XCOM lists no K edge above 1 keV.
+
+    Args:
+        Z (int): atomic number.
+        backend (photon_data.XcomXraylibBackend): photon data.
+
+    Returns:
+        float or None: the K edge in keV.
+    """
+    element = backend.element(int(Z))
+    labels = tuple(element.edge_labels)
+    return float(element.edge_energy_ev[labels.index("K")]) * 1.0e-3 if "K" in labels else None
+
+
+def k_fluorescence_lines(Z: int) -> list[tuple[float, float]]:
+    """Return the K x-ray lines of an element with the number of each line emitted per K-shell vacancy (xraylib).
+
+    Args:
+        Z (int): atomic number.
+
+    Returns:
+        list[tuple[float, float]]: (line energy in keV, fluorescence yield times radiative rate) per line; empty for
+        elements without K lines above 1 keV.
+    """
+    import xraylib
+
+    try:
+        fluorescence_yield = xraylib.FluorYield(int(Z), xraylib.K_SHELL)
+    except ValueError:
+        return []
+    lines = []
+    for name in K_LINES:
+        try:
+            line = getattr(xraylib, name)
+            energy, rate = xraylib.LineEnergy(int(Z), line), xraylib.RadRate(int(Z), line)
+        except (AttributeError, ValueError):
+            continue
+        if energy > 1.0 and rate > 0:
+            lines.append((float(energy), float(fluorescence_yield * rate)))
+    return lines
+
+
+def k_shell_share(Z: int, energy_kev: np.ndarray, backend) -> np.ndarray:
+    """Return the fraction of an element's photoabsorptions that ionize its K shell (xraylib's subshell cross
+    sections), zero below the K edge of the photon data.
+
+    Args:
+        Z (int): atomic number.
+        energy_kev (np.ndarray): [K] photon energies in keV.
+        backend (photon_data.XcomXraylibBackend): photon data (the K edge).
+
+    Returns:
+        np.ndarray: [K] K-shell share in [0, 1].
+    """
+    import xraylib
+
+    energies = np.asarray(energy_kev, dtype=np.float64).reshape(-1)
+    edge = k_shell_edge(Z, backend)
+    share = np.zeros_like(energies)
+    if edge is None:
+        return share
+    try:
+        xraylib_edge = xraylib.EdgeEnergy(int(Z), xraylib.K_SHELL)
+    except ValueError:
+        return share
+    for i, energy in enumerate(energies):
+        if energy < edge:
+            continue
+        e = max(float(energy), xraylib_edge * (1.0 + 1e-9))  # the two data sets place the edge a few eV apart
+        try:
+            share[i] = xraylib.CS_Photo_Partial(int(Z), xraylib.K_SHELL, e) / xraylib.CS_Photo(int(Z), e)
+        except ValueError:
+            share[i] = 0.0
+    return np.clip(share, 0.0, 1.0)
+
+
+def _fluorescence_escape_deposit(sigma: dict[str, np.ndarray], composition: dict[int, float], density: float,
+                                 thickness_cm: float, energy_nodes: np.ndarray, thetas_rad: np.ndarray,
+                                 backend) -> np.ndarray:
+    """Return the energy a slab deposits per incident photon when its K x-rays escape (method.rst, "Detector models").
+
+    Args:
+        sigma (dict[str, np.ndarray]): [E] mass cross sections of the slab material at ``energy_nodes``
+            (:func:`material_cross_sections`).
+        composition (dict[int, float]): mass fraction per atomic number Z.
+        density (float): density in g/cm^3.
+        thickness_cm (float): slab thickness t in cm.
+        energy_nodes (np.ndarray): [E] photon energies in keV.
+        thetas_rad (np.ndarray): [T] incidence angles to the normal in rad.
+        backend (photon_data.XcomXraylibBackend): photon data.
+
+    Returns:
+        np.ndarray: [E, T] keV deposited per incident photon.
+    """
+    from scipy.special import expn
+
+    from .cross_sections import ELECTRON_REST_KEV
+
+    t = float(thickness_cm)
+    E = energy_nodes
+    mu = sigma["total"] * density  # [E] 1/cm
+    cosine = np.cos(np.clip(thetas_rad, 0.0, math.pi / 2 - 1e-9))  # [T]
+    interacting = -np.expm1(-mu[:, None] * t / cosine[None, :])  # [E, T]
+    pair_kept = np.clip(E - 2.0 * ELECTRON_REST_KEV, 0.0, None)
+    kept = (sigma["photoelectric"] * E + sigma["compton"] * E * _compton_energy_transfer_fraction(E)
+            + sigma["pair"] * pair_kept) / sigma["total"]  # [E] keV per interaction without the K x-ray escape
+    if t <= 0:
+        return kept[:, None] * interacting
+    # depth of the interaction: x(u) inverts the interaction probability, u uniform in [0, 1]
+    nodes, weights = np.polynomial.legendre.leggauss(64)
+    u, wu = 0.5 * (nodes + 1.0), 0.5 * weights
+    with np.errstate(divide="ignore", invalid="ignore"):
+        depth = -(cosine[None, :, None] / mu[:, None, None]) * np.log1p(-u[None, None, :] * interacting[:, :, None])
+    depth = np.clip(np.nan_to_num(depth, nan=0.5 * t), 0.0, t)  # [E, T, U] (mu = 0: anywhere)
+    # depth nodes clustered at both faces, where the escape probability has a logarithmic slope
+    x = 0.5 * t * (1.0 - np.cos(np.pi * np.linspace(0.0, 1.0, 4001)))
+    lost = np.zeros((E.size, cosine.size))
+    sigma_pe = np.where(sigma["photoelectric"] > 0, sigma["photoelectric"], 1.0)
+    for Z, w in composition.items():
+        lines = k_fluorescence_lines(Z)
+        if not lines:
+            continue
+        vacancies = w * backend.sigma("photoelectric", Z, E) * k_shell_share(Z, E, backend) / sigma_pe  # [E]
+        if not np.any(vacancies > 0):
+            continue
+        line_energy = np.array([e for e, _ in lines])
+        line_mu = sum(wz * backend.sigma("total", Zz, line_energy) for Zz, wz in composition.items()) * density
+        escaping = sum(y * e * 0.5 * (expn(2, m * x) + expn(2, m * (t - x)))
+                       for (e, y), m in zip(lines, line_mu))  # [X] keV escaping per K vacancy at depth x
+        lost += vacancies[:, None] * (np.interp(depth, x, escaping) @ wu)
+    per_interaction = kept[:, None] - (sigma["photoelectric"] / sigma["total"])[:, None] * lost
+    return per_interaction * interacting
+
+
 def _compton_energy_transfer_fraction(energy_kev: np.ndarray) -> np.ndarray:
     """Return the mean fraction of the photon energy given to the electron in Klein-Nishina Compton scattering.
 
@@ -403,9 +567,11 @@ def detector_response(material: str = "cesium_iodide", thickness_cm: float = 0.0
         density (float, optional): density rho in g/cm^3. Defaults to None (the catalogue density).
         mode (str, optional): "energy_integrating" (keV deposited per incident photon) or "photon_counting"
             (counts per incident photon). Defaults to "energy_integrating".
-        deposition (str, optional): "full" (every interacting photon deposits its whole energy and is counted) or
+        deposition (str, optional): "full" (every interacting photon deposits its whole energy and is counted),
             "local" (only the energy of the first interaction stays: scattered and annihilation photons escape, and
-            Rayleigh scattering is not counted). Defaults to "full".
+            Rayleigh scattering is not counted) or "fluorescence_escape" (as "local", but a photoabsorption deposits
+            the photon energy minus the K x-rays that escape the layer; a photon-counting detector counts as with
+            "local"). Defaults to "full".
         energies (ArrayLike, optional): table energies in keV; None uses 10 to 150 keV every 0.5 keV, then 160 nodes
             logarithmically spaced up to 20 MeV (pass the group energies to make the table exact at the groups).
             Defaults to None.
@@ -415,20 +581,29 @@ def detector_response(material: str = "cesium_iodide", thickness_cm: float = 0.0
     Returns:
         DetectorResponse: the response, float64 tables on the CPU.
     """
-    from .cross_sections import ELECTRON_REST_KEV, MATERIAL_CATALOGUE
+    from .cross_sections import ELECTRON_REST_KEV
 
     if thickness_cm < 0:
         raise ValueError("thickness must be non-negative")
     if mode not in ("energy_integrating", "photon_counting"):
         raise ValueError(f"mode must be 'energy_integrating' or 'photon_counting', got {mode!r}")
-    if deposition not in ("full", "local"):
-        raise ValueError(f"deposition must be 'full' or 'local', got {deposition!r}")
+    if deposition not in DEPOSITION_MODELS:
+        raise ValueError(f"deposition must be one of {DEPOSITION_MODELS}, got {deposition!r}")
+    from .photon_data import resolve_backend
+
+    backend = resolve_backend() if backend is None else backend
     energy_nodes = _nodes(energies, _default_energy_nodes())
     thetas_rad = _nodes(thetas, _theta_nodes_detector())
     sigma = material_cross_sections(material, energy_nodes, backend)
-    rho = float(MATERIAL_CATALOGUE[material][0]) if density is None else float(density)
+    name, rho, composition = material_entry(material, density, backend)
     path = thickness_cm / np.cos(np.clip(thetas_rad, 0.0, math.pi / 2 - 1e-9))  # [T]
     interacting = -np.expm1(-sigma["total"][:, None] * rho * path[None, :])  # [E, T]
+    label = "energy integrating" if mode == "energy_integrating" else "photon counting"
+    if deposition == "fluorescence_escape" and mode == "energy_integrating":
+        response = _fluorescence_escape_deposit(sigma, composition, rho, thickness_cm, energy_nodes, thetas_rad,
+                                                backend)
+        return DetectorResponse(torch.as_tensor(energy_nodes), torch.as_tensor(thetas_rad), torch.as_tensor(response),
+                                name=f"{name} {thickness_cm * 10:.2f} mm, {label}, {deposition} deposition")
     if deposition == "full":
         per_interaction = np.ones_like(energy_nodes)
     elif mode == "energy_integrating":
@@ -439,9 +614,8 @@ def detector_response(material: str = "cesium_iodide", thickness_cm: float = 0.0
         per_interaction = (sigma["total"] - sigma["rayleigh"]) / sigma["total"]
     scale = energy_nodes if mode == "energy_integrating" else np.ones_like(energy_nodes)
     response = (scale * per_interaction)[:, None] * interacting
-    label = "energy integrating" if mode == "energy_integrating" else "photon counting"
     return DetectorResponse(torch.as_tensor(energy_nodes), torch.as_tensor(thetas_rad), torch.as_tensor(response),
-                            name=f"{material} {thickness_cm * 10:.2f} mm, {label}, {deposition} deposition")
+                            name=f"{name} {thickness_cm * 10:.2f} mm, {label}, {deposition} deposition")
 
 
 def tabulated_detector_response(energy_kev: ArrayLike, response: ArrayLike, theta_rad: Optional[ArrayLike] = None,
@@ -658,47 +832,74 @@ def focused_1d_grid(ratio: float = 10.0, lamella_thickness_cm: float = 0.0036, l
                              f"(geometric model)")
 
 
-def anti_scatter_grid(geometry: Optional[ConeGeometry], septum_thickness_cm: float, septum_height_cm: float, *,
-                      septum_material: str = "lead", focal_distance_cm: Optional[float] = None,
-                      pitch_cm: Optional[float] = None, septa_along: str = "channels",
-                      density: Optional[float] = None, energies: Optional[ArrayLike] = None,
-                      theta1: Optional[ArrayLike] = None, backend=None) -> GridResponse:
-    """Build an anti-scatter grid from its septa, with the septum attenuation from the photon data.
+def anti_scatter_grid(geometry: Optional[ConeGeometry], septum_thickness_cm: float,
+                      septum_height_cm: Optional[float] = None, *, ratio: Optional[float] = None,
+                      lines_per_cm: Optional[float] = None, septum_material="lead", interspace_material="air",
+                      focal_distance_cm: Optional[float] = None, pitch_cm: Optional[float] = None,
+                      septa_along: str = "channels", density: Optional[float] = None,
+                      interspace_density: Optional[float] = None, model: str = "analytic",
+                      detector: Optional[DetectorResponse] = None, energies: Optional[ArrayLike] = None,
+                      theta1: Optional[ArrayLike] = None, theta2: Optional[ArrayLike] = None,
+                      backend=None) -> GridResponse:
+    """Build an anti-scatter grid from its septa and interspace, with the attenuation from the photon data.
 
-    The transmission is the geometric septum-shadow model of :func:`focused_1d_grid` with the septum material's
-    attenuation; with the default pitch, one septum per pixel, every pixel sees the same septum shadow. Septa in both
-    directions (a crossed or 2-D grid) transmit the product of the two 1-D transmissions, which is exact for opaque
-    septa (the shadows along u and v do not interact) and counts the septum material twice where the walls cross.
+    The default model is analytic (:func:`grid_model.grid_signal_transmission`): the signal behind the grid relative
+    to the signal without it, from the photons that cross it without interacting plus the first-order scatter and the
+    fluorescence of the septa (and of a solid interspace) that reach the detector layer. ``model="septum_shadow"`` is
+    the geometric septum-shadow model of :func:`focused_1d_grid` with the septum material's attenuation, which ignores
+    the interspace, the grid's secondaries and theta2. Septa in both directions (a crossed or 2-D grid) transmit the
+    product of the two 1-D transmissions.
 
     Args:
         geometry (ConeGeometry or ParallelGeometry, optional): the panel; needed for the default pitch and focal
-            distance. None requires both ``pitch_cm`` and ``focal_distance_cm``.
+            distance. None requires the pitch (``pitch_cm`` or ``lines_per_cm``) and ``focal_distance_cm``.
         septum_thickness_cm (float): septum thickness t in cm.
-        septum_height_cm (float): septum height h in cm (along the panel normal).
-        septum_material (str, optional): catalogue material name of the septa. Defaults to "lead".
+        septum_height_cm (float, optional): septum height h in cm (along the panel normal); give it or ``ratio``.
+            Defaults to None.
+        ratio (float, optional): grid ratio ``h / (p - t)``, which sets the height. Defaults to None.
+        lines_per_cm (float, optional): septa per cm, ``1 / p``; give it or ``pitch_cm``. Defaults to None.
+        septum_material (str or Material, optional): septum material. Defaults to "lead".
+        interspace_material (str or Material, optional): material between the septa ("aluminium", "carbon_fibre",
+            ...); the analytic model only. Defaults to "air".
         focal_distance_cm (float, optional): distance of the focal line from the panel in cm, ``math.inf`` for an
             unfocused grid. Defaults to None (``default_focal_distance``: the source-detector distance of a cone beam,
             focused at the focal spot; unfocused for a parallel beam).
-        pitch_cm (float, optional): septum pitch p in cm, of both directions for ``"both"``. Defaults to None (the
-            detector pixel pitch across the septa).
+        pitch_cm (float, optional): septum pitch p in cm, of both directions for ``"both"``. Defaults to None
+            (``1 / lines_per_cm``, else the detector pixel pitch across the septa).
         septa_along (str, optional): "channels" (septa along u, repeating along the rows), "rows" (septa along v,
             parallel to the rotation axis, repeating along the channels) or "both" (septa along u and v, as in the
             2-D collimators of CT detectors). Defaults to "channels".
-        density (float, optional): septum density in g/cm^3. Defaults to None (the catalogue density).
+        density (float, optional): septum density in g/cm^3. Defaults to None (the nominal density).
+        interspace_density (float, optional): interspace density in g/cm^3. Defaults to None (the nominal density).
+        model (str, optional): "analytic" or "septum_shadow". Defaults to "analytic".
+        detector (DetectorResponse, optional): the detector layer that scores the analytic model's signal. Defaults to
+            None (0.6 mm of CsI, ``detector_response(deposition="fluorescence_escape")``).
         energies (ArrayLike, optional): table energies in keV; None uses 10 to 150 keV every 0.5 keV, then 160 nodes
             logarithmically spaced up to 20 MeV. Defaults to None.
         theta1 (ArrayLike, optional): table angles theta1 in rad; None uses nodes dense up to twice the cut-off angle
             ``atan((p - t) / h)`` and coarser up to 89.5 degrees. Defaults to None.
+        theta2 (ArrayLike, optional): table angles theta2 in rad of the analytic model; None uses every 10 degrees
+            up to 80 degrees and 89.5 degrees. Defaults to None.
         backend (photon_data.XcomXraylibBackend, optional): photon data. Defaults to None (loaded on first use).
 
     Returns:
         GridResponse: the response, float64 tables on the CPU.
     """
-    from .cross_sections import MATERIAL_CATALOGUE
-
+    if model not in GRID_MODELS:
+        raise ValueError(f"model must be one of {GRID_MODELS}, got {model!r}")
+    if pitch_cm is not None and lines_per_cm is not None:
+        raise ValueError("give pitch_cm or lines_per_cm, not both")
+    if lines_per_cm is not None:
+        if not lines_per_cm > 0:
+            raise ValueError(f"lines_per_cm must be positive, got {lines_per_cm}")
+        pitch_cm = 1.0 / float(lines_per_cm)
+    if (septum_height_cm is None) == (ratio is None):
+        raise ValueError("give septum_height_cm or ratio, exactly one")
     if septa_along == "both":
-        options = dict(septum_material=septum_material, focal_distance_cm=focal_distance_cm, pitch_cm=pitch_cm,
-                       density=density, energies=energies, theta1=theta1, backend=backend)
+        options = dict(ratio=ratio, septum_material=septum_material, interspace_material=interspace_material,
+                       focal_distance_cm=focal_distance_cm, pitch_cm=pitch_cm, density=density,
+                       interspace_density=interspace_density, model=model, detector=detector, energies=energies,
+                       theta1=theta1, theta2=theta2, backend=backend)
         along_channels = anti_scatter_grid(geometry, septum_thickness_cm, septum_height_cm, septa_along="channels",
                                            **options)
         along_rows = anti_scatter_grid(geometry, septum_thickness_cm, septum_height_cm, septa_along="rows", **options)
@@ -709,27 +910,128 @@ def anti_scatter_grid(geometry: Optional[ConeGeometry], septum_thickness_cm: flo
         raise ValueError(f"septa_along must be one of {SEPTA_DIRECTIONS + ('both',)}, got {septa_along!r}")
     if pitch_cm is None or focal_distance_cm is None:
         if geometry is None:
-            raise ValueError("pass the geometry, or both pitch_cm and focal_distance_cm")
+            raise ValueError("pass the geometry, or both the pitch (pitch_cm or lines_per_cm) and focal_distance_cm")
     p = float(pitch_cm if pitch_cm is not None else
               (geometry.delta_det_row if septa_along == "channels" else geometry.delta_det_channel))
     f = float(focal_distance_cm if focal_distance_cm is not None else default_focal_distance(geometry))
-    t, h = float(septum_thickness_cm), float(septum_height_cm)
-    if not (0.0 <= t < p) or h < 0:
-        raise ValueError(f"need 0 <= septum thickness < pitch ({p:g} cm) and height >= 0")
+    t = float(septum_thickness_cm)
+    h = float(septum_height_cm) if septum_height_cm is not None else float(ratio) * (p - t)
+    if not (0.0 <= t < p) or h < 0 or (model == "analytic" and h == 0):
+        raise ValueError(f"need 0 <= septum thickness < pitch ({p:g} cm) and height > 0")
     energy_nodes = _nodes(energies, _default_energy_nodes())
     if theta1 is None:
         cutoff_deg = math.degrees(math.atan2(p - t, h))
         dense = np.radians(np.linspace(0.0, min(89.5, 2.0 * cutoff_deg), 401))
         theta1 = np.unique(np.concatenate([dense, _theta_nodes_grid()]))
-    mass_attenuation = material_cross_sections(septum_material, energy_nodes, backend)["total"]
-    rho = float(MATERIAL_CATALOGUE[septum_material][0]) if density is None else float(density)
-    grid = focused_1d_grid(lamella_thickness_cm=t, lamella_height_cm=h, pitch_cm=p, focal_distance_cm=f,
-                           mass_attenuation=lambda e: np.interp(e, energy_nodes, mass_attenuation),
-                           lead_density=rho, energies=energy_nodes, theta1=theta1)
-    ratio = h / (p - t)
-    return replace(grid, septa_along=septa_along,
-                   name=f"focused 1D grid, {septum_material} septa {t * 10:.3g} mm x {h * 10:.3g} mm at "
-                        f"{p * 10:.3g} mm pitch (ratio {ratio:.1f}), septa along the {septa_along}")
+    from .photon_data import resolve_backend
+
+    backend = resolve_backend() if backend is None else backend
+    septum_name, rho, _ = material_entry(septum_material, density, backend)
+    label = (f"{septum_name} septa {t * 10:.3g} mm x {h * 10:.3g} mm at {p * 10:.3g} mm pitch "
+             f"(ratio {h / (p - t):.1f})")
+    if model == "septum_shadow":
+        mass_attenuation = material_cross_sections(septum_material, energy_nodes, backend)["total"]
+        grid = focused_1d_grid(lamella_thickness_cm=t, lamella_height_cm=h, pitch_cm=p, focal_distance_cm=f,
+                               mass_attenuation=lambda e: np.interp(e, energy_nodes, mass_attenuation),
+                               lead_density=rho, energies=energy_nodes, theta1=theta1)
+        return replace(grid, septa_along=septa_along,
+                       name=f"focused 1D grid, {label}, septa along the {septa_along}")
+    from .grid_model import grid_signal_transmission
+
+    theta1_nodes = _nodes(theta1, _theta_nodes_grid())
+    theta2_nodes = _nodes(theta2, np.radians(np.append(np.arange(0.0, 81.0, 10.0), 89.5)))
+    parts = grid_signal_transmission(p, t, h, strip_material=septum_material, interspace_material=interspace_material,
+                                     detector=detector, strip_density=density, interspace_density=interspace_density,
+                                     energies=energy_nodes, theta1=theta1_nodes, theta2=theta2_nodes, backend=backend)
+    table = np.clip(parts["direct"] + parts["secondary"], 0.0, 1.0)
+    interspace_name = material_entry(interspace_material, interspace_density, backend)[0]
+    return GridResponse(torch.as_tensor(energy_nodes), torch.as_tensor(theta1_nodes), torch.as_tensor(theta2_nodes),
+                        torch.as_tensor(table), focal_distance_cm=f, septa_along=septa_along,
+                        name=f"focused 1D grid, {label}, {interspace_name} interspace, septa along the {septa_along} "
+                             f"(analytic model)")
+
+
+# ---- responses averaged over the energy groups ---------------------------------------------------------------
+
+def _group_step_nodes(library) -> list[tuple[int, float, float, Tensor]]:
+    """Energy nodes of a table that is constant over each group, and the fine energies of each group.
+
+    Each group gets two nodes just inside its edges (and around its group energy), so that a table holding the same
+    value at both returns it anywhere inside the group.
+
+    Args:
+        library (MultigroupLibrary): the library (``group_edges``, ``group_energy``, ``fine_group``).
+
+    Returns:
+        list[tuple[int, float, float, Tensor]]: per group, its index, its two node energies in keV and the bool mask
+        of its fine energies.
+    """
+    edges = library.group_edges.detach().cpu().to(torch.float64)
+    energy = library.group_energy.detach().cpu().to(torch.float64)
+    fine_group = library.fine_group.detach().cpu()
+    out = []
+    for g in range(int(energy.numel())):
+        high, low = float(edges[g]), float(edges[g + 1])
+        inset = min(1e-3, 0.25 * (high - low))
+        e = float(energy[g])
+        out.append((g, min(low + inset, e), max(high - inset, e), fine_group == g))
+    return out
+
+
+def group_averaged_responses(detector: DetectorResponse, grid_response: GridResponse,
+                             library) -> tuple[DetectorResponse, GridResponse]:
+    """Average a detector and a grid response over the fine energies of each group of a library.
+
+    The detector response of group g becomes the mean over its fine energies weighted by the source photons
+    (``fine_weight``), and the grid transmission the mean weighted by the source photons times the detector response
+    at normal incidence, since it multiplies a signal; the angle nodes are kept. A group without source photons keeps
+    the responses at its group energy. The new tables are constant over each group, so an evaluation at the group
+    energy, as the solver does, returns the group's mean.
+
+    Args:
+        detector (DetectorResponse): the detector response.
+        grid_response (GridResponse): the grid response (with its crossed septa).
+        library (MultigroupLibrary): the library (``fine_energy``, ``fine_weight``, ``fine_group``, ``group_edges``,
+            ``group_energy``).
+
+    Returns:
+        (DetectorResponse, GridResponse): the averaged responses, float64 tables on the CPU.
+    """
+    fine_energy = library.fine_energy.detach().cpu().to(torch.float64)
+    fine_weight = library.fine_weight.detach().cpu().to(torch.float64)
+    group_energy = library.group_energy.detach().cpu().to(torch.float64)
+    groups = _group_step_nodes(library)
+    theta = detector.theta_rad.to(torch.float64)
+    normal = detector.at(fine_energy, torch.zeros(1, dtype=torch.float64))[:, 0]  # [K]
+
+    def averaged(values_at, weight: Tensor) -> tuple[Tensor, Tensor]:
+        """Step table [2G, ...] of the weighted group means of ``values_at(energies)`` and its energy nodes."""
+        nodes, rows = [], []
+        for g, low, high, mask in groups:
+            w = weight[mask]
+            if bool(mask.any()) and float(w.sum()) > 0:
+                mean = torch.tensordot(w, values_at(fine_energy[mask]), dims=1) / w.sum()
+            else:
+                mean = values_at(group_energy[g:g + 1])[0]
+            nodes += [low, high]
+            rows += [mean, mean]
+        order = sorted(range(len(nodes)), key=lambda i: nodes[i])
+        return torch.tensor([nodes[i] for i in order], dtype=torch.float64), torch.stack([rows[i] for i in order])
+
+    nodes, table = averaged(lambda e: detector.at(e, theta), fine_weight)
+    averaged_detector = DetectorResponse(nodes, theta, table, name=f"{detector.name} (group-averaged)")
+
+    def averaged_grid(grid: GridResponse) -> GridResponse:
+        """The grid table (and its crossed septa) averaged over each group."""
+        t1 = grid.theta1_rad.to(torch.float64)
+        t2 = grid.theta2_rad.to(torch.float64)
+        theta1, theta2 = t1[:, None].expand(-1, t2.numel()), t2[None, :].expand(t1.numel(), -1)
+        nodes, table = averaged(lambda e: grid.at(e, theta1, theta2), fine_weight * normal)
+        crossed = None if grid.crossed is None else averaged_grid(grid.crossed)
+        return replace(grid, energy_kev=nodes, transmission=table, crossed=crossed,
+                       name=f"{grid.name} (group-averaged)")
+
+    return averaged_detector, averaged_grid(grid_response)
 
 
 # ---- angles -------------------------------------------------------------------------------------------
