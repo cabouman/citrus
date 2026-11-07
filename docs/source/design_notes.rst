@@ -306,6 +306,43 @@ as sublevel sets, so its maximum over the differences of a panel point and a box
 that polytope, a pair of a panel corner and a box corner. If a box corner is not strictly on the source side of the
 panel plane the cone is the full hemisphere.
 
+Detector and grid responses
+---------------------------
+
+**An analytic grid instead of a calibration.** A real grid's signal response depends on its pitch, its strip
+thickness and height, its strip and interspace materials and the detector behind it; above the strip material's K
+edge its K x-rays and its scatter add a large share of the signal at oblique incidence, which a shadow model leaves
+out. A Monte Carlo table per grid captures that but has to be run again for every other grid. The analytic model
+(``grid_model``) computes the same two parts from the geometry and the photon data when the grid is built: the direct
+photons exactly (the strip path is piecewise linear in the entry offset, so the mean over one pitch has a closed
+form) and the first-order scatter and fluorescence of every point of the strips, scored by the same detector model as
+the solver. The tests compare both parts and the detector model with Geant4 results stored in ``tests/data``.
+
+**Directions that resolve the slots.** A photon scattered deep inside a strip reaches the detector only through the
+narrow cone of directions that pass the slots, of width about the slot angle :math:`\arctan((p - t)/h)`. The outgoing
+directions are therefore slope-parametrized, :math:`(\tan a, \tan b, 1)/|\cdot|`, with Gauss panels in :math:`a`
+whose edges scale with the slot angle, dense near :math:`a = 0`; a direction set that does not scale with the grid
+undersamples the slots of a high-ratio grid.
+
+**Cost.** Only the incident path, the scattering angle and the deposit depend on the incident direction; the paths
+from every emission point to the bottom of the grid along every outgoing direction are computed once per grid. Per
+energy the Rayleigh escape is one matrix product for all incident directions, the Compton escape (whose energy depends
+on the angle) one batched product per chunk of directions, and every fluorescence line's escape is computed once. The
+secondaries are smooth in energy apart from the absorption edges, so they are computed every 5 keV and on both sides
+of each edge and interpolated; the direct part, which carries the edges, at every table energy.
+
+**K x-ray escape in the detector.** "full" deposition counts the K x-rays of the scintillator that leave it, which
+at the iodine and cesium K edges is a sizeable share of the photon energy, and "local" counts none of the energy of a
+photoabsorption that is not given to the photoelectron. The escape model sits between them with the physics that
+matters at kV energies: the K x-rays leave by the exact slab escape probability of an isotropic line, depth by depth.
+It needs only the element data of the compound, so it applies to any scintillator or semiconductor.
+
+**Averaged responses rather than split groups.** A group that straddles a K edge of the grid or the detector can be
+split at the edge, but the edges to split at depend on the grid, the detector and the spectrum, and every split adds a
+group to the transport. Averaging the responses over the fine energies of each group fixes the cause (one energy
+standing for a group across an edge) for any configuration and costs nothing per view: the averaged tables are
+constant over each group, so the solver's evaluations at the group energy are unchanged.
+
 Ray tracing and kernels
 -----------------------
 

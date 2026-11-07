@@ -236,6 +236,7 @@ iteration and the scatter updates; CITRUS, one sweep per outer iteration, is the
    schedule = Schedule(scatter_sweeps_per_outer_iteration="converged", num_scatter_updates=1)  # sequential
    recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, schedule=schedule)
    info["schedule"], info["outer_iterations_total"]
+
 ``scatter_view_interpolation_order``: 3 cubic Catmull-Rom on 4 neighbors
 (default), 2 quadratic (3-point
 Lagrange), 1 linear, 0 nearest computed view; ``None`` leaves the skipped views uncorrected (diagnostics only); ignored
@@ -439,6 +440,10 @@ descriptions. The first setting of each group names the group.
      - ``8``
      - directions per octant per sweep chunk and per batch of the scatter image (with the fused kernels both take
        more, as many as fit a memory budget)
+   * - ``group_averaged_responses`` (responses)
+     - ``False``
+     - evaluate the detector response and the grid transmission as their means over the fine energies of each group
+       instead of at the group energy (groups that straddle an absorption edge)
    * - ``dtype`` (numerics)
      - ``"float32"``
      - float32 (production) or float64 (reference and tests)
@@ -484,24 +489,37 @@ describes the models.
                                       emission_profile_from_open_field, tabulated_detector_response)
 
    detector = detector_response("cesium_iodide", 0.06)                           # energy integrating, full deposition
+   detector = detector_response("cesium_iodide", 0.06, deposition="fluorescence_escape")   # K x-rays escape
    detector = detector_response("gadolinium_oxysulfide", 0.02, deposition="local")   # thin screen, MV beams
    detector = detector_response("cadmium_telluride", 0.2, mode="photon_counting")
    detector = tabulated_detector_response(energies_kev, response)                # e.g. from a Monte Carlo run
-   septa = anti_scatter_grid(geometry, septum_thickness_cm=0.002, septum_height_cm=0.15)   # lead, one septum per
-   septa = anti_scatter_grid(geometry, 0.002, 0.15, septa_along="rows", septum_material="tungsten")  # pixel
-   septa = anti_scatter_grid(geometry, 0.01, 2.0, septa_along="both", septum_material="tungsten")  # 2-D collimator
+   septa = anti_scatter_grid(geometry, 0.0036, ratio=10, lines_per_cm=60)      # 10:1 lead grid, analytic model
+   septa = anti_scatter_grid(geometry, 0.0036, ratio=10, lines_per_cm=60, interspace_material="aluminium",
+                             septa_along="rows", detector=detector)            # scored by the panel's detector
+   septa = anti_scatter_grid(geometry, 0.002, 0.15, septa_along="rows", septum_material="tungsten")  # one septum
+   septa = anti_scatter_grid(geometry, 0.01, 2.0, septa_along="both", septum_material="tungsten")  # per pixel, 2-D
+   septa = anti_scatter_grid(geometry, 0.0036, ratio=10, lines_per_cm=60, model="septum_shadow")  # earlier model
    source = SourceModel(emission_profile=bowtie_emission_profile(geometry, edge_weight=0.2))
    source = SourceModel(emission_profile=emission_profile_from_open_field(open_field, solver, detector_gain=gain))
    solver = ScatterSolver(library, config, geometry, detector=detector, grid_response=septa, source=source,
                           device="cuda")
 
-``detector_response`` takes any catalogue material (:doc:`conventions`, "Materials") with its catalogue density or
-``density=``, ``mode`` "energy_integrating" (keV per photon) or "photon_counting", and ``deposition`` "full" or
-"local". ``anti_scatter_grid`` takes the septum material, thickness and height, ``focal_distance_cm`` (default: the
-source-detector distance of a cone beam, infinite, an unfocused grid, for a parallel beam), ``pitch_cm`` (default:
-the pixel pitch across the septa) and ``septa_along`` ("channels", the default, "rows", or "both" for a crossed or
-2-D grid, whose transmission is the product of the two directions). ``csi_response`` and
-``focused_1d_grid`` remain the built-in CsI and lead models. ``SourceModel(emission_profile=...)`` takes a
+``detector_response`` takes any catalogue material (:doc:`conventions`, "Materials") or ``Material`` with its
+nominal density or ``density=``, ``mode`` "energy_integrating" (keV per photon) or "photon_counting", and
+``deposition`` "full", "local" or "fluorescence_escape" (the K x-rays of a photoabsorption that leave the layer are
+lost). ``anti_scatter_grid`` takes the septum thickness, the height (``septum_height_cm``, or ``ratio``), the septum
+and interspace materials (``septum_material``, default lead, ``interspace_material``, default air),
+``focal_distance_cm`` (default: the source-detector distance of a cone beam, infinite, an unfocused grid, for a
+parallel beam), the pitch (``lines_per_cm`` or ``pitch_cm``; default: the pixel pitch across the septa) and
+``septa_along`` ("channels", the default, "rows", or "both" for a crossed or 2-D grid, whose transmission is the
+product of the two directions). Its default model, ``"analytic"``, adds the scatter and fluorescence of the septa
+that reach the detector to the photons that cross the grid, scored by ``detector`` (default: 0.6 mm of CsI with the
+K x-ray escape), and is computed when the grid is built, on the GPU when there is one, and cached;
+``model="septum_shadow"`` is the geometric model of earlier versions (:doc:`method`, "Detector and grid
+responses"). ``csi_response`` and ``focused_1d_grid`` remain the built-in CsI and lead models.
+``SolverConfig(group_averaged_responses=True)`` makes the solver evaluate both responses as their means over each
+energy group (``solver.responses()``), which matters when a group straddles the K edge of the septa or of the
+scintillator. ``SourceModel(emission_profile=...)`` takes a
 ``[rows, channels]`` profile, or ``[views, rows, channels]`` with ``emission_profile_angles``. ``citrus_recon`` sets
 the profile itself from an open-field image.
 

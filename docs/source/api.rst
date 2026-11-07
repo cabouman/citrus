@@ -66,6 +66,9 @@ The LBTE source iteration solver, one module per stage.
 :doc:`api/detector`
     Detector and anti-scatter-grid responses.
 
+:doc:`api/grid_model`
+    The analytic anti-scatter grid: direct photons and the first-order scatter and fluorescence of the septa.
+
 :doc:`api/angular_quadrature`
     Direction sets, real spherical harmonics and the scattering-source operator.
 
@@ -101,6 +104,7 @@ The LBTE source iteration solver, one module per stage.
    api/photon_data
    api/source
    api/detector
+   api/grid_model
    api/angular_quadrature
    api/linear_discontinuous_cell
    api/wavefront

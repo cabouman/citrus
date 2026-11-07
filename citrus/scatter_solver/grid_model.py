@@ -1,4 +1,5 @@
-"""Analytic signal response of a 1-D anti-scatter grid from its geometry and materials, without a Monte Carlo calibration.
+"""Analytic signal response of a 1-D anti-scatter grid from its geometry and materials, without a Monte Carlo
+calibration.
 
 :func:`grid_signal_transmission` tabulates, for a parallel beam of one energy and direction, the energy a detector
 layer behind the grid absorbs per incident photon relative to the same beam without the grid, split into the photons
@@ -32,7 +33,8 @@ _SECONDARY_STEP_KEV = 5.0  # spacing of the secondary energies up to _SECONDARY_
 _SECONDARY_LINEAR_TOP_KEV = 150.0
 _EDGE_OFFSET_KEV = 0.05  # secondary energies on both sides of every edge, this far from it
 _COMPTON_CHUNK_BYTES = 256 * 2 ** 20  # memory of one chunk of the outgoing Compton attenuation
-_MEMORY_CACHE: dict[str, dict[str, np.ndarray]] = {}
+_MEMORY_CACHE: dict[str, np.ndarray] = {}  # the secondaries on their coarse energies and angles, by input hash
+_DEFAULT_DETECTORS: dict[int, object] = {}  # the default scoring detector per photon-data backend
 
 
 # ---- geometry ---------------------------------------------------------------------------------------------------
@@ -402,8 +404,9 @@ def _secondary_angles(slot_angle_rad: float) -> tuple[np.ndarray, np.ndarray]:
     """
     top = math.radians(89.5)
     near = slot_angle_rad * np.array([0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0])
+    near = near[near < top]
     far = np.radians([15.0, 20.0, 30.0, 45.0, 60.0, 75.0])
-    theta1 = np.concatenate([near[near < top], far[far > 1.2 * near.max()], [top]])
+    theta1 = np.concatenate([near, far[far > 1.2 * near.max()], [top]])
     theta2 = np.radians([0.0, 20.0, 40.0, 60.0, 80.0])
     return np.unique(theta1), theta2
 
@@ -560,8 +563,8 @@ def grid_signal_transmission(pitch_cm: float, strip_thickness_cm: float, strip_h
 
     Both parts are signals of the detector layer behind the grid per incident photon, relative to the signal of the
     same photon without the grid (docs/source/method.rst, "Grid model"). The direct part is computed at every table
-    energy and angle, the secondaries on a coarser set of energies and angles and interpolated. Tables are cached in
-    memory and, unless ``cache_dir`` is None, as ``grid_<hash>.npz`` files.
+    energy and angle, the secondaries on a coarser set of energies and angles and interpolated. The secondaries are
+    cached in memory and, unless ``cache_dir`` is None, as ``grid_<hash>.npz`` files.
 
     Args:
         pitch_cm (float): strip pitch p in cm (1 / lines per cm).
@@ -592,58 +595,58 @@ def grid_signal_transmission(pitch_cm: float, strip_thickness_cm: float, strip_h
         raise ValueError(f"need 0 <= strip thickness < pitch ({p:g} cm) and a positive height, got t = {t:g} cm, "
                          f"h = {h:g} cm")
     backend = resolve_backend() if backend is None else backend
-    detector = detector_response(deposition="fluorescence_escape", backend=backend) if detector is None else detector
+    if detector is None:
+        if id(backend) not in _DEFAULT_DETECTORS:
+            _DEFAULT_DETECTORS[id(backend)] = detector_response(deposition="fluorescence_escape", backend=backend)
+        detector = _DEFAULT_DETECTORS[id(backend)]
     strip = material_entry(strip_material, strip_density, backend)
     interspace = material_entry(interspace_material, interspace_density, backend)
     energies = np.asarray(energies, dtype=np.float64).reshape(-1)
     theta1 = np.asarray(theta1, dtype=np.float64).reshape(-1)
     theta2 = np.asarray(theta2, dtype=np.float64).reshape(-1)
-    key = _cache_key(_MODEL_VERSION, p, t, h, strip, interspace, detector.energy_kev, detector.theta_rad,
-                     detector.response, energies, theta1, theta2, backend.name, getattr(backend, "xcom_sha256", ""))
-    if key in _MEMORY_CACHE:
-        return {name: value.copy() for name, value in _MEMORY_CACHE[key].items()}
-    path = None
-    if cache_dir is not None:
-        path = os.path.join(default_cache_dir() if cache_dir == "default" else cache_dir, f"grid_{key[:32]}.npz")
-        if os.path.exists(path):
-            try:
-                with np.load(path) as stored:
-                    result = {"direct": stored["direct"], "secondary": stored["secondary"]}
-                _MEMORY_CACHE[key] = result
-                return {name: value.copy() for name, value in result.items()}
-            except (OSError, KeyError, ValueError):
-                pass  # unreadable: computed again below
     device = torch.device(device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
+    edges = [np.asarray(backend.element(Z).edge_energy_ev, dtype=np.float64) * 1.0e-3
+             for Z in list(strip[2]) + (list(interspace[2]) if interspace[1] >= _GAS_DENSITY else [])
+             if Z >= _MIN_FLUORESCENCE_Z]
+    edges = np.concatenate(edges) if edges else np.zeros(0)
+    secondary_energy = _secondary_energies(energies, edges[edges > 5.0])
+    nodes1, nodes2 = _secondary_angles(math.atan2(p - t, h))
     with torch.no_grad():
         mu_strip = _Attenuation(strip[2], strip[1], energies.max(), backend, device)
         mu_interspace = _Attenuation(interspace[2], interspace[1], energies.max(), backend, device)
         e = torch.as_tensor(energies, device=device)
         direct = _direct(p, t, h, mu_strip(e), mu_interspace(e), torch.as_tensor(theta1, device=device),
                          torch.as_tensor(theta2, device=device)).cpu().numpy()
-        edges = [np.asarray(backend.element(Z).edge_energy_ev, dtype=np.float64) * 1.0e-3
-                 for Z in list(strip[2]) + (list(interspace[2]) if interspace[1] >= _GAS_DENSITY else [])
-                 if Z >= _MIN_FLUORESCENCE_Z]
-        edges = np.concatenate(edges) if edges else np.zeros(0)
-        secondary_energy = _secondary_energies(energies, edges[edges > 5.0])
-        nodes1, nodes2 = _secondary_angles(math.atan2(p - t, h))
-        coarse = _secondaries(p, t, h, strip[1:], interspace[1:], detector, secondary_energy, nodes1, nodes2,
-                              backend, device)  # [S, A1, A2]
+        key = _cache_key(_MODEL_VERSION, p, t, h, strip, interspace, detector.energy_kev, detector.theta_rad,
+                         detector.response, secondary_energy, nodes1, nodes2, backend.name,
+                         getattr(backend, "xcom_sha256", ""))
+        coarse = _MEMORY_CACHE.get(key)
+        path = None
+        if coarse is None and cache_dir is not None:
+            path = os.path.join(default_cache_dir() if cache_dir == "default" else cache_dir, f"grid_{key[:32]}.npz")
+            try:
+                with np.load(path) as stored:
+                    coarse = stored["secondary"]
+            except (OSError, KeyError, ValueError):
+                coarse = None  # absent or unreadable: computed below
+        if coarse is None:
+            coarse = _secondaries(p, t, h, strip[1:], interspace[1:], detector, secondary_energy, nodes1, nodes2,
+                                  backend, device)  # [S, A1, A2]
+            if path is not None:
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    temporary = f"{path}.{os.getpid()}.tmp.npz"
+                    np.savez(temporary, secondary=coarse)
+                    os.replace(temporary, path)
+                except OSError:
+                    pass  # the disk cache is optional
+        _MEMORY_CACHE[key] = coarse
     on_angles = _interpolate_angles(coarse, nodes1, nodes2, theta1, theta2)  # [S, T1, T2]
-    index = np.clip(np.searchsorted(secondary_energy, energies, side="right"), 1, max(1, len(secondary_energy) - 1))
     if len(secondary_energy) == 1:
         secondary = np.repeat(on_angles, len(energies), axis=0)
     else:
+        index = np.clip(np.searchsorted(secondary_energy, energies, side="right"), 1, len(secondary_energy) - 1)
         e0, e1 = secondary_energy[index - 1], secondary_energy[index]
         w = np.clip((energies - e0) / (e1 - e0), 0.0, 1.0)[:, None, None]
         secondary = on_angles[index - 1] * (1 - w) + on_angles[index] * w
-    result = {"direct": direct, "secondary": np.clip(secondary, 0.0, None)}
-    _MEMORY_CACHE[key] = result
-    if path is not None:
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            temporary = f"{path}.{os.getpid()}.tmp.npz"
-            np.savez(temporary, **result)
-            os.replace(temporary, path)
-        except OSError:
-            pass  # the disk cache is optional
-    return {name: value.copy() for name, value in result.items()}
+    return {"direct": direct, "secondary": np.clip(secondary, 0.0, None)}

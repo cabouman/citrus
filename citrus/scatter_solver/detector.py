@@ -4,9 +4,10 @@
 tabulates G(E, theta1, theta2), the transmitted fraction of one set of anti-scatter-grid septa (a crossed grid
 holds a second set, ``GridResponse.crossed``); tables from a Monte Carlo
 simulation can replace the analytic builders. :func:`detector_response` and :func:`anti_scatter_grid` build them for
-any material of the catalogue from the photon data, :func:`csi_response` and :func:`focused_1d_grid` from coarse
-built-in tables, and :func:`tabulated_detector_response` from a user table. :func:`detector_angle` and
-:func:`grid_angles` give the angles of the photons arriving at the panel.
+any material of the catalogue from the photon data (the analytic grid of ``grid_model`` by default),
+:func:`csi_response` and :func:`focused_1d_grid` from coarse built-in tables, and :func:`tabulated_detector_response`
+from a user table. :func:`group_averaged_responses` averages a pair of responses over each energy group of a library.
+:func:`detector_angle` and :func:`grid_angles` give the angles of the photons arriving at the panel.
 """
 
 from __future__ import annotations

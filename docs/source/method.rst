@@ -420,42 +420,138 @@ or 2-D grid (``septa_along="both"``, as the 2-D collimators of CT detectors) has
 angles; its transmission is the product of the two (``GridResponse.crossed``, ``GridResponse.transmission_at``).
 
 **Detector models.** A detector layer of thickness :math:`t`, density :math:`\rho` and total mass attenuation
-:math:`\mu(E)` (``detector_response``: any catalogue material, with the cross sections of the photon data) stops a
-photon at incidence angle :math:`\theta_0` with probability
+:math:`\mu(E)` (``detector_response``: any catalogue material or ``Material``, with the cross sections of the photon
+data) stops a photon at incidence angle :math:`\theta_0` with probability
 :math:`P(E, \theta_0) = 1 - e^{-\mu(E)\,\rho\,t/\cos\theta_0}`. An energy-integrating detector records
-:math:`D = E\,P\,f(E)` and a photon-counting detector :math:`D = P\,c(E)`, with two models of what an interaction
+:math:`D = E\,P\,f(E)` and a photon-counting detector :math:`D = P\,c(E)`, with three models of what an interaction
 leaves in the layer:
 
 * ``deposition="full"``: every interacting photon deposits its whole energy and is counted, :math:`f = c = 1` (no
-  escape of scattered or fluorescence photons; adequate for a thick scintillator at kV energies);
+  escape of scattered or fluorescence photons);
 * ``deposition="local"``: only the energy given to charged particles in the first interaction stays, and the
   secondary photons escape: :math:`f = (\mu_{pe} + \mu_{C}\,\bar T_{KN}(E)/E + \mu_{pair}\,(1 - 2 m_e c^2/E))/\mu`
   with :math:`\bar T_{KN}` the mean Klein-Nishina electron energy, and a counting detector counts every interaction
   except Rayleigh scattering, :math:`c = (\mu - \mu_{R})/\mu` (adequate for a thin layer and at MV energies, where
-  full deposition overestimates the signal).
+  full deposition overestimates the signal);
+* ``deposition="fluorescence_escape"``: as "local", except that the K-shell vacancy left by a photoabsorption emits
+  its K x-rays, and only those that leave the layer are lost (below).
 
-The two bracket a real detector, which also loses part of the fluorescence and re-absorbs part of the scattered
-photons; a Monte Carlo table (``tabulated_detector_response``, a function of energy and optionally of the angle)
-replaces both. ``csi_response`` is the full-deposition model of CsI with a coarse built-in attenuation table.
+**K x-ray escape.** A photoabsorption at depth :math:`x` (along the normal) ionizes the K shell of element :math:`Z`
+with probability :math:`c_Z(E) = w_Z\,\sigma_{pe,Z}(E)\,s_Z(E)/\sigma_{pe}(E)`, with :math:`w_Z` the mass fraction
+and :math:`s_Z` the K-shell share of the element's photoabsorption (xraylib's subshell cross sections, 0 below the K
+edge of the photon data). The vacancy emits line :math:`l` (energy :math:`E_l`) with probability
+:math:`y_l = \omega_K R_l`, the fluorescence yield times the radiative rate (xraylib), isotropically; the photon
+leaves the slab without interacting with probability :math:`\tfrac12[E_2(\mu_l x) + E_2(\mu_l (t - x))]`, with
+:math:`\mu_l` the layer's total attenuation at :math:`E_l` and :math:`E_2` the exponential integral. The energy left
+by an interaction at depth :math:`x` is
 
-**Grid model.** ``focused_1d_grid`` and ``anti_scatter_grid`` are a
-geometric lamella-shadow model for lamellae of thickness :math:`t` and height :math:`h` at pitch :math:`p`. A photon
-tilted by :math:`\theta_1` passes the interspace only with the open fraction
+.. math::
+
+   d(E, x) = \frac{\mu_{pe}}{\mu}\Big(E - \sum_Z c_Z(E) \sum_{l \in Z} y_l E_l\,
+   \tfrac12\big[E_2(\mu_l x) + E_2(\mu_l (t - x))\big]\Big)
+   + \frac{\mu_C}{\mu}\,\bar T_{KN}(E) + \frac{\mu_{pair}}{\mu}\,(E - 2 m_e c^2),
+
+and :math:`D(E, \theta_0) = \int_0^t \frac{\mu}{\cos\theta_0} e^{-\mu x/\cos\theta_0} d(E, x)\,dx`. The depth
+integral runs over the interaction probability (64 Gauss-Legendre nodes, :math:`x` from its inverse), with the escape
+term tabulated on depth nodes clustered at both faces, where it has a logarithmic slope. Compton-scattered and
+Rayleigh photons escape as in "local", and the L x-rays stay in the layer. A photon-counting detector counts as with
+"local". The model applies to any compound (CsI, Gd₂O₂S, CdTe, ...). Next to a real thick scintillator it lies a
+little low, since the scintillator re-absorbs part of its Compton photons; "full" lies well above.
+
+A Monte Carlo table (``tabulated_detector_response``, a function of energy and optionally of the angle) replaces
+all three. ``csi_response`` is the full-deposition model of CsI with a coarse built-in attenuation table.
+
+**Grid model.** ``anti_scatter_grid`` builds a grid of septa (strips) of thickness :math:`t` and height :math:`h`
+at pitch :math:`p` (``lines_per_cm`` = :math:`1/p`, independent of the pixel pitch; ``ratio`` = :math:`h/(p - t)`) in
+an interspace material, both any catalogue material or ``Material``. By default (``model="analytic"``,
+``grid_model.grid_signal_transmission``) :math:`G` is the signal of the detector layer behind the grid per incident
+photon of energy :math:`E` and direction :math:`\mathbf d = (\tan\theta_1, \tan\theta_2, 1)/|\cdot|` in the frame of
+the septa (:math:`\theta_1` across them, :math:`\theta_2` along them, :math:`z` down through the grid), relative to
+the signal :math:`D(E, \theta_0)` of the same photon without the grid: :math:`G = G_{direct} + G_{secondary}`, the
+photons that cross the grid without interacting and the first-order scatter and fluorescence of the grid. Its inputs
+are the geometry, the materials and the detector, so another grid needs no calibration.
+
+*Direct photons.* With :math:`F(x) = \lfloor x/p \rfloor t + \min(\max(x - \lfloor x/p \rfloor p, 0), t)` the
+septum length between 0 and :math:`x` across the strips, a photon entering the top of the grid at offset :math:`x_0`
+crosses the septa over :math:`\ell_s(x_0) = L\,(F(x_0 + \Delta) - F(x_0))/\Delta` of its path :math:`L = h/d_z`,
+:math:`\Delta = h\tan\theta_1`, and
+
+.. math::
+
+   G_{direct} = \frac1p \int_0^p e^{-\mu_s \ell_s(x_0) - \mu_i (L - \ell_s(x_0))}\,dx_0,
+
+with the linear attenuations :math:`\mu_s` of the septa and :math:`\mu_i` of the interspace. :math:`\ell_s` is linear in
+:math:`x_0` between the offsets at which the entry or the exit point meets a septum face (:math:`x_0 \equiv 0, t,
+-\Delta, t - \Delta` modulo :math:`p`), so the integral is a sum of at most four closed-form exponential integrals:
+exact for every angle and every number of septa crossed, with no mean-path approximation.
+
+*Secondaries.* Every point :math:`\mathbf r` of a septum, and of the interspace unless it is a gas, scatters the
+photons that reach it (Rayleigh scattering at :math:`E`, Compton scattering to :math:`E'(\cos\theta_s)` with the
+incoherent scattering function; xraylib's shapes scaled to XCOM's integrated cross sections, as in the library) and
+emits the K and L fluorescence lines of its elements (xraylib's line production with cascades, isotropic). Each
+photon is attenuated from the top of the grid to :math:`\mathbf r` and from :math:`\mathbf r` to the bottom along
+its exact path through the septa and the interspace (the same :math:`F`), and scored by the detector at its own
+energy and incidence angle :math:`\theta_k`:
+
+.. math::
+
+   G_{secondary} = \frac{1}{D(E, \theta_0)} \frac{1}{p} \int_{\text{cell}} \frac{a_{in}(\mathbf r)}{d_z}
+   \sum_k w_k \Big[\frac{d\mu_R}{d\Omega} D(E, \theta_k)\,a_k(\mathbf r, E)
+   + \frac{d\mu_C}{d\Omega} D(E'_k, \theta_k)\,a_k(\mathbf r, E'_k)
+   + \sum_l \frac{q_l(E)}{4\pi} D(E_l, \theta_k)\,a_k(\mathbf r, E_l)\Big]\,dA,
+
+with :math:`a_{in}` the attenuation of the incident photon to :math:`\mathbf r`, :math:`a_k(\mathbf r, E)` that of
+a photon of energy :math:`E` from :math:`\mathbf r` along direction :math:`k` and :math:`q_l` the production of
+line :math:`l` per unit path. The cell holds 16 x 48 midpoints per material; the outgoing directions
+:math:`(\tan a, \tan b, 1)/|\cdot|` lie on Gauss panels in :math:`a` (across the strips) whose edges scale with the
+slot angle :math:`\arctan((p - t)/h)`, so that the narrow cones through the slots are resolved, and on fixed
+panels in :math:`b`, with their solid angles :math:`w_k`. The secondaries are computed every 5 keV, on both sides of
+every absorption edge of the grid's materials and on a logarithmic grid above 150 keV, at grid angles dense within a
+few slot angles, and interpolated onto the table; the direct part is computed at every node of the table. The scoring
+detector (``detector``) is by default 0.6 mm of CsI with the K x-ray escape. The table is computed when the grid is
+built (on the GPU when there is one) and cached by its inputs, in memory and as ``grid_<hash>.npz`` in
+``$CITRUS_CACHE_DIR``. The model is first order: photons scattered more than once in the grid, the grid's cover and
+the photons the detector itself scatters back are left out.
+
+*Septum shadow.* ``model="septum_shadow"`` (and ``focused_1d_grid``) is the geometric shadow model of earlier
+versions. A photon tilted by :math:`\theta_1` passes the interspace only with the open fraction
 :math:`o = \max(0, (p - t) - h|\tan\theta_1|)/p`; the mean septum path over all photons is
 :math:`(t/p)\,h/\cos\theta_1`, so the shadowed photons cross the mean septum path
 :math:`L_s = (t/p)\,h/\cos\theta_1/(1 - o)` (:math:`h` at :math:`\theta_1 = 0`), and
 :math:`G = o + (1 - o)\,e^{-\mu_{s}(E)\,\rho_{s}\,L_s}` with the mass attenuation :math:`\mu_s` and density
-:math:`\rho_s` of the septa (lead for ``focused_1d_grid``). A tilt along the lamellae does not change the shadow, so
-:math:`G` does not depend on :math:`\theta_2`; the interspace material and the cover are ignored. The geometry is
-set by :math:`(t, h, p)` alone: the nominal ratio is only a label (with the default lamellae,
-:math:`h/(p - t) = 11.5` and :math:`h/p = 9.0` for a nominal 10:1 grid). The open fraction is the mean over one
-period, so it is exact for a pixel that spans whole periods. ``anti_scatter_grid`` builds the grid from its septa:
-any catalogue material (attenuation from the photon data), thickness, height, focal distance, direction and pitch, by
-default the pixel pitch across the septa, one septum per pixel, so that every pixel sees the same septum shadow. The
-grid transmission enters the primary and the scatter signals alike, so the scatter-to-primary ratio of the solver is
-that of the detector behind the grid, in the CITRUS loop and in the synthetic data. For a crossed grid the product of
-the two 1-D transmissions is exact for opaque septa, since the shadows along :math:`u` and :math:`v` do not interact,
-and counts the septum material twice where the walls of a 2-D grid cross, a correction of order :math:`(t/p)^2`.
+:math:`\rho_s` of the septa (lead for ``focused_1d_grid``). It does not depend on :math:`\theta_2` and ignores the
+interspace, the cover and the grid's secondaries. The nominal ratio of ``focused_1d_grid`` is only a label (with its
+default lamellae, :math:`h/(p - t) = 11.5` and :math:`h/p = 9.0` for a nominal 10:1 grid).
+
+Both models are means over one period, exact for a pixel that spans whole periods. Without ``pitch_cm`` or
+``lines_per_cm`` the pitch is the pixel pitch across the septa (one septum per pixel, so that every pixel sees the same
+septum shadow). The grid transmission enters the primary and the scatter signals alike, so the scatter-to-primary
+ratio of the solver is that of the detector behind the grid, in the CITRUS loop and in the synthetic data. For a
+crossed grid the product of the two 1-D transmissions is exact for opaque septa, since the shadows along :math:`u`
+and :math:`v` do not interact, and counts the septum material twice where the walls of a 2-D grid cross, a correction
+of order :math:`(t/p)^2`.
+
+**Responses averaged over each group.** The solver evaluates the detector and the grid at one energy per group, the
+group energy. A group that straddles an absorption edge of the grid or the detector (lead's K edge at 88 keV, the I
+and Cs K edges at 33 and 36 keV, the Gd K edge at 50 keV) then gets the response of one side of the edge only, and a
+small change of the spectrum or of the group edges that moves the group energy across the edge changes the signal of
+the whole group. With ``SolverConfig.group_averaged_responses`` the solver replaces both responses, once per library
+(``ScatterSolver.responses``, ``detector.group_averaged_responses``), by their means over the fine energies of each
+group,
+
+.. math::
+
+   \bar D_g(\theta_0) = \frac{\sum_{E \in g} w_E\, D(E, \theta_0)}{\sum_{E \in g} w_E}, \qquad
+   \bar G_g(\theta_1, \theta_2) = \frac{\sum_{E \in g} w_E\, D(E, 0)\, G(E, \theta_1, \theta_2)}
+   {\sum_{E \in g} w_E\, D(E, 0)},
+
+with the source photons :math:`w_E` of the fine energies (``fine_weight``); the grid is weighted by the deposit at
+normal incidence too, since it multiplies a signal. The averaged tables are constant in energy over each group (two
+nodes just inside its edges) and keep the angle nodes, so the scatter image, the primary and the open field evaluate
+them as before, at the same cost. A group without source photons keeps its responses at the group energy. The weights
+are those of the source spectrum: the average does not follow the hardening of the beam in the object or the
+downscatter within a group. Averaging works for any detector, grid and spectrum, where splitting the groups at the
+edges would depend on them.
 
 **Attenuation of the built-in models.** The mass attenuation of CsI and lead in ``csi_response`` and
 ``focused_1d_grid`` are coarse tables of NIST XCOM total
