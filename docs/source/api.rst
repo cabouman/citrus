@@ -61,7 +61,8 @@ The LBTE source iteration solver, one module per stage.
     The photon data: NIST XCOM cross sections (downloaded on first use) and xraylib angular distributions.
 
 :doc:`api/source`
-    The source: spectrum, emission profile and collimation of the focal spot or the parallel beam.
+    The source: spectrum, emission profile, collimated field, off-focal emission and beam filter of the focal spot or the
+    parallel beam.
 
 :doc:`api/detector`
     Detector and anti-scatter-grid responses.

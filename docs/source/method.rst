@@ -125,8 +125,9 @@ Boltzmann transport equation (LBTE)
 
 with vacuum boundaries and a point source at the focal spot :math:`\mathbf r_0`,
 :math:`q = s(E)\,b(\boldsymbol\Omega)\,\delta(\mathbf r - \mathbf r_0)`, where :math:`s(E)` is the normalized spectrum
-and :math:`b` the angular weight of the source: 0 for directions that miss the panel (the collimation), else the
-emission profile toward the panel, 1 by default ("Source emission profile and open field", below). Interactions:
+and :math:`b` the angular weight of the source: 0 for directions outside the collimated field (by default the panel),
+else the emission profile toward the panel, 1 by default ("Source emission profile and open field", below); a beam
+filter adds its path to every transmission from the focal spot. Interactions:
 photoelectric absorption
 (local deposition), Compton scattering (Klein-Nishina kinematics with the incoherent scattering function, no Doppler
 broadening) and Rayleigh scattering (form factors), and pair production (local deposition) at MV energies, with the
@@ -145,12 +146,13 @@ The fluence splits into the uncollided part, known in closed form, and the colli
 .. math::
 
    \phi_{UC,g}(\mathbf r) = \frac{b(\boldsymbol\Omega_{UC})}{|\mathbf r - \mathbf r_0|^2}
-   \sum_{E\in g} w_E \exp\!\Big(-\sum_m P_m(\mathbf r)\, m_m(E)\Big),
+   \sum_{E\in g} w_E \exp\!\Big(-\sum_m P_m(\mathbf r)\, m_m(E) - \rho_f\, t(\boldsymbol\Omega_{UC})\, m_f(E)\Big),
    \qquad P_m(\mathbf r) = \int_{\mathbf r_0}^{\mathbf r} \rho_m\, dl,
 
 i.e. one ray trace per material present in the volume and a fine-energy table (the fine bins of the library, weights
 :math:`w_E` of the spectrum): exact in energy, without the within-group beam-hardening error of group-averaged
-attenuation. The collided
+attenuation. The last term is the path through the source's beam filter (none by default; "Source emission profile
+and open field", below). The collided
 fluence satisfies the same LBTE with the **first-collision source** in place of :math:`q`,
 
 .. math::
@@ -469,33 +471,62 @@ Source emission profile and open field
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The source of a cone beam is an isotropic point source at the focal spot, that of a parallel beam a uniform beam over
-the panel's area; a bowtie or beam filter, the heel effect or any other non-uniform
-emission enters as the angular weight :math:`b(\boldsymbol\Omega)` of the source (``SourceModel.emission_profile``),
-given per detector pixel: :math:`b` is the profile at the point where the ray from the focal spot (for a parallel
-beam, the ray along the beam) hits the panel,
-interpolated bilinearly between the pixel centres, constant from the outermost pixel centres to the panel edge, and
-0 off the panel. The same :math:`b` weights the uncollided fluence, and with it the first-collision source and every
-collision order of the scatter, and the solver's primary, so the scatter-to-primary ratio accounts for the parts of
-the object that a bowtie spares. The scale of :math:`b` cancels in that ratio.
+the panel's area (``SourceModel``). Four settings shape it, each evaluated at the point where the ray from the focal
+spot (for a parallel beam, the ray along the beam) meets the panel plane, and each the same in the uncollided fluence,
+and with it the first-collision source and every collision order of the scatter, and in the solver's primary:
+
+* **The collimated field.** By default the field is the panel's active area, edge to edge. A real scan often opens
+  the blades wider than the panel sees (a half-fan beam past the panel's short edge, axial blades wider than the rows);
+  the tissue there is irradiated and scatters into the panel. ``field_margin_channels_cm`` and
+  ``field_margin_rows_cm`` widen the field past both panel edges along the channels and the rows, in cm at the panel.
+* **Off-focal emission.** The tube also emits from around the focal spot, and the blades do not stop that radiation.
+  Past the field edge the weight is a tabulated fraction of the edge emission (``off_focal_distance_cm``,
+  ``off_focal_fraction``), interpolated linearly in the distance :math:`d` past the edge, its first value below the
+  first distance and 0 beyond the last; past both a row and a channel edge :math:`d` is the distance from the ray's
+  panel point to the field rectangle, :math:`\sqrt{d_u^2 + d_v^2}`. The table can be measured on a scan's own air
+  columns past the blades, as the signal there over the signal in the field.
+* **The emission profile** :math:`p` (``emission_profile``), given per detector pixel: the heel effect, or a bowtie
+  known only as a gray weight. It is interpolated bilinearly between the pixel centres and held at the value of the
+  outermost centres beyond them, so the margins and the off-focal region get the emission of the field's edge.
+* **The beam filter** (a bowtie): ``filter_material`` (a catalogue name or a ``Material``, at its nominal density
+  :math:`\rho_f`) and ``filter_thickness_cm``, the path length :math:`t` through the filter of the ray from the focal
+  spot to each pixel centre (one row for every row, or one value per pixel), its minimum thickness included,
+  interpolated and held like the profile.
+
+The angular weight is :math:`b = c\,p` with :math:`c` 1 in the field, the off-focal fraction past it and 0 elsewhere.
+The filter does not enter :math:`b`: it adds :math:`\rho_f\,t\,m_f(E)` to the optical depth of every transmission that
+starts at the focal spot, with the filter's total mass attenuation :math:`m_f` from the photon data at the library's
+fine energies, so the spectrum hardens per direction exactly in energy: under a bowtie's thick wings the uncollided
+fluence, the scatter and the primary all have the harder spectrum. A filter of zero thickness gives the results of no
+filter. The library's energy groups and effective energy follow the spectrum as given, so the spectrum is the one
+without the filter. The scale of :math:`b` cancels in the scatter-to-primary ratio.
+
+The thickness of a filter is rarely given; its transmission is measured as the open field with the filter over the
+open field without it. ``filter_thickness_from_transmission`` inverts that ratio per pixel in the model's
+transmission of a uniform filter of each thickness (the solver's open field with the filter over the one without),
+interpolated linearly in the log of the transmission, with the solver's spectrum and responses. The ratio must not be
+normalized to its maximum, or the filter's minimum thickness is lost; a profile normalized to its maximum is first
+scaled to the model's transmission of a given minimum thickness.
 
 The profile comes from the measured open field :math:`F` (flat-field image) of the scanner. The solver's images are
-per source photon per steradian through the true geometry, so its own open field of a uniform source,
+per source photon per steradian through the true geometry, so its own open field of its source without a profile,
 :math:`F_{solver}` (``ScatterSolver.open_field_signal``, the primary signal of an empty volume), already contains the
-inverse-square and obliquity falloff of a point source (none for a parallel beam) and the grid and detector
-responses. With a per-pixel
-detector gain :math:`g` (the open field is gain times emission),
+inverse-square and obliquity falloff of a point source (none for a parallel beam), the attenuation of the beam filter
+and the grid and detector responses. With a per-pixel detector gain :math:`g` (the open field is gain times
+emission),
 
 .. math::
 
-   b = \frac{F}{g\,F_{solver}} \Big/ \operatorname{mean}\Big(\frac{F}{g\,F_{solver}}\Big),
+   p = \frac{F}{g\,F_{solver}} \Big/ \operatorname{mean}\Big(\frac{F}{g\,F_{solver}}\Big),
 
 per view for a per-view open field (``emission_profile_from_open_field``). No absolute scale or :math:`I_0` is
-involved. Without a gain map the whole open field is treated as emission; a gain pattern then appears in :math:`b`,
-which matters only where it is large. ``citrus_recon`` given an open-field image normalizes the counts pixel by pixel,
-:math:`y = -\log(Y/F)`, and gives the solver's source this profile for the duration of the call; given a number
-:math:`I_0` it keeps the solver's source (uniform by default), and :math:`I_0` then stands for the open field with the
-falloff of :math:`F_{solver}` divided out. The profile is a single spectrum-integrated weight per direction: it does
-not represent the spectral hardening of a real bowtie, whose thicker parts harden the beam toward the edges.
+involved. With the filter in the source the profile holds only what the model does not explain (the heel effect);
+without it the bowtie appears in :math:`p` as a gray weight, the same spectrum in every direction. Without a gain map
+the whole open field is treated as emission; a gain pattern then appears in :math:`p`, which matters only where it
+is large. ``citrus_recon`` given an open-field image normalizes the counts pixel by pixel, :math:`y = -\log(Y/F)`,
+and gives the solver's source this profile for the duration of the call, keeping every other setting of the source;
+given a number :math:`I_0` it keeps the solver's source, and :math:`I_0` then stands for the open field with the
+falloff of :math:`F_{solver}` divided out.
 
 One view of the solver
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -588,6 +619,49 @@ Uncollided trace
 ``uncollided_trace_grid`` sets the grid through which :math:`\phi_{UC}` is traced to the quadrature points:
 ``"quadrature"`` (default; boundaries resolved at the point spacing), ``"coarse"`` (the transport grid, which smears a
 material boundary inside a cell) or ``"fine"`` (the reconstruction grid, for validation).
+
+Scatter scene beyond the reconstructed slab
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The solver sees the reconstructed volume only, but the body continues past the slab the cone measures, and the field
+past the panel's rows (margins, off-focal emission) irradiates more of it; its scatter reaches the panel. With
+``CitrusConfig.extend_scatter_scene`` the solver's scene is the reconstruction grid extended along z by whole slices
+until it covers the field of the source through the grid's in-plane box at every view (``ScatterScene``), and every
+column of voxels is continued past its last voxel that every view measures whole, by repeating that voxel. A voxel
+:math:`[z_a, z_b]` of a column whose points lie at most :math:`r` from the axis projects at every view within
+:math:`v = \mathrm{SDD}\,z / (\mathrm{SID} - y_v)`, :math:`|y_v| \le r`, so it is measured whole when that range lies
+within the panel's rows (:math:`v = z` for a parallel beam). The rule is geometric: the voxels near the slab's ends
+are incomplete in a circular cone beam and unreliable, and the scene replaces them by the nearest complete voxel of
+their column; the reconstruction and the primary keep the reconstruction grid. The transport grid covers the scene,
+so the cost grows with its slices. The option does not apply to a helical scan, whose grid must already hold the
+whole object the helix illuminates.
+
+Beam hardening
+~~~~~~~~~~~~~~
+
+MBIR reconstructs a monoenergetic attenuation from polychromatic data, so the line integrals of thick or dense paths
+are too low (cupping in water, dark streaks between bones), and under a bowtie the wings' harder spectrum changes
+that error along the channels. Two options of ``CitrusConfig`` correct the line integrals of every outer iteration
+before its MBIR iterations, with the solver's own primary model:
+
+* ``hardening_materials``: library materials treated as sources of hardening beyond water. After every scatter
+  update each line integral gets the offset :math:`\ln(P / P_{ref})`, with :math:`P` the solver's polychromatic
+  primary of the current volume and :math:`P_{ref}` the same primary with the path of every listed material replaced
+  by water of the same monoenergetic attenuation at the density model's effective energy, adding
+  :math:`(\mu_m(E_{eff}) / \mu_{water}(E_{eff}))\,P_m` to water's path; the other materials stay. The two primaries
+  share the projections of the scatter update, and the beam filter is in both. After the offset the data look like
+  data of the volume with the listed materials made of water.
+* ``beam_hardening_correction``: the water linearization of every pixel (``water_linearization``). For each pixel
+  the solver's primary signal :math:`S_p(L)` through water thicknesses :math:`L` (up to 60 cm, with the source's
+  filter, the detector and the grid; the emission profile cancels) gives water's polychromatic line integral
+  :math:`-\ln(S_p(L) / S_p(0))`, and a line integral is mapped to :math:`\mu_{water}(E_{eff})\,L`, :math:`L`
+  interpolated linearly in the pixel's table and continued with its end segments. The table depends on the pixel
+  through the filter's thickness and the incidence angle, not on the view of a circular or helical scan.
+
+The offset comes first, so that the water linearization applies to water-like data. ``mbir_recon`` takes the water
+linearization too, given the solver of the scanner (``solver=``); the offset needs the solver's primary of the current
+volume and belongs to the CITRUS loop. Synthetic data with ``polychromatic_primary`` (``synthesize_cone_beam_data``)
+have the primary of the solver's transmission, with these effects; by default their primary is monoenergetic.
 
 MBIR iterations per outer iteration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -757,9 +831,10 @@ perpendicular to a flat panel at the distance ``axis_detector_dist`` from the ro
 "Frames"). There is no focal spot, and every notion of the solver that depends on it is taken along the beam
 direction :math:`\mathbf w`:
 
-* the source is a unit fluence of parallel rays over the beam's cross-section, the panel's area (the collimation),
-  weighted per pixel by the emission profile (``SourceModel.beam_weight``): :math:`b(\mathbf r)` is the profile at the
-  panel point of the ray through :math:`\mathbf r` and 0 off the panel;
+* the source is a unit fluence of parallel rays over the beam's cross-section, the collimated field (by default the
+  panel's area), weighted per pixel by the emission profile (``SourceModel.beam_weight``): :math:`b(\mathbf r)` is the
+  field weight times the profile at the panel point of the ray through :math:`\mathbf r`, and the beam filter adds its
+  path to the transmission of that ray;
 * the uncollided fluence has no inverse-square factor and a single direction,
   :math:`\phi_{UC,g}(\mathbf r) = b(\mathbf r) \sum_{E\in g} w_E \exp(-\sum_m P_m(\mathbf r)\, m_m(E))`,
   :math:`\boldsymbol\Omega_{UC} = \mathbf w`, the line integrals :math:`P_m` traced along :math:`\mathbf w` from

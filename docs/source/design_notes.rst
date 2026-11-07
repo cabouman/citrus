@@ -97,7 +97,26 @@ in :math:`q` between them.
 (``group_transmission``), without the within-group beam hardening of group-averaged attenuation.
 
 On float32 CUDA one kernel sums the fine energies of every ray, group by group (the library sorts them by group),
-so no (fine energy, ray) tensor is formed. The PyTorch path evaluates the sum in blocks of at most :math:`2^{22}`
+so no (fine energy, ray) tensor is formed. A source's beam filter is one more term of the optical depth, its path per
+ray times its fine mass attenuation, added after the materials; the kernel has it as a compile-time constant
+(``FILTER``), so a source without a filter runs the kernel without it, and a filter of zero thickness adds an exact
+zero. The filter's fine mass attenuation is computed once per material and library from the photon data
+(``source._fine_attenuation``).
+
+**Source outside the panel.** The field margins, the off-focal emission and the filter are properties of the ray's
+point on the panel plane, so the source keeps one rule for every place it enters (uncollided fluence, primary, open
+field) and for both beam types. The distance past a corner of the field is the distance to the field rectangle:
+a stated rule that reduces to the one-dimensional distance past a single edge, where tables are measured, and a
+corner carries little of the off-focal emission. The emission profile and the filter thickness are held at their
+edge values past the outermost pixels, the only values known there.
+
+**Scatter scene and beam hardening.** The scene beyond the slab uses a geometric rule (the voxels every view measures
+whole, per column) instead of a threshold on the volume, so it does not depend on the object or the noise; the
+columns near the axis keep more of the measured slab than the outer ones. The primary keeps the reconstruction grid,
+the operator MBIR fits. The water linearization is tabulated per pixel with the solver's own primary: the filter and
+the incidence angle both change the spectrum a pixel sees, and the table is the exact polychromatic model of the
+loop's primary. A material's hardening beyond water uses the primary of the current volume twice, as it is and with
+the material made of water, which reuses the projections of the scatter update. The PyTorch path evaluates the sum in blocks of at most :math:`2^{22}`
 (fine energy, ray) pairs: per block one optical-depth tensor (M fused multiply-adds), an in-place exponential and one
 matrix product with the fine-to-group weights, accumulated into the result. The float32 matrix product assumes that
 TF32 is off (``torch.backends.cuda.matmul.allow_tf32 = False``, the PyTorch default).

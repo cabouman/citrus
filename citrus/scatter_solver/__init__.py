@@ -14,8 +14,9 @@ from .detector import (anti_scatter_grid, csi_response, detector_response, energ
                        focused_1d_grid, ideal_counting_response, no_grid, tabulated_detector_response)
 from .geometry import ConeGeometry, Grid, ParallelGeometry
 from .ray_tracing import Projectors, SiddonProjectors
-from .scatter_solver import (MaterialFields, ScatterSolver, ViewResult, build_solver_library,
-                             emission_profile_from_open_field)
+from .scatter_solver import (MaterialFields, ScatterSolver, ViewResult, WaterLinearization, build_solver_library,
+                             emission_profile_from_open_field, filter_thickness_from_transmission,
+                             water_linearization)
 from .source import SourceModel, bowtie_emission_profile
 
 __all__ = [
@@ -45,4 +46,7 @@ __all__ = [
     "SourceModel",
     "bowtie_emission_profile",
     "emission_profile_from_open_field",
+    "filter_thickness_from_transmission",
+    "WaterLinearization",
+    "water_linearization",
 ]

@@ -52,6 +52,9 @@ __all__ = [
     "ViewResult",
     "ScatterSolver",
     "emission_profile_from_open_field",
+    "filter_thickness_from_transmission",
+    "WaterLinearization",
+    "water_linearization",
 ]
 
 DeviceLike = Union[torch.device, str, None]
@@ -970,7 +973,7 @@ class ScatterSolver:
         """Detector signal of an empty volume (the solver's open field) for one view.
 
         It carries the inverse-square and obliquity factors of the point source (none for a parallel beam), the
-        emission profile of ``source`` and the grid and detector responses.
+        emission profile and the beam filter of ``source`` and the grid and detector responses.
 
         Args:
             angle (float): view angle in radians.
@@ -1125,9 +1128,11 @@ def emission_profile_from_open_field(open_field: Union[Tensor, np.ndarray], solv
                                      detector_gain: Optional[Union[Tensor, np.ndarray]] = None) -> Tensor:
     """Emission profile of the source from a measured open field (flat field), for ``SourceModel.emission_profile``.
 
-    The profile is the measured open field divided by the detector gain and by the solver's own open field of a
-    uniform source (``ScatterSolver.open_field_signal``), which carries the inverse-square and obliquity falloff and
-    the responses, normalized to a mean of one per view; without a gain map the whole open field counts as emission.
+    The profile is the measured open field divided by the detector gain and by the solver's own open field of its
+    source without an emission profile (``ScatterSolver.open_field_signal``), which carries the inverse-square and
+    obliquity falloff, the responses and the attenuation of the source's beam filter, normalized to a mean of one per
+    view: it holds only what the model does not explain (the heel effect, a filter missing from the source). Without a
+    gain map the whole open field counts as emission.
 
     Args:
         open_field (Tensor or ndarray): [Rd, Cd] open-field signal, the same for every view, or [V, Rd, Cd] per view.
@@ -1156,7 +1161,7 @@ def emission_profile_from_open_field(open_field: Union[Tensor, np.ndarray], solv
         gain = torch.as_tensor(detector_gain, dtype=torch.float64, device=device)
         if tuple(gain.shape) != shape or not bool(torch.isfinite(gain).all()) or bool((gain <= 0).any()):
             raise ValueError(f"detector_gain must be a positive [rows, channels] = {list(shape)} map")
-    uniform = SourceModel()
+    uniform = replace(solver.source, emission_profile=None, emission_profile_angles=None)
     tiny = torch.finfo(torch.float64).tiny
 
     def profile_of(measured: Tensor, angle: float) -> Tensor:
@@ -1171,3 +1176,198 @@ def emission_profile_from_open_field(open_field: Union[Tensor, np.ndarray], solv
     else:
         profile = torch.stack([profile_of(field[v], angle_list[v]) for v in range(field.shape[0])])
     return profile.cpu()
+
+
+# =====================================================================================================
+# beam filter thickness and water linearization from the solver's primary model
+# =====================================================================================================
+
+def _invert_tables(tables: Tensor, nodes: Tensor, values: Tensor) -> Tensor:
+    """Invert increasing tables row by row: the node coordinate at which the table of each row reaches each value.
+
+    The tables are interpolated linearly between the nodes and continued with their end segments outside them.
+
+    Args:
+        tables (Tensor): [P, N] values of P functions at N >= 2 nodes, strictly increasing along N.
+        nodes (Tensor): [N] the nodes, increasing, the dtype and device of ``tables``.
+        values (Tensor): [P, K] values to invert, row p in the table of row p.
+
+    Returns:
+        Tensor: [P, K] node coordinates, in the dtype of ``tables``.
+    """
+    n = int(tables.shape[1])
+    values = values.to(tables.dtype).contiguous()
+    upper = torch.searchsorted(tables.contiguous(), values).clamp(1, n - 1)  # [P, K]
+    lower = upper - 1
+    t0, t1 = tables.gather(1, lower), tables.gather(1, upper)
+    x0, x1 = nodes[lower], nodes[upper]
+    return x0 + (x1 - x0) * (values - t0) / (t1 - t0)
+
+
+def _non_negative_float(value) -> float:
+    """Return a finite non-negative number as a float.
+
+    Args:
+        value (float): the number.
+
+    Returns:
+        float: the value.
+    """
+    if isinstance(value, bool) or not np.isfinite(float(value)) or float(value) < 0:
+        raise ValueError(f"expected a finite number >= 0, got {value!r}")
+    return float(value)
+
+
+def filter_thickness_from_transmission(transmission: Union[Tensor, np.ndarray], solver: ScatterSolver, material,
+                                       minimum_thickness_cm: Optional[float] = None, angle: float = 0.0,
+                                       num_thicknesses: int = 128) -> Tensor:
+    """Thickness of a beam filter per pixel from its measured transmission, with the solver's spectrum and responses.
+
+    The transmission is the open field with the filter over the open field without it, per pixel and not normalized,
+    so that the filter's minimum thickness is kept. It is inverted per pixel in the model's transmission of a uniform
+    filter, the open-field signal of the solver's source with that filter over the one without
+    (``ScatterSolver.open_field_signal``), interpolated linearly in the log of the transmission on a grid of
+    thicknesses. A profile normalized to its maximum is first scaled to the model's transmission of
+    ``minimum_thickness_cm`` at the pixel of the maximum.
+
+    Args:
+        transmission (Tensor or ndarray): [channels] (the central rows) or [rows, channels] measured transmission.
+        solver (ScatterSolver): solver of the scanner (spectrum, detector and grid responses).
+        material (str or Material): filter material, at its nominal density.
+        minimum_thickness_cm (float, optional): thickness of the filter at the maximum of a normalized profile.
+            Defaults to None (the transmission is absolute).
+        angle (float, optional): view angle in rad of the model's open fields. Defaults to 0.0.
+        num_thicknesses (int, optional): thicknesses of the inversion grid, at least 2. Defaults to 128.
+
+    Returns:
+        Tensor: thickness in cm (``SourceModel.filter_thickness_cm``), the shape of ``transmission``, float64 on the
+        CPU.
+    """
+    geometry = solver.geometry
+    rows, channels = geometry.image_shape
+    measured = torch.as_tensor(transmission, dtype=torch.float64).detach().to(solver.device)
+    if measured.dim() not in (1, 2) or int(measured.shape[-1]) != channels or (measured.dim() == 2
+                                                                                and int(measured.shape[0]) != rows):
+        raise ValueError(f"the transmission must be [channels] = [{channels}] or [rows, channels] = [{rows}, "
+                         f"{channels}], got {tuple(measured.shape)}")
+    if not bool(torch.isfinite(measured).all()) or not bool((measured > 0).all()):
+        raise ValueError("the transmission must be finite and positive")
+    if int(num_thicknesses) < 2:
+        raise ValueError("num_thicknesses must be >= 2")
+    base_source = replace(solver.source, emission_profile=None, emission_profile_angles=None, filter_material=None,
+                          filter_thickness_cm=None)
+    base = solver.open_field_signal(angle, base_source, dtype=torch.float64).clamp_min(torch.finfo(torch.float64).tiny)
+
+    def model(thickness_cm: float) -> Tensor:  # [rows or 1, channels] transmission of a uniform filter
+        uniform = replace(base_source, filter_material=material,
+                          filter_thickness_cm=torch.full((channels,), float(thickness_cm), dtype=torch.float64))
+        ratio = solver.open_field_signal(angle, uniform, dtype=torch.float64) / base
+        if measured.dim() == 2:
+            return ratio
+        return ratio[[(rows - 1) // 2, rows // 2]].mean(0, keepdim=True)  # the central rows
+
+    if minimum_thickness_cm is not None:
+        peak = int(torch.argmax(measured))
+        measured = measured / measured.max() * model(_non_negative_float(minimum_thickness_cm)).reshape(-1)[peak]
+    # the grid of thicknesses reaches past the smallest transmission at the centre of the panel
+    target = float(measured.min())
+    largest = 1.0
+    while float(model(largest).reshape(-1)[measured.numel() // 2]) > target and largest < 1.0e3:
+        largest *= 2.0
+    nodes = torch.linspace(0.0, largest, int(num_thicknesses), dtype=torch.float64, device=solver.device)
+    tables = torch.stack([-torch.log(model(float(t)).reshape(-1)) for t in nodes], dim=1)  # [pixels, N], increasing
+    thickness = _invert_tables(tables, nodes, -torch.log(measured.reshape(-1, 1)))
+    return thickness.clamp_min(0.0).reshape(measured.shape).cpu()
+
+
+@dataclass(frozen=True, eq=False)
+class WaterLinearization:
+    """Map of line integrals to water's monoenergetic line integrals, per detector pixel.
+
+    Row p of ``polychromatic`` holds water's polychromatic line integrals ``-ln(S_p(L) / S_p(0))`` at the thicknesses
+    ``thickness_cm``, S_p the solver's primary signal of pixel p (spectrum, beam filter, detector and grid responses).
+    A line integral y of pixel p maps to ``attenuation * L``, with L interpolated linearly in the table of p and
+    continued with its end segments.
+
+    Attributes:
+        polychromatic (Tensor): [Rd Cd, N] polychromatic line integrals of water per pixel, increasing along N.
+        thickness_cm (Tensor): [N] water thicknesses in cm, increasing from 0.
+        attenuation (float): attenuation of water in 1/cm at ``energy_kev``.
+        energy_kev (float): the effective energy in keV.
+        image_shape (tuple[int, int]): (Rd, Cd) of the panel.
+    """
+
+    polychromatic: Tensor
+    thickness_cm: Tensor
+    attenuation: float
+    energy_kev: float
+    image_shape: tuple[int, int]
+
+    def __call__(self, line_integrals: Tensor, views_per_chunk: Optional[int] = None) -> Tensor:
+        """Map line integrals to water's monoenergetic line integrals.
+
+        Args:
+            line_integrals (Tensor): [..., Rd, Cd] line integrals of the pixels.
+            views_per_chunk (int, optional): images mapped at once. Defaults to None (about 2^24 values per chunk).
+
+        Returns:
+            Tensor: [..., Rd, Cd] linearized line integrals, in the dtype and on the device of ``line_integrals``.
+        """
+        shape = tuple(line_integrals.shape)
+        if shape[-2:] != tuple(self.image_shape):
+            raise ValueError(f"line integrals must be [..., {self.image_shape[0]}, {self.image_shape[1]}], got {shape}")
+        pixels = self.image_shape[0] * self.image_shape[1]
+        images = line_integrals.reshape(-1, pixels)
+        tables = self.polychromatic.to(line_integrals.device)
+        nodes = self.thickness_cm.to(line_integrals.device, tables.dtype)
+        chunk = max(1, (1 << 24) // pixels) if views_per_chunk is None else max(1, int(views_per_chunk))
+        out = torch.empty_like(images)
+        for start in range(0, images.shape[0], chunk):
+            block = images[start:start + chunk].t()  # [pixels, n]
+            out[start:start + chunk] = (_invert_tables(tables, nodes, block) * self.attenuation).t().to(out.dtype)
+        return out.reshape(shape)
+
+
+def water_linearization(solver: ScatterSolver, energy_kev: Optional[float] = None, max_thickness_cm: float = 60.0,
+                        num_thicknesses: int = 61, angle: float = 0.0) -> WaterLinearization:
+    """Per-pixel water linearization of the solver's primary model (``WaterLinearization``).
+
+    The tables are the solver's primary signal through water thicknesses from 0 to ``max_thickness_cm`` with its source
+    (beam filter included; the emission profile cancels in the ratio and is left out), detector and grid responses;
+    the target is water's attenuation at ``energy_kev``. The library must hold water.
+
+    Args:
+        solver (ScatterSolver): the scatter solver; a lazy library is built here.
+        energy_kev (float, optional): effective energy of the monoenergetic line integrals in keV. Defaults to None (the
+            spectrum mean of the library).
+        max_thickness_cm (float, optional): largest water thickness of the tables in cm. Defaults to 60.0.
+        num_thicknesses (int, optional): equally spaced water thicknesses of the tables, at least 2. Defaults to 61.
+        angle (float, optional): view angle in rad of the tables (the ratio does not depend on it for a circular or
+            helical scan). Defaults to 0.0.
+
+    Returns:
+        WaterLinearization: the map.
+    """
+    from ..utilities import effective_energy, mass_attenuation_at
+    from .cross_sections import material_index
+
+    if int(num_thicknesses) < 2 or not float(max_thickness_cm) > 0:
+        raise ValueError("water_linearization needs num_thicknesses >= 2 and max_thickness_cm > 0")
+    library = solver.library
+    water = material_index(library, "water")
+    density = float(library.nominal_density[water])
+    energy = effective_energy(library) if energy_kev is None else float(energy_kev)
+    attenuation = float(mass_attenuation_at(library, energy)[water]) * density
+    source = replace(solver.source, emission_profile=None, emission_profile_angles=None)
+    rows, channels = solver.geometry.image_shape
+    nodes = torch.linspace(0.0, float(max_thickness_cm), int(num_thicknesses), dtype=torch.float64)
+    signals = []
+    for thickness in nodes.tolist():
+        path = torch.full((1, rows, channels), density * thickness, device=solver.device, dtype=solver.dtype)
+        signals.append(primary_from_path_lengths(library, path, [water], solver.geometry, angle, source,
+                                                 solver.detector, solver.grid_response)["signal"].to(torch.float64))
+    signal = torch.stack(signals, dim=-1).reshape(rows * channels, -1)  # [pixels, N]
+    tiny = torch.finfo(torch.float64).tiny
+    polychromatic = -torch.log(signal.clamp_min(tiny) / signal[:, :1].clamp_min(tiny))
+    return WaterLinearization(polychromatic=polychromatic.contiguous(), thickness_cm=nodes.to(solver.device),
+                              attenuation=attenuation, energy_kev=energy, image_shape=(rows, channels))

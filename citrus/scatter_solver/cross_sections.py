@@ -795,12 +795,14 @@ def fine_group_weights(library: MultigroupLibrary, device=None, dtype=None) -> T
 
 
 def group_transmission(library: MultigroupLibrary, path: Tensor, block: int = _TRANSMISSION_BLOCK,
-                       materials: Optional[Sequence[int]] = None) -> Tensor:
+                       materials: Optional[Sequence[int]] = None, filter_path: Optional[Tensor] = None,
+                       filter_attenuation: Optional[Tensor] = None) -> Tensor:
     """Return the group-integrated transmission from material line integrals, exact in energy up to the fine quadrature.
 
-    ``T_g = sum_{e: fine_group[e] = g} fine_weight[e] exp(-sum_m fine_mu_t[m, e] path[m])``. On float32 CUDA one fused
-    kernel sums the fine energies of every ray (``kernels.transmission_kernels``); the PyTorch path evaluates the sum in
-    blocks of at most ``block`` (fine energy, ray) pairs.
+    ``T_g = sum_{e: fine_group[e] = g} fine_weight[e] exp(-sum_m fine_mu_t[m, e] path[m] - mu_f[e] P_f)``, the last term
+    the path ``P_f`` of each ray through a beam filter of fine mass attenuation ``mu_f`` (none by default). On float32
+    CUDA one fused kernel sums the fine energies of every ray (``kernels.transmission_kernels``); the PyTorch path
+    evaluates the sum in blocks of at most ``block`` (fine energy, ray) pairs.
 
     Args:
         library (MultigroupLibrary): the cross-section library.
@@ -808,18 +810,27 @@ def group_transmission(library: MultigroupLibrary, path: Tensor, block: int = _T
         block (int, optional): maximum number of (fine energy, ray) pairs per block. Defaults to ``2**22``.
         materials (Sequence[int] or None, optional): library indices of the rows of ``path`` when it holds a subset of
             the materials. Defaults to None (all, in library order).
+        filter_path (Tensor, optional): [...] path of each ray through the beam filter in g/cm^2, the spatial shape of
+            ``path``. Defaults to None (no filter).
+        filter_attenuation (Tensor, optional): [E] mass attenuation of the filter at ``library.fine_energy`` in
+            cm^2/g, required with ``filter_path``. Defaults to None.
 
     Returns:
         Tensor: [G, ...] source photons per steradian per group surviving the path (sum 1 over g for a zero path), in
         the dtype and on the device of ``path``.
     """
+    if (filter_path is None) != (filter_attenuation is None):
+        raise ValueError("filter_path and filter_attenuation must be given together")
+    if filter_path is not None and tuple(filter_path.shape) != tuple(path.shape[1:]):
+        raise ValueError(f"filter_path must be {tuple(path.shape[1:])}, got {tuple(filter_path.shape)}")
     if transmission_kernels.use_kernel(library, path):
-        return transmission_kernels.group_transmission(library, path, materials)
-    return _group_transmission_torch(library, path, block, materials)
+        return transmission_kernels.group_transmission(library, path, materials, filter_path, filter_attenuation)
+    return _group_transmission_torch(library, path, block, materials, filter_path, filter_attenuation)
 
 
 def _group_transmission_torch(library: MultigroupLibrary, path: Tensor, block: int,
-                              materials: Optional[Sequence[int]]) -> Tensor:
+                              materials: Optional[Sequence[int]], filter_path: Optional[Tensor] = None,
+                              filter_attenuation: Optional[Tensor] = None) -> Tensor:
     """PyTorch path of ``group_transmission``, in blocks of at most ``block`` (fine energy, ray) pairs.
 
     Args:
@@ -827,6 +838,8 @@ def _group_transmission_torch(library: MultigroupLibrary, path: Tensor, block: i
         path (Tensor): [M', ...] line integrals of the density maps in g/cm^2.
         block (int): maximum number of (fine energy, ray) pairs per block.
         materials (Sequence[int] or None): library indices of the rows of ``path``, or None for all.
+        filter_path (Tensor, optional): [...] path through the beam filter in g/cm^2. Defaults to None.
+        filter_attenuation (Tensor, optional): [E] fine mass attenuation of the filter in cm^2/g. Defaults to None.
 
     Returns:
         Tensor: [G, ...] transmission per group.
@@ -846,6 +859,12 @@ def _group_transmission_torch(library: MultigroupLibrary, path: Tensor, block: i
         raise ValueError(f"path has {M} materials, the library {fine_mu_t.shape[0]}")
     group_weights = fine_group_weights(library, device, dtype)  # [G, E]
     num_energies = fine_mu_t.shape[1]
+    filter_rays = filter_mu = None
+    if filter_path is not None:
+        filter_rays = filter_path.reshape(-1).to(dtype)
+        filter_mu = filter_attenuation.reshape(-1).to(device=device, dtype=dtype)
+        if filter_rays.numel() != num_rays or filter_mu.numel() != num_energies:
+            raise ValueError(f"filter_path must hold {num_rays} rays and filter_attenuation {num_energies} energies")
     out = torch.zeros(group_weights.shape[0], num_rays, device=device, dtype=dtype)
     rays_per_block = max(1, min(num_rays, int(block)))
     energies_per_block = max(1, int(block) // rays_per_block)
@@ -857,6 +876,9 @@ def _group_transmission_torch(library: MultigroupLibrary, path: Tensor, block: i
             tau = mu_block[0][:, None] * path_block[0][None, :]
             for k in range(1, M):
                 tau.addcmul_(mu_block[k][:, None], path_block[k][None, :])
+            if filter_rays is not None:  # the filter after the materials, as the kernel adds it
+                tau.addcmul_(filter_mu[energy_start:energy_start + energies_per_block][:, None],
+                             filter_rays[ray_start:ray_start + rays_per_block][None, :])
             out_block.addmm_(group_weights[:, energy_start:energy_start + energies_per_block], tau.neg_().exp_())
     return out.reshape(group_weights.shape[0], *spatial)
 
