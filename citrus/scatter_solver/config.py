@@ -56,6 +56,9 @@ class SolverConfig:
         cone_num_azimuthal (int): azimuthal directions of the cone direction set of the scatter image. Defaults to 32.
         direction_chunk (int): directions per octant per sweep chunk and per batch of the scatter image (with the
             fused kernels both take more, as many as fit a memory budget). Defaults to 8.
+        group_averaged_responses (bool): evaluate the detector response and the grid transmission as their means over
+            the fine energies of each group (``detector.group_averaged_responses``) instead of at the group energy.
+            Defaults to False.
         dtype (str): "float32" (production) or "float64" (reference and tests). Defaults to "float32".
     """
 
@@ -90,6 +93,9 @@ class SolverConfig:
     cone_num_polar: int = 16
     cone_num_azimuthal: int = 32
     direction_chunk: int = 8
+
+    # --- detector and grid responses ----------------------------------------------------------
+    group_averaged_responses: bool = False
 
     # --- numerics -----------------------------------------------------------------------------
     dtype: Literal["float32", "float64"] = "float32"
@@ -210,5 +216,7 @@ class SolverConfig:
             raise ValueError("need cone_num_polar >= 1 and cone_num_azimuthal >= 1")
         if self.direction_chunk < 1:
             raise ValueError("direction_chunk must be >= 1")
+        if not isinstance(self.group_averaged_responses, bool):
+            raise ValueError(f"group_averaged_responses must be True or False, got {self.group_averaged_responses!r}")
         if self.dtype not in ("float32", "float64"):
             raise ValueError(f"dtype must be 'float32' or 'float64', got {self.dtype!r}")

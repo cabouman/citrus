@@ -192,16 +192,17 @@ def test_tabulated_detector_response():
 # ---- anti-scatter grid -----------------------------------------------------------------------------------------
 
 def test_anti_scatter_grid_from_septa(photon_data):
-    """A lead grid from the photon data agrees with the built-in lead model; the default pitch is the pixel pitch
-    across the septa; septa along the rows swap u and v in the grid angles."""
+    """A lead grid of the septum-shadow model from the photon data agrees with the built-in lead model; the default
+    pitch is the pixel pitch across the septa; septa along the rows swap u and v in the grid angles."""
     t1 = torch.tensor([0.0, 0.01, 0.03, 0.2], dtype=F64)
     reference = focused_1d_grid().at(E_G, t1, 0 * t1)
-    grid = anti_scatter_grid(None, 0.0036, 0.15, pitch_cm=1 / 60, focal_distance_cm=150.0, backend=photon_data)
+    grid = anti_scatter_grid(None, 0.0036, 0.15, pitch_cm=1 / 60, focal_distance_cm=150.0, backend=photon_data,
+                             model="septum_shadow")
     np.testing.assert_allclose(grid.at(E_G, t1, 0 * t1).numpy(), reference.numpy(), rtol=0.01, atol=1e-3)
     geometry = ConeGeometry(100.0, 150.0, 5, 7, 0.3, 0.4)
-    across_rows = anti_scatter_grid(geometry, 0.02, 2.0, backend=photon_data)
+    across_rows = anti_scatter_grid(geometry, 0.02, 2.0, backend=photon_data, model="septum_shadow")
     across_channels = anti_scatter_grid(geometry, 0.02, 2.0, septa_along="rows", septum_material="tungsten",
-                                        backend=photon_data)
+                                        backend=photon_data, model="septum_shadow")
     assert across_rows.septa_along == "channels" and across_rows.focal_distance_cm == 150.0
     assert across_channels.septa_along == "rows"
     zero = torch.zeros((), dtype=F64)
@@ -361,11 +362,13 @@ def test_ideal_responses_keep_the_planar_fluence():
 
 def test_crossed_grid_is_the_product_of_its_septa(photon_data):
     """Septa along both directions transmit the product of the grids along the channels and along the rows, each at
-    its own grid angles and pitch; on the primary ray of a focused grid that is the product of the open fractions."""
+    its own grid angles and pitch; on the primary ray of a focused grid of the septum-shadow model (independent of
+    theta2) that is the product of the open fractions."""
     geometry = ConeGeometry(100.0, 150.0, 5, 7, 0.3, 0.4)
-    both = anti_scatter_grid(geometry, 0.02, 2.0, septa_along="both", backend=photon_data)
-    channels = anti_scatter_grid(geometry, 0.02, 2.0, backend=photon_data)
-    rows = anti_scatter_grid(geometry, 0.02, 2.0, septa_along="rows", backend=photon_data)
+    shadow = dict(backend=photon_data, model="septum_shadow")
+    both = anti_scatter_grid(geometry, 0.02, 2.0, septa_along="both", **shadow)
+    channels = anti_scatter_grid(geometry, 0.02, 2.0, **shadow)
+    rows = anti_scatter_grid(geometry, 0.02, 2.0, septa_along="rows", **shadow)
     assert both.crossed is not None and both.crossed.septa_along == "rows" and "crossed" in both.name
     assert both.depends_on_angles and not no_grid().depends_on_angles
     angle = 0.8

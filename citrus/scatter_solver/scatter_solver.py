@@ -22,7 +22,7 @@ from .angular_quadrature import Quadrature, product_quadrature, scatter_source_m
 from .config import SolverConfig
 from .cross_sections import (MaterialPairs, MultigroupLibrary, check_material_names, material_pairs_if_compact,
                              material_table, mu_t_volume, transfer_moments_volume)
-from .detector import DetectorResponse, GridResponse
+from .detector import DetectorResponse, GridResponse, group_averaged_responses
 from .geometry import ConeGeometry, Grid, resample_conservative
 from .kernels import sweep_kernels, uncollided_kernels
 from .ray_tracing import Projectors, SiddonProjectors
@@ -389,8 +389,25 @@ class ScatterSolver:
         self._cone_quadratures: dict[tuple[Grid, float], Quadrature] = {}
         self.direction_context_cache_size = max(0, int(direction_context_cache_size))
         self._direction_contexts: OrderedDict[tuple, DirectionSetContext] = OrderedDict()
+        self._averaged_responses: Optional[tuple] = None
 
     # ---- library and configuration --------------------------------------------------------------
+    def responses(self) -> tuple[DetectorResponse, GridResponse]:
+        """Detector and grid responses the solver evaluates.
+
+        They are ``detector`` and ``grid_response``, or with ``config.group_averaged_responses`` their means over each
+        energy group of the library (``detector.group_averaged_responses``), computed once per library and responses.
+
+        Returns:
+            (DetectorResponse, GridResponse): the responses.
+        """
+        if not self._config.group_averaged_responses:
+            return self.detector, self.grid_response
+        inputs = (self.detector, self.grid_response, self.library)
+        if self._averaged_responses is None or any(a is not b for a, b in zip(self._averaged_responses[0], inputs)):
+            self._averaged_responses = (inputs, group_averaged_responses(*inputs))
+        return self._averaged_responses[1]
+
     def _set_library(self, library: MultigroupLibrary) -> None:
         """Move a library to the solver's device and dtype and derive its collided-transport library.
 
@@ -556,13 +573,15 @@ class ScatterSolver:
         """
         quadrature = self.cone_quadrature(fields.grid_fine, angle) if quadrature is None else quadrature
         chunk = self.image_direction_chunk(fields)
+        detector, grid_response = self.responses()
         key = (float(angle), id(quadrature), tuple(fields.grid_fine.shape), tuple(fields.grid_coarse.shape),
                tuple(fields.grid_quadrature.shape), chunk)
         context = self._direction_contexts.get(key)
-        if context is not None and context.quadrature is quadrature:
+        if (context is not None and context.quadrature is quadrature and context.detector is detector
+                and context.grid_response is grid_response):
             self._direction_contexts.move_to_end(key)
             return context
-        context = make_direction_context(quadrature, self.geometry, angle, self.detector, self.grid_response,
+        context = make_direction_context(quadrature, self.geometry, angle, detector, grid_response,
                                          self.library, self.device, self.dtype, chunk=chunk)
         if self.direction_context_cache_size > 0:
             self._direction_contexts[key] = context
@@ -911,7 +930,7 @@ class ScatterSolver:
         return combined_scatter_image(
             self.library, fields.rho_quadrature, phi_uncollided, fields.grid_quadrature, fields.q,
             scatter_source_moments, self.L, self.geometry, angle, quadrature, fields.mu_t_coarse, self.projectors,
-            self.detector, self.grid_response, context, chunk=self.config.direction_chunk,
+            *self.responses(), context, chunk=self.config.direction_chunk,
             first_collision_chunk=self.first_collision_chunk, pairs=fields.first_collision_pairs,
             grid_coarse=fields.grid_coarse, signal_only=signal_only)
 
@@ -929,7 +948,7 @@ class ScatterSolver:
         """
         if fields.rho_fine is not None:
             return primary_image(self.library, fields.rho_fine, fields.grid_fine, self.geometry, angle, self.source,
-                                 self.projectors, self.detector, self.grid_response,
+                                 self.projectors, *self.responses(),
                                  samples_per_pixel_axis=self.primary_samples_per_pixel_axis)
         materials = list(fields.fine_materials)
         path_lengths = torch.cat([self.primary_path_lengths(fields.fine_material(m)[None], fields.grid_fine, angle)
@@ -963,7 +982,7 @@ class ScatterSolver:
             dict: fluence, planar_fluence and signal_per_group [G, Rd, Cd] and signal [Rd, Cd].
         """
         return primary_from_path_lengths(self.library, path.to(self.device, self.dtype), materials, self.geometry,
-                                         angle, self.source, self.detector, self.grid_response)
+                                         angle, self.source, *self.responses())
 
     def open_field_signal(self, angle: float, source: Optional[SourceModel] = None,
                           dtype: Optional[torch.dtype] = None) -> Tensor:
@@ -983,8 +1002,7 @@ class ScatterSolver:
         Rd, Cd = self.geometry.num_det_rows, self.geometry.num_det_channels
         zero_path = torch.zeros(1, Rd, Cd, device=self.device, dtype=self.dtype if dtype is None else dtype)
         return primary_from_path_lengths(self.library, zero_path, [0], self.geometry, angle,
-                                         self.source if source is None else source, self.detector,
-                                         self.grid_response)["signal"]
+                                         self.source if source is None else source, *self.responses())["signal"]
 
     # ---- timing ----------------------------------------------------------------------------------
     @contextmanager
