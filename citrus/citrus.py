@@ -1974,10 +1974,11 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
         t0 = time.perf_counter()
         # every view, from the reconstruction grid
         reference = torch.empty_like(primary) if config.hardening_materials else None
+        reference_arguments = {} if reference is None else dict(
+            reference=reference, energy_kev=density_model.energy_kev,
+            reference_materials=[material_index(solver.library, m) for m in config.hardening_materials])
         primary_signals(solver, fields if scene is None else _primary_fields(fields, X, grid, density_model),
-                        angle_array, projector, config.primary_views_per_chunk, out=primary, reference=reference,
-                        reference_materials=[material_index(solver.library, m) for m in config.hardening_materials],
-                        energy_kev=density_model.energy_kev)
+                        angle_array, projector, config.primary_views_per_chunk, out=primary, **reference_arguments)
         if reference is not None:  # the hardening beyond water of the listed materials of the current volume
             hardening[0] = torch.log(primary.clamp_min(tiny) / reference.clamp_min(tiny))
             record["hardening_offset_max"] = float(hardening[0].abs().max())
