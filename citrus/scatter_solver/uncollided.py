@@ -163,7 +163,8 @@ def uncollided_from_path_lengths(library: MultigroupLibrary, path_lengths: Tenso
 
     Computes ``phi_UC,g(r) = b(Omega_UC(r)) / |r - r0|^2 sum_{E in g} w_E exp(-sum_m P_m(r) m_m(E))``; for a parallel
     beam ``phi_UC,g(r) = b(r) sum_{E in g} w_E exp(-sum_m P_m(r) m_m(E))`` with the beam weight b of
-    ``SourceModel.beam_weight`` (unit incident fluence).
+    ``SourceModel.beam_weight`` (unit incident fluence). A source with a beam filter adds its path through the filter
+    to the exponent (``SourceModel.filter_path``).
 
     Args:
         library (MultigroupLibrary): cross-section library with the fine-energy weights and mass attenuation.
@@ -179,12 +180,18 @@ def uncollided_from_path_lengths(library: MultigroupLibrary, path_lengths: Tenso
         Tensor: [G, rows, cols, slices] fluence on ``points`` in photons/cm^2 per source photon/sr.
     """
     device, dtype = path_lengths.device, path_lengths.dtype
-    transmission = group_transmission(library, path_lengths, materials=materials)  # [G, R, C, S]
     r = points.center_coordinates(device, dtype)
     if geometry.is_parallel:
+        filter_path = source.beam_filter_path(r, geometry, angle)
+    else:
+        r0 = device_tensor(geometry.source_position(angle), device, dtype)
+        d = r - r0
+        filter_path = source.filter_path(d, geometry, angle)
+    transmission = group_transmission(library, path_lengths, materials=materials, filter_path=filter_path,
+                                      filter_attenuation=source.filter_attenuation(library, device, dtype))
+    del filter_path  # [G, R, C, S]
+    if geometry.is_parallel:
         return transmission.mul_(source.beam_weight(r, geometry, angle)[None])
-    r0 = device_tensor(geometry.source_position(angle), device, dtype)
-    d = r - r0
     distance_squared = (d * d).sum(-1)  # [R, C, S]
     b = source.angular_weight(d, geometry, angle)  # [R, C, S]
     return transmission.mul_((b / distance_squared)[None])

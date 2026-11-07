@@ -56,6 +56,10 @@ Frames and tensor layouts (MBIRTORCH conventions)
   The primary ray of a point starts upstream of the traced grid's box, ``p - (p . w + D) w`` with the beam direction w
   and D the radius of the box's circle about the axis plus 1 cm (``ParallelGeometry.ray_starts``).
 * Detector images: ``[..., num_det_rows, num_det_channels]``. Sinograms: ``(views, rows, channels)``.
+* Source settings (``SourceModel``) live on the panel: the field margins and the off-focal distances are in cm at the
+  panel along u and v, past the panel's edges (``panel_half_extent`` about the centre ``(-det_channel_offset,
+  -det_row_offset)``); the emission profile and the filter thickness are given at the pixel centres, the thickness in
+  cm along the ray from the focal spot to each pixel centre, ``[channels]`` for every row or ``[rows, channels]``.
 * The solver works in the recon frame per view: ``ConeGeometry`` returns the source position, panel center and panel
   axes rotated into the recon frame. Directions are unit vectors in the recon frame unless a name says ``_view``.
 * The geometry interface: the solver reaches the scan only through ``ConeGeometry`` methods of a view angle:

@@ -1,9 +1,10 @@
 """Fused Triton kernel of the group-integrated transmission along material line integrals.
 
-``_group_transmission_kernel`` forms ``T_g = sum_{e in g} w_e exp(-sum_m mu_m(e) P_m)`` for a block of rays per
-program, over the fine energies of each group in turn (the library sorts them by group), so no [energies, rays]
-temporary is formed. ``group_transmission`` is the host wrapper of ``cross_sections.group_transmission`` and
-``kernels_usable`` checks the kernel against its PyTorch path once per device.
+``_group_transmission_kernel`` forms ``T_g = sum_{e in g} w_e exp(-sum_m mu_m(e) P_m - mu_f(e) P_f)`` for a block of
+rays per program, over the fine energies of each group in turn (the library sorts them by group), so no [energies,
+rays] temporary is formed; the filter term ``mu_f(e) P_f`` of a source with a beam filter is compiled in only when
+there is one (the ``FILTER`` constant). ``group_transmission`` is the host wrapper of
+``cross_sections.group_transmission`` and ``kernels_usable`` checks the kernel against its PyTorch path once per device.
 """
 
 from __future__ import annotations
@@ -73,7 +74,7 @@ def use_kernel(library, path: Tensor) -> bool:
 
 def _self_check(device: torch.device) -> tuple[bool, str]:
     """Compare the kernel with the PyTorch path of ``cross_sections.group_transmission`` on a random problem with a
-    subset of the materials, a zero path and a long path.
+    subset of the materials, a zero path and a long path, without and with a filter term.
 
     Args:
         device (torch.device): the CUDA device to check.
@@ -89,11 +90,17 @@ def _self_check(device: torch.device) -> tuple[bool, str]:
     path = (torch.rand(len(materials), 7, 9, generator=generator) * 20.0).to(device)
     path[:, 0, 0] = 0.0
     path[:, 1, 1] = 200.0
-    reference = _group_transmission_torch(library, path, 2 ** 22, materials)
-    out = group_transmission(library, path, materials)
-    torch.cuda.synchronize(device)
-    worst = float((out - reference).abs().max()) / max(float(reference.abs().max()), 1e-30)
-    if out.shape != reference.shape or worst > SELF_CHECK_REL_TOL:
+    filter_path = (torch.rand(7, 9, generator=generator) * 3.0).to(device)
+    filter_attenuation = library.fine_mu_t[1].to(device=device, dtype=torch.float32) * 2.0
+    worst = 0.0
+    for filter_args in ((None, None), (filter_path, filter_attenuation)):
+        reference = _group_transmission_torch(library, path, 2 ** 22, materials, *filter_args)
+        out = group_transmission(library, path, materials, *filter_args)
+        torch.cuda.synchronize(device)
+        if out.shape != reference.shape:
+            return False, "self-check: the transmission kernel returned the wrong shape"
+        worst = max(worst, float((out - reference).abs().max()) / max(float(reference.abs().max()), 1e-30))
+    if worst > SELF_CHECK_REL_TOL:
         return False, f"self-check: transmission kernel deviates from the PyTorch path by {worst:.2e} (rel)"
     return True, f"transmission kernel matches the PyTorch path (max rel dev {worst:.1e})"
 
@@ -178,9 +185,11 @@ if triton is not None:
         _exp = tl.exp
 
     @triton.jit(do_not_specialize=["R", "E", "ps_m"],
-                do_not_specialize_on_alignment=["path_ptr", "mu_ptr", "weight_ptr", "start_ptr", "out_ptr"])
-    def _group_transmission_kernel(path_ptr, mu_ptr, weight_ptr, start_ptr, out_ptr, R, E, ps_m,
-                                   G: tl.constexpr, M: tl.constexpr, BLOCK: tl.constexpr):
+                do_not_specialize_on_alignment=["path_ptr", "mu_ptr", "weight_ptr", "start_ptr", "out_ptr",
+                                                "filter_path_ptr", "filter_mu_ptr"])
+    def _group_transmission_kernel(path_ptr, mu_ptr, weight_ptr, start_ptr, out_ptr, filter_path_ptr, filter_mu_ptr,
+                                   R, E, ps_m, G: tl.constexpr, M: tl.constexpr, FILTER: tl.constexpr,
+                                   BLOCK: tl.constexpr):
         """Group-integrated transmission of BLOCK rays (program_id 0).
 
         Args:
@@ -189,15 +198,20 @@ if triton is not None:
             weight_ptr: [E] float32 fine weights.
             start_ptr: [G + 1] int32 first fine energy of each group, and E.
             out_ptr: [G, R] float32 transmission.
+            filter_path_ptr: [R] float32 path of each ray through the beam filter in g/cm^2 (read with FILTER).
+            filter_mu_ptr: [E] float32 fine mass attenuation of the filter in cm^2/g (read with FILTER).
             R: number of rays.
             E: number of fine energies.
             ps_m: element stride of the material axis of the line integrals.
             G (constexpr): number of groups.
             M (constexpr): number of traced materials.
+            FILTER (constexpr): add the filter term after the materials.
             BLOCK (constexpr): rays per program.
         """
         r = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         rm = r < R
+        if FILTER:
+            filter_path = tl.load(filter_path_ptr + r, mask=rm, other=0.0)
         for g in tl.static_range(G):
             e_start = tl.load(start_ptr + g)
             e_end = tl.load(start_ptr + g + 1)
@@ -206,11 +220,14 @@ if triton is not None:
                 tau = tl.zeros((BLOCK,), dtype=tl.float32)
                 for m in tl.static_range(M):  # in row order, as the PyTorch path sums them
                     tau += tl.load(mu_ptr + m * E + e) * tl.load(path_ptr + m * ps_m + r, mask=rm, other=0.0)
-                acc += tl.load(weight_ptr + e) * _exp(-tau)
+                if FILTER:  # after the materials, as the PyTorch path adds it
+                    tau += tl.load(filter_mu_ptr + e) * filter_path
+                acc +=tl.load(weight_ptr + e) * _exp(-tau)
             tl.store(out_ptr + g * R + r, acc, mask=rm)
 
 
-def group_transmission(library, path: Tensor, materials: Optional[Sequence[int]] = None) -> Tensor:
+def group_transmission(library, path: Tensor, materials: Optional[Sequence[int]] = None,
+                       filter_path: Optional[Tensor] = None, filter_attenuation: Optional[Tensor] = None) -> Tensor:
     """Group-integrated transmission on float32 CUDA line integrals, without availability check.
 
     The fused form of ``cross_sections.group_transmission``; the library's fine energies must be sorted by group.
@@ -220,6 +237,9 @@ def group_transmission(library, path: Tensor, materials: Optional[Sequence[int]]
         path (Tensor): [M', ...] line integrals of the density maps in g/cm^2.
         materials (Sequence[int] or None, optional): library indices of the rows of ``path``. Defaults to None (all, in
             library order).
+        filter_path (Tensor, optional): [...] path of each ray through a beam filter in g/cm^2. Defaults to None.
+        filter_attenuation (Tensor, optional): [E] mass attenuation of the filter at the fine energies in cm^2/g,
+            given with ``filter_path``. Defaults to None.
 
     Returns:
         Tensor: [G, ...] transmission per group.
@@ -240,7 +260,16 @@ def group_transmission(library, path: Tensor, materials: Optional[Sequence[int]]
     out = torch.empty(G, R, device=device, dtype=torch.float32)
     if R == 0:
         return out.reshape(G, *spatial)
+    has_filter = filter_path is not None
+    if has_filter:
+        filter_rays = filter_path.reshape(-1).to(torch.float32).contiguous()
+        filter_mu = filter_attenuation.reshape(-1).to(device=device, dtype=torch.float32).contiguous()
+        if filter_rays.numel() != R or filter_mu.numel() != int(mu.shape[1]):
+            raise ValueError(f"filter_path must hold {R} rays and filter_attenuation {int(mu.shape[1])} energies")
+    else:  # not read by the variant without the filter term
+        filter_rays, filter_mu = paths, mu
     triton_utilities.launch(_group_transmission_kernel, (triton.cdiv(R, BLOCK), 1, 1),
-                            (paths, mu, tables.weight, tables.starts, out, R, int(mu.shape[1]), paths.stride(0)),
-                            dict(G=G, M=M, BLOCK=BLOCK), NUM_WARPS)
+                            (paths, mu, tables.weight, tables.starts, out, filter_rays, filter_mu, R,
+                             int(mu.shape[1]), paths.stride(0)),
+                            dict(G=G, M=M, FILTER=has_filter, BLOCK=BLOCK), NUM_WARPS)
     return out.reshape(G, *spatial)

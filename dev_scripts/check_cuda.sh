@@ -1,8 +1,9 @@
 #!/bin/bash
 # Reports the GPU driver, PyTorch / CUDA and Triton availability, runs the per-device self-checks of the fused
 # Triton kernels of citrus (ray tracer on flat and curved panels with circular and helical views and on parallel
-# beams, first-collision source of cone and parallel beams, transport sweep) against their PyTorch paths, and
-# reports xraylib and the NIST XCOM data (the photon data of the cross-section library) and the cache.
+# beams, first-collision source of cone and parallel beams, transport sweep, transmission with a beam filter)
+# against their PyTorch paths, and reports xraylib and the NIST XCOM data (the photon data of the cross-section
+# library) and the cache.
 # Usage: ./check_cuda.sh   (exit code 0 if CUDA is usable, 1 otherwise)
 
 echo "=== GPU driver ==="
@@ -35,7 +36,8 @@ except Exception as exc:  # noqa: BLE001
     print(f"triton not importable: {type(exc).__name__}: {exc}")
 
 print("\n=== citrus kernels ===")
-from citrus.scatter_solver.kernels import ray_tracing_kernels, sweep_kernels, triton_utilities, uncollided_kernels
+from citrus.scatter_solver.kernels import (ray_tracing_kernels, sweep_kernels, transmission_kernels, triton_utilities,
+                                          uncollided_kernels)
 
 print("probe:              ", triton_utilities.triton_available())
 if cuda:
@@ -43,6 +45,7 @@ if cuda:
     print("ray tracing kernels:", ray_tracing_kernels.kernels_usable(device))
     print("first-collision:    ", uncollided_kernels.kernel_usable(device))
     print("sweep plane kernel: ", sweep_kernels.kernels_usable(device))
+    print("transmission kernel:", transmission_kernels.kernels_usable(device))
 else:
     print("no CUDA device: the PyTorch paths are used")
 try:

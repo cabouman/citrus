@@ -1153,14 +1153,17 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
                               I0: float = 1.0e5, noise: bool = True, seed: int = 0, *,
                               energy_kev: Optional[float] = None, device=None,
                               progress: Optional[Callable[[int, float], None]] = None,
-                              detector_gain=None) -> dict:
+                              detector_gain=None, polychromatic_primary: bool = False) -> dict:
     """Counts with scatter, ``Y = Poisson(F exp(-A X_true) (1 + SPR))``, of a cone-beam or parallel-beam scan.
 
     The primary is MBIRTORCH's projection of the true attenuation and SPR the solver's scatter-to-primary ratio of the
     detector signals of one fully converged solve per view; a lazy solver with the "scattered_fluence" group rule first
     takes its grouping object size and medium from the true object, then builds its library. The open field F is the
-    number I0 for a solver with uniform emission and no gain map, else the image ``I0 g f / mean(f)`` of the gain g and
-    the solver's open-field signal f (``ScatterSolver.open_field_signal``, with the source's emission profile).
+    number I0 for a solver with uniform emission, no beam filter and no gain map, else the image ``I0 g f / mean(f)``
+    of the gain g and the solver's open-field signal f (``ScatterSolver.open_field_signal``, with the source's emission
+    profile and filter). With ``polychromatic_primary`` the primary is ``F p / f`` instead, p the solver's primary
+    signal of the true densities from MBIRTORCH's projections of the material maps (``citrus.primary_signals``): the
+    polychromatic transmission of every pixel, with the beam hardening of the object and of the source's filter.
 
     Args:
         densities: true object on ``grid``: a density model with ``material(X, m)`` (e.g. ``WlabPhantom``) or a
@@ -1178,6 +1181,8 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
             solved view. Defaults to None.
         detector_gain (Tensor or ndarray, optional): [Rd, Cd] multiplicative per-pixel detector gain. Defaults to None
             (1).
+        polychromatic_primary (bool): the primary from the solver's polychromatic transmission instead of the
+            monoenergetic ``exp(-A X_true)``. Defaults to False.
 
     Returns:
         dict: numpy arrays (float32 unless noted) X_true [R, C, S] in 1/cm, angles [V] (float64), line_integrals, P,
@@ -1221,7 +1226,7 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
     # the open field: the number I0 (uniform emission, no gain), else the image of the solver's open-field signal
     V, Rd, Cd = len(angles), geometry.num_det_rows, geometry.num_det_channels
     open_field: Union[float, Tensor] = float(I0)
-    if solver.source.emission_profile is not None or detector_gain is not None:
+    if solver.source.emission_profile is not None or solver.source.has_filter or detector_gain is not None:
         per_view = solver.source.emission_profile.dim() == 3 if solver.source.emission_profile is not None else False
         view_angles_used = angles if per_view else angles[:1]
         relative = torch.stack([solver.open_field_signal(float(a), dtype=torch.float64) for a in view_angles_used])
@@ -1264,6 +1269,10 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
     phi_air = solver.primary_from_path_lengths(zero_path, [0], 0.0)["planar_fluence"].sum(0)
     del zero_path
 
+    if polychromatic_primary:  # the solver's transmission of each pixel, its open field divided out
+        for v in range(V):
+            P[v] = (open_field if not isinstance(open_field, Tensor) or open_field.dim() == 2 else open_field[v]) * (
+                solver_primary[v] / solver.open_field_signal(float(angles[v])).to(device, torch.float32))
     SPR = solver_scatter / solver_primary.clamp_min(torch.finfo(solver_primary.dtype).tiny)
     S = SPR * P
     Y_mean = P + S
@@ -1295,6 +1304,7 @@ def synthesize_cone_beam_data(densities, grid: Grid, geometry: ConeGeometry, ang
         "grid_response": getattr(solver.grid_response, "name", "grid"), "solver_dtype": str(solver.dtype),
         "open_field": "image" if isinstance(open_field, Tensor) else "number",
         "emission_profile": solver.source.emission_profile is not None, "detector_gain": detector_gain is not None,
+        "beam_filter": solver.source.has_filter, "polychromatic_primary": bool(polychromatic_primary),
         "mbirtorch_version": mbirtorch_version(), "torch_version": torch.__version__, "device": str(device),
         "seconds": {"total": time.perf_counter() - start_time, "mbirtorch_projection": projection_seconds,
                     "solver_total": solver_seconds,
@@ -1388,7 +1398,8 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
                             progress: Optional[Callable[[int, float], None]] = None,
                             geometry: Optional[ConeGeometry] = None, spectrum=None,
                             detector: Optional[DetectorResponse] = None, grid_response: Optional[GridResponse] = None,
-                            source: Optional[SourceModel] = None, detector_gain=None) -> dict:
+                            source: Optional[SourceModel] = None, detector_gain=None,
+                            polychromatic_primary: bool = False) -> dict:
     """Synthetic data of the WLAB phantom (``synthesize_cone_beam_data``), optionally written to disk.
 
     The phantom is placed on ``wlab_grid(delta_voxel)`` in the water and bone rows of the library of ``wlab_solver``;
@@ -1419,9 +1430,11 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
         detector (DetectorResponse, optional): detector response of the truth solver. Defaults to None (ideal
             counting).
         grid_response (GridResponse, optional): anti-scatter grid of the truth solver. Defaults to None (no grid).
-        source (SourceModel, optional): source model (emission profile) of the truth solver. Defaults to None
-            (uniform emission).
+        source (SourceModel, optional): source model (emission profile, field, beam filter) of the truth solver.
+            Defaults to None (uniform emission).
         detector_gain (Tensor or ndarray, optional): [Rd, Cd] per-pixel detector gain. Defaults to None (1).
+        polychromatic_primary (bool): the primary from the solver's polychromatic transmission
+            (``synthesize_cone_beam_data``). Defaults to False.
 
     Returns:
         dict: the data set, as returned by ``synthesize_cone_beam_data``.
@@ -1436,7 +1449,8 @@ def synthesize_wlab_dataset(num_views: int = 180, delta_voxel: float = 0.5, I0: 
     angles = view_angles(num_views, geometry, start_view_angle, end_view_angle)
     end = float(start_view_angle) + math.pi + fan_angle(geometry) if end_view_angle is None else float(end_view_angle)
     out = synthesize_cone_beam_data(phantom, grid, geometry, angles, solver, I0, noise, seed, energy_kev=energy_kev,
-                                    device=device, progress=progress, detector_gain=detector_gain)
+                                    device=device, progress=progress, detector_gain=detector_gain,
+                                    polychromatic_primary=polychromatic_primary)
     out["meta"].update(description="synthetic WLAB scatter dataset, citrus.utilities.synthesize_wlab_dataset",
                        delta_voxel=float(delta_voxel), start_view_angle=float(start_view_angle),
                        end_view_angle=end, short_scan=bool(end - float(start_view_angle) < 2.0 * math.pi - 1e-9))

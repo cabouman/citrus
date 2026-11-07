@@ -171,7 +171,8 @@ The entries of ``info``:
   ``scatter_seconds``, ``mbir_seconds`` (of all its MBIR iterations), ``total_seconds``,
   ``volume_change_relative`` (``|X_k - X_{k-1}| / |X_k|``),
   ``scatter_change_relative`` (from outer iteration 2 on: mean absolute change of the scatter-count estimate over its
-  mean absolute value), ``metal_measurement_fraction``, ``metal_voxels`` and ``metal_fill_scale`` (with
+  mean absolute value), ``hardening_offset_max`` (with ``hardening_materials``: the largest offset
+  ``|ln(P / P_ref)|``), ``metal_measurement_fraction``, ``metal_voxels`` and ``metal_fill_scale`` (with
   ``metal_attenuation_threshold``: the share of measurements left out, the size of the metal set and the scale of its
   fill) and, on CUDA, ``gpu_peak_allocated_mib``; a record with a scatter stage also holds
   ``negative_fraction`` (voxels clamped by the density model), ``accumulator_change_mean`` /
@@ -190,7 +191,9 @@ The entries of ``info``:
 * ``grouping_object_size_cm``, ``grouping_medium`` (the object size and medium of the solver's energy groups, None
   when its group rule is not ``"scattered_fluence"``), ``grouping_applied`` (whether ``citrus_recon`` set them;
   False for a prebuilt library) and ``library_seconds`` (time to build or load a lazy solver's library);
-* ``emission_profile``: the source's emission profile derived from an open-field image (None for a number).
+* ``emission_profile``: the source's emission profile derived from an open-field image (None for a number);
+* ``scatter_scene_slices``: the slices the scatter scene adds below and above the grid (``extend_scatter_scene``, else
+  None) and ``water_linearization``: the per-pixel map of ``beam_hardening_correction`` (else None).
 
 ``mbir_recon`` returns the same entries without those of the scatter solver.
 
@@ -206,6 +209,25 @@ gain from the emission:
    recon, info = citrus_recon(Y, open_field, angles, grid, geometry, solver, config, detector_gain=gain)
    info["emission_profile"]                     # [rows, channels], mean 1
    baseline, _ = mbir_recon(Y, open_field, angles, grid, geometry, config)   # the same normalization, no correction
+
+The source of the solver can open the field past the panel's edges, emit off-focal radiation past the field edge and
+carry a beam filter whose thickness per pixel hardens the spectrum per direction (:doc:`method`, "Source emission
+profile and open field"). With the filter in the source, the profile derived from the open field holds only what the
+filter does not explain; the loop can also extend the scatter scene past the reconstructed slab and correct the beam
+hardening (:doc:`method`, "Scatter scene beyond the reconstructed slab" and "Beam hardening"):
+
+.. code-block:: python
+
+   from citrus.scatter_solver import SourceModel, filter_thickness_from_transmission
+
+   thickness = filter_thickness_from_transmission(flood_with / flood_without, solver, "aluminium")  # [rows, channels]
+   solver.source = SourceModel(field_margin_channels_cm=4.0, field_margin_rows_cm=2.0,
+                               off_focal_distance_cm=distances, off_focal_fraction=fractions,
+                               filter_material="aluminium", filter_thickness_cm=thickness)
+   config = CitrusConfig(extend_scatter_scene=True, beam_hardening_correction=True,
+                         hardening_materials=("bone_cortical_icrp",))
+   recon, info = citrus_recon(Y, open_field, angles, grid, geometry, solver, config)
+   info["scatter_scene_slices"], info["water_linearization"]    # (slices below, above), the per-pixel map
 
 The iteration counts and the view schedule (:doc:`method`, "MBIR iterations per outer iteration" and "Scatter step
 on every m-th view"):
@@ -249,8 +271,9 @@ rounding), ``primary_views_per_chunk`` (views per chunk of the primary projectio
 lengths), ``gpu_state_budget_mib`` and ``pinned_memory_limit_gib`` (where the per-view accumulators are stored),
 ``mbir_subsets_per_iteration`` (subsets of pixel columns that an MBIR iteration updates in turn; ``"auto"`` scales
 them with the in-plane size of the volume, :doc:`method`, "Subsets per MBIR iteration"), ``energy_kev``,
-``min_counts``, ``base_seed``, ``verbose``, and ``metal_attenuation_threshold`` (the metal mask, :doc:`method`,
-"Metal").
+``min_counts``, ``base_seed``, ``verbose``, ``metal_attenuation_threshold`` (the metal mask, :doc:`method`,
+"Metal"), ``extend_scatter_scene`` (:doc:`method`, "Scatter scene beyond the reconstructed slab") and
+``beam_hardening_correction`` and ``hardening_materials`` (:doc:`method`, "Beam hardening").
 
 A curved (cylindrical) panel and helical views are part of the geometry, so the same calls reconstruct them
 (:doc:`method`, "Curved panels and helical scans"; :doc:`conventions`, "Frames"):
@@ -352,6 +375,18 @@ descriptions. The first setting of each group names the group.
    * - ``metal_attenuation_threshold``
      - ``None``
      - attenuation in 1/cm above which a voxel is metal; the measurements whose rays cross metal get zero weight
+   * - ``extend_scatter_scene``
+     - ``False``
+     - extend the scatter solver's scene along z over the irradiated field, each column repeated past its last voxel
+       every view measures whole (not for helical scans)
+   * - ``beam_hardening_correction``
+     - ``False``
+     - map the corrected line integrals per pixel to water's monoenergetic line integrals with the solver's primary
+       model (spectrum, beam filter, detector and grid)
+   * - ``hardening_materials``
+     - ``()``
+     - library materials whose hardening beyond water is removed with the offset ln(P / P_ref) of the current volume
+       before the water linearization
    * - ``grouping_object_size``
      - ``"auto"``
      - object size in cm of the solver's scattered-fluence groups; auto measures the initial volume (escape

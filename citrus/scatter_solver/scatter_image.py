@@ -1392,12 +1392,37 @@ def primary_path_lengths(projectors: Projectors, rho: Tensor, grid: Grid, geomet
     return projectors.primary_project(rho, grid, subpixel_geometry, angle)
 
 
+def _primary_filter_path(source: SourceModel, geometry: ConeGeometry, angle: float, n: int, device,
+                         dtype: torch.dtype) -> Optional[Tensor]:
+    """Path through the source's beam filter of the primary rays to the n x n sub-pixels of every pixel.
+
+    Args:
+        source (SourceModel): source model.
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
+        angle (float): view angle in radians.
+        n (int): sub-pixel samples per axis.
+        device (torch.device): device of the result.
+        dtype (torch.dtype): dtype of the result.
+
+    Returns:
+        Tensor or None: [Rd n, Cd n] path in g/cm^2, None without a filter.
+    """
+    if not source.has_filter:
+        return None
+    points = primary_subpixel_geometry(geometry, n).pixel_centers(angle, device, dtype)  # [Rd n, Cd n, 3]
+    if geometry.is_parallel:
+        return source.beam_filter_path(points, geometry, angle)
+    r0 = device_tensor(geometry.source_position(angle), device, dtype)
+    return source.filter_path(points - r0, geometry, angle)
+
+
 def primary_from_path_lengths(library: MultigroupLibrary, path: Tensor, materials: Optional[Sequence[int]],
                               geometry: ConeGeometry, angle: float, source: SourceModel, detector: DetectorResponse,
                               grid_response: GridResponse) -> dict[str, Tensor]:
     """Primary image of one view from its per-material density line integrals, exact in energy.
 
-    The fine-energy transmission is averaged over the n x n sub-pixels of every pixel; the inverse-square and
+    The fine-energy transmission, with the path through the source's beam filter if it has one, is averaged over the
+    n x n sub-pixels of every pixel; the inverse-square and
     collimation factors (the beam weight of a parallel beam) and the responses are evaluated at the pixel centers
     (docs/source/method.rst, "The primary").
 
@@ -1420,7 +1445,9 @@ def primary_from_path_lengths(library: MultigroupLibrary, path: Tensor, material
     n = int(path.shape[1]) // Rd if path.dim() == 3 else 0
     if n < 1 or tuple(path.shape[1:]) != (Rd * n, Cd * n):
         raise ValueError(f"path must be [M', {Rd} n, {Cd} n] (n >= 1 sub-pixels per axis), got {tuple(path.shape)}")
-    transmission = group_transmission(library, path, materials=materials)  # [G, Rd n, Cd n]
+    transmission = group_transmission(library, path, materials=materials,  # [G, Rd n, Cd n]
+                                      filter_path=_primary_filter_path(source, geometry, angle, n, device, dtype),
+                                      filter_attenuation=source.filter_attenuation(library, device, dtype))
     if n > 1:
         transmission = transmission.reshape(-1, Rd, n, Cd, n).mean(dim=(2, 4))
     pixels = geometry.pixel_centers(angle, device, dtype)
