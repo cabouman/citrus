@@ -785,60 +785,6 @@ def couch_attenuation(case_dir: str, name: str, shape: tuple[int, int], voxel_cm
     return mu, outer | inner
 
 
-def couch_line_integrals(couch_per_cm: np.ndarray, voxel_cm: float, num_slices: int, geometry: ConeGeometry,
-                         angles: np.ndarray, device="cuda") -> np.ndarray:
-    """The couch's line integrals on every ray, with the couch extended along z over the grid.
-
-    Args:
-        couch_per_cm (ndarray): [rows, cols] couch attenuation in 1/cm on a grid wide enough for the whole couch.
-        voxel_cm (float): voxel size in cm.
-        num_slices (int): slices of the projected volume (longer than the panel's z coverage).
-        geometry (ConeGeometry): scan geometry.
-        angles (ndarray): [V] view angles in rad.
-        device (str): device of the projector. Defaults to "cuda".
-
-    Returns:
-        ndarray: [V, Rd, Cd] float32 line integrals.
-    """
-    import torch
-
-    from citrus.recon.mbir_bridge import forward_project, make_cone_model
-
-    grid = Grid(shape=(couch_per_cm.shape[0], couch_per_cm.shape[1], int(num_slices)), delta_voxel=voxel_cm)
-    model = make_cone_model(grid, geometry, angles, device=device)
-    volume = torch.as_tensor(np.ascontiguousarray(np.broadcast_to(couch_per_cm[:, :, None], grid.shape)),
-                             device=device)
-    p = forward_project(model, volume)
-    out = (p.cpu().numpy() if torch.is_tensor(p) else np.asarray(p)).astype(np.float32)
-    del model, volume, p
-    return out
-
-
-def insert_couch(solver, couch_per_cm: np.ndarray, couch_mask: np.ndarray) -> None:
-    """Put the couch model into the scatter solver's scene in place of the volume there.
-
-    The solver's ``material_fields_from_attenuation`` is wrapped: the couch's voxels of every axial plane of the
-    volume it receives (same rows and columns as the couch map) take the couch's attenuation.
-
-    Args:
-        solver (ScatterSolver): the scatter solver.
-        couch_per_cm (ndarray): [rows, cols] couch attenuation in 1/cm on the loop grid's axial plane.
-        couch_mask (ndarray): [rows, cols] bool mask of the couch.
-    """
-    import torch
-
-    original = solver.material_fields_from_attenuation
-    mu = torch.as_tensor(couch_per_cm, device=solver.device)[:, :, None]
-    mask = torch.as_tensor(couch_mask, device=solver.device)[:, :, None]
-
-    def with_couch(X, grid, *args, **kwargs):
-        if tuple(X.shape[:2]) == tuple(mask.shape[:2]):
-            X = torch.where(mask, mu.to(X.dtype).expand_as(X), X)
-        return original(X, grid, *args, **kwargs)
-
-    solver.material_fields_from_attenuation = with_couch
-
-
 # ======================================================================================================================
 # Initial volume and resampling
 # ======================================================================================================================

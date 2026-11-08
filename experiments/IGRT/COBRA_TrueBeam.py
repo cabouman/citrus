@@ -6,22 +6,26 @@ if needed, and the parameters read from its metadata, (3) the preprocessing of t
 
     python COBRA_TrueBeam.py
 
-It needs a CUDA GPU with about 12 GB and about 16 GB of RAM; a case is about 1.3 GB on disk.
+It needs a CUDA GPU with 12 GB and about 25 GB of free RAM; a case is about 1.25 GB on disk.
 """
 
 import os
+import time
+
+# the allocator settings of the runs, before torch starts CUDA
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0.7,max_split_size_mb:256")
 
 import numpy as np
 import torch
 
 from cobra_tools import (CobraScan, blade_field_margin_cm, bowtie_transmission, citrus_to_lps, comparison_figure,
-                         couch_attenuation, couch_line_integrals, download_case, half_fan_weights, initial_volume,
-                         insert_couch, load_scan, read_case_info, read_volume, write_volume)
+                         couch_attenuation, download_case, half_fan_weights, initial_volume, load_scan, read_case_info,
+                         read_volume, write_volume)
 
 from citrus import CitrusConfig, Schedule, citrus_recon
 from citrus.recon.mbir_bridge import make_cone_model
-from citrus.scatter_solver import (Grid, ScatterSolver, SolverConfig, anti_scatter_grid, detector_response,
-                                   load_spectrum_txt)
+from citrus.scatter_solver import (Grid, ScatterSolver, SolverConfig, SourceModel, anti_scatter_grid,
+                                   detector_response, filter_thickness_from_transmission, load_spectrum_txt)
 from citrus.utilities import effective_energy, mass_attenuation_at
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -81,6 +85,9 @@ WEIGHT_CAP = 1e-6                      # cap on the MBIR weights Y / I0 (every r
 OUTER_ITERATIONS, MBIR_ITERATIONS_PER_OUTER = 14, 8
 HARDENING_MATERIALS = ("bone_cortical_icrp",)   # beam hardening beyond water's, corrected in the loop
 DEVICE = "cuda"
+# share of the GPU's memory PyTorch may hold: with a cap its allocator frees cached blocks before it reaches it
+# (garbage_collection_threshold above), without one Windows spills into host memory
+GPU_MEMORY_FRACTION = 0.9
 RECONSTRUCT = True                     # False: only the figure, from the saved reconstruction
 OUTPUT = os.path.join(HERE, "results", CASE)
 
@@ -100,77 +107,72 @@ if RECONSTRUCT:
     # ==================================================================================================================
     # 3. Preprocessing
     # ==================================================================================================================
+    start = time.time()
+    torch.cuda.set_per_process_memory_fraction(GPU_MEMORY_FRACTION)
     scan: CobraScan = load_scan(info, ROW_BIN, CHANNEL_BIN, VIEW_STRIDE, drift=DRIFT)
     geometry = scan.geometry
     print(f"[{CASE}] {len(scan.angles)} views of {scan.counts.shape[1]} x {scan.counts.shape[2]} pixels, "
           f"{'half' if scan.half_fan else 'full'} fan", flush=True)
-    # MBIR weights: the half-fan overlap's redundancy weights, 0 on dead pixels
-    measurement_weights = np.broadcast_to(half_fan_weights(geometry), scan.counts.shape).astype(np.float32)
+    # MBIR weights: the half-fan overlap's redundancy weights per channel, 0 on dead pixels
+    measurement_weights = half_fan_weights(geometry)
     if scan.dead is not None:
         measurement_weights = measurement_weights * ~scan.dead
     # the bowtie's transmission per channel from the scan's own air pair, its thinnest part included
     bowtie, bowtie_source = bowtie_transmission(case_dir, CHANNEL_BIN)
     print(f"[{CASE}] bowtie transmission from {bowtie_source}: {bowtie.min():.3f} to {bowtie.max():.3f}", flush=True)
     field_margin_rows_cm = blade_field_margin_cm(info, geometry)   # the axial blades open past the panel's rows
-    # the volume
+    # the volume: at least GRID_WIDTH_CM and the reference volume wide
     width_cm = max(GRID_WIDTH_CM, ct.shape[2] * spacing[0] / 10.0, ct.shape[1] * spacing[1] / 10.0)
     n_xy = int(round(width_cm / VOXEL_CM))
     grid = Grid(shape=(n_xy, n_xy, int(round(GRID_LENGTH_CM / VOXEL_CM))), delta_voxel=VOXEL_CM)
-    # the couch: its model in the scatter scene (section 4), its line integrals removed from the counts
-    couch = dict(case_dir=case_dir, name=info.couch_top, voxel_cm=VOXEL_CM, top_mm=CASES[CASE]["couch_top_mm"],
-                 lateral_mm=info.couch_lateral_mm, shell_per_cm=COUCH_SHELL_PER_CM,
-                 interior_per_cm=COUCH_INTERIOR_PER_CM)
-    couch_per_cm, couch_mask = couch_attenuation(shape=grid.shape[:2], **couch)
-    n_couch = int(np.ceil(60.0 / VOXEL_CM / 2)) * 2   # a grid wide enough for the whole couch, 1.5 x as long
-    wide_couch, _ = couch_attenuation(shape=(n_couch, n_couch), **couch)
-    couch_paths = couch_line_integrals(wide_couch, VOXEL_CM, int(round(grid.shape[2] * 1.5)), geometry, scan.angles,
-                                       DEVICE)
-    counts = scan.counts * np.exp(couch_paths)   # -ln(counts / I0) loses the couch's line integrals
-    del couch_paths
-    torch.cuda.empty_cache()
+    # the couch, a known object: in the scatter scene and the modelled primary, its line integrals removed from the
+    # corrected data
+    couch_per_cm, couch_mask = couch_attenuation(case_dir, info.couch_top, grid.shape[:2], VOXEL_CM,
+                                                 CASES[CASE]["couch_top_mm"], info.couch_lateral_mm,
+                                                 COUCH_SHELL_PER_CM, COUCH_INTERIOR_PER_CM)
+    if couch_mask[[0, -1]].any() or couch_mask[:, [0, -1]].any():
+        raise ValueError("the couch reaches the edge of the volume: widen GRID_WIDTH_CM")
+    couch = np.ascontiguousarray(np.broadcast_to(couch_per_cm[:, :, None], grid.shape), dtype=np.float32)
 
     # ==================================================================================================================
     # 4. Reconstruction
     # ==================================================================================================================
-    default = SolverConfig()
+    detector = detector_response("cesium_iodide", info.scintillator_cm, deposition="fluorescence_escape")
+    septa_along = "channels" if "transaxial" in info.grid_orientation.lower() else "rows"
+    grid_response = anti_scatter_grid(geometry, GRID_SEPTUM_THICKNESS_CM, ratio=info.grid_ratio,
+                                      lines_per_cm=GRID_LINES_PER_CM, interspace_material="air", detector=detector,
+                                      septa_along=septa_along)
     solver_config = SolverConfig(grouping_object_size_cm=GROUPING_OBJECT_SIZE_CM,
                                  quadrature_point_spacing_cm=QUADRATURE_POINT_SPACING_CM,
-                                 cone_num_polar=CONE_POLAR_FACTOR * default.cone_num_polar)
-    # TODO(release API): SolverConfig(group_averaged_responses=True)
-    septa_along = "channels" if "transaxial" in info.grid_orientation.lower() else "rows"
-    grid_response = anti_scatter_grid(geometry, GRID_SEPTUM_THICKNESS_CM,
-                                      info.grid_ratio * (1.0 / GRID_LINES_PER_CM - GRID_SEPTUM_THICKNESS_CM),
-                                      septum_material="lead", pitch_cm=1.0 / GRID_LINES_PER_CM, septa_along=septa_along)
-    # TODO(release API): the analytic grid model is the release's default of anti_scatter_grid; confirm the
-    # interspace (air) and whether the detector takes deposition="fluorescence_escape"
-    solver = ScatterSolver(None, solver_config, geometry,
-                           detector=detector_response("cesium_iodide", info.scintillator_cm, mode="energy_integrating"),
-                           grid_response=grid_response, spectrum=load_spectrum_txt(SPECTRUM_FILE), device=DEVICE)
-    # TODO(release API): the source model with the field past the panel rows and the bowtie as a beam filter:
-    #   thickness = filter_thickness_from_transmission(bowtie, solver, "aluminium")
-    #   solver.source = SourceModel(field_margin_rows_cm=field_margin_rows_cm, filter_material="aluminium",
-    #                               filter_thickness_cm=thickness)
-    # and check that citrus_recon keeps these fields when it sets the emission profile from the flat field.
-    insert_couch(solver, couch_per_cm, couch_mask)
+                                 cone_num_polar=CONE_POLAR_FACTOR * SolverConfig().cone_num_polar,
+                                 group_averaged_responses=True)
+    solver = ScatterSolver(None, solver_config, geometry, detector=detector, grid_response=grid_response,
+                           spectrum=load_spectrum_txt(SPECTRUM_FILE), device=DEVICE)
+    # the source: the bowtie as an aluminium beam filter, its thickness per channel from the measured transmission
+    thickness = filter_thickness_from_transmission(bowtie, solver, "aluminium")
+    print(f"[{CASE}] bowtie: {10 * float(thickness.min()):.2f} to {10 * float(thickness.max()):.2f} mm Al", flush=True)
+    solver.source = SourceModel(field_margin_rows_cm=field_margin_rows_cm, filter_material="aluminium",
+                                filter_thickness_cm=thickness)
     model = make_cone_model(grid, geometry, scan.angles, device=DEVICE)
     initial = initial_volume(scan, model, grid, DEVICE)
     config = CitrusConfig(scatter_view_stride=SCATTER_VIEW_STRIDE, grouping_object_size=GROUPING_OBJECT_SIZE_CM,
-                          verbose=True)
-    # TODO(release API): pass the IGRT inputs to the loop, names to be confirmed:
-    #   measurement_weights=measurement_weights, the cap WEIGHT_CAP on the MBIR weights Y / I0,
-    #   scatter_scene_support_hu=SCATTER_SCENE_SUPPORT_HU,
-    #   scatter_scene_support_margin_cm=SCATTER_SCENE_SUPPORT_MARGIN_CM,
-    #   air_threshold_hu=AIR_THRESHOLD_HU, beam_hardening_correction (water linearization with the bowtie per channel),
-    #   the hardening materials HARDENING_MATERIALS, and the scatter scene continued past the slab (edge slices).
+                          extend_scatter_scene=True, beam_hardening_correction=True,
+                          hardening_materials=HARDENING_MATERIALS, measurement_weights=measurement_weights,
+                          max_measurement_weight=WEIGHT_CAP, scatter_scene_support_hu=SCATTER_SCENE_SUPPORT_HU,
+                          scatter_scene_support_margin_cm=SCATTER_SCENE_SUPPORT_MARGIN_CM,
+                          air_threshold_hu=AIR_THRESHOLD_HU, known_objects=couch, verbose=True)
     schedule = Schedule(num_outer_iterations=OUTER_ITERATIONS,
                         mbir_iterations_per_outer_iteration=MBIR_ITERATIONS_PER_OUTER)
-    X, loop_info = citrus_recon(counts, scan.flat_field, scan.angles, grid, geometry, solver, config,
+    X, loop_info = citrus_recon(scan.counts, scan.flat_field, scan.angles, grid, geometry, solver, config,
                                 schedule=schedule, init_recon=initial, model=model)
     library = solver.library
-    mu_water = float(mass_attenuation_at(library, effective_energy(library))[library.materials.index("water")])
+    water = library.materials.index("water")
+    mu_water = float(mass_attenuation_at(library, effective_energy(library))[water] * library.nominal_density[water])
     recon_hu = 1000.0 * (citrus_to_lps(X.cpu().numpy(), grid, ct.shape, origin, spacing) - mu_water) / mu_water
     write_volume(recon_hu, origin, spacing, recon_path)
-    print(f"[{CASE}] saved {recon_path}", flush=True)
+    peak = max([r.get("gpu_peak_allocated_mib", 0.0) for r in loop_info["records"]] + [0.0]) / 1024
+    print(f"[{CASE}] saved {recon_path}: {time.time() - start:.0f} s, GPU peak {peak:.1f} GB, "
+          f"scatter-to-primary ratio mean {float(loop_info['spr'].mean()):.3f}", flush=True)
 
 # ======================================================================================================================
 # 5. Figure
