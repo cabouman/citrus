@@ -720,17 +720,37 @@ Scatter scene beyond the reconstructed slab
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The solver sees the reconstructed volume only, but the body continues past the slab the cone measures, and the field
-past the panel's rows (margins, off-focal emission) irradiates more of it; its scatter reaches the panel. With
-``CitrusConfig.extend_scatter_scene`` the solver's scene is the reconstruction grid extended along z by whole slices
-until it covers the field of the source through the grid's in-plane box at every view (``ScatterScene``), and every
-column of voxels is continued past its last voxel that every view measures whole, by repeating that voxel. A voxel
-:math:`[z_a, z_b]` of a column whose points lie at most :math:`r` from the axis projects at every view within
-:math:`v = \mathrm{SDD}\,z / (\mathrm{SID} - y_v)`, :math:`|y_v| \le r`, so it is measured whole when that range lies
-within the panel's rows (:math:`v = z` for a parallel beam). The rule is geometric: the voxels near the slab's ends
-are incomplete in a circular cone beam and unreliable, and the scene replaces them by the nearest complete voxel of
-their column; the reconstruction and the primary keep the reconstruction grid. The transport grid covers the scene,
-so the cost grows with its slices. The option does not apply to a helical scan, whose grid must already hold the
-whole object the helix illuminates.
+past the panel's rows (margins, off-focal emission) irradiates more of it; its scatter reaches the panel. A grid longer
+than the measured slab holds that region, but the reconstruction there is incomplete. With
+``CitrusConfig.extend_scatter_scene`` the solver's scene continues the body along z within the grid
+(``extend_scene_slices``): a slice is filled when its fraction of voxels above half of water's attenuation is at least
+0.8 of the median fraction over the central 5 cm, and every slice beyond the first and last filled slice, moved
+two slices inward, repeats that slice. The reconstruction is unchanged, and the grid must reach as far along z as
+the scene should.
+
+What the scatter solver sees
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A reconstruction holds noise, streaks and a faint haze in the air around the object. The scatter solver would treat
+them as matter that scatters, so two settings clear them from the volume it sees, while the reconstruction keeps them.
+``CitrusConfig.air_threshold_hu`` sets every voxel below that value to air at every scatter update.
+``scatter_scene_support_hu`` builds a support at every scatter update from the current volume without the known
+objects: that volume is smoothed by a Gaussian of 0.8 cm standard deviation and thresholded, the result is dilated by
+``scatter_scene_support_margin_cm`` along each axis, and it is cut to the field of view, the cylinder about the
+rotation axis that the widest ray reaches (``scatter_scene_support``, ``utilities.field_of_view_radius``). Outside
+the support the solver sees air. Its threshold sits well below soft tissue, so the object stays inside it while the
+haze is too faint to pass it. Outside the field of view the reconstruction is not determined by the data, and MBIR
+can leave a haze there that the solver would take for matter beside the object; an object wider than the field of
+view keeps its outer part with ``scatter_scene_beyond_field_of_view``. HU values are converted with water's
+attenuation at the density model's effective energy. The primary, which divides the scatter in the scatter-to-primary ratio, is
+that of the same volume, so the scatter and the primary describe one scene.
+
+Objects known in advance, such as the patient couch from its model, are given as an attenuation volume
+(``known_objects``). Where it is positive it replaces the volume in the scatter solver's scene and in the modelled
+primary, so the scatter and the scatter-to-primary ratio include them; their forward projection at the effective
+energy is removed from the corrected line integrals of every outer iteration, after the water linearization, so MBIR
+reconstructs only the rest. This suits an object that lies partly outside the field of view, which MBIR could not
+reconstruct.
 
 Beam hardening
 ~~~~~~~~~~~~~~

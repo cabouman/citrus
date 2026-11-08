@@ -58,6 +58,7 @@ __all__ = [
     "object_size_cm",
     "grouping_medium_estimate",
     "fan_angle",
+    "field_of_view_radius",
     "view_angles",
     "helical_scan",
     "synthesize_cone_beam_data",
@@ -1090,6 +1091,29 @@ def fan_angle(geometry: ConeGeometry) -> float:
     if geometry.use_curved_detector:
         return 2.0 * half / float(geometry.source_detector_dist)
     return 2.0 * math.atan(half / float(geometry.source_detector_dist))
+
+
+def field_of_view_radius(geometry: ConeGeometry) -> float:
+    """Radius in cm about the rotation axis of the in-plane field of view: the distance of the widest ray from the axis.
+
+    The widest ray passes the outer edge of the channel farthest from the central ray, offset included, so a half-fan
+    panel gives the radius of its long side.
+
+    Args:
+        geometry (ConeGeometry or ParallelGeometry): scan geometry.
+
+    Returns:
+        float: field-of-view radius in cm.
+    """
+    channels = int(geometry.num_det_channels)
+    pitch = float(geometry.delta_det_channel)
+    edges = (np.array([-0.5, channels - 0.5]) - 0.5 * (channels - 1)) * pitch - float(geometry.det_channel_offset)
+    u = float(np.abs(edges).max())
+    if geometry.is_parallel:
+        return u
+    sdd = float(geometry.source_detector_dist)
+    angle = u / sdd if geometry.use_curved_detector else math.atan(u / sdd)
+    return float(geometry.source_iso_dist) * math.sin(min(angle, 0.5 * math.pi))
 
 
 def view_angles(num_views: int, geometry: Optional[ConeGeometry] = None, start_view_angle: float = 0.0,

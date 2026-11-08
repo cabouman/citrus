@@ -1383,7 +1383,7 @@ def water_linearization(solver: ScatterSolver, energy_kev: Optional[float] = Non
     for thickness in nodes.tolist():
         path = torch.full((1, rows, channels), density * thickness, device=solver.device, dtype=solver.dtype)
         signals.append(primary_from_path_lengths(library, path, [water], solver.geometry, angle, source,
-                                                 solver.detector, solver.grid_response)["signal"].to(torch.float64))
+                                                 *solver.responses())["signal"].to(torch.float64))
     signal = torch.stack(signals, dim=-1).reshape(rows * channels, -1)  # [pixels, N]
     tiny = torch.finfo(torch.float64).tiny
     polychromatic = -torch.log(signal.clamp_min(tiny) / signal[:, :1].clamp_min(tiny))

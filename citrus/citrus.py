@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import asdict, dataclass, field, replace
-from typing import Callable, Literal, Optional, Sequence, Union
+from typing import Any, Callable, Literal, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -26,11 +26,10 @@ from .scatter_solver.cross_sections import MultigroupLibrary, material_index
 from .scatter_solver.geometry import ConeGeometry, Grid
 from .scatter_solver.scatter_solver import (MaterialFields, ScatterSolver, WaterLinearization,
                                             emission_profile_from_open_field, water_linearization)
-from .scatter_solver.source import SourceModel
 from .scatter_solver.source_iteration import source_iteration
 from .scatter_solver.uncollided import present_materials
-from .utilities import (attenuation_to_densities, attenuation_to_density, effective_energy, grouping_medium_estimate,
-                        mass_attenuation_at, object_mask, object_size_cm)
+from .utilities import (attenuation_to_densities, attenuation_to_density, effective_energy, field_of_view_radius,
+                        grouping_medium_estimate, mass_attenuation_at, object_mask, object_size_cm)
 
 __all__ = [
     "CitrusState",
@@ -43,7 +42,8 @@ __all__ = [
     "citrus_view_step",
     "primary_signals",
     "DensityModel",
-    "ScatterScene",
+    "extend_scene_slices",
+    "scatter_scene_support",
     "StateStore",
     "CitrusConfig",
     "Schedule",
@@ -563,123 +563,101 @@ class DensityModel:
 # the scatter solver's scene beyond the reconstructed slab
 # =====================================================================================================
 
-@dataclass(frozen=True, eq=False)
-class ScatterScene:
-    """The scatter solver's scene: the reconstruction grid extended along z over the whole irradiated field.
+def extend_scene_slices(X: Tensor, threshold: float, slice_cm: float, fill_fraction: float = 0.8,
+                        central_cm: float = 5.0, margin_slices: int = 2) -> tuple[Tensor, tuple[int, int]]:
+    """The volume with the slices past the body replaced by the last slice the body fills, at both ends.
 
-    Every column of voxels continues past its last voxel that every view measures whole, by repeating that voxel: a
-    voxel is measured whole when its z extent, at the column's largest distance from the axis, projects within the
-    panel's rows at every view. The scene's grid adds whole slices below and above the reconstruction grid until it
-    covers the field of the source (``SourceModel.field_half_extent``) through the grid's in-plane box at every view
-    (docs/source/method.rst, "Scatter scene beyond the reconstructed slab"). Helical scans are not supported: their
-    grid must already hold the whole object the helix illuminates.
-
-    Attributes:
-        grid (Grid): the scene's grid, the reconstruction grid with ``slices_below`` and ``slices_above`` more slices.
-        reconstruction_grid (Grid): the reconstruction grid.
-        slices_below (int): slices added below the reconstruction grid (toward -z).
-        slices_above (int): slices added above it.
-        first_complete (Tensor): [R, C] int64 first slice of each column that every view measures whole.
-        last_complete (Tensor): [R, C] int64 last such slice.
-    """
-
-    grid: Grid
-    reconstruction_grid: Grid
-    slices_below: int
-    slices_above: int
-    first_complete: Tensor
-    last_complete: Tensor
-
-    @classmethod
-    def of(cls, grid: Grid, geometry: ConeGeometry, source: SourceModel) -> "ScatterScene":
-        """The scene of a reconstruction grid for a scan and its source.
-
-        Args:
-            grid (Grid): reconstruction grid.
-            geometry (ConeGeometry or ParallelGeometry): geometry of a circular cone-beam or a parallel-beam scan.
-            source (SourceModel): the source, whose field (margins and off-focal reach) the scene covers.
-
-        Returns:
-            ScatterScene: the scene.
-        """
-        if geometry.is_helical:
-            raise ValueError("the scatter scene is not extended for a helical scan: its reconstruction grid must hold "
-                             "the whole object the helix illuminates")
-        R, C, S = grid.shape
-        dx, dy, dz = grid.deltas
-        half_v = geometry.panel_half_extent()[1]
-        rows_low, rows_high = -half_v - geometry.det_row_offset, half_v - geometry.det_row_offset
-        field_v = source.field_half_extent(geometry)[1]
-        field_low, field_high = -field_v - geometry.det_row_offset, field_v - geometry.det_row_offset
-        x = dx * (np.arange(C) - (C - 1) / 2.0)
-        y = dy * (np.arange(R) - (R - 1) / 2.0)
-        radius = np.hypot(np.abs(x)[None, :] + dx / 2.0, np.abs(y)[:, None] + dy / 2.0)  # [R, C] largest in a voxel
-        box_radius = math.hypot(C * dx / 2.0, R * dy / 2.0)
-        if geometry.is_parallel:  # a point projects to v = z
-            low = np.full((R, C), rows_low)
-            high = np.full((R, C), rows_high)
-            z_low, z_high = field_low, field_high
-        else:
-            sid, sdd = geometry.source_iso_dist, geometry.source_detector_dist
-            if not box_radius < sid:
-                raise ValueError(f"the grid's in-plane box (radius {box_radius:g} cm) reaches the focal spot")
-            # v = SDD z / (SID - y_v) with |y_v| <= r over the views: a voxel [z_a, z_b] of a column at distance r is
-            # measured whole when z_a >= low and z_b <= high
-            low = rows_low * np.where(rows_low < 0, sid - radius, sid + radius) / sdd
-            high = rows_high * np.where(rows_high > 0, sid - radius, sid + radius) / sdd
-            # the field reaches these z through the grid's in-plane box
-            z_low = field_low * ((sid + box_radius) if field_low < 0 else (sid - box_radius)) / sdd
-            z_high = field_high * ((sid + box_radius) if field_high > 0 else (sid - box_radius)) / sdd
-        z0 = grid.recon_slice_offset - dz * (S - 1) / 2.0  # centre of slice 0
-        first = np.ceil((low + dz / 2.0 - z0) / dz - 1e-9).astype(np.int64)
-        last = np.floor((high - dz / 2.0 - z0) / dz + 1e-9).astype(np.int64)
-        middle = np.rint(((low + high) / 2.0 - z0) / dz).astype(np.int64)
-        empty = (first > last) | (first > S - 1) | (last < 0)  # no voxel of the column is measured whole
-        first = np.where(empty, middle, first).clip(0, S - 1)
-        last = np.where(empty, middle, last).clip(0, S - 1)
-        grid_low, grid_high = z0 - dz / 2.0, z0 + dz * (S - 0.5)
-        below = max(0, int(math.ceil((grid_low - z_low) / dz - 1e-9)))
-        above = max(0, int(math.ceil((z_high - grid_high) / dz - 1e-9)))
-        scene_grid = replace(grid, shape=(R, C, S + below + above),
-                             recon_slice_offset=grid.recon_slice_offset + (above - below) * dz / 2.0)
-        return cls(grid=scene_grid, reconstruction_grid=grid, slices_below=below, slices_above=above,
-                   first_complete=torch.as_tensor(first), last_complete=torch.as_tensor(last))
-
-    def fill(self, X: Tensor) -> Tensor:
-        """The scene of a volume: each column repeated past its voxels that every view measures whole.
-
-        Args:
-            X (Tensor): [R, C, S] volume on the reconstruction grid.
-
-        Returns:
-            Tensor: [R, C, S'] volume on the scene's grid, in the dtype and on the device of ``X``.
-        """
-        if tuple(X.shape) != tuple(self.reconstruction_grid.shape):
-            raise ValueError(f"X must be {self.reconstruction_grid.shape}, got {tuple(X.shape)}")
-        first = self.first_complete.to(X.device)
-        last = self.last_complete.to(X.device)
-        out = torch.empty(self.grid.shape, device=X.device, dtype=X.dtype)
-        for k in range(self.grid.num_slices):
-            source_slice = torch.clamp(torch.full_like(first, k - self.slices_below), first, last)
-            out[:, :, k] = X.gather(2, source_slice[:, :, None])[:, :, 0]
-        return out
-
-
-def _primary_fields(fields: MaterialFields, X: Tensor, grid: Grid, density_model: DensityModel) -> MaterialFields:
-    """The fields of the scene with the fine maps of the reconstruction X instead, for ``primary_signals``.
+    A slice is filled when its fraction of voxels above ``threshold`` is at least ``fill_fraction`` of that fraction's
+    median over the central ``central_cm``; the slices beyond the first and last filled slice, moved ``margin_slices`` inward,
+    repeat that slice. The grid is unchanged: the scene extends within it, past the slab the cone measures well.
 
     Args:
-        fields (MaterialFields): fields of the scene.
-        X (Tensor): [R, C, S] attenuation on the reconstruction grid.
-        grid (Grid): reconstruction grid.
-        density_model (DensityModel): the density model.
+        X (Tensor): [R, C, S] attenuation in 1/cm of the scatter scene.
+        threshold (float): attenuation in 1/cm above which a voxel is part of the body.
+        slice_cm (float): slice pitch in cm.
+        fill_fraction (float, optional): fraction of the central fill a slice needs. Defaults to 0.8.
+        central_cm (float, optional): length in cm about the centre whose median fill is the reference (at least one
+            slice). Defaults to 5.0.
+        margin_slices (int, optional): slices the repeated slice lies inside the filled ones. Defaults to 2.
 
     Returns:
-        MaterialFields: fields whose fine maps are those of X on ``grid``.
+        (Tensor, (int, int)): the [R, C, S] volume and the first and last slice kept (the whole grid when no slice
+        is filled).
     """
-    present = tuple(m for m in range(fields.num_materials) if bool(density_model.material(X, m).ne(0).any()))
-    return replace(fields, grid_fine=grid, rho_fine=None, attenuation=X, fine_maps=None,
-                   fine_materials=present if present else (0,))
+    S = int(X.shape[2])
+    fill = (X > float(threshold)).to(X.dtype).mean((0, 1))
+    n = max(1, int(round(float(central_cm) / float(slice_cm))))  # the central slices
+    first = max(0, S // 2 - n // 2)
+    reference = fill[first: first + n].median()
+    filled = torch.nonzero(fill >= float(fill_fraction) * reference).ravel()
+    if not filled.numel() or not float(reference) > 0:
+        return X, (0, S - 1)
+    k0 = min(int(filled[0]) + int(margin_slices), S - 1)
+    k1 = max(int(filled[-1]) - int(margin_slices), k0)
+    out = torch.cat([X[:, :, k0:k0 + 1].expand(-1, -1, k0), X[:, :, k0:k1 + 1],
+                     X[:, :, k1:k1 + 1].expand(-1, -1, S - k1 - 1)], dim=2)
+    return out, (k0, k1)
+
+
+def scatter_scene_support(volume: Tensor, grid: Grid, threshold: float, margin_cm: float,
+                          smoothing_cm: float = 0.8, radius_cm: Optional[float] = None) -> Tensor:
+    """Support of the scatter scene: the voxels within a margin of where the smoothed volume exceeds a threshold.
+
+    The volume is smoothed by a Gaussian of ``smoothing_cm`` standard deviation, thresholded, and the result dilated by
+    ``margin_cm`` along each axis (a box), so that the object is kept while the streaks and the haze of the
+    reconstruction in the air around it are not. With ``radius_cm`` the support is also cut to the cylinder of that
+    radius about the rotation axis, the field of view.
+
+    Args:
+        volume (Tensor): [R, C, S] attenuation in 1/cm.
+        grid (Grid): grid of the volume.
+        threshold (float): attenuation in 1/cm above which the smoothed volume is part of the object.
+        margin_cm (float): dilation in cm along each axis.
+        smoothing_cm (float, optional): standard deviation in cm of the Gaussian smoothing. Defaults to 0.8.
+        radius_cm (float, optional): radius in cm of the cylinder the support is cut to. Defaults to None (no cut).
+
+    Returns:
+        Tensor: [R, C, S] bool support, on the device of ``volume``.
+    """
+    pitch = (grid.delta_voxel * grid.voxel_row_aspect, grid.delta_voxel, grid.delta_voxel * grid.voxel_slice_aspect)
+    X = volume.detach().to(torch.float32)[None, None]  # [1, 1, R, C, S]
+    for axis, d in enumerate(pitch):
+        sigma = float(smoothing_cm) / d
+        half = int(math.ceil(3.0 * sigma))
+        if half < 1:
+            continue
+        t = torch.arange(-half, half + 1, device=X.device, dtype=torch.float32)
+        kernel = torch.exp(-0.5 * (t / sigma) ** 2)
+        shape = [1, 1, 1, 1, 1]
+        shape[2 + axis] = kernel.numel()
+        padding = [0, 0, 0]
+        padding[axis] = half
+        X = torch.nn.functional.conv3d(X, (kernel / kernel.sum()).reshape(shape), padding=tuple(padding))
+    mask = (X > float(threshold)).to(torch.float32)
+    del X
+    reach = tuple(int(round(float(margin_cm) / d)) for d in pitch)
+    if any(reach):
+        mask = torch.nn.functional.max_pool3d(mask, kernel_size=tuple(2 * r + 1 for r in reach), stride=1,
+                                              padding=reach)
+    support = mask[0, 0] > 0.5
+    if radius_cm is not None:
+        R, C = support.shape[:2]
+        y = (torch.arange(R, device=support.device, dtype=torch.float32) - 0.5 * (R - 1)) * pitch[0]
+        x = (torch.arange(C, device=support.device, dtype=torch.float32) - 0.5 * (C - 1)) * pitch[1]
+        support &= ((y[:, None] ** 2 + x[None, :] ** 2) <= float(radius_cm) ** 2)[:, :, None]
+    return support
+
+
+def _water_attenuation(density_model: "DensityModel") -> float:
+    """Attenuation of water in 1/cm at the density model's effective energy; the library must hold water."""
+    library = density_model.library
+    water = material_index(library, "water")
+    return float(mass_attenuation_at(library, density_model.energy_kev)[water]) * float(library.nominal_density[water])
+
+
+def _attenuation_of_hu(hu: float, water: float) -> float:
+    """Attenuation in 1/cm of a value in HU, given water's attenuation (air at -1000 HU has none)."""
+    return water * (1.0 + float(hu) / 1000.0)
 
 
 # =====================================================================================================
@@ -868,9 +846,9 @@ class CitrusConfig:
             the scatter solver sees and of the returned volume are filled from the volume in which the metal was
             first found (usually the initial one), scaled to keep its total attenuation (``metal_fill``). None turns
             the metal mask off. Defaults to None.
-        extend_scatter_scene (bool): the scatter solver sees the volume extended along z over the whole irradiated
-            field, each column repeated past its last voxel that every view measures whole (``ScatterScene``); the
-            primary keeps the reconstruction grid. Not for helical scans. Defaults to False.
+        extend_scatter_scene (bool): the scatter solver sees the body continued along z within the grid: the slices
+            past the last slice the body fills (above half of water's attenuation) repeat that slice
+            (``extend_scene_slices``). Defaults to False.
         beam_hardening_correction (bool): map the corrected line integrals of every outer iteration, per pixel, from
             water's polychromatic line integral with the spectrum reaching that pixel (the source's beam filter, the
             detector and grid responses: ``scatter_solver.water_linearization``) to water's line integral at the
@@ -880,6 +858,30 @@ class CitrusConfig:
             polychromatic primary of the current volume and P_ref the same primary with the path of every listed
             material replaced by water of the same attenuation at the density model's effective energy, before the
             water linearization of ``beam_hardening_correction``. The library must hold water. Defaults to () (none).
+        measurement_weights (array or None): non-negative multipliers of the MBIR weights, [V, Rd, Cd] or broadcastable
+            to it ([Rd, Cd] or [Cd]), e.g. the redundancy taper of a half-fan scan's overlap; 0 leaves a measurement out
+            of the fit. They do not change the scatter estimate. Defaults to None (all 1).
+        max_measurement_weight (float or None): the MBIR weight of a measurement, its transmission Y / I0, is capped at
+            this value; a value below every transmission gives all measurements the same weight. Defaults to None (no
+            cap).
+        scatter_scene_support_hu (float or None): threshold in HU of the scatter scene's support, rebuilt at every
+            scatter update from the current volume without the known objects: the voxels within
+            ``scatter_scene_support_margin_cm`` of where that volume, smoothed by a Gaussian of 0.8 cm standard
+            deviation, exceeds the threshold, inside the field of view. Outside it the scatter solver sees air (the
+            reconstruction itself is not masked); the known objects are put in afterwards. None turns the support off.
+            Defaults to None.
+        scatter_scene_support_margin_cm (float): margin in cm by which the support of ``scatter_scene_support_hu``
+            extends past the thresholded region along each axis. Defaults to 2.0.
+        scatter_scene_beyond_field_of_view (bool): let the support of ``scatter_scene_support_hu`` reach past the
+            field of view (``utilities.field_of_view_radius``), for an object wider than it. Defaults to False.
+        air_threshold_hu (float or None): voxels below this value in HU are air (density 0) in the volume the scatter
+            solver sees at every scatter update; the reconstruction keeps them. None keeps every voxel. Defaults to
+            None.
+        known_objects (array or None): [R, C, S] attenuation in 1/cm on the reconstruction grid of objects known in
+            advance, such as the patient couch from its model. Where it is positive it replaces the volume in the
+            scatter solver's scene and in the modelled primary, and its forward projection is removed from the
+            corrected line integrals of every outer iteration (after ``beam_hardening_correction``), so that MBIR
+            reconstructs the rest. None adds nothing. Defaults to None.
     """
 
     num_outer_iterations: Optional[int] = None
@@ -900,6 +902,13 @@ class CitrusConfig:
     extend_scatter_scene: bool = False
     beam_hardening_correction: bool = False
     hardening_materials: Sequence[str] = ()
+    measurement_weights: Optional[Any] = None
+    max_measurement_weight: Optional[float] = None
+    scatter_scene_support_hu: Optional[float] = None
+    scatter_scene_support_margin_cm: float = 2.0
+    scatter_scene_beyond_field_of_view: bool = False
+    air_threshold_hu: Optional[float] = None
+    known_objects: Optional[Any] = None
 
     def validate(self) -> None:
         """Check the settings.
@@ -928,7 +937,8 @@ class CitrusConfig:
             raise ValueError(f"hardening_materials must be a sequence of material names, got {hardening!r}")
         if "water" in hardening:
             raise ValueError("hardening_materials: water is the reference of the hardening correction")
-        for name in ("resume_error_sinogram", "extend_scatter_scene", "beam_hardening_correction"):
+        for name in ("resume_error_sinogram", "extend_scatter_scene", "beam_hardening_correction",
+                     "scatter_scene_beyond_field_of_view"):
             if not isinstance(getattr(self, name), (bool, np.bool_)):
                 raise ValueError(f"{name} must be a bool, got {getattr(self, name)!r}")
         size = self.grouping_object_size
@@ -940,6 +950,29 @@ class CitrusConfig:
                                       or not isinstance(threshold, (int, float, np.floating, np.integer))
                                       or not float(threshold) > 0):
             raise ValueError(f"metal_attenuation_threshold must be None or a positive number (1/cm), got {threshold!r}")
+        for name in ("max_measurement_weight", "scatter_scene_support_hu", "air_threshold_hu"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float, np.floating,
+                                                                                          np.integer))
+                                      or not np.isfinite(float(value))):
+                raise ValueError(f"{name} must be None or a finite number, got {value!r}")
+        if self.max_measurement_weight is not None and not float(self.max_measurement_weight) > 0:
+            raise ValueError(f"max_measurement_weight must be > 0, got {self.max_measurement_weight!r}")
+        margin = self.scatter_scene_support_margin_cm
+        if isinstance(margin, bool) or not isinstance(margin, (int, float, np.floating, np.integer)) or not (
+                np.isfinite(float(margin)) and float(margin) >= 0):
+            raise ValueError(f"scatter_scene_support_margin_cm must be >= 0, got {margin!r}")
+        if self.known_objects is not None:
+            known = torch.as_tensor(self.known_objects)
+            if known.is_complex() or known.dim() != 3 or not bool(torch.isfinite(known.double()).all()) or bool(
+                    (known.double() < 0).any()):
+                raise ValueError("known_objects must be a finite non-negative [R, C, S] attenuation volume")
+        if self.measurement_weights is not None:
+            weights = torch.as_tensor(self.measurement_weights)
+            if weights.is_complex() or weights.dim() not in (1, 2, 3) or not bool(torch.isfinite(weights.double()).all()):
+                raise ValueError("measurement_weights must be a finite [V, Rd, Cd], [Rd, Cd] or [Cd] array")
+            if bool((weights.double() < 0).any()):
+                raise ValueError("measurement_weights must be non-negative")
 
 
 @dataclass
@@ -1474,6 +1507,15 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
     config.validate()
     schedule.validate()
     weights_of_counts = Y / I0
+    if config.max_measurement_weight is not None:
+        weights_of_counts = weights_of_counts.clamp_max(float(config.max_measurement_weight))
+    if config.measurement_weights is not None:
+        multipliers = torch.as_tensor(config.measurement_weights, device=Y.device, dtype=Y.dtype)
+        try:
+            weights_of_counts = weights_of_counts * multipliers.expand_as(Y)
+        except RuntimeError:
+            raise ValueError(f"measurement_weights {tuple(multipliers.shape)} do not broadcast to the measurements "
+                             f"{tuple(Y.shape)}") from None
     measured_line_integrals = -torch.log(Y.clamp_min(config.min_counts) / I0)
     if model is None:
         model = make_model(grid, geometry, angles, device=device)
@@ -1876,13 +1918,20 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
     library_seconds: list[float] = [0.0]
     # the water linearization of beam_hardening_correction, made with the density model
     linearization: list[Optional[WaterLinearization]] = [None]
-    # the scatter solver's scene: the reconstruction grid, or that grid extended over the irradiated field
-    scene = ScatterScene.of(grid, geometry, solver.source) if config.extend_scatter_scene else None
-    scene_grid = grid if scene is None else scene.grid
-    transport_grid = solver.transport_grid(scene_grid)
+    scene_slices: list[Optional[tuple[int, int]]] = [None]  # the slices extend_scatter_scene kept, last update
+    known: Optional[Tensor] = None  # the known objects and their line integrals, removed from the corrected data
+    known_line_integrals: Optional[Tensor] = None
+    if config.known_objects is not None:
+        known = torch.as_tensor(config.known_objects, device=device, dtype=torch.float32)
+        if tuple(known.shape) != tuple(grid.shape):
+            raise ValueError(f"known_objects must be on the reconstruction grid {tuple(grid.shape)}, got "
+                             f"{tuple(known.shape)}")
+    transport_grid = solver.transport_grid(grid)
     if model is None:
         model = make_model(grid, geometry, angle_array, device=device)
     projector = ViewChunkProjector(grid, geometry, angle_array, model=model, device=device)
+    if known is not None:
+        known_line_integrals = forward_project(model, known).to(device)
     full_shape = (solver.num_groups, (solver.L + 1) ** 2, 4) + tuple(transport_grid.shape)
     computed = scatter_view_indices(V, config.scatter_view_stride)
     sparse = len(computed) < V
@@ -1904,8 +1953,35 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
     last_scatter: list[Optional[Tensor]] = [None]
     last_ratio: list[Optional[Tensor]] = [None]  # the scatter-to-primary ratio of the last scatter update
 
+    # the radius the scatter scene's support is cut to (None: not cut)
+    support_radius = (None if config.scatter_scene_support_hu is None or config.scatter_scene_beyond_field_of_view
+                      else field_of_view_radius(geometry))
+
     def after_initialization(X: Tensor, info: dict) -> None:
         info.update(_apply_grouping_estimates(solver, X, grid, config))
+
+    def scene_volume(X: Tensor, density_model: DensityModel) -> Tensor:
+        """The volume the scatter solver sees: X with the air and the voxels outside the support set to 0, extended
+        past the body along z (extend_scatter_scene) and with the known objects in place. The support is rebuilt from
+        X without the known objects."""
+        water = _water_attenuation(density_model)
+        if config.air_threshold_hu is not None:
+            X = torch.where(X < _attenuation_of_hu(float(config.air_threshold_hu), water), torch.zeros_like(X), X)
+        if config.scatter_scene_support_hu is not None:
+            body = X if known is None else torch.where(known > 0, torch.zeros_like(X), X)
+            support = scatter_scene_support(body, grid, _attenuation_of_hu(float(config.scatter_scene_support_hu),
+                                                                           water),
+                                            float(config.scatter_scene_support_margin_cm), radius_cm=support_radius)
+            X = torch.where(support, body, torch.zeros_like(body))
+            del body, support
+        if config.extend_scatter_scene:
+            X, scene_slices[0] = extend_scene_slices(X, _attenuation_of_hu(-500.0, water),
+                                                     grid.delta_voxel * grid.voxel_slice_aspect)
+        return with_known_objects(X)
+
+    def with_known_objects(X: Tensor) -> Tensor:
+        """X with the known objects in place where they are."""
+        return X if known is None else torch.where(known > 0, known, X)
 
     def prepare() -> DensityModel:  # once the grouping is set: the library, the density model and the source
         if density_models[0] is None:
@@ -1934,7 +2010,9 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
         prepare()
         if hardening[0] is not None:  # the hardening of the listed materials beyond water
             line_integrals = line_integrals + hardening[0]
-        return line_integrals if linearization[0] is None else linearization[0](line_integrals)
+        if linearization[0] is not None:
+            line_integrals = linearization[0](line_integrals)
+        return line_integrals if known_line_integrals is None else line_integrals - known_line_integrals
 
     def scatter_stage(k: int, X: Tensor, record: dict) -> Optional[Tensor]:
         if not schedule.updates_scatter(k + 1):
@@ -1943,8 +2021,9 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
         transfer_seconds_before = state_store.transfer_seconds
         record["negative_fraction"] = density_model.negative_fraction(X)
         # shared by every view of this outer iteration; built material by material, no [M, R, C, S] volume
-        fields = solver.material_fields_from_attenuation(X if scene is None else scene.fill(X), scene_grid,
-                                                         density_model)
+        X_scene = scene_volume(X, density_model)
+        fields = solver.material_fields_from_attenuation(X_scene, grid, density_model)
+        del X_scene
         computed_scatter = torch.empty((len(computed), Rd, Cd), device=device, dtype=torch.float32)
         primary = torch.empty((V, Rd, Cd), device=device, dtype=torch.float32)
         changes, converged_sweeps = [], []
@@ -1972,13 +2051,12 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
         record["transfer_seconds"] = state_store.transfer_seconds - transfer_seconds_before
         _sync(device)
         t0 = time.perf_counter()
-        # every view, from the reconstruction grid
+        # every view, of the volume the scatter solver sees (the primary and the scatter of one scene)
         reference = torch.empty_like(primary) if config.hardening_materials else None
         reference_arguments = {} if reference is None else dict(
             reference=reference, energy_kev=density_model.energy_kev,
             reference_materials=[material_index(solver.library, m) for m in config.hardening_materials])
-        primary_signals(solver, fields if scene is None else _primary_fields(fields, X, grid, density_model),
-                        angle_array, projector, config.primary_views_per_chunk, out=primary, **reference_arguments)
+        primary_signals(solver, fields, angle_array, projector, config.primary_views_per_chunk, out=primary, **reference_arguments)
         if reference is not None:  # the hardening beyond water of the listed materials of the current volume
             hardening[0] = torch.log(primary.clamp_min(tiny) / reference.clamp_min(tiny))
             record["hardening_offset_max"] = float(hardening[0].abs().max())
@@ -2008,9 +2086,10 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
                               label="citrus", after_initialization=after_initialization,
                               mbir_callback=mbir_callback,
                               line_integral_correction=correct_line_integrals if (
-                                  config.beam_hardening_correction or config.hardening_materials) else None)
+                                  config.beam_hardening_correction or config.hardening_materials
+                                  or known is not None) else None)
         info["library_seconds"] = library_seconds[0]
-        info["scatter_scene_slices"] = None if scene is None else (scene.slices_below, scene.slices_above)
+        info["scatter_scene_slices"] = scene_slices[0]
         info["water_linearization"] = linearization[0]
         info["state"] = state_store.describe()
         info["computed_views"] = computed.copy()

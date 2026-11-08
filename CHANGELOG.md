@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.26.0 - 2026-11-08
+
+- **Analytic anti-scatter grid.** `anti_scatter_grid` builds an analytic model by default: the direct photons exactly
+  over the entry offset, and first-order scatter and fluorescence of the septa scored by the detector layer.
+  `model="septum_shadow"` keeps the earlier geometric model.
+- **Detector and grid responses.** `detector_response(deposition="fluorescence_escape")` subtracts the K x-rays that
+  escape the scintillator. `SolverConfig.group_averaged_responses` averages the detector and grid responses over each
+  energy group instead of taking them at one energy per group.
+- **Source field.** `SourceModel` takes field margins past the panel (`field_margin_channels_cm`,
+  `field_margin_rows_cm`), off-focal emission (`off_focal_distance_cm`, `off_focal_fraction`) and a beam filter per
+  direction (`filter_material`, `filter_thickness_cm`), which enters every transmission from the focal spot exactly
+  in energy. `filter_thickness_from_transmission` turns a measured bowtie transmission into a filter thickness.
+  `citrus_recon` keeps the user's source settings.
+- **Beam hardening.** `CitrusConfig.beam_hardening_correction` linearizes the corrected line integrals per pixel with
+  the solver's own primary model (`water_linearization`). `hardening_materials` adds, for each listed material, the
+  hardening beyond water's from the primary of the current volume.
+- **Scatter scene past the slab.** `CitrusConfig.extend_scatter_scene` fills the slices of the grid past the
+  well-filled body with the last filled slice, two slices inward (`extend_scene_slices`); `info["scatter_scene_slices"]`
+  gives the slices kept. The modelled primary is that of the scatter solver's scene.
+- **What the scatter solver sees.** `air_threshold_hu` sets voxels below it to air in the scatter scene.
+  `scatter_scene_support_hu` (with `scatter_scene_support_margin_cm`) rebuilds a support at every scatter update from
+  the current volume and cuts it to the field of view (`utilities.field_of_view_radius`);
+  `scatter_scene_beyond_field_of_view` lets it reach past. `known_objects` puts objects known in advance, such as the
+  couch, into the scene and the primary and removes their line integrals from the corrected data.
+- **MBIR weights.** `CitrusConfig.measurement_weights` multiplies the MBIR weights (a half-fan overlap taper, dead
+  pixels) and `max_measurement_weight` caps the weight Y / I0 of a measurement.
+- **Synthetic data.** `synthesize_cone_beam_data(..., polychromatic_primary=True)` gives a polychromatic primary.
+
 ## v0.25.0 - 2026-10-22
 
 - **Schedules.** A `Schedule` (`citrus_recon(..., schedule=)`, `mbir_recon(..., schedule=)`) holds the number of

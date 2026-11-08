@@ -192,8 +192,8 @@ The entries of ``info``:
   when its group rule is not ``"scattered_fluence"``), ``grouping_applied`` (whether ``citrus_recon`` set them;
   False for a prebuilt library) and ``library_seconds`` (time to build or load a lazy solver's library);
 * ``emission_profile``: the source's emission profile derived from an open-field image (None for a number);
-* ``scatter_scene_slices``: the slices the scatter scene adds below and above the grid (``extend_scatter_scene``, else
-  None) and ``water_linearization``: the per-pixel map of ``beam_hardening_correction`` (else None).
+* ``scatter_scene_slices``: the first and last slice the scatter scene kept at its last update, the others repeating
+  them (``extend_scatter_scene``, else None) and ``water_linearization``: the per-pixel map of ``beam_hardening_correction`` (else None).
 
 ``mbir_recon`` returns the same entries without those of the scatter solver.
 
@@ -227,7 +227,7 @@ hardening (:doc:`method`, "Scatter scene beyond the reconstructed slab" and "Bea
    config = CitrusConfig(extend_scatter_scene=True, beam_hardening_correction=True,
                          hardening_materials=("bone_cortical_icrp",))
    recon, info = citrus_recon(Y, open_field, angles, grid, geometry, solver, config)
-   info["scatter_scene_slices"], info["water_linearization"]    # (slices below, above), the per-pixel map
+   info["scatter_scene_slices"], info["water_linearization"]    # (first, last slice kept), the per-pixel map
 
 The iteration counts and the view schedule (:doc:`method`, "MBIR iterations per outer iteration" and "Scatter step
 on every m-th view"):
@@ -273,7 +273,10 @@ lengths), ``gpu_state_budget_mib`` and ``pinned_memory_limit_gib`` (where the pe
 them with the in-plane size of the volume, :doc:`method`, "Subsets per MBIR iteration"), ``energy_kev``,
 ``min_counts``, ``base_seed``, ``verbose``, ``metal_attenuation_threshold`` (the metal mask, :doc:`method`,
 "Metal"), ``extend_scatter_scene`` (:doc:`method`, "Scatter scene beyond the reconstructed slab") and
-``beam_hardening_correction`` and ``hardening_materials`` (:doc:`method`, "Beam hardening").
+``beam_hardening_correction`` and ``hardening_materials`` (:doc:`method`, "Beam hardening"),
+``measurement_weights`` and ``max_measurement_weight`` (the MBIR weights), ``scatter_scene_support_hu``,
+``scatter_scene_support_margin_cm``, ``scatter_scene_beyond_field_of_view``, ``air_threshold_hu`` and
+``known_objects`` (:doc:`method`, "What the scatter solver sees").
 
 A curved (cylindrical) panel and helical views are part of the geometry, so the same calls reconstruct them
 (:doc:`method`, "Curved panels and helical scans"; :doc:`conventions`, "Frames"):
@@ -377,8 +380,8 @@ descriptions. The first setting of each group names the group.
      - attenuation in 1/cm above which a voxel is metal; the measurements whose rays cross metal get zero weight
    * - ``extend_scatter_scene``
      - ``False``
-     - extend the scatter solver's scene along z over the irradiated field, each column repeated past its last voxel
-       every view measures whole (not for helical scans)
+     - continue the body along z in the scatter solver's scene: the slices past the last slice the body fills repeat
+       that slice
    * - ``beam_hardening_correction``
      - ``False``
      - map the corrected line integrals per pixel to water's monoenergetic line integrals with the solver's primary
@@ -387,6 +390,30 @@ descriptions. The first setting of each group names the group.
      - ``()``
      - library materials whose hardening beyond water is removed with the offset ln(P / P_ref) of the current volume
        before the water linearization
+   * - ``measurement_weights``
+     - ``None``
+     - non-negative multipliers of the MBIR weights, [V, Rd, Cd], [Rd, Cd] or [Cd] (e.g. a half-fan overlap taper);
+       0 leaves a measurement out of the fit
+   * - ``max_measurement_weight``
+     - ``None``
+     - cap on the MBIR weight Y / I0 of a measurement; a value below every transmission weights all equally
+   * - ``scatter_scene_support_hu``
+     - ``None``
+     - threshold in HU of the scatter scene's support, rebuilt at every scatter update from the current volume
+       (smoothed by 0.8 cm) and cut to the field of view; outside it the scatter solver sees air
+   * - ``scatter_scene_support_margin_cm``
+     - ``2.0``
+     - margin in cm by which that support extends past the thresholded region along each axis
+   * - ``scatter_scene_beyond_field_of_view``
+     - ``False``
+     - let that support reach past the field of view, for an object wider than it
+   * - ``air_threshold_hu``
+     - ``None``
+     - voxels below this value in HU are air in the volume the scatter solver sees
+   * - ``known_objects``
+     - ``None``
+     - [R, C, S] attenuation of objects known in advance (e.g. the couch): in the scatter scene and the primary, their
+       line integrals removed from the corrected data
    * - ``grouping_object_size``
      - ``"auto"``
      - object size in cm of the solver's scattered-fluence groups; auto measures the initial volume (escape

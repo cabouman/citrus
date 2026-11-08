@@ -1,6 +1,6 @@
 """The source's field past the panel edges, its off-focal emission and its beam filter (citrus/scatter_solver/source.py,
 the filter term of cross_sections.group_transmission and its Triton kernel, filter_thickness_from_transmission,
-water_linearization), the scatter scene beyond the reconstructed slab (citrus.citrus.ScatterScene) and the loop's
+water_linearization), the scatter scene beyond the reconstructed slab (citrus.citrus.extend_scene_slices) and the loop's
 options extend_scatter_scene and beam_hardening_correction.
 
 The end-to-end tests run CITRUS on small noise-free WLAB problems: data of an aluminium bowtie with a polychromatic
@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from conftest import SPECTRUM_125KVP
-from citrus.citrus import CitrusConfig, ScatterScene, citrus_recon, estimate_regularization, mbir_recon
+from citrus.citrus import CitrusConfig, citrus_recon, extend_scene_slices, estimate_regularization, mbir_recon
 from citrus.scatter_solver import (ParallelGeometry, ScatterSolver, SolverConfig, SourceModel,
                                    emission_profile_from_open_field, filter_thickness_from_transmission,
                                    focused_1d_grid, ideal_counting_response, monoenergetic_spectrum, no_grid,
@@ -292,40 +292,19 @@ def test_water_linearization(real_library, photon_data):
 
 # ---- the scatter scene beyond the slab ---------------------------------------------------------------------------
 
-def test_scatter_scene_covers_the_field_and_repeats_the_complete_voxels():
-    geometry = ConeGeometry(100.0, 150.0, 16, 38, 1.6, 1.6)
-    grid = Grid((10, 15, 12), 2.0)
-    source = SourceModel(field_margin_rows_cm=10.0)
-    scene = ScatterScene.of(grid, geometry, source)
-    R, C, S = grid.shape
-    assert scene.grid.shape[:2] == (R, C) and scene.grid.num_slices == S + scene.slices_below + scene.slices_above
-    # the field through the grid's box reaches past the scene's ends by less than a slice
-    half_v = source.field_half_extent(geometry)[1]
-    z_reach = half_v * (100.0 + math.hypot(15.0, 10.0)) / 150.0
-    top = scene.grid.recon_slice_offset + scene.grid.extent[2] / 2
-    assert top >= z_reach > top - 2.0 and scene.slices_below == scene.slices_above > 0
-    # every voxel measured whole: |z| * 150 / (100 - r) <= 12.8 at its column's largest distance r from the axis
-    z = np.arange(S) * 2.0 - 11.0
-    for i, j in ((0, 0), (4, 7), (2, 9)):
-        r = math.hypot(abs((j - 7) * 2.0) + 1.0, abs((i - 4.5) * 2.0) + 1.0)
-        whole = np.nonzero((np.abs(z) + 1.0) * 150.0 / (100.0 - r) <= 12.8 + 1e-9)[0]
-        assert (int(scene.first_complete[i, j]), int(scene.last_complete[i, j])) == (whole[0], whole[-1])
-    X = torch.arange(R * C * S, dtype=torch.float32).reshape(R, C, S)
-    filled = scene.fill(X)
-    k0, k1 = int(scene.first_complete[4, 7]), int(scene.last_complete[4, 7])
-    column = filled[4, 7]
-    b = scene.slices_below
-    assert torch.equal(column[b + k0:b + k1 + 1], X[4, 7, k0:k1 + 1])
-    assert bool((column[:b + k0] == X[4, 7, k0]).all()) and bool((column[b + k1:] == X[4, 7, k1]).all())
-    # without margins the scene still repeats the incomplete slices; a parallel beam measures every slice whole
-    plain = ScatterScene.of(grid, geometry, SourceModel())
-    assert plain.slices_below == plain.slices_above
-    parallel = ParallelGeometry.from_grid(grid, 50.0, 20, 2.0)
-    flat = ScatterScene.of(grid, parallel, SourceModel(field_margin_rows_cm=3.0))
-    assert (flat.slices_below, flat.slices_above) == (2, 2)
-    assert bool((flat.first_complete == 0).all()) and bool((flat.last_complete == S - 1).all())
-    with pytest.raises(ValueError, match="helical"):
-        ScatterScene.of(grid, geometry.with_helical_z_shifts([0.0, 1.0], [0.0, 1.0]), source)
+def test_scene_slices_repeat_the_last_filled_slice():
+    R, C, S = 6, 6, 50
+    X = torch.zeros(R, C, S)
+    X[1:5, 1:5, 10:41] = 0.2                     # the body fills slices 10..40
+    X[2:4, 2:4, 6:10] = 0.2                      # a thin end below it, under 0.8 of the central fill
+    X[..., 25] += 0.01                           # mark the slices: each is told apart by its value
+    X = X + torch.arange(S, dtype=torch.float32) * 1e-4
+    out, (k0, k1) = extend_scene_slices(X, 0.1, 0.125)
+    assert (k0, k1) == (12, 38)                  # the first and last filled slices, two slices inward
+    assert torch.equal(out[:, :, k0:k1 + 1], X[:, :, k0:k1 + 1])
+    assert bool((out[:, :, :k0] == X[:, :, k0:k0 + 1]).all()) and bool((out[:, :, k1:] == X[:, :, k1:k1 + 1]).all())
+    empty = torch.zeros(R, C, S)
+    assert extend_scene_slices(empty, 0.1, 0.125)[1] == (0, S - 1)
 
 
 # ---- end to end ------------------------------------------------------------------------------------------------
@@ -422,32 +401,36 @@ def test_bowtie_filter_end_to_end(real_library):
 
 @cuda
 def test_scatter_scene_end_to_end(real_library):
-    """Data of the 40 cm WLAB prism with the field opened 10 cm past the panel's rows, reconstructed on a 24 cm slab:
-    the scatter-to-primary ratio of CITRUS with the extended scatter scene is much closer to the truth."""
+    """Data of the 40 cm WLAB prism from an 8-row panel with the field opened 10 cm past its rows, reconstructed on a
+    40 cm grid whose end slices no ray measures: the scatter-to-primary ratio of CITRUS with those slices filled from
+    the last well-filled ones is much closer to the truth."""
     pytest.importorskip("mbirtorch")
     from citrus.recon.mbir_bridge import make_cone_model
     from citrus.utilities import synthesize_wlab_dataset, wlab_geometry, wlab_grid, wlab_solver
 
-    geometry = replace(wlab_geometry(), num_det_rows=16, num_det_channels=38, delta_det_row=1.6, delta_det_channel=1.6)
+    geometry = replace(wlab_geometry(), num_det_rows=8, num_det_channels=38, delta_det_row=1.6, delta_det_channel=1.6)
     config = SolverConfig(transport_cell_cm=2.0)
     source = SourceModel(field_margin_rows_cm=10.0)
     data = synthesize_wlab_dataset(16, 2.0, noise=False, library=real_library, geometry=geometry, config=config,
                                    source=source)
-    grid = replace(wlab_grid(2.0), shape=(10, 15, 12))
+    grid = replace(wlab_grid(2.0), shape=(10, 15, 20))
     model = make_cone_model(grid, geometry, data["angles"], device=DEVICE)
     Y = torch.as_tensor(data["Y"], device=DEVICE)
     regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=DEVICE) / 1e5),
                                              Y / 1e5)
     truth = torch.as_tensor(data["SPR"], device=DEVICE)
-    errors = {}
+    errors, slices = {}, {}
     for extend in (True, False):
         solver = wlab_solver(2.0, config=config, library=real_library, geometry=geometry, device=DEVICE,
                              source=source)
-        loop = CitrusConfig(mbir_iterations_per_outer_iteration=2, num_outer_iterations=5, extend_scatter_scene=extend)
+        loop = CitrusConfig(mbir_iterations_per_outer_iteration=2, num_outer_iterations=5, extend_scatter_scene=extend,
+                            scatter_scene_support_hu=-750.0)
         _, info = citrus_recon(data["Y"], 1e5, data["angles"], grid, geometry, solver, loop,
                                regularization=regularization, model=model)
-        assert info["scatter_scene_slices"] == ((3, 3) if extend else None)
+        slices[extend] = info["scatter_scene_slices"]
         errors[extend] = float((info["spr"] - truth).norm() / truth.norm())
+    k0, k1 = slices[True]
+    assert 0 < k0 < k1 < grid.shape[2] - 1, slices
     assert errors[True] < 0.6 * errors[False], errors
 
 

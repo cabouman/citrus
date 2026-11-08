@@ -110,10 +110,13 @@ a stated rule that reduces to the one-dimensional distance past a single edge, w
 corner carries little of the off-focal emission. The emission profile and the filter thickness are held at their
 edge values past the outermost pixels, the only values known there.
 
-**Scatter scene and beam hardening.** The scene beyond the slab uses a geometric rule (the voxels every view measures
-whole, per column) instead of a threshold on the volume, so it does not depend on the object or the noise; the
-columns near the axis keep more of the measured slab than the outer ones. The primary keeps the reconstruction grid,
-the operator MBIR fits. The water linearization is tabulated per pixel with the solver's own primary: the filter and
+**Scatter scene and beam hardening.** The scene beyond the slab repeats whole slices, the last ones the body fills,
+rather than each column's last voxel that every view measures whole: that voxel lies at the edge of the measured
+region, where the reconstruction changes from one outer iteration to the next, and repeating it over many slices
+fed those changes back into the scatter. The primary is that of the scatter solver's scene, so the
+scatter-to-primary ratio compares one volume with itself. The scene's support follows the current volume rather than
+the initial one: an FDK start has streaks above the threshold outside the field of view, and a support built from
+them kept the haze MBIR leaves there in the scene, beside the object, for the whole run. The water linearization is tabulated per pixel with the solver's own primary: the filter and
 the incidence angle both change the spectrum a pixel sees, and the table is the exact polychromatic model of the
 loop's primary. A material's hardening beyond water uses the primary of the current volume twice, as it is and with
 the material made of water, which reuses the projections of the scatter update. The PyTorch path evaluates the sum in blocks of at most :math:`2^{22}`
