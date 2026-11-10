@@ -524,20 +524,24 @@ def blade_field_margin_cm(info: CaseInfo, geometry: ConeGeometry) -> float:
 def drift_correction(frame: np.ndarray, k: int, drift: dict) -> np.ndarray:
     """One frame of counts with the panel's global drift removed.
 
-    The model is y = (1 + B (1 - e^{-k / tau_g})) x + A (1 - e^{-k / tau_o}) on every pixel, k the frame's index in
-    the acquisition (every frame counted); it is inverted for x.
+    The model is y = (1 + B (1 - e^{-k / tau_g}) + B_f (1 - e^{-k / tau_f})) x + A (1 - e^{-k / tau_o}) on every
+    pixel, k the frame's index in the acquisition (every frame counted); it is inverted for x. The fast gain term is
+    optional.
 
     Args:
         frame (ndarray): [rows, cols] counts y of the frame.
         k (int): frame index.
-        drift (dict): ``gain_buildup`` B, ``gain_time_constant_frames`` tau_g, ``offset_buildup_counts`` A and
-            ``offset_time_constant_frames`` tau_o.
+        drift (dict): ``gain_buildup`` B, ``gain_time_constant_frames`` tau_g, ``offset_buildup_counts`` A,
+            ``offset_time_constant_frames`` tau_o, and optionally ``fast_gain_buildup`` B_f and
+            ``fast_gain_time_constant_frames`` tau_f.
 
     Returns:
         ndarray: [rows, cols] counts x.
     """
     offset = drift["offset_buildup_counts"] * (1.0 - np.exp(-k / drift["offset_time_constant_frames"]))
     gain = 1.0 + drift["gain_buildup"] * (1.0 - np.exp(-k / drift["gain_time_constant_frames"]))
+    if drift.get("fast_gain_buildup", 0.0):
+        gain += drift["fast_gain_buildup"] * (1.0 - np.exp(-k / drift["fast_gain_time_constant_frames"]))
     return (frame - offset) / gain
 
 
@@ -882,6 +886,58 @@ def initial_volume(scan: CobraScan, model, grid: Grid, device="cuda"):
     else:
         X = fdk(model, p, geometry=scan.geometry, angles=scan.angles)
     return torch.as_tensor(X, device=device).clamp_min(0.0)
+
+
+def air_row_profile(scan: CobraScan, air_level: float = 0.85) -> np.ndarray:
+    """Each row's open-beam level relative to the middle rows, from the scan's own air.
+
+    In every view the air columns are those whose middle half of the rows reads above ``air_level`` of the flat field;
+    the view's profile is each row's median transmission over those columns divided by the middle rows' median, and
+    the result is the median over the views. The air scans and the scan cut the beam with different axial blades, so
+    their open beams differ near the field's edges; the flat field times this profile matches the scan's.
+
+    Args:
+        scan (CobraScan): the scan, its flat field already at the scan's open-beam level.
+        air_level (float): transmission above which a column counts as air. Defaults to 0.85.
+
+    Returns:
+        ndarray: [Rd] float32 factor per row (1 in the middle rows).
+    """
+    V, R, _ = scan.counts.shape
+    middle = slice(R // 4, 3 * R // 4)
+    profiles = []
+    for v in range(V):
+        transmission = scan.counts[v] / scan.flat_field[v]
+        level = np.median(transmission[middle], axis=0)
+        air = level > air_level
+        if air.sum() >= 5:
+            profiles.append(np.median(transmission[:, air], axis=1) / np.median(level[air]))
+    if not profiles:
+        raise ValueError("no view has air columns: the row profile cannot be measured")
+    return np.median(np.array(profiles), axis=0).astype(np.float32)
+
+
+def field_of_view_region(grid: Grid, geometry: ConeGeometry, known: Optional[np.ndarray] = None) -> np.ndarray:
+    """MBIR's region of reconstruction: the field of view, plus a known object such as the couch.
+
+    The field of view is the cylinder about the rotation axis that the widest ray reaches
+    (``citrus.utilities.field_of_view_radius``). Outside it the data do not determine the volume.
+
+    Args:
+        grid (Grid): the loop grid.
+        geometry (ConeGeometry): the scan geometry.
+        known (ndarray, optional): [R, C] bool footprint of a known object to keep in the region. Defaults to None.
+
+    Returns:
+        ndarray: [R, C] bool region.
+    """
+    from citrus.utilities import field_of_view_radius
+
+    R, C = grid.shape[:2]
+    y = (np.arange(R) - (R - 1) / 2) * grid.delta_voxel * grid.voxel_row_aspect
+    x = (np.arange(C) - (C - 1) / 2) * grid.delta_voxel
+    region = np.hypot(y[:, None], x[None, :]) <= float(field_of_view_radius(geometry))
+    return region if known is None else region | known
 
 
 def read_volume(path: str) -> tuple[np.ndarray, tuple, tuple]:
