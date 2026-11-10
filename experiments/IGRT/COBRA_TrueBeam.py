@@ -1,7 +1,7 @@
 """CITRUS reconstruction of a COBRA2026 Varian TrueBeam case (centre G: half-fan CBCT of the pelvis, 125 kV).
 
 The script runs in five sections: (1) the case and the parameters the metadata does not give, (2) the data, downloaded
-if needed, and the parameters read from its metadata, (3) the preprocessing of the counts (drift, flat fields, couch),
+if needed, and the parameters read from its metadata, (3) the preprocessing of the counts (drift, open beam, couch),
 (4) the CITRUS reconstruction and (5) the figure against the clinical CBCT and the deformed planning CT.
 
     python COBRA_TrueBeam.py
@@ -18,9 +18,9 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "garbage_collection_threshold:0
 import numpy as np
 import torch
 
-from cobra_tools import (CobraScan, blade_field_margin_cm, bowtie_transmission, citrus_to_lps, comparison_figure,
-                         couch_attenuation, download_case, half_fan_weights, initial_volume, load_scan, read_case_info,
-                         read_volume, write_volume)
+from cobra_tools import (CobraScan, air_row_profile, blade_field_margin_cm, bowtie_transmission, citrus_to_lps,
+                         comparison_figure, couch_attenuation, download_case, field_of_view_region, half_fan_weights,
+                         initial_volume, load_scan, read_case_info, read_volume, write_volume)
 
 from citrus import CitrusConfig, Schedule, citrus_recon
 from citrus.recon.mbir_bridge import make_cone_model
@@ -40,18 +40,26 @@ CASES = {
     # couch_top_mm: y in mm of the IGRT couch top's upper surface (CITRUS y, anterior positive), fitted to the rays
     # through the couch alone at gantry 247-282 deg (a scan of the couch height and lateral position). Scan.xml's
     # CouchVrt reads -136.2 mm (G008) and -139.3 mm (G007). The lateral position is Scan.xml's CouchLat.
-    "G008": {"couch_top_mm": -140.6},
-    "G007": {"couch_top_mm": -143.0},
+    # open_beam_scale: the scan's open beam over the air scans scaled by the mAs (0.1 mAs to the scan's 1.2 mAs),
+    # from the air the scan itself measures: in every frame with air beside the patient, the brightest 1% of the
+    # transmission (the pixels chosen in the neighbouring frames, so that their noise does not choose them), fitted
+    # together with the drift below.
+    "G008": {"couch_top_mm": -140.6, "open_beam_scale": 0.7812},
+    "G007": {"couch_top_mm": -143.0, "open_beam_scale": 0.7507},
 }
 
 # The scanner. Global drift of the PaxScan 4030CB panel over the acquisition, the same on every pixel:
-# y = (1 + B (1 - exp(-k / tau_g))) x + A (1 - exp(-k / tau_o)), k the frame index (every frame counted), x the
-# counts without drift. Fitted once for the panel, shared by G008 and G007, to their lines measured twice (the
-# conjugate rays of the half-fan overlap and the seam where the rotation closes).
-DRIFT = {"gain_buildup": 0.035640,                 # B
-         "gain_time_constant_frames": 176.71,      # tau_g
-         "offset_buildup_counts": 13.427,          # A
-         "offset_time_constant_frames": 163.06}    # tau_o
+# y = (1 + B (1 - exp(-k / tau_g)) + B_f (1 - exp(-k / tau_f))) x + A (1 - exp(-k / tau_o)), k the frame index
+# (every frame counted), x the counts without drift. Fitted once for the panel, shared by G008 and G007, to their
+# lines measured twice (the conjugate rays of the half-fan overlap and the seam where the rotation closes, with the
+# scatter-to-primary ratios of this script) and to the open-beam level of every frame with air beside the patient.
+# The fast gain follows the first frames; its time constant sits at the fit's lower bound of 2 frames.
+DRIFT = {"gain_buildup": 0.029912,                 # B
+         "gain_time_constant_frames": 194.98,      # tau_g
+         "fast_gain_buildup": 0.013897,            # B_f
+         "fast_gain_time_constant_frames": 2.0,    # tau_f
+         "offset_buildup_counts": 19.876,          # A
+         "offset_time_constant_frames": 160.60}    # tau_o
 # Couch: Varian's couch-top contours (Calibrations/COUCH) filled with one attenuation for the carbon-fibre shell and
 # one for the foam interior, fitted to the couch-only rays of G008 (G007 gives the same values). The shell value is
 # an effective one: its 4-5 mm wall is barely resolved.
@@ -78,8 +86,6 @@ SCATTER_VIEW_STRIDE = 16               # the scatter is computed on every 16th v
 GROUPING_OBJECT_SIZE_CM = 30.0         # object size of the solver's energy groups
 QUADRATURE_POINT_SPACING_CM = 1.0      # spacing of the scatter solver's quadrature points
 CONE_POLAR_FACTOR = 2                  # the polar directions of the detector projection, times the default
-SCATTER_SCENE_SUPPORT_HU = -750.0      # the scatter scene is the current volume above this (0.25 x water), smoothed
-SCATTER_SCENE_SUPPORT_MARGIN_CM = 2.0  # by 8 mm, dilated by this margin and cut to the field of view
 AIR_THRESHOLD_HU = -900.0              # voxels below this (0.1 x water) are air in the scatter scene
 WEIGHT_CAP = 1e-6                      # cap on the MBIR weights Y / I0 (every ray above it gets the same weight)
 OUTER_ITERATIONS, MBIR_ITERATIONS_PER_OUTER = 14, 8
@@ -110,6 +116,13 @@ if RECONSTRUCT:
     start = time.time()
     torch.cuda.set_per_process_memory_fraction(GPU_MEMORY_FRACTION)
     scan: CobraScan = load_scan(info, ROW_BIN, CHANNEL_BIN, VIEW_STRIDE, drift=DRIFT)
+    # the flat field at the scan's open beam: its level, then each row's level from the scan's own air columns (the
+    # air scans and the scan cut the beam with different axial blades)
+    scan.flat_field *= np.float32(CASES[CASE]["open_beam_scale"])
+    row_profile = air_row_profile(scan)
+    scan.flat_field *= row_profile[None, :, None]
+    print(f"[{CASE}] open beam: {CASES[CASE]['open_beam_scale']:.4f} of the air scans; row profile "
+          f"{row_profile.min():.3f} to {row_profile.max():.3f}", flush=True)
     geometry = scan.geometry
     print(f"[{CASE}] {len(scan.angles)} views of {scan.counts.shape[1]} x {scan.counts.shape[2]} pixels, "
           f"{'half' if scan.half_fan else 'full'} fan", flush=True)
@@ -154,13 +167,16 @@ if RECONSTRUCT:
     solver.source = SourceModel(field_margin_rows_cm=field_margin_rows_cm, filter_material="aluminium",
                                 filter_thickness_cm=thickness)
     model = make_cone_model(grid, geometry, scan.angles, device=DEVICE)
-    initial = initial_volume(scan, model, grid, DEVICE)
+    # MBIR reconstructs the field of view and the couch; the start is 0 elsewhere, since the scatter solver sees the
+    # whole volume and an FDK leaves streaks outside the field of view
+    region = field_of_view_region(grid, geometry, couch_per_cm > 0)
+    model.set_params(use_ror_mask=region)
+    initial = initial_volume(scan, model, grid, DEVICE) * torch.as_tensor(region, device=DEVICE)[:, :, None]
     config = CitrusConfig(scatter_view_stride=SCATTER_VIEW_STRIDE, grouping_object_size=GROUPING_OBJECT_SIZE_CM,
                           extend_scatter_scene=True, beam_hardening_correction=True,
                           hardening_materials=HARDENING_MATERIALS, measurement_weights=measurement_weights,
-                          max_measurement_weight=WEIGHT_CAP, scatter_scene_support_hu=SCATTER_SCENE_SUPPORT_HU,
-                          scatter_scene_support_margin_cm=SCATTER_SCENE_SUPPORT_MARGIN_CM,
-                          air_threshold_hu=AIR_THRESHOLD_HU, known_objects=couch, verbose=True)
+                          max_measurement_weight=WEIGHT_CAP, air_threshold_hu=AIR_THRESHOLD_HU, known_objects=couch,
+                          verbose=True)
     schedule = Schedule(num_outer_iterations=OUTER_ITERATIONS,
                         mbir_iterations_per_outer_iteration=MBIR_ITERATIONS_PER_OUTER)
     X, loop_info = citrus_recon(scan.counts, scan.flat_field, scan.angles, grid, geometry, solver, config,
