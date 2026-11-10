@@ -114,9 +114,9 @@ edge values past the outermost pixels, the only values known there.
 rather than each column's last voxel that every view measures whole: that voxel lies at the edge of the measured
 region, where the reconstruction changes from one outer iteration to the next, and repeating it over many slices
 fed those changes back into the scatter. The primary is that of the scatter solver's scene, so the
-scatter-to-primary ratio compares one volume with itself. The scene's support follows the current volume rather than
-the initial one: an FDK start has streaks above the threshold outside the field of view, and a support built from
-them kept the haze MBIR leaves there in the scene, beside the object, for the whole run. The water linearization is tabulated per pixel with the solver's own primary: the filter and
+scatter-to-primary ratio compares one volume with itself. The scene has no support of its own: an air threshold
+removes the noise that the density model's clamp at 0 turns into matter, and with the start set to 0 outside MBIR's
+region nothing else lies beside the object, so the scene needs no mask around it. The water linearization is tabulated per pixel with the solver's own primary: the filter and
 the incidence angle both change the spectrum a pixel sees, and the table is the exact polychromatic model of the
 loop's primary. A material's hardening beyond water uses the primary of the current volume twice, as it is and with
 the material made of water, which reuses the projections of the scatter update. The PyTorch path evaluates the sum in blocks of at most :math:`2^{22}`

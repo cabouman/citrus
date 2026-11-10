@@ -10,7 +10,6 @@ The method is described in docs/source/method.rst, "The CITRUS loop" and "Option
 
 from __future__ import annotations
 
-import math
 import time
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Callable, Literal, Optional, Sequence, Union
@@ -28,8 +27,8 @@ from .scatter_solver.scatter_solver import (MaterialFields, ScatterSolver, Water
                                             emission_profile_from_open_field, water_linearization)
 from .scatter_solver.source_iteration import source_iteration
 from .scatter_solver.uncollided import present_materials
-from .utilities import (attenuation_to_densities, attenuation_to_density, effective_energy, field_of_view_radius,
-                        grouping_medium_estimate, mass_attenuation_at, object_mask, object_size_cm)
+from .utilities import (attenuation_to_densities, attenuation_to_density, effective_energy, grouping_medium_estimate,
+                        mass_attenuation_at, object_mask, object_size_cm)
 
 __all__ = [
     "CitrusState",
@@ -43,7 +42,6 @@ __all__ = [
     "primary_signals",
     "DensityModel",
     "extend_scene_slices",
-    "scatter_scene_support",
     "StateStore",
     "CitrusConfig",
     "Schedule",
@@ -599,55 +597,6 @@ def extend_scene_slices(X: Tensor, threshold: float, slice_cm: float, fill_fract
     return out, (k0, k1)
 
 
-def scatter_scene_support(volume: Tensor, grid: Grid, threshold: float, margin_cm: float,
-                          smoothing_cm: float = 0.8, radius_cm: Optional[float] = None) -> Tensor:
-    """Support of the scatter scene: the voxels within a margin of where the smoothed volume exceeds a threshold.
-
-    The volume is smoothed by a Gaussian of ``smoothing_cm`` standard deviation, thresholded, and the result dilated by
-    ``margin_cm`` along each axis (a box), so that the object is kept while the streaks and the haze of the
-    reconstruction in the air around it are not. With ``radius_cm`` the support is also cut to the cylinder of that
-    radius about the rotation axis, the field of view.
-
-    Args:
-        volume (Tensor): [R, C, S] attenuation in 1/cm.
-        grid (Grid): grid of the volume.
-        threshold (float): attenuation in 1/cm above which the smoothed volume is part of the object.
-        margin_cm (float): dilation in cm along each axis.
-        smoothing_cm (float, optional): standard deviation in cm of the Gaussian smoothing. Defaults to 0.8.
-        radius_cm (float, optional): radius in cm of the cylinder the support is cut to. Defaults to None (no cut).
-
-    Returns:
-        Tensor: [R, C, S] bool support, on the device of ``volume``.
-    """
-    pitch = (grid.delta_voxel * grid.voxel_row_aspect, grid.delta_voxel, grid.delta_voxel * grid.voxel_slice_aspect)
-    X = volume.detach().to(torch.float32)[None, None]  # [1, 1, R, C, S]
-    for axis, d in enumerate(pitch):
-        sigma = float(smoothing_cm) / d
-        half = int(math.ceil(3.0 * sigma))
-        if half < 1:
-            continue
-        t = torch.arange(-half, half + 1, device=X.device, dtype=torch.float32)
-        kernel = torch.exp(-0.5 * (t / sigma) ** 2)
-        shape = [1, 1, 1, 1, 1]
-        shape[2 + axis] = kernel.numel()
-        padding = [0, 0, 0]
-        padding[axis] = half
-        X = torch.nn.functional.conv3d(X, (kernel / kernel.sum()).reshape(shape), padding=tuple(padding))
-    mask = (X > float(threshold)).to(torch.float32)
-    del X
-    reach = tuple(int(round(float(margin_cm) / d)) for d in pitch)
-    if any(reach):
-        mask = torch.nn.functional.max_pool3d(mask, kernel_size=tuple(2 * r + 1 for r in reach), stride=1,
-                                              padding=reach)
-    support = mask[0, 0] > 0.5
-    if radius_cm is not None:
-        R, C = support.shape[:2]
-        y = (torch.arange(R, device=support.device, dtype=torch.float32) - 0.5 * (R - 1)) * pitch[0]
-        x = (torch.arange(C, device=support.device, dtype=torch.float32) - 0.5 * (C - 1)) * pitch[1]
-        support &= ((y[:, None] ** 2 + x[None, :] ** 2) <= float(radius_cm) ** 2)[:, :, None]
-    return support
-
-
 def _water_attenuation(density_model: "DensityModel") -> float:
     """Attenuation of water in 1/cm at the density model's effective energy; the library must hold water."""
     library = density_model.library
@@ -864,16 +813,6 @@ class CitrusConfig:
         max_measurement_weight (float or None): the MBIR weight of a measurement, its transmission Y / I0, is capped at
             this value; a value below every transmission gives all measurements the same weight. Defaults to None (no
             cap).
-        scatter_scene_support_hu (float or None): threshold in HU of the scatter scene's support, rebuilt at every
-            scatter update from the current volume without the known objects: the voxels within
-            ``scatter_scene_support_margin_cm`` of where that volume, smoothed by a Gaussian of 0.8 cm standard
-            deviation, exceeds the threshold, inside the field of view. Outside it the scatter solver sees air (the
-            reconstruction itself is not masked); the known objects are put in afterwards. None turns the support off.
-            Defaults to None.
-        scatter_scene_support_margin_cm (float): margin in cm by which the support of ``scatter_scene_support_hu``
-            extends past the thresholded region along each axis. Defaults to 2.0.
-        scatter_scene_beyond_field_of_view (bool): let the support of ``scatter_scene_support_hu`` reach past the
-            field of view (``utilities.field_of_view_radius``), for an object wider than it. Defaults to False.
         air_threshold_hu (float or None): voxels below this value in HU are air (density 0) in the volume the scatter
             solver sees at every scatter update; the reconstruction keeps them. None keeps every voxel. Defaults to
             None.
@@ -904,9 +843,6 @@ class CitrusConfig:
     hardening_materials: Sequence[str] = ()
     measurement_weights: Optional[Any] = None
     max_measurement_weight: Optional[float] = None
-    scatter_scene_support_hu: Optional[float] = None
-    scatter_scene_support_margin_cm: float = 2.0
-    scatter_scene_beyond_field_of_view: bool = False
     air_threshold_hu: Optional[float] = None
     known_objects: Optional[Any] = None
 
@@ -937,8 +873,7 @@ class CitrusConfig:
             raise ValueError(f"hardening_materials must be a sequence of material names, got {hardening!r}")
         if "water" in hardening:
             raise ValueError("hardening_materials: water is the reference of the hardening correction")
-        for name in ("resume_error_sinogram", "extend_scatter_scene", "beam_hardening_correction",
-                     "scatter_scene_beyond_field_of_view"):
+        for name in ("resume_error_sinogram", "extend_scatter_scene", "beam_hardening_correction"):
             if not isinstance(getattr(self, name), (bool, np.bool_)):
                 raise ValueError(f"{name} must be a bool, got {getattr(self, name)!r}")
         size = self.grouping_object_size
@@ -950,7 +885,7 @@ class CitrusConfig:
                                       or not isinstance(threshold, (int, float, np.floating, np.integer))
                                       or not float(threshold) > 0):
             raise ValueError(f"metal_attenuation_threshold must be None or a positive number (1/cm), got {threshold!r}")
-        for name in ("max_measurement_weight", "scatter_scene_support_hu", "air_threshold_hu"):
+        for name in ("max_measurement_weight", "air_threshold_hu"):
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float, np.floating,
                                                                                           np.integer))
@@ -958,10 +893,6 @@ class CitrusConfig:
                 raise ValueError(f"{name} must be None or a finite number, got {value!r}")
         if self.max_measurement_weight is not None and not float(self.max_measurement_weight) > 0:
             raise ValueError(f"max_measurement_weight must be > 0, got {self.max_measurement_weight!r}")
-        margin = self.scatter_scene_support_margin_cm
-        if isinstance(margin, bool) or not isinstance(margin, (int, float, np.floating, np.integer)) or not (
-                np.isfinite(float(margin)) and float(margin) >= 0):
-            raise ValueError(f"scatter_scene_support_margin_cm must be >= 0, got {margin!r}")
         if self.known_objects is not None:
             known = torch.as_tensor(self.known_objects)
             if known.is_complex() or known.dim() != 3 or not bool(torch.isfinite(known.double()).all()) or bool(
@@ -1953,27 +1884,15 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
     last_scatter: list[Optional[Tensor]] = [None]
     last_ratio: list[Optional[Tensor]] = [None]  # the scatter-to-primary ratio of the last scatter update
 
-    # the radius the scatter scene's support is cut to (None: not cut)
-    support_radius = (None if config.scatter_scene_support_hu is None or config.scatter_scene_beyond_field_of_view
-                      else field_of_view_radius(geometry))
-
     def after_initialization(X: Tensor, info: dict) -> None:
         info.update(_apply_grouping_estimates(solver, X, grid, config))
 
     def scene_volume(X: Tensor, density_model: DensityModel) -> Tensor:
-        """The volume the scatter solver sees: X with the air and the voxels outside the support set to 0, extended
-        past the body along z (extend_scatter_scene) and with the known objects in place. The support is rebuilt from
-        X without the known objects."""
+        """The volume the scatter solver sees: X with the air set to 0, extended past the body along z
+        (extend_scatter_scene) and with the known objects in place."""
         water = _water_attenuation(density_model)
         if config.air_threshold_hu is not None:
             X = torch.where(X < _attenuation_of_hu(float(config.air_threshold_hu), water), torch.zeros_like(X), X)
-        if config.scatter_scene_support_hu is not None:
-            body = X if known is None else torch.where(known > 0, torch.zeros_like(X), X)
-            support = scatter_scene_support(body, grid, _attenuation_of_hu(float(config.scatter_scene_support_hu),
-                                                                           water),
-                                            float(config.scatter_scene_support_margin_cm), radius_cm=support_radius)
-            X = torch.where(support, body, torch.zeros_like(body))
-            del body, support
         if config.extend_scatter_scene:
             X, scene_slices[0] = extend_scene_slices(X, _attenuation_of_hu(-500.0, water),
                                                      grid.delta_voxel * grid.voxel_slice_aspect)

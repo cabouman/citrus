@@ -731,19 +731,15 @@ the scene should.
 What the scatter solver sees
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-A reconstruction holds noise, streaks and a faint haze in the air around the object. The scatter solver would treat
-them as matter that scatters, so two settings clear them from the volume it sees, while the reconstruction keeps them.
-``CitrusConfig.air_threshold_hu`` sets every voxel below that value to air at every scatter update.
-``scatter_scene_support_hu`` builds a support at every scatter update from the current volume without the known
-objects: that volume is smoothed by a Gaussian of 0.8 cm standard deviation and thresholded, the result is dilated by
-``scatter_scene_support_margin_cm`` along each axis, and it is cut to the field of view, the cylinder about the
-rotation axis that the widest ray reaches (``scatter_scene_support``, ``utilities.field_of_view_radius``). Outside
-the support the solver sees air. Its threshold sits well below soft tissue, so the object stays inside it while the
-haze is too faint to pass it. Outside the field of view the reconstruction is not determined by the data, and MBIR
-can leave a haze there that the solver would take for matter beside the object; an object wider than the field of
-view keeps its outer part with ``scatter_scene_beyond_field_of_view``. HU values are converted with water's
-attenuation at the density model's effective energy. The primary, which divides the scatter in the scatter-to-primary ratio, is
-that of the same volume, so the scatter and the primary describe one scene.
+A reconstruction holds noise in the air around the object. The density model clamps negative attenuation at 0, so
+that noise, zero on average, reaches the scatter solver as a thin positive density, and it lies outside the object,
+where nothing shields its scatter from the panel. ``CitrusConfig.air_threshold_hu`` sets every voxel below that value
+to air in the volume the scatter solver sees, at every scatter update, while the reconstruction keeps them. HU values
+are converted with water's attenuation at the density model's effective energy. The solver sees every voxel of the
+volume, including those outside MBIR's region of reconstruction, which keep their initial values; a start that holds
+matter there, such as an FDK beyond the field of view, is set to 0 there before the loop. The primary, which divides
+the scatter in the scatter-to-primary ratio, is that of the same volume, so the scatter and the primary describe one
+scene.
 
 Objects known in advance, such as the patient couch from its model, are given as an attenuation volume
 (``known_objects``). Where it is positive it replaces the volume in the scatter solver's scene and in the modelled

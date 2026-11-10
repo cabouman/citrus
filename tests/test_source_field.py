@@ -424,7 +424,7 @@ def test_scatter_scene_end_to_end(real_library):
         solver = wlab_solver(2.0, config=config, library=real_library, geometry=geometry, device=DEVICE,
                              source=source)
         loop = CitrusConfig(mbir_iterations_per_outer_iteration=2, num_outer_iterations=5, extend_scatter_scene=extend,
-                            scatter_scene_support_hu=-750.0)
+                            air_threshold_hu=-900.0)
         _, info = citrus_recon(data["Y"], 1e5, data["angles"], grid, geometry, solver, loop,
                                regularization=regularization, model=model)
         slices[extend] = info["scatter_scene_slices"]

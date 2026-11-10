@@ -1,5 +1,5 @@
 """The MBIR weight settings (measurement_weights, max_measurement_weight) and what the scatter solver sees
-(scatter_scene_support_hu, air_threshold_hu) of CitrusConfig."""
+(air_threshold_hu, known_objects) of CitrusConfig."""
 
 from __future__ import annotations
 
@@ -12,10 +12,8 @@ import torch
 
 from conftest import SPECTRUM_125KVP
 from citrus import citrus as citrus_module
-from citrus.citrus import (CitrusConfig, DensityModel, citrus_recon, estimate_regularization, mbir_recon,
-                           scatter_scene_support)
+from citrus.citrus import CitrusConfig, DensityModel, citrus_recon, estimate_regularization, mbir_recon
 from citrus.scatter_solver.config import SolverConfig
-from citrus.scatter_solver.geometry import Grid
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="the CITRUS reconstruction tests run on CUDA")
@@ -23,9 +21,7 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="the CITRUS reco
 
 @pytest.mark.parametrize("settings", [
     dict(max_measurement_weight=0.0), dict(max_measurement_weight=float("nan")), dict(max_measurement_weight=True),
-    dict(scatter_scene_support_hu="-750"), dict(scatter_scene_support_margin_cm=-1.0),
-    dict(scatter_scene_beyond_field_of_view=1),
-    dict(air_threshold_hu=float("inf")), dict(measurement_weights=np.full(4, -1.0)),
+    dict(air_threshold_hu="-900"), dict(air_threshold_hu=float("inf")), dict(measurement_weights=np.full(4, -1.0)),
     dict(measurement_weights=np.zeros((1, 1, 1, 4))),
 ])
 def test_loop_options_are_validated(settings):
@@ -37,31 +33,8 @@ def test_loop_options_default_off():
     config = CitrusConfig()
     config.validate()
     assert config.measurement_weights is None and config.max_measurement_weight is None
-    assert config.scatter_scene_support_hu is None and config.air_threshold_hu is None
-    assert config.scatter_scene_beyond_field_of_view is False
-    CitrusConfig(measurement_weights=np.ones(4), max_measurement_weight=1e-6, scatter_scene_support_hu=-750.0,
-                 air_threshold_hu=-900.0).validate()
-
-
-def test_scatter_scene_support_keeps_the_object_with_its_margin():
-    """A cylinder above the threshold is kept with its margin; a faint haze and a single bright voxel in the air are
-    not (the smoothing spreads the voxel below the threshold)."""
-    grid = Grid((30, 30, 12), 1.0)
-    y, x = torch.meshgrid(torch.arange(30) - 14.5, torch.arange(30) - 14.5, indexing="ij")
-    cylinder = (x * x + y * y <= 36.0)[:, :, None].expand(30, 30, 12)
-    X = torch.where(cylinder, torch.tensor(0.2), torch.tensor(0.01))  # 1/cm: tissue, and haze around it
-    X[1, 1, 6] = 0.3  # a streak voxel in the air
-    support = scatter_scene_support(X, grid, threshold=0.05, margin_cm=2.0)
-    assert support.dtype == torch.bool and tuple(support.shape) == grid.shape
-    assert bool(support[cylinder].all())
-    radius = torch.sqrt(x * x + y * y)
-    assert bool(support[(radius <= 7.5)[:, :, None].expand_as(support)].all())  # the margin around the object
-    assert not bool(support[(radius >= 11.0)[:, :, None].expand_as(support)].any())  # nothing far in the air
-    assert not bool(support[1, 1, 6])
-    no_margin = scatter_scene_support(X, grid, threshold=0.05, margin_cm=0.0)
-    assert int(no_margin.sum()) < int(support.sum())
-    cut = scatter_scene_support(X, grid, threshold=0.05, margin_cm=2.0, radius_cm=6.5)
-    assert bool(cut[cylinder].all()) and torch.equal(cut, support & (radius <= 6.5)[:, :, None].expand_as(support))
+    assert config.air_threshold_hu is None
+    CitrusConfig(measurement_weights=np.ones(4), max_measurement_weight=1e-6, air_threshold_hu=-900.0).validate()
 
 
 def test_field_of_view_radius():
@@ -149,8 +122,8 @@ def test_measurement_weights_leave_measurements_out(tiny):
 
 @cuda
 def test_scene_options_change_only_what_the_scatter_solver_sees(tiny):
-    """With the air threshold and the support the solver's volume has no voxel below the threshold, none outside the
-    field of view and none outside the support of that volume; the defaults pass the volume unchanged."""
+    """With the air threshold the solver's volume has no voxel between 0 and the threshold; the defaults pass the
+    volume unchanged."""
     data, grid, geometry, solver, regularization = tiny
     seen = []
     original = solver.material_fields_from_attenuation
@@ -166,8 +139,7 @@ def test_scene_options_change_only_what_the_scatter_solver_sees(tiny):
                                                regularization=regularization)
         assert torch.equal(seen[0], info_default["init_recon"])
         seen.clear()
-        options = replace(loop, air_threshold_hu=-500.0, scatter_scene_support_hu=-750.0,
-                          scatter_scene_support_margin_cm=0.0)
+        options = replace(loop, air_threshold_hu=-500.0)
         X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, options,
                                regularization=regularization)
     finally:
@@ -175,14 +147,10 @@ def test_scene_options_change_only_what_the_scatter_solver_sees(tiny):
     water = float(DensityModel.from_library(solver.library).energy_kev)  # E_eff of the loop's density model
     from citrus.citrus import _water_attenuation
     mu_water = _water_attenuation(DensityModel.from_library(solver.library, water))
-    from citrus.utilities import field_of_view_radius
-    radius = field_of_view_radius(geometry)
     assert len(seen) == 2
     for scene in seen:
         assert bool((scene > 0).any())
         assert not bool(((scene > 0) & (scene < 0.5 * mu_water)).any())
-        support = scatter_scene_support(scene, grid, 0.25 * mu_water, 0.0, radius_cm=radius)
-        assert not bool(scene[~support].any())
     assert bool(torch.isfinite(X).all()) and X.shape == X_default.shape
 
 

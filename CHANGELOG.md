@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.27.0 - 2026-11-10
+
+- **No scatter scene support.** `scatter_scene_support_hu`, `scatter_scene_support_margin_cm`,
+  `scatter_scene_beyond_field_of_view` and `scatter_scene_support` are removed, with the cut of the scene to the field
+  of view. `air_threshold_hu` alone clears the air: the density model's clamp at 0 turns the noise of the air into a
+  thin positive density, and the threshold sets it to air. Voxels outside MBIR's region of reconstruction keep their
+  initial values and the scatter solver sees them, so a start with matter there is set to 0 before the loop.
+  `utilities.field_of_view_radius` stays.
+- **COBRA2026 scripts.** The TrueBeam and Halcyon scripts take the open-beam level and its row profile from the scan's
+  own air, fit the panel drift with a fast and a slow gain and the air level, and reconstruct inside the field of view
+  with the start set to 0 outside it.
+
 ## v0.26.0 - 2026-11-08
 
 - **Analytic anti-scatter grid.** `anti_scatter_grid` builds an analytic model by default: the direct photons exactly

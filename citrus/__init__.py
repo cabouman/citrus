@@ -7,7 +7,7 @@ MBIRTORCH bridge (``citrus.recon``) and the phantoms, density model, view angles
 helpers (``citrus.utilities``). The main entry points of the loop are re-exported here.
 """
 
-__version__ = "0.26.0"
+__version__ = "0.27.0"
 
 from .citrus import CitrusConfig, CitrusState, Schedule, citrus_recon, citrus_step, mbir_recon  # noqa: E402
 

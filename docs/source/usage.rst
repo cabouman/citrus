@@ -274,8 +274,7 @@ them with the in-plane size of the volume, :doc:`method`, "Subsets per MBIR iter
 ``min_counts``, ``base_seed``, ``verbose``, ``metal_attenuation_threshold`` (the metal mask, :doc:`method`,
 "Metal"), ``extend_scatter_scene`` (:doc:`method`, "Scatter scene beyond the reconstructed slab") and
 ``beam_hardening_correction`` and ``hardening_materials`` (:doc:`method`, "Beam hardening"),
-``measurement_weights`` and ``max_measurement_weight`` (the MBIR weights), ``scatter_scene_support_hu``,
-``scatter_scene_support_margin_cm``, ``scatter_scene_beyond_field_of_view``, ``air_threshold_hu`` and
+``measurement_weights`` and ``max_measurement_weight`` (the MBIR weights), ``air_threshold_hu`` and
 ``known_objects`` (:doc:`method`, "What the scatter solver sees").
 
 A curved (cylindrical) panel and helical views are part of the geometry, so the same calls reconstruct them
@@ -397,16 +396,6 @@ descriptions. The first setting of each group names the group.
    * - ``max_measurement_weight``
      - ``None``
      - cap on the MBIR weight Y / I0 of a measurement; a value below every transmission weights all equally
-   * - ``scatter_scene_support_hu``
-     - ``None``
-     - threshold in HU of the scatter scene's support, rebuilt at every scatter update from the current volume
-       (smoothed by 0.8 cm) and cut to the field of view; outside it the scatter solver sees air
-   * - ``scatter_scene_support_margin_cm``
-     - ``2.0``
-     - margin in cm by which that support extends past the thresholded region along each axis
-   * - ``scatter_scene_beyond_field_of_view``
-     - ``False``
-     - let that support reach past the field of view, for an object wider than it
    * - ``air_threshold_hu``
      - ``None``
      - voxels below this value in HU are air in the volume the scatter solver sees
