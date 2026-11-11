@@ -36,6 +36,7 @@ _cache/
 # COBRA2026 cases and reconstructions of the IGRT experiments (downloaded, about 1.25 GB per case)
 experiments/IGRT/data/TrueBeam/
 experiments/IGRT/data/Halcyon/
+experiments/IGRT/data/Elekta/
 experiments/IGRT/results/
 
 # Geant4 / Monte Carlo validation data and builds
