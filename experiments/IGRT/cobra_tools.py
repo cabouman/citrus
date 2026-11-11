@@ -1,14 +1,16 @@
-"""Shared code of the COBRA2026 IGRT experiments (COBRA_TrueBeam.py, COBRA_Halcyon.py).
+"""Shared code of the COBRA2026 IGRT experiments (COBRA_TrueBeam.py, COBRA_Halcyon.py, COBRA_Synergy.py).
 
 The scripts read as five sections: parameters, data, preprocessing, reconstruction and figure. This module holds what
 they share: the downloader of the COBRA2026 cases, the readers of the Varian files (Scan.xml, geometry.xml, .xim
-images, the calibration XML files), the preprocessing of the counts and flat fields, the couch model, the half-fan
-weights and the figure.
+images, the calibration XML files) and of the Elekta files (reconstruction.yaml), the preprocessing of the counts and
+flat fields, the couch model, the half-fan weights and the figure.
 
 Frames: a COBRA2026 case is in LPS with the origin at the isocenter. RTK puts the source at +z for gantry angle 0 and
 rotates it toward +x; CITRUS puts it at +y for view angle 0 and rotates it toward +x, so CITRUS's (x, y, z) are LPS
 (L, A, I) and a CITRUS volume [rows, cols, slices] indexes (anterior, left, inferior). The view angle is the RTK
-gantry angle (the kV source angle). The air scans carry the treatment gantry angle, 90 degrees ahead of it. RTK's
+gantry angle (the kV source angle) for Varian, and the recorded gantry angle plus 90 degrees for Elekta (the XVI kV
+source sits 90 degrees from the MV gantry). The Varian air scans carry the treatment gantry angle, 90 degrees ahead
+of the view angle. RTK's
 ProjectionOffsetX/Y are the panel centre's u and v, which CITRUS subtracts, so the offsets change sign.
 """
 
@@ -32,7 +34,7 @@ import yaml
 from scipy.ndimage import gaussian_filter1d, map_coordinates
 from scipy.ndimage import shift as shift_image
 
-from citrus.scatter_solver import ConeGeometry, Grid
+from citrus.scatter_solver import ConeGeometry, Grid, SourceModel
 
 # ======================================================================================================================
 # Download
@@ -47,6 +49,21 @@ CASE_FILES = ("projections.mha", "geometry.xml", "Scan.xml", "metadata.yaml", "c
 # case files left out of the download (unused here): the simulated projections, the CT before registration, the
 # full-field deformed CT and the dataset's FDK, about 1.6 GB per case
 SKIPPED_FILES = ("projections_simulated.mha", "ct_original.mha", "ct_def.mha", "cbct_rtk.mha")
+# an Elekta case (centres A-D) has reconstruction.yaml in place of Scan.xml and no calibrations
+ELEKTA_CASE_FILES = ("projections.mha", "geometry.xml", "metadata.yaml", "reconstruction.yaml", "cbct_clinical.mha",
+                     "ct_def_masked.mha", "fov_cbct.mha", "fov_cbct_nocouch.mha")
+
+
+def is_elekta_case(case_dir: str) -> bool:
+    """Whether a case folder is an Elekta case: centres A to D (Varian: F and G).
+
+    Args:
+        case_dir (str): case folder, e.g. data/Elekta/B003.
+
+    Returns:
+        bool: True for centres A-D.
+    """
+    return os.path.basename(os.path.normpath(case_dir))[:1] in ("A", "B", "C", "D")
 
 
 def missing_case_files(case_dir: str) -> list[str]:
@@ -58,8 +75,11 @@ def missing_case_files(case_dir: str) -> list[str]:
     Returns:
         list[str]: the missing files and calibrations (empty when the case is complete).
     """
-    paths = {name: os.path.join(case_dir, name) for name in CASE_FILES}
+    elekta = is_elekta_case(case_dir)
+    paths = {name: os.path.join(case_dir, name) for name in (ELEKTA_CASE_FILES if elekta else CASE_FILES)}
     missing = [name for name, path in paths.items() if not os.path.isfile(path) or os.path.getsize(path) == 0]
+    if elekta:
+        return missing
     calibrations = os.path.join(case_dir, "Calibrations")
     for label, pattern in (("air scans", os.path.join("AIR*Bowtie*", "Current", "FilterBowtie_*.xim")),
                            ("grid calibration", os.path.join("SC*", "*", "Calibration.xml")),
@@ -424,6 +444,8 @@ class CobraScan:
         lit_rows (tuple or None): raw panel rows (first, end) kept inside the axial blades, None when all are kept.
         half_fan (bool): whether the panel is offset (half fan).
         off_focal (tuple or None): (distances in cm past the lit rows' edges, emission there over the lit level).
+        clipped (ndarray or None): [V, Rd, Cd] bool binned pixels holding a raw pixel clipped at the panel's maximum
+            (Elekta; their counts are set to the flat field).
     """
 
     case_id: str
@@ -436,6 +458,7 @@ class CobraScan:
     lit_rows: Optional[tuple[int, int]]
     half_fan: bool
     off_focal: Optional[tuple[np.ndarray, np.ndarray]] = None
+    clipped: Optional[np.ndarray] = None
 
 
 def bin_image(image: np.ndarray, row_bin: int, channel_bin: int) -> np.ndarray:
@@ -649,6 +672,179 @@ def load_scan(info: CaseInfo, row_bin: int, channel_bin: int, view_stride: int =
                      half_fan=abs(mean_x) > 0.25 * Cd * pitch_u, off_focal=off_focal)
 
 
+# ======================================================================================================================
+# Elekta
+# ======================================================================================================================
+
+@dataclass
+class ElektaInfo:
+    """The parameters of an Elekta case from metadata.yaml and reconstruction.yaml.
+
+    Attributes:
+        case_id (str): case name.
+        case_dir (str): case folder.
+        kvp (float): tube voltage in kV.
+        tube_current_ma (float): tube current in mA.
+        pulse_ms (float): pulse length in ms.
+        kv_filter (str): "F1" (bowtie) or "F0" (none).
+        collimator (str): XVI collimator cassette, e.g. "M20".
+        flat_field (float): open-beam level of the flood-corrected projections at the scan's exposure: the flood
+            image's norm scaled from its exposure to the scan's (Eq. 2 of the COBRA2026 paper).
+        metadata (dict): metadata.yaml's cbct block.
+    """
+
+    case_id: str
+    case_dir: str
+    kvp: float
+    tube_current_ma: float
+    pulse_ms: float
+    kv_filter: str
+    collimator: str
+    flat_field: float
+    metadata: dict = field(default_factory=dict)
+
+
+def read_elekta_info(case_dir: str) -> ElektaInfo:
+    """Read an Elekta case's parameters.
+
+    Args:
+        case_dir (str): case folder.
+
+    Returns:
+        ElektaInfo: the parameters.
+    """
+    with open(os.path.join(case_dir, "metadata.yaml"), encoding="utf-8") as f:
+        cbct = yaml.safe_load(f)["cbct"]
+    with open(os.path.join(case_dir, "reconstruction.yaml"), encoding="utf-8") as f:
+        rec = yaml.safe_load(f)["RECONSTRUCTION"]
+    ma, ms, kv_filter = float(rec["tubema"]), float(rec["tubekvlength"]), str(rec["kvfilter"])
+    flood = {"F1": "floodimagefilter", "F0": "floodimageopen"}[kv_filter]
+    flat_field = float(rec[flood + "norm"]) * (ma * ms) / (float(rec[flood + "ma"]) * float(rec[flood + "ms"]))
+    return ElektaInfo(case_id=os.path.basename(os.path.normpath(case_dir)), case_dir=case_dir,
+                      kvp=float(cbct["TubeVoltage"]), tube_current_ma=ma, pulse_ms=ms, kv_filter=kv_filter,
+                      collimator=str(cbct.get("Collimator", "")), flat_field=flat_field, metadata=cbct)
+
+
+def load_elekta_scan(info: ElektaInfo, row_bin: int, channel_bin: int, view_stride: int = 1,
+                     drift: Optional[dict] = None) -> CobraScan:
+    """Read and preprocess the flood-corrected projections of an Elekta case.
+
+    The XVI writes its projections divided by the flood image, so the open beam reads ``info.flat_field`` on every
+    pixel. Every kept view is drift corrected (``drift_correction``, on the raw frame index), its pixels clipped at
+    65535 are set to the open beam and marked, and it is shifted to the mean panel offset (the flex map) and binned;
+    views whose angle repeats the previous one are dropped before every view_stride-th view is kept. A clipped pixel
+    only says that its transmission is above 65535 over the open beam, so the binned pixels holding one are returned
+    in ``clipped``. The view angle is the recorded gantry angle plus 90 degrees.
+
+    Args:
+        info (ElektaInfo): case parameters.
+        row_bin (int): rows per binned row.
+        channel_bin (int): channels per binned channel.
+        view_stride (int): keep every n-th view. Defaults to 1.
+        drift (dict, optional): global drift model of the scan (``drift_correction``). Defaults to None (none).
+
+    Returns:
+        CobraScan: the scan, its flat field a [1, 1, 1] array of the open-beam level.
+    """
+    image = sitk.ReadImage(os.path.join(info.case_dir, "projections.mha"))
+    raw = sitk.GetArrayViewFromImage(image)                       # [V, rows, cols] uint16
+    pitch_u, pitch_v = image.GetSpacing()[0], image.GetSpacing()[1]
+    geom = read_rtk_geometry(os.path.join(info.case_dir, "geometry.xml"))
+    V, Rd, Cd = raw.shape
+    if len(geom["gantry_deg"]) != V or geom["radius_mm"] != 0.0:
+        raise ValueError("geometry.xml does not match the projections (or a curved panel)")
+    unwrapped = np.degrees(np.unwrap(np.radians(geom["gantry_deg"])))
+    order = np.argsort(unwrapped)
+    step, last, keep = np.median(np.diff(unwrapped[order])), unwrapped[order[0]], [order[0]]
+    for k in order[1:]:
+        if unwrapped[k] - last >= 0.25 * step:
+            keep.append(k)
+            last = unwrapped[k]
+    frames = np.array(keep[::view_stride])
+
+    mean_x, mean_y = float(geom["offset_x_mm"].mean()), float(geom["offset_y_mm"].mean())
+    counts = np.empty((len(frames), Rd // row_bin, Cd // channel_bin), np.float32)
+    clipped = np.empty(counts.shape, bool)
+    for i, k in enumerate(frames):
+        y = raw[k].astype(np.float32)
+        saturated = y >= 65535
+        if drift is not None:
+            y = drift_correction(y, int(k), drift)
+        y[saturated] = info.flat_field
+        mark = saturated.astype(np.float32)
+        du = (geom["offset_x_mm"][k] - mean_x) / pitch_u
+        dv = (geom["offset_y_mm"][k] - mean_y) / pitch_v
+        if abs(du) > 1e-3 or abs(dv) > 1e-3:
+            y = shift_image(y, (dv, du), order=1, mode="nearest")
+            mark = shift_image(mark, (dv, du), order=1, mode="nearest")
+        counts[i] = bin_image(y, row_bin, channel_bin)
+        clipped[i] = bin_image(mark, row_bin, channel_bin) > 0
+    del raw, image
+    dead = ~np.isfinite(counts) | (counts <= 0)
+    if dead.any():
+        counts[dead] = info.flat_field
+        print(f"[{info.case_id}] {int(dead.sum())} pixels with a zero or non-finite count", flush=True)
+    else:
+        dead = None
+    print(f"[{info.case_id}] {100 * clipped.mean():.1f} % of the binned pixels hold a clipped pixel", flush=True)
+    geometry = ConeGeometry(source_iso_dist=geom["sid_mm"] / 10.0, source_detector_dist=geom["sdd_mm"] / 10.0,
+                            num_det_rows=counts.shape[1], num_det_channels=counts.shape[2],
+                            delta_det_row=pitch_v * row_bin / 10.0, delta_det_channel=pitch_u * channel_bin / 10.0,
+                            det_row_offset=-mean_y / 10.0, det_channel_offset=-mean_x / 10.0)
+    return CobraScan(case_id=info.case_id, counts=counts,
+                     flat_field=np.full((1, 1, 1), info.flat_field, np.float32),
+                     angles=np.radians(unwrapped[frames] + 90.0), geometry=geometry, dead=dead, frames=frames,
+                     lit_rows=None, half_fan=abs(mean_x) > 0.25 * Cd * pitch_u, clipped=clipped)
+
+
+@dataclass(frozen=True, eq=False)
+class LongSideFieldSource(SourceModel):
+    """``SourceModel`` whose collimated field also reaches ``field_margin_long_side_cm`` past the long edge of an
+    offset (half-fan) panel, in cm at the panel; the short edge keeps ``field_margin_channels_cm`` alone.
+
+    Attributes:
+        field_margin_long_side_cm (float): extra reach past the long edge in cm at the panel. Defaults to 0.
+    """
+
+    field_margin_long_side_cm: float = 0.0
+
+    def field_half_extent(self, geometry) -> tuple[float, float]:
+        """Half widths of the lit region about the panel centre (the long-side margin on both sides, a bound)."""
+        half_u, half_v = super().field_half_extent(geometry)
+        return half_u + self.field_margin_long_side_cm, half_v
+
+    def _field_weight(self, u, v, geometry):
+        """1 in the field, 0 past it (no off-focal table)."""
+        if self.off_focal_distance_cm is not None:
+            raise NotImplementedError("LongSideFieldSource has no off-focal emission")
+        half_u, half_v = geometry.panel_half_extent()
+        w = u + geometry.det_channel_offset                     # panel-centred coordinate along the channels
+        extra = self.field_margin_long_side_cm
+        long_negative = geometry.det_channel_offset > 0         # the panel reaches further toward negative u
+        low = -half_u - self.field_margin_channels_cm - (extra if long_negative else 0.0)
+        high = half_u + self.field_margin_channels_cm + (0.0 if long_negative else extra)
+        return (w >= low) & (w <= high) & ((v + geometry.det_row_offset).abs() <= half_v + self.field_margin_rows_cm)
+
+
+def parabolic_bowtie_cm(geometry: ConeGeometry, centre_mm: float, edge_mm: float, power: float = 2.0) -> np.ndarray:
+    """Thickness per channel of a bowtie that rises as a power of the fan angle (the square by default) from its centre
+    to the panel's far edge, symmetric about the central ray.
+
+    Args:
+        geometry (ConeGeometry): scan geometry.
+        centre_mm (float): thickness on the central ray in mm.
+        edge_mm (float): thickness at the channel farthest from the central ray in mm.
+        power (float, optional): exponent of the fan angle. Defaults to 2.0.
+
+    Returns:
+        ndarray: [Cd] float32 thickness in cm.
+    """
+    u = (np.arange(geometry.num_det_channels) - (geometry.num_det_channels - 1) / 2) * geometry.delta_det_channel \
+        - geometry.det_channel_offset
+    angle = np.arctan(np.abs(u) / geometry.source_detector_dist)
+    return ((centre_mm + (edge_mm - centre_mm) * (angle / angle.max()) ** power) / 10.0).astype(np.float32)
+
+
 def air_column_profile(transmission: np.ndarray, first_lit_row: int, num_lit_rows: int) -> Optional[np.ndarray]:
     """One view's transmission per row of the whole panel, the median over its air columns.
 
@@ -787,6 +983,59 @@ def couch_attenuation(case_dir: str, name: str, shape: tuple[int, int], voxel_cm
     inner = Path(interior).contains_points(points).reshape(rows, cols)
     mu = np.where(inner, interior_per_cm, np.where(outer, shell_per_cm, 0.0)).astype(np.float32)
     return mu, outer | inner
+
+
+
+
+def ibeam_evo_couch(shape: tuple[int, int], voxel_cm: float, top_cm: float, carbon_per_cm: float, foam_per_cm: float,
+                    thickness_cm: float = 5.05, top_width_cm: float = 48.0, bottom_width_cm: float = 42.0,
+                    overall_width_cm: float = 53.0, skin_cm: float = 0.12, flange_cm: float = 0.45,
+                    lateral_cm: float = 0.0, subsamples: int = 8) -> tuple[np.ndarray, np.ndarray]:
+    """The cross-section of an Elekta iBEAM evo couch top on an axial plane of a CITRUS grid: a carbon-fibre box with
+    sloped side walls around a foam core, and a solid flange on each side at the top (Med. Phys. 37, 2010,
+    doi 10.1118/1.3451114). Each voxel holds the attenuation averaged over sub-samples, so that the thin skins keep
+    their mass.
+
+    Args:
+        shape (tuple[int, int]): (rows, cols) of the grid's axial plane (rows along y, cols along x).
+        voxel_cm (float): voxel size in cm.
+        top_cm (float): y of the couch's top surface in cm (CITRUS y, anterior positive).
+        carbon_per_cm (float): attenuation of the carbon-fibre skins, walls and flanges in 1/cm.
+        foam_per_cm (float): attenuation of the foam core in 1/cm.
+        thickness_cm (float, optional): thickness of the box in cm. Defaults to 5.05.
+        top_width_cm (float, optional): width of the box at the top of its walls in cm. Defaults to 48.
+        bottom_width_cm (float, optional): width of the box at the bottom in cm. Defaults to 42.
+        overall_width_cm (float, optional): width over the flanges in cm. Defaults to 53.
+        skin_cm (float, optional): thickness of the skins and walls in cm. Defaults to 0.12.
+        flange_cm (float, optional): thickness of the flanges in cm. Defaults to 0.45.
+        lateral_cm (float, optional): x of the couch's centre in cm. Defaults to 0.
+        subsamples (int, optional): sub-samples per voxel along each axis. Defaults to 8.
+
+    Returns:
+        (ndarray, ndarray): [rows, cols] float32 attenuation in 1/cm and bool mask of the couch.
+    """
+    rows, cols = shape
+    offsets = ((np.arange(subsamples) + 0.5) / subsamples - 0.5) * voxel_cm
+    y_rows = (np.arange(rows) - (rows - 1) / 2) * voxel_cm
+    x_cols = (np.arange(cols) - (cols - 1) / 2) * voxel_cm
+    band = (y_rows <= top_cm + voxel_cm) & (y_rows >= top_cm - thickness_cm - voxel_cm)   # rows the couch can touch
+    y = (y_rows[band][:, None] + offsets[None, :]).reshape(-1)
+    x = np.abs((x_cols[:, None] + offsets[None, :]).reshape(-1) - lateral_cm)
+    Y, X = np.meshgrid(y, x, indexing="ij")
+    bottom = top_cm - thickness_cm
+    half = 0.5 * bottom_width_cm + 0.5 * (top_width_cm - bottom_width_cm) * (Y - bottom) / thickness_cm
+    box = (Y <= top_cm) & (Y >= bottom) & (X <= half)
+    wall_slope = np.arctan2(thickness_cm, 0.5 * (top_width_cm - bottom_width_cm))
+    core = (Y <= top_cm - skin_cm) & (Y >= bottom + skin_cm) & (X <= half - skin_cm / np.sin(wall_slope))
+    flange = (Y <= top_cm) & (Y >= top_cm - flange_cm) & (X <= 0.5 * overall_width_cm) & ~box
+    fine = np.where(box & core, foam_per_cm, np.where(box | flange, carbon_per_cm, 0.0))
+    mu = np.zeros(shape, np.float32)
+    mu[band] = fine.reshape(int(band.sum()), subsamples, cols, subsamples).mean(axis=(1, 3))
+    return mu, mu > 0
+
+
+
+
 
 
 # ======================================================================================================================

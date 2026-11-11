@@ -1,19 +1,21 @@
 # CITRUS on the COBRA2026 IGRT cases
 
-Reconstructions of Varian pelvis CBCT scans of the COBRA2026 dataset (training split, Zenodo / CREATIS warehouse) with
-CITRUS, compared with the vendor's clinical CBCT and the deformed planning CT.
+Reconstructions of Varian and Elekta pelvis CBCT scans of the COBRA2026 dataset (training split, Zenodo / CREATIS
+warehouse) with CITRUS, compared with the vendor's clinical CBCT and the deformed planning CT.
 
 | script | scanner | cases |
 |---|---|---|
 | `COBRA_TrueBeam.py` | TrueBeam, half fan, whole rotation (centre G) | G008, G007 |
 | `COBRA_Halcyon.py` | Halcyon, full fan, short scan (centre F) | F015, F003, F041 |
+| `COBRA_Synergy.py` | Elekta Synergy (XVI), half fan, whole rotation (centre C) | C039, C041, C013 |
 
 Each script has five sections:
 
 1. the case (`CASE = ...`) and the parameters its metadata does not give: the panel's drift model, the couch height and
    attenuation, the spectrum, the grid's strips, and the CITRUS settings;
-2. the data: the case is downloaded into `data/TrueBeam/<case>` or `data/Halcyon/<case>` unless the folder already holds
-   the needed files, and the rest of the parameters are read from `metadata.yaml`, `Scan.xml` and `Calibrations/`;
+2. the data: the case is downloaded into `data/TrueBeam/<case>`, `data/Halcyon/<case>` or `data/Elekta/<case>` unless
+   the folder already holds the needed files, and the rest of the parameters are read from `metadata.yaml` and
+   `Scan.xml` with `Calibrations/` (Varian) or `reconstruction.yaml` (Elekta);
 3. the preprocessing: drift correction, the air scans as flat fields, the rows under the blades left out, binning, the
    half-fan weights, the bowtie's transmission, the off-focal emission (Halcyon) and the couch model, a known object
    of the loop (in the scatter scene and the modelled primary, its line integrals removed from the corrected data);
@@ -25,9 +27,17 @@ The Halcyon scans are cropped to the rows inside the axial blades; the panel's r
 counts are not shifted (the research loader `cobra/cobra_io.py` also shifted the cropped views by the crop's centre
 offset, which an obsolete z correction of its volume grid cancelled).
 
-`cobra_tools.py` holds the shared code (download, Varian file readers, preprocessing, couch, figure).
-`data/spectra/` holds the x-ray spectra: `varian_125kvp_tube.txt` (tube and window, used with the bowtie as the source
-model's filter) and `varian_125kvp_lit.txt` (the bowtie's thinnest part folded in).
+The Elekta projections are already divided by the flood image, so the open beam is one level, the flood's norm scaled
+to the scan's mA and pulse length; every pixel that sees air saturates at the panel's maximum and is set to that level.
+The flood also removes the F1 bowtie from the projections but not from the scatter it causes, so the source model
+carries an aluminium bowtie whose thickness rises as the square of the fan angle (the F1 profile is not published).
+The couch is the iBEAM evo top, its published cross-section with the carbon and foam attenuation fitted to the rays
+through the couch alone; its height is set per case in the script, from the couch's two skins under the patient.
+
+`cobra_tools.py` holds the shared code (download, Varian and Elekta file readers, preprocessing, couch, figure).
+`data/spectra/` holds the x-ray spectra: for Varian `varian_125kvp_tube.txt` (tube and window, used with the bowtie as
+the source model's filter) and `varian_125kvp_lit.txt` (the bowtie's thinnest part folded in), for Elekta
+`elekta_120kvp_open.txt` (the XVI's open beam, used with the F1 bowtie as the source model's filter).
 
 ## Running
 
@@ -35,13 +45,14 @@ From this folder, with CITRUS installed:
 
     python COBRA_TrueBeam.py
     python COBRA_Halcyon.py
+    python COBRA_Synergy.py
 
 Set `CASE` at the top of a script to choose the case, and `RECONSTRUCT = False` to redraw the figure from a saved
 reconstruction.
 
-- Data: about 1.25 GB per case is downloaded (the simulated projections, the planning CT and the dataset's own FDK are
-  skipped). The data folders and `results/` are not tracked by git.
-- GPU: a CUDA GPU with 12 GB for the TrueBeam settings (1.25 mm voxels); the Halcyon settings (2 mm) need less. The
-  scripts cap PyTorch at 90 % of the card (`GPU_MEMORY_FRACTION`): without a cap its cache grows past the card on
-  Windows, which then spills into host memory and runs many times slower.
+- Data: about 1.25 GB per Varian case and 1 GB per Elekta case is downloaded (the simulated projections, the planning
+  CT and the dataset's own FDK are skipped). The data folders and `results/` are not tracked by git.
+- GPU: a CUDA GPU with 12 GB for the TrueBeam and Synergy settings (1.25 mm voxels); the Halcyon settings (2 mm) need
+  less. The scripts cap PyTorch at 90 % of the card (`GPU_MEMORY_FRACTION`): without a cap its cache grows past the
+  card on Windows, which then spills into host memory and runs many times slower.
 - RAM: about 25 GB free (the projections of a case are read whole before binning).
