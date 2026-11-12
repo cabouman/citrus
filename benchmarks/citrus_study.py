@@ -203,7 +203,7 @@ def main() -> None:
         tag += f"_cell{args.transport_cell_cm:g}".replace(".", "p")
     if truth_config != base_config:
         tag += f"_truth{truth_polar}x{truth_azimuthal}_cone{cone_polar}x{cone_azimuthal}"
-    tag += "_v2"  # data-set format 2: SPR with the primary model of the loop (citrus >= 0.3.0)
+    tag += "_v3"  # data-set format 3: primary and scatter from the solver's signals with the spectrum (citrus >= 0.28.0)
     start_time = time.perf_counter()
 
     # ---- 1. data ------------------------------------------------------------------------------------------------

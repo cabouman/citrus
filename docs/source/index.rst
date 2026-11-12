@@ -11,9 +11,8 @@ corrupted by scatter, and never revisits it. CITRUS (Coupled Iterative Tomograph
 Recursively-Updated Scatter) instead interleaves model-based iterative reconstruction (MBIR) with steps of a
 deterministic solver of the linear Boltzmann transport equation (LBTE): every outer iteration refreshes the scatter
 estimate of every view with one transport sweep from the current reconstruction, corrects the measured data with it
-and runs MBIR iterations on the result (by default as many as the fit of the corrected data keeps improving). The
-scatter estimate and the reconstruction converge together, for the cost of one transport sweep per view per outer
-iteration.
+and runs a fixed number of MBIR iterations on the result. The scatter estimate and the reconstruction converge
+together, for the cost of one transport sweep per view per outer iteration.
 
 A reconstruction in a few lines
 -------------------------------
@@ -32,7 +31,8 @@ A reconstruction in a few lines
 ``counts`` are the measured projections (primary plus scatter), ``grid`` and ``geometry`` describe the volume and the
 scanner (a cone beam with a flat or curved panel and circular or helical views, or a parallel beam) in MBIRTORCH's
 conventions, and the configuration runs the scatter step on every 8th view only, interpolating the others in angle.
-:doc:`usage` describes the seven demos and the study script that compares CITRUS with MBIR without scatter correction.
+:doc:`usage` describes the seven demos and the study script that compares CITRUS with MBIR without scatter correction,
+and :doc:`experiments` the reconstructions of clinical pelvis CBCT scans of three scanners.
 
 What CITRUS gives you
 ---------------------
@@ -69,11 +69,16 @@ What CITRUS gives you
       conventions; the user's spectrum (kV, MV or one line), an emission profile from the measured open field, and
       detector responses and anti-scatter grids (septa along one or both directions) built from material data.
 
-   .. grid-item-card:: Any materials, metal included
+   .. grid-item-card:: Any materials
 
-      Reference materials from a catalogue of tissues, compounds and every element, or defined by a formula. A metal
-      mask leaves the rays through metal out of MBIR, so that starved and inconsistent rays do not streak the tissue
-      around it.
+      Reference materials from a catalogue of tissues, compounds and every element, or defined by a formula. MBIR takes
+      measurement weights of the user's choice, such as MBIRTORCH's metal artifact reduction weights.
+
+   .. grid-item-card:: Measured scans
+
+      A beam filter per direction, field margins and off-focal emission in the source, a per-pixel beam-hardening
+      correction from the solver's own primary model, objects known in advance such as the patient couch, and
+      multigrid stages that start the loop on coarse voxels and binned data.
 
 How it works
 ------------
@@ -129,7 +134,7 @@ Documentation
       :link: installation
       :link-type: doc
 
-      Installation, the demos and the options of the reconstruction loop.
+      Installation, the demos, the options of the reconstruction loop and the clinical experiments.
 
    .. grid-item-card:: User guide
       :link: method
@@ -152,6 +157,7 @@ Documentation
    overview
    installation
    usage
+   experiments
 
 .. toctree::
    :maxdepth: 2

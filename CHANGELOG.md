@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.28.0 - 2026-11-12
+
+- **No metal mask.** `CitrusConfig.metal_attenuation_threshold`, `citrus.citrus.metal_fill` and the records
+  `metal_measurement_fraction`, `metal_voxels` and `metal_fill_scale` are removed. On real pelvic scans with hip
+  implants (COBRA2026) leaving the rays through metal out of MBIR made the tissue worse than keeping them in, whatever
+  the mask and fill. Demo basic 4 down-weights the rays through its amalgam with MBIRTORCH's metal artifact reduction
+  weights (`mbirtorch.gen_weights_mar`) passed as `measurement_weights`.
+- **Synthetic data from the spectrum.** `synthesize_cone_beam_data` takes the primary and the scatter from the solver's
+  signals with its spectrum, `P = F p / f` and `S = F s / f`, so the data carry beam hardening and the scatter keeps
+  its smooth floor behind dense objects. Before, the scatter was the solver's ratio times a monoenergetic primary,
+  which removed the scatter behind metal. `polychromatic_primary` is removed; the data format is 3 and
+  `load_dataset` refuses older data sets.
+- **Multigrid stages.** `Schedule(stages=...)` runs the loop once per `Stage`, coarse to fine: each stage takes every
+  n-th view, averages the data over blocks of detector rows and channels and reconstructs on voxels `voxel_factor`
+  (any number >= 1) times larger within the same extent, starting from the previous stage's volume and taking over its
+  per-view scatter state when the computed views and transport grid are the same. A binned block with a weight-0 pixel
+  gets weight 0, and the known objects are averaged onto the coarser grids. The last stage is at full resolution;
+  `info["stages"]` holds every stage's info.
+- **COBRA2026 scripts in two resolutions.** `experiments/IGRT` has a `LowRes` and a `FullRes` script per scanner
+  (TrueBeam, Halcyon, Synergy), both multigrid: binned data on a 12 GB GPU, or every pixel on the clinical CBCT's
+  voxels on a large GPU.
+- **No `torch.compile` by default.** The MBIRTORCH models are built with `compile_mode="off"`: compiled kernels
+  recompile at every new image or subset size. `compile_mode="auto"` turns it back on.
+- **Uniform MBIR weights by default.** `CitrusConfig.mbir_weighting="uniform"` gives every measurement the same weight
+  before `measurement_weights`; `"transmission"` is the former weighting by Y / I0, which `max_measurement_weight`
+  caps.
+- **Air threshold in 1/cm.** `air_threshold_hu` is now `air_threshold`, an attenuation in 1/cm like every other
+  setting. The body of `extend_scatter_scene` is still the voxels above half of water's attenuation, now taken from
+  the photon data when the materials do not include water; demo basic 2 (no water among its materials) failed since
+  v0.26.
+
 ## v0.27.0 - 2026-11-10
 
 - **No scatter scene support.** `scatter_scene_support_hu`, `scatter_scene_support_margin_cm`,

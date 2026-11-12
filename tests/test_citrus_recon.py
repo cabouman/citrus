@@ -99,7 +99,7 @@ def tiny(real_library):
     model = make_cone_model(grid, geometry, data["angles"], device=DEVICE)
     Y = torch.as_tensor(data["Y"], device=DEVICE)
     P = torch.as_tensor(data["P"], device=DEVICE)
-    regularization = estimate_regularization(model, -torch.log(P / 1.0e5), Y / 1.0e5)
+    regularization = estimate_regularization(model, -torch.log(P / 1.0e5))  # uniform weights, as in the loop
     return data, grid, geometry, solver, regularization
 
 
@@ -502,85 +502,77 @@ def test_residual_without_resume_matches(tiny):
     assert np.allclose(out[True], out[False], rtol=1e-4)
 
 
-# ---- weights: scatter as noise, metal mask -------------------------------------------------------------------
-
-def test_metal_threshold_is_validated():
-    assert CitrusConfig().metal_attenuation_threshold is None
-    CitrusConfig(metal_attenuation_threshold=2).validate()
-    CitrusConfig(metal_attenuation_threshold=np.float32(1.5)).validate()
-    for bad in (0, -1.0, True, "2"):
-        with pytest.raises(ValueError, match="metal_attenuation_threshold"):
-            CitrusConfig(metal_attenuation_threshold=bad).validate()
+def test_relative_norm():
+    error = torch.tensor([3.0, 4.0])
+    reference = torch.tensor([6.0, 8.0])
+    assert citrus_module._relative_norm(error, reference) == pytest.approx(0.5)
 
 
-def test_relative_norm_over_a_mask():
-    error = torch.tensor([3.0, 100.0])
-    reference = torch.tensor([4.0, 1.0])
-    assert citrus_module._relative_norm(error, reference, torch.tensor([True, False])) == pytest.approx(0.75)
-    assert citrus_module._relative_norm(error, reference) == pytest.approx(float(error.norm() / reference.norm()))
+# ---- multigrid stages -------------------------------------------------------------------------------------------
+
+def test_stages_are_validated():
+    from citrus import Stage
+
+    Schedule(stages=(Stage(2, 2, 2, 2, 3), Stage(0.5 / 0.0947), Stage())).validate()
+    for bad in ((Stage(2),), (), (Stage(0),), (Stage(0.5), Stage()), (Stage(1, 1.5), Stage()), ("stage",)):
+        with pytest.raises(ValueError):
+            Schedule(stages=bad).validate()
 
 
-@cuda
-def test_metal_mask_zeroes_the_rays_through_metal(tiny):
-    """The measurements whose rays cross a voxel above the threshold get weight 0 and leave the fit; a volume without
-    such a voxel keeps its weights."""
-    from citrus.recon.mbir_bridge import forward_project, make_cone_model
+def test_stage_grids_and_weights():
+    """A stage's grid has floor(n / voxel_factor) voxels per axis; a binned block with a weight-0 pixel gets weight 0;
+    a profile broadcast over the rows is binned along the channels only."""
+    from citrus import Stage
+    from citrus.multigrid import _stage_grid, _stage_panel, _stage_weights
+    from citrus.scatter_solver import ConeGeometry, Grid
 
-    data, grid, geometry, solver, regularization = tiny
-    model = make_cone_model(grid, geometry, data["angles"], device=DEVICE)
-    W = torch.as_tensor(data["Y"], device=DEVICE) / 1.0e5
-    X = torch.full(grid.shape, 0.2, device=DEVICE)
-    config = CitrusConfig(metal_attenuation_threshold=5.0)
-    record: dict = {}
-    weights, kept = citrus_module._metal_mask(model, X, W, config, record)
-    assert kept is None and record["metal_measurement_fraction"] == 0.0 and torch.equal(weights, W)
-    unmasked, none = citrus_module._metal_mask(model, X, W, CitrusConfig(), {})
-    assert unmasked is W and none is None
-    X[4, 7, 10] = 40.0
-    weights, kept = citrus_module._metal_mask(model, X, W, config, record)
-    through = forward_project(model, (X > 5.0).float()) > 0
-    assert torch.equal(kept, ~through) and bool(through.any())
-    assert float(weights[through].abs().max()) == 0.0 and torch.equal(weights[kept], W[kept])
-    assert 0.0 < record["metal_measurement_fraction"] < 0.2
+    grid = Grid(shape=(634, 634, 337), delta_voxel=0.0947)
+    coarse = _stage_grid(grid, Stage(0.5 / 0.0947))
+    assert coarse.shape == (120, 120, 63) and math.isclose(coarse.delta_voxel, 0.5)
+    geometry = ConeGeometry(source_iso_dist=100.0, source_detector_dist=150.0, num_det_rows=4, num_det_channels=6,
+                            delta_det_row=0.1, delta_det_channel=0.1)
+    panel, _ = _stage_panel(geometry, Stage(row_binning=2, channel_binning=2))
+    weights = torch.ones(4, 6)
+    weights[0, 0] = 0.0
+    binned = _stage_weights(panel, weights, 1)
+    assert float(binned[0, 0]) == 0.0 and bool((binned.flatten()[1:] == 1).all())
+    # a profile broadcast over the rows ([1, C], e.g. a beam filter's thickness per channel) is binned along C only
+    profile = torch.arange(6.0)[None]
+    assert torch.equal(panel.image(profile), torch.tensor([[0.5, 2.5, 4.5]]))
 
 
 @cuda
-@pytest.mark.parametrize("resume", [True, False])
-def test_citrus_recon_with_a_metal_threshold(tiny, resume):
-    """With a threshold below the bone of the phantom, the bone's rays leave the fit: every outer iteration records
-    the fraction it masked (none while the bone is below the threshold), and the residual over the other rays falls
-    within each outer iteration."""
+def test_stages_carry_the_scatter_state(tiny):
+    """A binned stage on every second view, then full resolution: the full-resolution stage takes over the scatter
+    state of the same computed views, the callbacks see the stage, and the volume is on the full grid."""
+    from citrus import Stage
+
     data, grid, geometry, solver, regularization = tiny
-    config = CitrusConfig(num_outer_iterations=2, mbir_iterations_per_outer_iteration=2, resume_error_sinogram=resume,
-                          metal_attenuation_threshold=0.3)
+    stages = (Stage(row_binning=2, channel_binning=2, view_stride=2, num_outer_iterations=2), Stage())
+    config = CitrusConfig(mbir_iterations_per_outer_iteration=2, scatter_view_stride=2)
+    seen = []
     X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, config,
-                           regularization=regularization,
-                           mbir_callback=lambda i, X, record: None)  # the residual is tracked without resume too
-    records = info["records"][1:]
-    assert bool(torch.isfinite(X).all())
-    fractions = [r["metal_measurement_fraction"] for r in records]  # the FDK's bone may stay below the threshold
-    assert all(0.0 <= f < 0.5 for f in fractions) and fractions[-1] > 0.0, fractions
-    assert records[-1]["metal_voxels"] > 0 and records[-1]["metal_fill_scale"] > 0.0
-    assert all(0 < r["sinogram_nrmse"] < r["sinogram_nrmse_start"] < 1 for r in records)
+                           schedule=Schedule(stages=stages), regularization=regularization,
+                           callback=lambda k, volume, record: seen.append(record["stage"]))
+    assert tuple(X.shape) == tuple(grid.shape) and bool(torch.isfinite(X).all())
+    first, last = info["stages"]
+    assert first["num_views"] == 8 and first["geometry"].num_det_rows == 23 and first["geometry"].num_det_channels == 19
+    assert len(first["records"]) == 3 and len(last["records"]) == 2 and info["records"] is last["records"]
+    assert first["state_carried"] is False and last["state_carried"] is True
+    assert seen == [1, 1, 1, 2, 2]
+    assert solver.geometry == geometry  # the stages work on copies of the solver
 
 
-def test_metal_fill_keeps_the_total_of_the_reference():
-    """The first volume with metal becomes the reference; a later, tighter metal set gets the reference's values
-    scaled to the reference's total, and the other voxels are unchanged."""
-    blurred = torch.zeros(5, 5, 1)
-    blurred[1:4, 1:4] = 3.0
-    blurred[2, 2] = 9.0  # metal above 2: 9 voxels, total 33
-    record: dict = {}
-    filled, reference = citrus_module.metal_fill(blurred, 2.0, None, record)
-    assert torch.equal(filled, blurred) and float(reference[1]) == 33.0
-    assert record == {"metal_voxels": 9, "metal_fill_scale": 1.0}
-    faded = torch.full((5, 5, 1), 0.2)
-    faded[2, 2] = 4.0  # the set has shrunk to the core
-    filled, same = citrus_module.metal_fill(faded, 2.0, reference, record)
-    assert same is reference and record["metal_voxels"] == 1
-    assert float(filled[2, 2]) == pytest.approx(33.0) and record["metal_fill_scale"] == pytest.approx(33.0 / 9.0)
-    assert torch.equal(filled[faded <= 2.0], faded[faded <= 2.0])
-    empty = torch.full((5, 5, 1), 0.2)
-    unchanged, kept = citrus_module.metal_fill(empty, 2.0, reference, record)
-    assert unchanged is empty and kept is reference and record["metal_voxels"] == 0
-    assert citrus_module.metal_fill(empty, 2.0)[1] is None  # no metal, no reference
+@cuda
+def test_stages_on_a_coarser_grid(tiny):
+    """A stage on 5 times larger voxels hands its volume to the full grid."""
+    from citrus import Stage
+
+    data, grid, geometry, solver, regularization = tiny
+    stages = (Stage(voxel_factor=5, row_binning=2, channel_binning=2, view_stride=2, num_outer_iterations=1), Stage())
+    X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver,
+                           CitrusConfig(mbir_iterations_per_outer_iteration=2),
+                           schedule=Schedule(stages=stages), regularization=regularization)
+    assert info["stages"][0]["grid"].shape == tuple(n // 5 for n in grid.shape)
+    assert tuple(X.shape) == tuple(grid.shape) and bool(torch.isfinite(X).all())
+    assert _rmse(X, data) < 0.5

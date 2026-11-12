@@ -80,7 +80,8 @@ print(f"Scatter-to-primary ratio of the data: mean {data['SPR'].mean():.2f}, max
 solver = ScatterSolver(None, config, geometry, detector=detector, grid_response=grid_response, device="cuda",
                        spectrum=spectrum)
 config_citrus = CitrusConfig(num_outer_iterations=num_outer_iterations, scatter_view_stride=scatter_view_stride,
-                             mbir_iterations_per_outer_iteration=mbir_iterations_per_outer_iteration, verbose=True)
+                             mbir_iterations_per_outer_iteration=mbir_iterations_per_outer_iteration,
+                             beam_hardening_correction=True, verbose=True)
 X_citrus, info = citrus_recon(Y, I0, angles, grid, geometry, solver, config_citrus)
 
 # ---- Results ----------------------------------------------------------------------------------------------------

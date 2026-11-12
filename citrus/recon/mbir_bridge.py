@@ -87,8 +87,8 @@ def make_cone_model(grid: Grid, geometry: ConeGeometry, angles: Union[Sequence[f
             CPU).
         use_ror_mask (bool, optional): MBIRTORCH's region-of-reconstruction mask; False projects and updates every
             voxel. Defaults to False.
-        compile_mode (str, optional): MBIRTORCH's ``compile_mode``. Defaults to None (``"auto"`` on CUDA, ``"off"`` on
-            CPU).
+        compile_mode (str, optional): MBIRTORCH's ``compile_mode``; ``"auto"`` compiles its kernels with
+            ``torch.compile`` on CUDA. Defaults to None (``"off"``).
         verbose (int, optional): MBIRTORCH's verbosity. Defaults to 0.
         **params: passed to ``ConeBeamModel.set_params`` (e.g. ``snr_db``, ``sharpness``, ``positivity_flag``).
 
@@ -99,8 +99,8 @@ def make_cone_model(grid: Grid, geometry: ConeGeometry, angles: Union[Sequence[f
 
     device = (torch.device(device) if device is not None
               else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    if compile_mode is None:
-        compile_mode = "auto" if device.type == "cuda" else "off"
+    if compile_mode is None:  # off: torch.compile recompiles at every new image or subset size
+        compile_mode = "off"
     angle_array = _angles_array(angles)
     # the constructor arguments of the panel shape and the helical views, left out for the defaults
     view_arguments = {}
@@ -148,8 +148,8 @@ def make_parallel_model(grid: Grid, geometry: ParallelGeometry, angles: Union[Se
         device (torch.device or str, optional): the model's single device. Defaults to None (CUDA if available, else
             CPU).
         use_ror_mask (bool, optional): MBIRTORCH's region-of-reconstruction mask. Defaults to False.
-        compile_mode (str, optional): MBIRTORCH's ``compile_mode``. Defaults to None (``"auto"`` on CUDA, ``"off"`` on
-            CPU).
+        compile_mode (str, optional): MBIRTORCH's ``compile_mode``; ``"auto"`` compiles its kernels with
+            ``torch.compile`` on CUDA. Defaults to None (``"off"``).
         verbose (int, optional): MBIRTORCH's verbosity. Defaults to 0.
         **params: passed to ``ParallelBeamModel.set_params`` (e.g. ``snr_db``, ``sharpness``, ``positivity_flag``).
 
@@ -177,8 +177,8 @@ def make_parallel_model(grid: Grid, geometry: ParallelGeometry, angles: Union[Se
                          "not match the grid (" + "; ".join(mismatches) + "): build it with ParallelGeometry.from_grid")
     device = (torch.device(device) if device is not None
               else torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    if compile_mode is None:
-        compile_mode = "auto" if device.type == "cuda" else "off"
+    if compile_mode is None:  # off: torch.compile recompiles at every new image or subset size
+        compile_mode = "off"
     angle_array = _angles_array(angles)
     model = mbirtorch.ParallelBeamModel((len(angle_array), geometry.num_det_rows, geometry.num_det_channels),
                                         angle_array, compile_mode=compile_mode)

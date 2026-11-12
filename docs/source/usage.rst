@@ -41,9 +41,10 @@ CITRUS.
 ``demo_basic_4_custom_materials.py`` defines an iodine contrast agent and a dental amalgam with ``Material``, puts them
 in ``SolverConfig.materials`` next to catalogue names and builds a small head phantom (``dental_head_phantom``: a water
 cylinder with a bone rod, a vessel of contrast and an amalgam filling) as a density volume whose rows follow
-``solver.materials``. The rays through the amalgam are starved of primary photons; the metal mask
-(``metal_attenuation_threshold``) leaves them out of the MBIR iterations, and the demo compares the initial volume and
-CITRUS outside the filling.
+``solver.materials``. The rays through the amalgam are starved of primary photons. MBIRTORCH's metal artifact
+reduction weights (``mbirtorch.gen_weights_mar``, the metal segmented in an FDK of the data with a threshold above
+cortical bone's attenuation), passed to CITRUS as ``measurement_weights``, down-weight them, and the demo compares the
+initial volume and CITRUS outside the filling.
 
 ``demo_advanced_1_custom_callbacks.py`` runs CITRUS on the data of ``demo_basic_3_cone_beam.py`` with ``callback`` and
 ``mbir_callback``: it records the relative RMSE of the volume against the truth and the sinogram residual
@@ -113,7 +114,7 @@ The script uses the sample 125 kVp spectrum of ``demo/spectra`` and the full-fie
 
 Names: the data set is ``demo/input/<tag>.npz`` (with ``<tag>.json``), the tag recording the number of views, the voxel
 pitch, the angular range (``_short`` for the default short scan), ``_nonoise``, a transport cell size other than 1 cm,
-a finer truth discretization and the data-set format (``_v2``); files of other formats are never loaded. The outputs
+a finer truth discretization and the data-set format (``_v3``); files of other formats are never loaded. The outputs
 are ``demo/output/citrus_<tag>[suffixes]_<figure>.png`` and ``citrus_<tag>[suffixes].json``, with the suffixes
 ``_materials-<names>`` (a set of reference materials other than the default), ``_restart``
 (``--no-resume-error-sinogram``), ``_stride<n>`` (with ``_order<k>`` for an interpolation order other than 3) and
@@ -133,10 +134,11 @@ before MBIRTORCH's FDK or filtered back projection (``recon.mbir_bridge.redundan
 applies them itself does so), except for a helical scan, and the sparse-view interpolation runs along the arc. A
 parallel beam has no fan angle: its default range is 180 degrees.
 
-Ground truth: the scatter of every view is computed by the scatter solver from the TRUE densities with a fully
-converged source iteration, stored as the scatter-to-primary ratio and applied to MBIRTORCH's primary counts, then
-Poisson noise is drawn. This is an intentional inverse crime for the scatter (the truth and the correction come from
-the same solver), so the study measures how well the coupled loop converges, not the accuracy of the scatter model;
+Ground truth: the data come from ``synthesize_wlab_dataset`` ("Synthetic data", below), whose scatter of every view
+is computed by the scatter solver from the true densities with a fully converged source iteration, and Poisson noise
+is drawn on the primary plus scatter counts. This is an intentional inverse crime for the scatter (the truth and the
+correction come from the same solver), so the study measures how well the coupled loop converges, not the accuracy
+of the scatter model;
 ``--truth-sweep 16x32 --truth-cone 32x64`` generates the truth with finer angular discretizations than the loop (8x16,
 16x32) to expose the solver's own discretization error.
 
@@ -172,9 +174,7 @@ The entries of ``info``:
   ``volume_change_relative`` (``|X_k - X_{k-1}| / |X_k|``),
   ``scatter_change_relative`` (from outer iteration 2 on: mean absolute change of the scatter-count estimate over its
   mean absolute value), ``hardening_offset_max`` (with ``hardening_materials``: the largest offset
-  ``|ln(P / P_ref)|``), ``metal_measurement_fraction``, ``metal_voxels`` and ``metal_fill_scale`` (with
-  ``metal_attenuation_threshold``: the share of measurements left out, the size of the metal set and the scale of its
-  fill) and, on CUDA, ``gpu_peak_allocated_mib``; a record with a scatter stage also holds
+  ``|ln(P / P_ref)|``) and, on CUDA, ``gpu_peak_allocated_mib``; a record with a scatter stage also holds
   ``negative_fraction`` (voxels clamped by the density model), ``accumulator_change_mean`` /
   ``accumulator_change_max`` (relative accumulator change over the computed views; ``converged_sweeps_mean`` instead
   with ``"converged"``), ``transfer_seconds``,
@@ -193,7 +193,10 @@ The entries of ``info``:
   False for a prebuilt library) and ``library_seconds`` (time to build or load a lazy solver's library);
 * ``emission_profile``: the source's emission profile derived from an open-field image (None for a number);
 * ``scatter_scene_slices``: the first and last slice the scatter scene kept at its last update, the others repeating
-  them (``extend_scatter_scene``, else None) and ``water_linearization``: the per-pixel map of ``beam_hardening_correction`` (else None).
+  them (``extend_scatter_scene``, else None) and ``water_linearization``: the per-pixel map of
+  ``beam_hardening_correction`` (else None);
+* with ``Schedule.stages``: ``stages``, the info of every stage, each with ``stage``, ``grid``, ``geometry``,
+  ``num_views`` and ``state_carried``.
 
 ``mbir_recon`` returns the same entries without those of the scatter solver.
 
@@ -225,9 +228,16 @@ hardening (:doc:`method`, "Scatter scene beyond the reconstructed slab" and "Bea
                                off_focal_distance_cm=distances, off_focal_fraction=fractions,
                                filter_material="aluminium", filter_thickness_cm=thickness)
    config = CitrusConfig(extend_scatter_scene=True, beam_hardening_correction=True,
-                         hardening_materials=("bone_cortical_icrp",))
+                         hardening_materials=("bone_cortical_icrp",),
+                         measurement_weights=taper,            # e.g. half-fan redundancy weights, 0 on dead pixels
+                         air_threshold=0.02,                   # 1/cm: below this, air in the scatter solver's scene
+                         known_objects=couch)                  # [R, C, S] attenuation of the couch model
    recon, info = citrus_recon(Y, open_field, angles, grid, geometry, solver, config)
    info["scatter_scene_slices"], info["water_linearization"]    # (first, last slice kept), the per-pixel map
+
+Projections that the scanner has already divided by its flood image take a number as the flat field: an image would
+give the solver's source the flat emission profile of a flood-corrected open field. :doc:`experiments` shows these
+settings on measured scans of three scanners.
 
 The iteration counts and the view schedule (:doc:`method`, "MBIR iterations per outer iteration" and "Scatter step
 on every m-th view"):
@@ -259,6 +269,28 @@ iteration and the scatter updates; CITRUS, one sweep per outer iteration, is the
    recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, schedule=schedule)
    info["schedule"], info["outer_iterations_total"]
 
+Multigrid stages (:doc:`method`, "Multigrid stages") run the loop on coarse grids and binned data first. A ``Stage``
+gives its voxel size (any factor of at least 1), detector binning and view stride as factors of the full-resolution
+grid and data, and its number of outer iterations; the last stage is at full resolution:
+
+.. code-block:: python
+
+   from citrus import Schedule, Stage
+
+   stages = (Stage(voxel_factor=4, row_binning=8, channel_binning=4, view_stride=2, num_outer_iterations=6),
+             Stage(voxel_factor=2, row_binning=4, channel_binning=2, num_outer_iterations=3),
+             Stage(num_outer_iterations=1))
+   # voxels of 5 mm over a 0.947 mm grid: Stage(voxel_factor=0.5 / 0.0947, ...)
+   recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, config, schedule=Schedule(stages=stages))
+   info["stages"][0]["grid"], info["stages"][-1]["state_carried"]
+
+The other settings of the schedule and of the config apply to every stage, and so do the MBIR settings and the region of
+a given ``model``; the config's ``scatter_view_stride`` counts full-resolution views. ``info`` is the last stage's, with
+``info["stages"]`` the info of every stage (with ``"grid"``, ``"geometry"``, ``"num_views"`` and ``"state_carried"``),
+and the records the callbacks receive carry ``"stage"``. A stage's grid has floor(n / ``voxel_factor``) voxels along
+an axis of n; the stages keep one transport grid, and with it the scatter state, when the full grid's extent is a
+whole number of transport cells or slightly less.
+
 ``scatter_view_interpolation_order``: 3 cubic Catmull-Rom on 4 neighbors
 (default), 2 quadratic (3-point
 Lagrange), 1 linear, 0 nearest computed view; ``None`` leaves the skipped views uncorrected (diagnostics only); ignored
@@ -271,11 +303,10 @@ rounding), ``primary_views_per_chunk`` (views per chunk of the primary projectio
 lengths), ``gpu_state_budget_mib`` and ``pinned_memory_limit_gib`` (where the per-view accumulators are stored),
 ``mbir_subsets_per_iteration`` (subsets of pixel columns that an MBIR iteration updates in turn; ``"auto"`` scales
 them with the in-plane size of the volume, :doc:`method`, "Subsets per MBIR iteration"), ``energy_kev``,
-``min_counts``, ``base_seed``, ``verbose``, ``metal_attenuation_threshold`` (the metal mask, :doc:`method`,
-"Metal"), ``extend_scatter_scene`` (:doc:`method`, "Scatter scene beyond the reconstructed slab") and
-``beam_hardening_correction`` and ``hardening_materials`` (:doc:`method`, "Beam hardening"),
-``measurement_weights`` and ``max_measurement_weight`` (the MBIR weights), ``air_threshold_hu`` and
-``known_objects`` (:doc:`method`, "What the scatter solver sees").
+``min_counts``, ``base_seed``, ``verbose``, ``extend_scatter_scene`` (:doc:`method`, "Scatter scene beyond the
+reconstructed slab") and ``beam_hardening_correction`` and ``hardening_materials`` (:doc:`method`, "Beam hardening"),
+``mbir_weighting``, ``measurement_weights`` and ``max_measurement_weight`` (:doc:`method`, "MBIR weights"),
+``air_threshold`` and ``known_objects`` (:doc:`method`, "What the scatter solver sees").
 
 A curved (cylindrical) panel and helical views are part of the geometry, so the same calls reconstruct them
 (:doc:`method`, "Curved panels and helical scans"; :doc:`conventions`, "Frames"):
@@ -333,9 +364,10 @@ The per-view step is available on its own:
 Settings
 --------
 
-Every setting of the loop (``CitrusConfig``) and of the solver (``SolverConfig``), with its default; the sections
-above and :doc:`method` explain them, and the API pages (:doc:`api/citrus`, :doc:`api/config`) carry the same
-descriptions. The first setting of each group names the group.
+Every setting of the loop (``CitrusConfig``), of its schedule (``Schedule``, ``Stage``) and of the solver
+(``SolverConfig``), with its default; the sections above and :doc:`method` explain them, and the API pages
+(:doc:`api/citrus`, :doc:`api/multigrid`, :doc:`api/config`) carry the same descriptions. The first setting of each
+group names the group.
 
 **CitrusConfig**
 
@@ -347,11 +379,11 @@ descriptions. The first setting of each group names the group.
      - default
      - meaning
    * - ``num_outer_iterations`` (loop)
-     - ``14``
-     - outer iterations, one scatter correction each
+     - ``None``
+     - outer iterations, one scatter correction each; overwrites the schedule's count when set
    * - ``mbir_iterations_per_outer_iteration``
-     - ``8``
-     - MBIR iterations per outer iteration
+     - ``None``
+     - MBIR iterations per outer iteration; overwrites the schedule's count when set
    * - ``mbir_subsets_per_iteration``
      - ``"auto"``
      - subsets of pixel columns an MBIR iteration updates in turn: a number, ``"auto"`` (16 to 64 from the in-plane
@@ -374,9 +406,6 @@ descriptions. The first setting of each group names the group.
    * - ``energy_kev``
      - ``None``
      - effective energy of the density model; None for the spectrum mean of the library
-   * - ``metal_attenuation_threshold``
-     - ``None``
-     - attenuation in 1/cm above which a voxel is metal; the measurements whose rays cross metal get zero weight
    * - ``extend_scatter_scene``
      - ``False``
      - continue the body along z in the scatter solver's scene: the slices past the last slice the body fills repeat
@@ -389,16 +418,19 @@ descriptions. The first setting of each group names the group.
      - ``()``
      - library materials whose hardening beyond water is removed with the offset ln(P / P_ref) of the current volume
        before the water linearization
+   * - ``mbir_weighting``
+     - ``"uniform"``
+     - MBIR weight of a measurement: uniform (all the same) or transmission (Y / I0)
    * - ``measurement_weights``
      - ``None``
      - non-negative multipliers of the MBIR weights, [V, Rd, Cd], [Rd, Cd] or [Cd] (e.g. a half-fan overlap taper);
        0 leaves a measurement out of the fit
    * - ``max_measurement_weight``
      - ``None``
-     - cap on the MBIR weight Y / I0 of a measurement; a value below every transmission weights all equally
-   * - ``air_threshold_hu``
+     - cap on the transmission weights of ``mbir_weighting="transmission"``
+   * - ``air_threshold``
      - ``None``
-     - voxels below this value in HU are air in the volume the scatter solver sees
+     - voxels below this attenuation in 1/cm are air in the volume the scatter solver sees
    * - ``known_objects``
      - ``None``
      - [R, C, S] attenuation of objects known in advance (e.g. the couch): in the scatter scene and the primary, their
@@ -419,6 +451,59 @@ descriptions. The first setting of each group names the group.
    * - ``pinned_memory_limit_gib``
      - ``8.0``
      - largest pinned host allocation for the accumulators, in GiB
+
+**Schedule**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 16 50
+
+   * - setting
+     - default
+     - meaning
+   * - ``num_outer_iterations``
+     - ``14``
+     - outer iterations N, the most with ``outer_change_threshold``
+   * - ``outer_change_threshold``
+     - ``None``
+     - stop after the first outer iteration whose relative change of the volume falls below it
+   * - ``mbir_iterations_per_outer_iteration``
+     - ``8``
+     - MBIR iterations n per outer iteration
+   * - ``scatter_sweeps_per_outer_iteration``
+     - ``1``
+     - transport sweeps per computed view in each outer iteration (0: first-order scatter alone), or ``"converged"``
+   * - ``scatter_change_threshold``
+     - ``None``
+     - with ``"converged"``, the tolerance of each view's source iteration; None uses the solver's
+   * - ``num_scatter_updates``
+     - ``None``
+     - outer iterations, from the first, that make a new scatter estimate; None updates it in every one
+   * - ``stages``
+     - ``None``
+     - multigrid stages, coarse to fine (``Stage``); None runs one stage at full resolution
+
+**Stage**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 16 50
+
+   * - setting
+     - default
+     - meaning
+   * - ``voxel_factor``
+     - ``1``
+     - voxel size over that of the reconstruction grid, a number >= 1; floor(n / factor) voxels per axis
+   * - ``row_binning``, ``channel_binning``
+     - ``1``
+     - detector rows and channels averaged into one
+   * - ``view_stride``
+     - ``1``
+     - every n-th view is used
+   * - ``num_outer_iterations``
+     - ``1``
+     - outer iterations of the stage
 
 **SolverConfig**
 
@@ -661,9 +746,11 @@ counts with scatter of a cone-beam or parallel-beam scan (``geometry`` is the so
 volume ``rho [M, R, C, S]`` of the solver library's materials, or a density model that gives one material map at a
 time (``WlabPhantom``), so that a fine truth grid never holds the M volumes. It returns ``X_true`` (attenuation at the
 effective energy), line integrals, ``P``, ``S``, ``Y``, ``SPR``, ``open_field``, the solver's primary and scatter
-images and metadata. The primary uses MBIRTORCH's own projector, the scatter is ``S = SPR P`` with the
-scatter-to-primary ratio of one fully converged solve of ``solver`` per view, whose primary is the loop's primary
-model (``meta["data_format"]`` = 2). The truth solver may use a finer angular discretization than the solver of the
+images and metadata. The primary and the scatter are the solver's detector signals of the true object with its
+spectrum: the primary from MBIRTORCH's projections of the material maps (the loop's primary model), the scatter from
+one fully converged solve of ``solver`` per view (``meta["data_format"]`` = 3; ``load_dataset`` refuses data written
+before, whose primary was monoenergetic). The line integrals ``A X_true`` at the effective energy are kept for
+reference. The truth solver may use a finer angular discretization than the solver of the
 reconstruction loop. ``synthesize_wlab_dataset(num_views, delta_voxel, I0, noise, seed, out_path, config=...,
 geometry=..., start_view_angle=0.0, end_view_angle=None, spectrum=...)`` is the WLAB wrapper used by the demo and the
 study script (the spectrum is required unless a prebuilt ``library=`` is given; ``geometry`` defaults to
@@ -677,8 +764,8 @@ the planar fluence). The truth solver's source model sets the emission profile o
 ``detector_gain=`` a per-pixel gain map; ``synthesize_wlab_dataset`` passes ``detector=``, ``grid_response=``,
 ``source=`` and ``detector_gain=`` on. The data's ``open_field`` is the flat field to give ``citrus_recon``: the
 number ``I0`` for a uniform source without a gain map, else the image ``I0 g f / mean(f)`` of the gain :math:`g` and
-the truth solver's open-field signal :math:`f` with its emission profile, and the primary counts are
-``P = open_field exp(-A X)``:
+the truth solver's open-field signal :math:`f` with its emission profile, and the counts are
+``P = open_field p / f`` and ``S = open_field s / f`` for the solver's primary and scatter signals :math:`p`, :math:`s`:
 
 .. code-block:: python
 
@@ -691,13 +778,11 @@ the truth solver's open-field signal :math:`f` with its emission profile, and th
 
 The solver's images are in photons/cm^2 per source photon/sr (per unit incident fluence for a parallel beam); its
 primary carries the inverse-square and obliquity factors of the point source (none for a parallel beam) and the
-polychromatic transmission. MBIRTORCH's model is the flat, monochromatic line
-integral :math:`l = AX` at the effective energy with ``I0`` the flat-field count, which absorbs the inverse-square and
-obliquity factor ``phi_air`` (the solver's primary of an empty volume, saved with the data). The data tie the two
-models through the dimensionless per-pixel ratio, ``S = SPR P``: the scatter-to-primary ratio of the data equals the
-solver's physical ratio, and the CITRUS correction :math:`Y / (1 + \mathrm{SPR}(X))` does not depend on ``I0`` or on
-the monochromatic / polychromatic primary mismatch. The density volume itself is not stored (it is M fine volumes;
-``WlabPhantom`` rebuilds it).
+polychromatic transmission. Dividing both signals by the open-field signal removes the point-source factors, so
+``P / open_field`` is the polychromatic transmission of every pixel and ``SPR = S / P`` the solver's physical ratio.
+MBIRTORCH's model is the flat, monochromatic line integral :math:`l = AX` at the effective energy, so the data carry
+the beam hardening of the spectrum; ``beam_hardening_correction`` linearizes it in the loop. The density volume
+itself is not stored (it is M fine volumes; ``WlabPhantom`` rebuilds it).
 
 The Poisson draws use ``torch.Generator(seed)``, but the rates vary between runs at the float32 rounding level
 (atomic accumulation in the CUDA kernels of MBIRTORCH and of the solver), which flips a few draws; save and reuse a
