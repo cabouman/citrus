@@ -343,7 +343,7 @@ def test_citrus_recon_keeps_the_source_settings(real_library):
 
 @cuda
 def test_bowtie_filter_end_to_end(real_library):
-    """Data of an aluminium bowtie (minimum thickness 2 mm) with a polychromatic primary, behind a grid: CITRUS with the
+    """Data of an aluminium bowtie (minimum thickness 2 mm), behind a grid: CITRUS with the
     filtered source and the water linearization gives flatter and more accurate water than CITRUS with the bowtie as a
     gray emission profile (the measured open field over the unfiltered model's)."""
     pytest.importorskip("mbirtorch")
@@ -355,13 +355,13 @@ def test_bowtie_filter_end_to_end(real_library):
     u, _ = geometry.pixel_uv(dtype=F64)
     filtered = SourceModel(filter_material="aluminium", filter_thickness_cm=0.2 + 2.0 * (u / u.abs().max()) ** 2)
     data = synthesize_wlab_dataset(24, 2.0, noise=False, library=real_library, geometry=geometry, config=config,
-                                   grid_response=focused_1d_grid(), source=filtered, polychromatic_primary=True)
-    assert data["meta"]["open_field"] == "image" and data["meta"]["polychromatic_primary"]
+                                   grid_response=focused_1d_grid(), source=filtered)
+    assert data["meta"]["open_field"] == "image" and data["meta"]["data_format"] == 3
     grid = wlab_grid(2.0)
     model = make_cone_model(grid, geometry, data["angles"], device=DEVICE)
     open_field = torch.as_tensor(data["open_field"], device=DEVICE)
-    regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=DEVICE) / open_field),
-                                             torch.as_tensor(data["Y"], device=DEVICE) / open_field)
+    # uniform weights, as in the loop
+    regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=DEVICE) / open_field))
     truth = torch.as_tensor(data["X_true"], device=DEVICE)
     mu_water = float(truth[5, 7, 10])
     water = (truth - mu_water).abs() < 1e-6
@@ -416,15 +416,15 @@ def test_scatter_scene_end_to_end(real_library):
     grid = replace(wlab_grid(2.0), shape=(10, 15, 20))
     model = make_cone_model(grid, geometry, data["angles"], device=DEVICE)
     Y = torch.as_tensor(data["Y"], device=DEVICE)
-    regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=DEVICE) / 1e5),
-                                             Y / 1e5)
+    # uniform weights, as in the loop
+    regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=DEVICE) / 1e5))
     truth = torch.as_tensor(data["SPR"], device=DEVICE)
     errors, slices = {}, {}
     for extend in (True, False):
         solver = wlab_solver(2.0, config=config, library=real_library, geometry=geometry, device=DEVICE,
                              source=source)
         loop = CitrusConfig(mbir_iterations_per_outer_iteration=2, num_outer_iterations=5, extend_scatter_scene=extend,
-                            air_threshold_hu=-900.0)
+                            air_threshold=0.02)  # about a tenth of water
         _, info = citrus_recon(data["Y"], 1e5, data["angles"], grid, geometry, solver, loop,
                                regularization=regularization, model=model)
         slices[extend] = info["scatter_scene_slices"]
@@ -462,12 +462,11 @@ def test_hardening_materials_end_to_end(real_library):
     rho[water] = (inside & ~rods).double()[:, :, None]
     rho[bone] = 1.85 * rods.double()[:, :, None]
     angles = view_angles(32, end_view_angle=2 * math.pi)
-    data = synthesize_cone_beam_data(rho, grid, geometry, angles, make_solver(), noise=False,
-                                     polychromatic_primary=True)
+    data = synthesize_cone_beam_data(rho, grid, geometry, angles, make_solver(), noise=False)
     model = make_cone_model(grid, geometry, angles, device=DEVICE)
     open_field = torch.as_tensor(data["open_field"], device=DEVICE)
-    regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=DEVICE) / open_field),
-                                             torch.as_tensor(data["Y"], device=DEVICE) / open_field)
+    # uniform weights, as in the loop
+    regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=DEVICE) / open_field))
     truth = torch.as_tensor(data["X_true"], device=DEVICE)
     mu_water = float(truth[12, 12, 3])
     between = ((xx.abs() < 2.5) & (yy.abs() < 2.5)).to(DEVICE)[:, :, None].expand(grid.shape)

@@ -5,8 +5,8 @@ volumes (cone-beam scans on flat or curved panels, circular or helical, and para
 scatter-contaminated projections by iterating model-based iterative reconstruction (MBIR, via
 [MBIRTORCH](https://github.com/cabouman/mbirtorch)) and a deterministic scatter solver for the linear Boltzmann
 transport equation (LBTE) **jointly**: every outer iteration refreshes the scatter estimate with one source-iteration
-step of the scatter solver from the current reconstruction and runs MBIR iterations on the corrected data (as many as
-the fit of the corrected data keeps improving, by default). This replaces the usual sequential pipeline (a direct
+step of the scatter solver from the current reconstruction and runs a fixed number of MBIR iterations on the
+corrected data. This replaces the usual sequential pipeline (a direct
 reconstruction such as FDK, one scatter estimate from that volume, correction, then a reconstruction that never
 revisits the scatter), whose scatter estimate inherits the errors of the scatter-corrupted initial volume.
 
@@ -49,10 +49,15 @@ first-collision source, sweep).
 
 The user supplies the source spectrum (a two-column file, or one node for a monoenergetic source) and chooses the
 reference materials of the density model from a catalogue of compounds, tissues and every element, or defines their
-own. The scan is a cone beam with a flat or curved panel and circular or helical views, or a parallel beam; the source
-may carry an emission profile measured from the open field (a bowtie filter, the heel effect), the detector response
-and an anti-scatter grid (septa along one or both panel directions) are built from material data, and the rays through
-metal can be left out of MBIR with a metal mask.
+own. The scan is a cone beam with a flat or curved panel and circular or helical views, or a parallel beam. The
+source may open its field past the panel, emit off-focal radiation and carry an emission profile measured from the
+open field (the heel effect) and a beam filter whose thickness varies per direction (a bowtie); the detector response
+and an anti-scatter grid (septa along one or both panel directions) are built from material data.
+
+For measured scans the loop also linearizes the beam hardening per pixel with the solver's own primary model, takes
+objects known in advance such as the patient couch, takes MBIR measurement weights (uniform by default) and can run as
+multigrid stages, coarse voxels on binned data first. `experiments/IGRT/` reconstructs clinical pelvis CBCT scans of
+three scanners from the COBRA2026 dataset with these options.
 
 ## Installation
 
@@ -79,7 +84,7 @@ Install PyTorch first if you need a specific CUDA build. Every dependency instal
 Developer tools: `dev_scripts/` (conda test environment, clean install, tests, docs, CUDA check);
 `benchmarks/` (benchmarks of the sweep, the first-collision source, the ray tracer and the scatter image, profiles of
 the CITRUS step per stage and per kernel, the GPU memory of the loop, and the CITRUS study script
-`citrus_study.py`).
+`citrus_study.py`); `experiments/` (reconstructions of measured scans, see `experiments/IGRT/README.md`).
 
 ## Quick start
 
@@ -131,7 +136,7 @@ recon, info = citrus_recon(Y, I0, angles, grid, geometry, solver, CitrusConfig()
 Tests: `dev_scripts/run_tests.sh` or `python -m pytest -q` (GPU, Triton and MBIRTORCH tests, and those that need the
 XCOM data, are skipped when unavailable).
 
-`CHANGELOG.md` lists the changes of every version, including the old -> new table of renamed settings.
+`CHANGELOG.md` lists the changes of every version, including the settings renamed or removed.
 
 ## Citation
 
@@ -142,7 +147,7 @@ Please cite the software when referencing this package.
   title = {citrus},
   author = {Jordan Houri and Gregery T. Buzzard and Charles A. Bouman},
   howpublished = {Software library available from \url{https://github.com/cabouman/citrus}},
-  note = {Version 0.25.0},
+  note = {Version 0.28.0},
   year = 2026
 }
 ```

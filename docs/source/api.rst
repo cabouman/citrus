@@ -9,8 +9,10 @@ CITRUS
 The reconstruction loop and its utilities.
 
 :doc:`api/citrus`
-    The CITRUS loop, the per-view scatter step and its operators, the density model, the metal mask and fill and
-    the state storage.
+    The CITRUS loop, the per-view scatter step and its operators, the density model and the state storage.
+
+:doc:`api/multigrid`
+    ``Stage``: the multigrid stages of the loop, coarse grids and binned data first.
 
 :doc:`api/utilities`
     The WLAB phantom and geometries, the density model, the object size and medium of the energy groups, view
@@ -20,6 +22,7 @@ The reconstruction loop and its utilities.
    :hidden:
 
    api/citrus
+   api/multigrid
    api/utilities
 
 MBIRTORCH bridge
@@ -42,7 +45,8 @@ Scatter solver
 The LBTE source iteration solver, one module per stage.
 
 :doc:`api/scatter_solver`
-    ``ScatterSolver``: the assembled solver for one view.
+    ``ScatterSolver``: the assembled solver for one view; the emission profile from an open field, a beam filter's
+    thickness from its transmission and the water linearization of the beam-hardening correction.
 
 :doc:`api/config`
     ``SolverConfig``: every discretization parameter of the solver.
@@ -61,8 +65,8 @@ The LBTE source iteration solver, one module per stage.
     The photon data: NIST XCOM cross sections (downloaded on first use) and xraylib angular distributions.
 
 :doc:`api/source`
-    The source: spectrum, emission profile, collimated field, off-focal emission and beam filter of the focal spot or the
-    parallel beam.
+    The source: spectrum, emission profile, collimated field, off-focal emission and beam filter of the focal spot or
+    the parallel beam.
 
 :doc:`api/detector`
     Detector and anti-scatter-grid responses.

@@ -5,21 +5,21 @@ Define two materials that are not in the catalogue with ``Material(name, density
 cylinder with a bone insert, a vessel of contrast and a small amalgam filling), synthesize a short-scan cone-beam CT
 of it with scatter and reconstruct it with CITRUS. The data are made once and cached in demo/input.
 
-What to expect: the amalgam stops nearly every photon of the rays through it, so their counts are almost all scatter
-and noise (photon starvation), and the rays that graze it disagree with MBIR's linear model. In the initial FDK volume
-the filling throws dark streaks across the slice. CITRUS removes the scatter, and its metal mask
-(``metal_attenuation_threshold``) gives zero weight to every ray through a voxel above the threshold, which clears the
-streaks around the filling. The filling is filled from the initial volume (``metal_fill``); its attenuation comes out
-far too low because the data cannot hold it (the counts of its rays are floored at one), so the RMSE is computed
-outside it. Set the threshold to None to see the streaks.
+What to expect: the amalgam stops nearly every photon of the rays through it, and in the FDK volume the filling throws
+dark streaks across the slice. MBIRTORCH's metal artifact reduction weights (``mbirtorch.gen_weights_mar``), passed
+to CITRUS as ``measurement_weights``, down-weight the rays through the metal, which clears the streaks around the
+filling. The filling comes out bright, but far below its true attenuation: its starved rays cannot give that value,
+so the RMSE is computed outside it.
 """
 
 import os
 
 import matplotlib.pyplot as plt
+import mbirtorch
 import numpy as np
 
 from citrus import CitrusConfig, citrus_recon
+from citrus.recon.mbir_bridge import direct_reconstruction, make_cone_model
 from citrus.scatter_solver import (ConeGeometry, Grid, Material, ScatterSolver, SolverConfig,
                                    ideal_counting_response, load_spectrum_txt, no_grid)
 from citrus.utilities import (dental_head_phantom, load_dataset, plot_profiles, plot_slices, save_dataset,
@@ -51,7 +51,12 @@ I0 = 1.0e6                                 # flat-field counts per pixel
 num_outer_iterations = 20                  # outer iterations, one scatter correction each
 mbir_iterations_per_outer_iteration = 8    # MBIR iterations per outer iteration
 scatter_view_stride = 8                    # scatter step on every 8th view, the others interpolated in angle
-metal_attenuation_threshold = 2.0          # 1/cm: voxels above are metal (cortical bone is about 0.5 1/cm here)
+# MBIRTORCH's metal artifact reduction weights exp(-y (1 + gamma delta) / beta), delta = 1 on the rays through metal.
+# FDK voxels above metal_threshold in 1/cm are metal. Cortical bone is about 0.5 1/cm; MBIRTORCH's default, an Otsu
+# threshold of the FDK volume, would land between water and bone here and mark the bone rod as metal too. gamma = 1
+# (MBIRTORCH's default is 3) leaves the metal rays enough weight to bring the filling out, without its streaks.
+metal_threshold = 1.0
+metal_gamma = 1.0
 
 # ---- Scanner and solver: the solver lists the reference materials in library order (by attenuation) ---------------
 geometry = ConeGeometry(source_iso_dist=source_iso_dist, source_detector_dist=source_detector_dist,
@@ -83,12 +88,20 @@ else:
 Y, X_true = data["Y"], data["X_true"]
 print(f"Scatter-to-primary ratio of the data: median {np.median(data['SPR']):.2f}, max {data['SPR'].max():.3g}")
 
+# ---- Metal artifact reduction weights from MBIRTORCH: the metal is segmented in an FDK of the data ----------------
+sinogram = -np.log(np.maximum(Y, 1.0) / I0)
+model = make_cone_model(grid, geometry, angles, device="cuda")
+X_fdk = np.asarray(direct_reconstruction(model, sinogram, geometry=geometry, angles=angles).cpu()).clip(0.0)
+measurement_weights = mbirtorch.gen_weights_mar(model, sinogram, init_recon=X_fdk, metal_threshold=metal_threshold,
+                                                gamma=metal_gamma)
+
 # ---- CITRUS -------------------------------------------------------------------------------------------------------
 X_citrus, info = citrus_recon(Y, I0, angles, grid, geometry, solver,
                               CitrusConfig(num_outer_iterations=num_outer_iterations,
                                            mbir_iterations_per_outer_iteration=mbir_iterations_per_outer_iteration,
                                            scatter_view_stride=scatter_view_stride, verbose=True,
-                                           metal_attenuation_threshold=metal_attenuation_threshold))
+                                           beam_hardening_correction=True,
+                                           measurement_weights=measurement_weights), model=model)
 
 # ---- Results: the RMSE outside the filling, the images on a scale that saturates it -------------------------------
 X_citrus, X_initial = X_citrus.cpu().numpy(), info["init_recon"].cpu().numpy()

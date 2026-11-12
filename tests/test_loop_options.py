@@ -1,5 +1,5 @@
-"""The MBIR weight settings (measurement_weights, max_measurement_weight) and what the scatter solver sees
-(air_threshold_hu, known_objects) of CitrusConfig."""
+"""The MBIR weight settings (mbir_weighting, measurement_weights, max_measurement_weight) and what the scatter solver
+sees (air_threshold, known_objects) of CitrusConfig."""
 
 from __future__ import annotations
 
@@ -21,7 +21,8 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="the CITRUS reco
 
 @pytest.mark.parametrize("settings", [
     dict(max_measurement_weight=0.0), dict(max_measurement_weight=float("nan")), dict(max_measurement_weight=True),
-    dict(air_threshold_hu="-900"), dict(air_threshold_hu=float("inf")), dict(measurement_weights=np.full(4, -1.0)),
+    dict(air_threshold="0.02"), dict(air_threshold=float("inf")), dict(measurement_weights=np.full(4, -1.0)),
+    dict(mbir_weighting="poisson"),
     dict(measurement_weights=np.zeros((1, 1, 1, 4))),
 ])
 def test_loop_options_are_validated(settings):
@@ -33,8 +34,9 @@ def test_loop_options_default_off():
     config = CitrusConfig()
     config.validate()
     assert config.measurement_weights is None and config.max_measurement_weight is None
-    assert config.air_threshold_hu is None
-    CitrusConfig(measurement_weights=np.ones(4), max_measurement_weight=1e-6, air_threshold_hu=-900.0).validate()
+    assert config.mbir_weighting == "uniform" and config.air_threshold is None
+    CitrusConfig(measurement_weights=np.ones(4), mbir_weighting="transmission", max_measurement_weight=1e-6,
+                 air_threshold=0.02).validate()
 
 
 def test_field_of_view_radius():
@@ -72,7 +74,7 @@ def tiny():
     model = make_cone_model(grid, geometry, data["angles"], device=DEVICE)
     Y = torch.as_tensor(data["Y"], device=DEVICE)
     P = torch.as_tensor(data["P"], device=DEVICE)
-    regularization = estimate_regularization(model, -torch.log(P / 1.0e5), Y / 1.0e5)
+    regularization = estimate_regularization(model, -torch.log(P / 1.0e5))  # uniform weights, as in the loop
     return data, grid, geometry, solver, regularization
 
 
@@ -111,13 +113,16 @@ def test_measurement_weights_leave_measurements_out(tiny):
 
     citrus_module.mbir_iterations = spy
     try:
+        mbir_recon(P, 1.0e5, data["angles"], grid, geometry, replace(config, measurement_weights=keep), **options)
         mbir_recon(P, 1.0e5, data["angles"], grid, geometry,
-                   replace(config, max_measurement_weight=1e-6, measurement_weights=keep), **options)
+                   replace(config, mbir_weighting="transmission", max_measurement_weight=1e-6,
+                           measurement_weights=keep), **options)
     finally:
         citrus_module.mbir_iterations = original
-    weights = seen[0]
-    assert bool((weights[:, :, 14:20] == 0).all())
-    assert torch.allclose(weights[:, :, :14], torch.full_like(weights[:, :, :14], 1e-6))
+    uniform, capped = seen[0], seen[-1]
+    for weights, value in ((uniform, 1.0), (capped, 1e-6)):
+        assert bool((weights[:, :, 14:20] == 0).all())
+        assert torch.allclose(weights[:, :, :14], torch.full_like(weights[:, :, :14], value))
 
 
 @cuda
@@ -139,14 +144,13 @@ def test_scene_options_change_only_what_the_scatter_solver_sees(tiny):
                                                regularization=regularization)
         assert torch.equal(seen[0], info_default["init_recon"])
         seen.clear()
-        options = replace(loop, air_threshold_hu=-500.0)
+        from citrus.citrus import _water_attenuation
+        mu_water = _water_attenuation(DensityModel.from_library(solver.library))  # water at the loop's E_eff
+        options = replace(loop, air_threshold=0.5 * mu_water)
         X, info = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, options,
                                regularization=regularization)
     finally:
         solver.material_fields_from_attenuation = original
-    water = float(DensityModel.from_library(solver.library).energy_kev)  # E_eff of the loop's density model
-    from citrus.citrus import _water_attenuation
-    mu_water = _water_attenuation(DensityModel.from_library(solver.library, water))
     assert len(seen) == 2
     for scene in seen:
         assert bool((scene > 0).any())
@@ -183,3 +187,14 @@ def test_known_objects_come_off_the_reconstruction(tiny):
     error_plain = float((X_plain[rest] - X_true[rest]).norm() / X_true[rest].norm())
     error_known = float((X[rest] - X_true[rest]).norm() / X_true[rest].norm())
     assert error_known < 1.2 * error_plain + 0.01
+
+
+def test_water_attenuation_without_water_among_the_materials():
+    """Half of water's attenuation sets the body of extend_scatter_scene; without water among the materials it comes
+    from the photon data (water's mu/rho at 60 keV is 0.2059 cm^2/g)."""
+    from citrus.citrus import _water_attenuation
+    from citrus.scatter_solver.cross_sections import synthetic_library
+
+    library = synthetic_library(num_materials=3)
+    assert "water" not in library.materials
+    assert _water_attenuation(DensityModel(library, 60.0)) == pytest.approx(0.2059, rel=0.02)

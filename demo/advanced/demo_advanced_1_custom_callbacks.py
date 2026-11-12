@@ -91,7 +91,7 @@ def callback(k, X, record):
 
 # ---- CITRUS with the default iteration counts ---------------------------------------------------------------------
 X_citrus, info = citrus_recon(Y, I0, angles, grid, geometry, make_solver(),
-                              CitrusConfig(scatter_view_stride=scatter_view_stride),
+                              CitrusConfig(scatter_view_stride=scatter_view_stride, beam_hardening_correction=True),
                               callback=callback, mbir_callback=mbir_callback)
 print(f"Relative RMSE against the truth: initial volume {per_mbir_iteration['volume_rmse'][0]:.4f}, CITRUS "
       f"{per_mbir_iteration['volume_rmse'][-1]:.4f} after {info['mbir_iterations_total']} MBIR iterations")

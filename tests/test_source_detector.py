@@ -282,16 +282,19 @@ def test_bowtie_open_field_end_to_end(real_library):
     data = synthesize_wlab_dataset(16, 2.0, noise=False, seed=0, library=real_library, geometry=geometry,
                                    config=config, source=SourceModel(emission_profile=bowtie), detector_gain=gain)
     assert data["open_field"].shape == (46, 38) and data["meta"]["open_field"] == "image"
-    np.testing.assert_allclose(data["P"], data["open_field"] * np.exp(-data["line_integrals"]), rtol=1e-5)
+    # the primary carries the open field's bowtie and gain: its ratio to the open field is the solver's transmission
+    transmission = data["P"] / data["open_field"]
+    assert float(transmission.max()) <= 1.0 + 1e-5 and float(transmission.min()) > 0.0
     grid = wlab_grid(2.0)
     solver = wlab_solver(2.0, config=config, library=real_library, geometry=geometry, device=DEVICE)
     profile = emission_profile_from_open_field(data["open_field"], solver, detector_gain=gain)
     np.testing.assert_allclose(profile.numpy(), (bowtie / bowtie.mean()).numpy(), rtol=1e-5)
     model = make_cone_model(grid, geometry, data["angles"], device=DEVICE)
     open_field = torch.as_tensor(data["open_field"], device=DEVICE)
-    regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=DEVICE) / open_field),
-                                             torch.as_tensor(data["Y"], device=DEVICE) / open_field)
-    loop = CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=5)
+    # uniform weights, as in the loop
+    regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=DEVICE) / open_field))
+    loop = CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=5,
+                        beam_hardening_correction=True)
 
     def run(flat_field, detector_gain=None):
         X, info = citrus_recon(data["Y"], flat_field, data["angles"], grid, geometry, solver, loop,
@@ -337,13 +340,14 @@ def test_anti_scatter_grid_end_to_end(real_library, photon_data):
     solver = wlab_solver(2.0, config=config, library=real_library, geometry=geometry, device=DEVICE,
                          grid_response=septa)
     model = make_cone_model(grid, geometry, data["angles"], device=DEVICE)
-    regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=DEVICE) / 1.0e5),
-                                             torch.as_tensor(data["Y"], device=DEVICE) / 1.0e5)
-    loop = CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=5)
+    # uniform weights, as in the loop
+    regularization = estimate_regularization(model, -torch.log(torch.as_tensor(data["P"], device=DEVICE) / 1.0e5))
+    loop = CitrusConfig(mbir_iterations_per_outer_iteration=1, num_outer_iterations=5,
+                        beam_hardening_correction=True)
     X, info = citrus_recon(data["Y"], data["open_field"], data["angles"], grid, geometry, solver, loop,
                            regularization=regularization, model=model)
     X0, _ = mbir_recon(data["Y"], data["open_field"], data["angles"], grid, geometry, loop,
-                       regularization=regularization, model=model, init_recon=info["init_recon"])
+                       regularization=regularization, model=model, init_recon=info["init_recon"], solver=solver)
     assert _relative_rmse(X, data) < 0.7 * _relative_rmse(X0, data)
     spr_error = np.abs(info["spr"].cpu().numpy() - data["SPR"]).mean() / data["SPR"].mean()
     assert spr_error < 0.25

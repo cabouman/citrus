@@ -25,8 +25,7 @@ beam), and outer iteration :math:`k = 1, \dots, N`
 2. advances the collided fluence of every view by one transport sweep and projects its scatter signal :math:`s_v`;
 3. computes the primary signal :math:`p_v` of every view from :math:`\rho_k`;
 4. divides the measured counts by :math:`1 + s_v / p_v` and runs :math:`n` warm-started MBIR iterations on the
-   corrected data (``mbir_iterations_per_outer_iteration``), which give :math:`X_k`; with the metal mask the
-   measurements through metal get zero weight ("Metal", below).
+   corrected data (``mbir_iterations_per_outer_iteration``), which give :math:`X_k`.
 
 Steps 1 to 3 are the scatter stage, step 4 the MBIR stage; :math:`n` sets how many MBIR iterations follow each scatter
 correction and :math:`N` how many outer iterations run (``num_outer_iterations``; "MBIR iterations per outer
@@ -71,16 +70,17 @@ Scatter-to-primary correction
 The correction is multiplicative: :math:`Y_c = Y\,p/(p+s) = Y/(1 + \mathrm{SPR})` with :math:`\mathrm{SPR} = s/p` per
 pixel, both signals from the solver at the current densities. It is independent of the flat field and of the mismatch
 between the solver's polychromatic primary and MBIR's monoenergetic model, and it only rescales the noise of :math:`Y`,
-so the weights :math:`W = Y/I_0` of the measured counts are the inverse variances of :math:`y_c = -\log(Y_c/I_0)`
-(elementwise for an open-field image).
+so the transmissions :math:`Y/I_0` of the measured counts are proportional to the inverse variances of
+:math:`y_c = -\log(Y_c/I_0)` (elementwise for an open-field image). MBIR weights every measurement equally by default
+("MBIR weights", below).
 
 Warm-started MBIR
 ~~~~~~~~~~~~~~~~~
 
 Each outer iteration runs :math:`n` vectorized coordinate descent (VCD) iterations of MBIRTORCH on :math:`y_c`,
 started from :math:`X_{k-1}` at the position of the partition schedule after the MBIR iterations run so far (MBIR
-iterations are counted over the whole loop), with the weights :math:`W` and a regularization that is estimated once
-on the first corrected sinogram and then frozen. The partitions are drawn from a random generator seeded with
+iterations are counted over the whole loop), with the MBIR weights and a regularization that is estimated once on the
+first corrected sinogram and then frozen. The partitions are drawn from a random generator seeded with
 ``[base_seed, i]`` before MBIR iteration :math:`i`, so runs with identical inputs give identical MBIR sequences.
 ``mbir_recon`` runs the same loop without the solver (no
 correction, or a fixed SPR), so a comparison can share the initialization, the weights, the partition sequence and the
@@ -622,7 +622,9 @@ the whole open field is treated as emission; a gain pattern then appears in :mat
 is large. ``citrus_recon`` given an open-field image normalizes the counts pixel by pixel, :math:`y = -\log(Y/F)`,
 and gives the solver's source this profile for the duration of the call, keeping every other setting of the source;
 given a number :math:`I_0` it keeps the solver's source, and :math:`I_0` then stands for the open field with the
-falloff of :math:`F_{solver}` divided out.
+falloff of :math:`F_{solver}` divided out. Projections that the scanner has already divided by its flood image take
+a number. Their open field is flat, and an image of it would replace the source's emission profile with a uniform
+one.
 
 One view of the solver
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -723,23 +725,22 @@ The solver sees the reconstructed volume only, but the body continues past the s
 past the panel's rows (margins, off-focal emission) irradiates more of it; its scatter reaches the panel. A grid longer
 than the measured slab holds that region, but the reconstruction there is incomplete. With
 ``CitrusConfig.extend_scatter_scene`` the solver's scene continues the body along z within the grid
-(``extend_scene_slices``): a slice is filled when its fraction of voxels above half of water's attenuation is at least
-0.8 of the median fraction over the central 5 cm, and every slice beyond the first and last filled slice, moved
-two slices inward, repeats that slice. The reconstruction is unchanged, and the grid must reach as far along z as
-the scene should.
+(``extend_scene_slices``): a slice is filled when its fraction of voxels above half of water's attenuation (at the
+density model's effective energy) is at least 0.8 of the median fraction over the central 5 cm, and every slice beyond
+the first and last filled slice, moved two slices inward, repeats that slice. The
+reconstruction is unchanged, and the grid must reach as far along z as the scene should.
 
 What the scatter solver sees
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 A reconstruction holds noise in the air around the object. The density model clamps negative attenuation at 0, so
 that noise, zero on average, reaches the scatter solver as a thin positive density, and it lies outside the object,
-where nothing shields its scatter from the panel. ``CitrusConfig.air_threshold_hu`` sets every voxel below that value
-to air in the volume the scatter solver sees, at every scatter update, while the reconstruction keeps them. HU values
-are converted with water's attenuation at the density model's effective energy. The solver sees every voxel of the
-volume, including those outside MBIR's region of reconstruction, which keep their initial values; a start that holds
-matter there, such as an FDK beyond the field of view, is set to 0 there before the loop. The primary, which divides
-the scatter in the scatter-to-primary ratio, is that of the same volume, so the scatter and the primary describe one
-scene.
+where nothing shields its scatter from the panel. ``CitrusConfig.air_threshold`` (an attenuation in 1/cm) sets every
+voxel below it to air in the volume the scatter solver sees, at every scatter update, while the reconstruction keeps
+them. The solver sees every voxel of the volume, including those outside MBIR's region of reconstruction (the
+model's ``use_ror_mask``), which keep their initial values; a start that holds matter there, such as an FDK beyond the
+field of view, should be set to 0 there (``init_recon``). The primary, which divides the scatter in the
+scatter-to-primary ratio, is that of the same volume, so the scatter and the primary describe one scene.
 
 Objects known in advance, such as the patient couch from its model, are given as an attenuation volume
 (``known_objects``). Where it is positive it replaces the volume in the scatter solver's scene and in the modelled
@@ -772,8 +773,22 @@ before its MBIR iterations, with the solver's own primary model:
 
 The offset comes first, so that the water linearization applies to water-like data. ``mbir_recon`` takes the water
 linearization too, given the solver of the scanner (``solver=``); the offset needs the solver's primary of the current
-volume and belongs to the CITRUS loop. Synthetic data with ``polychromatic_primary`` (``synthesize_cone_beam_data``)
-have the primary of the solver's transmission, with these effects; by default their primary is monoenergetic.
+volume and belongs to the CITRUS loop. Synthetic data (``synthesize_cone_beam_data``) have the primary of the
+solver's polychromatic transmission, with these effects.
+
+MBIR weights
+~~~~~~~~~~~~
+
+``CitrusConfig.mbir_weighting`` sets the weight of a measurement in MBIR's data term: ``"uniform"`` (the default)
+gives every measurement the same weight, ``"transmission"`` weights it by its transmission :math:`Y/I_0`, which is
+proportional to the inverse variance of its corrected line integral ("Scatter-to-primary correction", above), and
+``max_measurement_weight`` caps those transmission weights. ``measurement_weights`` multiplies either: a weight per
+measurement ``[V, Rd, Cd]``, per pixel ``[Rd, Cd]`` or per channel ``[Cd]``, such as the redundancy weights of a
+half-fan scan's overlap, 0 for a dead pixel, or the metal artifact reduction weights of MBIRTORCH
+(``mbirtorch.gen_weights_mar``, which segments the metal in an FDK volume and down-weights the rays through it). A
+weight of 0 leaves a measurement out of the fit. The weights act on MBIR only; the scatter estimate and the
+correction use every measurement. MBIRTORCH's automatic regularization scales with the weights, so a constant factor
+on all of them does not change the reconstruction.
 
 MBIR iterations per outer iteration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -810,30 +825,32 @@ schedule, which ends at 128 subsets per iteration: volumes narrower than about 4
 with many subsets of few columns, and on volumes wider than about 360 voxels 128 is the count the rule asks for. An
 integer sets the count, and ``None`` always keeps the model's own partition schedule.
 
-Metal
-~~~~~
+Multigrid stages
+~~~~~~~~~~~~~~~~
 
-A measurement whose ray crosses metal fits MBIR's linear model poorly even when it has plenty of counts: the line
-integral changes steeply across the pixel (the exponential edge-gradient effect), the spectrum hardens, and through a
-thick piece no primary photon gets through, so the corrected data of the ray rest on the solver's scatter estimate.
-MBIR spreads such errors along the rays as streaks. With ``CitrusConfig.metal_attenuation_threshold`` (in 1/cm) every
-outer iteration marks the voxels of the current volume above the threshold, forward projects them and gives zero
-weight to every measurement whose ray crosses one; the residual (``sinogram_nrmse``) is computed over the other
-measurements, and ``records[k]["metal_measurement_fraction"]`` holds the share left out. The mask works on
-attenuation, so it applies to any material, including user-defined ones; the threshold must lie above every material
-of the object that is not metal (the nominal attenuations of the catalogue at the effective energy are in
-:doc:`conventions`, "Materials"). Since the threshold is an attenuation at the effective energy, a threshold set for
-a kilovoltage beam does not mark metal in a megavoltage beam, which passes through it. The default ``None`` turns the
-mask off.
+With ``Schedule.stages`` the loop runs once per stage (``multigrid.Stage``), coarse to fine, each with its own
+number of outer iterations. A stage takes every ``view_stride``-th view and averages the counts, the flat field, the
+measurement weights and the detector gain over blocks of ``row_binning`` x ``channel_binning`` pixels. A remainder of
+rows or channels is trimmed at both ends, with the panel centre moved and the source's field margins widened by the
+trim, and a block that holds a measurement of weight 0 (a dead pixel) gets weight 0. The stage reconstructs on a grid
+whose voxels are ``voxel_factor`` times larger, any number of at least 1, with floor(n / ``voxel_factor``) voxels
+along each axis of n, so that it lies within the full grid's extent. The known objects are averaged over the fine
+voxels of each coarse voxel, so that a thin object such as a couch shell keeps its line integrals, and the region of
+reconstruction of the given model is resampled to the stage's grid. The model's MBIR settings (sharpness, SNR, the
+prior's parameters) apply to every stage. The stage's solver is a copy of the scanner's with the binned geometry, the
+emission profile and filter thickness of the source binned like the data, and the library and settings of the
+previous stage.
 
-Without data, the metal voxels fade under the regularization, and the metal set shrinks with them from the blurred
-metal of the initial volume to its core, which tightens the mask. The volume the scatter solver sees and the returned
-volume therefore get a filled metal (``metal_fill``): the current metal voxels take the values of the volume in which
-the metal was first found (usually the initial volume), scaled so that their sum equals that volume's total over its
-own metal voxels, since blur spreads the attenuation of the metal but keeps its sum. The records hold the size of the
-set and the scale (``metal_voxels``, ``metal_fill_scale``). The metal's attenuation is as good as the initial volume's
-total: the counts floor ``min_counts`` caps every measured line integral at :math:`\log(I_0 / \mathrm{min\_counts})`,
-so the data of a thick piece cannot hold its attenuation; the option is for the tissue around the metal.
+The first stage starts from the FDK of its own data (or the given initial volume, averaged onto its grid), every
+later stage from the previous stage's volume interpolated to its grid. The accumulators of the computed views carry
+over from one stage to the next when the stages compute the scatter of the same full-resolution views (the config's
+``scatter_view_stride`` counts full-resolution views and is divided by the stage's view stride) and their transport
+grids are the same. The transport grid has ceil(extent / ``transport_cell_cm``) cells along each axis, so the stages
+share it when their extents, which the floor above can shorten by up to one coarse voxel, round up to the same number
+of cells. A full grid whose extent is a whole number of cells, or slightly less, gives that.
+``info["stages"][s]["state_carried"]`` records whether stage s took the state over. The coarse stages take up the
+large change from the initial volume at a fraction of the cost of a full-resolution outer iteration, and the last
+stage, at full resolution, refines the image.
 
 Scatter step on every m-th view
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

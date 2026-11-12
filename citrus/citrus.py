@@ -3,7 +3,7 @@
 Every outer iteration advances the collided fluence of every view by one transport sweep, divides the measured counts
 by one plus the scatter-to-primary ratio of the current densities and runs warm-started MBIR iterations on the
 corrected data. The module holds the loop (``citrus_recon``, ``mbir_recon``) and its schedule (``Schedule``), the
-per-view scatter step and its operators, the density model, the metal mask and fill, the compact per-view state
+per-view scatter step and its operators, the density model, the compact per-view state
 storage and the angular interpolation of sparse-view scatter.
 The method is described in docs/source/method.rst, "The CITRUS loop" and "Options and secondary components".
 """
@@ -21,6 +21,7 @@ from torch import Tensor
 from .recon.mbir_bridge import (ViewChunkProjector, direct_reconstruction, forward_project, make_model,
                                 mbir_iterations, vcd_partitions)
 from .scatter_solver.angular_quadrature import Quadrature
+from .multigrid import Stage, multigrid_recon
 from .scatter_solver.cross_sections import MultigroupLibrary, material_index
 from .scatter_solver.geometry import ConeGeometry, Grid
 from .scatter_solver.scatter_solver import (MaterialFields, ScatterSolver, WaterLinearization,
@@ -566,8 +567,8 @@ def extend_scene_slices(X: Tensor, threshold: float, slice_cm: float, fill_fract
     """The volume with the slices past the body replaced by the last slice the body fills, at both ends.
 
     A slice is filled when its fraction of voxels above ``threshold`` is at least ``fill_fraction`` of that fraction's
-    median over the central ``central_cm``; the slices beyond the first and last filled slice, moved ``margin_slices`` inward,
-    repeat that slice. The grid is unchanged: the scene extends within it, past the slab the cone measures well.
+    median over the central ``central_cm``; the slices beyond the first and last filled slice, moved ``margin_slices``
+    inward, repeat that slice. The grid is unchanged: the scene extends within it, past the slab the cone measures well.
 
     Args:
         X (Tensor): [R, C, S] attenuation in 1/cm of the scatter scene.
@@ -598,15 +599,18 @@ def extend_scene_slices(X: Tensor, threshold: float, slice_cm: float, fill_fract
 
 
 def _water_attenuation(density_model: "DensityModel") -> float:
-    """Attenuation of water in 1/cm at the density model's effective energy; the library must hold water."""
+    """Attenuation of water in 1/cm at the density model's effective energy: from the library when it holds water,
+    else from the photon data (the materials need not include water)."""
     library = density_model.library
-    water = material_index(library, "water")
+    try:
+        water = material_index(library, "water")
+    except ValueError:
+        from .scatter_solver.cross_sections import material_table
+        from .scatter_solver.detector import material_cross_sections
+
+        (_, density, _), = material_table(("water",))
+        return float(material_cross_sections("water", [density_model.energy_kev])["total"][0]) * float(density)
     return float(mass_attenuation_at(library, density_model.energy_kev)[water]) * float(library.nominal_density[water])
-
-
-def _attenuation_of_hu(hu: float, water: float) -> float:
-    """Attenuation in 1/cm of a value in HU, given water's attenuation (air at -1000 HU has none)."""
-    return water * (1.0 + float(hu) / 1000.0)
 
 
 # =====================================================================================================
@@ -789,14 +793,8 @@ class CitrusConfig:
             it. Defaults to True.
         grouping_object_size (str or float): object size in cm of the solver's ``"scattered_fluence"`` energy groups;
             ``"auto"`` measures it on the initial reconstruction. Defaults to "auto".
-        metal_attenuation_threshold (float or None): attenuation in 1/cm above which a voxel of the current volume
-            counts as metal; the measurements whose rays cross a metal voxel get zero weight in the MBIR iterations
-            of the outer iteration and are left out of its fit (``sinogram_nrmse``). The metal voxels of the volume
-            the scatter solver sees and of the returned volume are filled from the volume in which the metal was
-            first found (usually the initial one), scaled to keep its total attenuation (``metal_fill``). None turns
-            the metal mask off. Defaults to None.
         extend_scatter_scene (bool): the scatter solver sees the body continued along z within the grid: the slices
-            past the last slice the body fills (above half of water's attenuation) repeat that slice
+            past the last slice the body fills (its voxels above half of water's attenuation) repeat that slice
             (``extend_scene_slices``). Defaults to False.
         beam_hardening_correction (bool): map the corrected line integrals of every outer iteration, per pixel, from
             water's polychromatic line integral with the spectrum reaching that pixel (the source's beam filter, the
@@ -810,12 +808,14 @@ class CitrusConfig:
         measurement_weights (array or None): non-negative multipliers of the MBIR weights, [V, Rd, Cd] or broadcastable
             to it ([Rd, Cd] or [Cd]), e.g. the redundancy taper of a half-fan scan's overlap; 0 leaves a measurement out
             of the fit. They do not change the scatter estimate. Defaults to None (all 1).
-        max_measurement_weight (float or None): the MBIR weight of a measurement, its transmission Y / I0, is capped at
-            this value; a value below every transmission gives all measurements the same weight. Defaults to None (no
-            cap).
-        air_threshold_hu (float or None): voxels below this value in HU are air (density 0) in the volume the scatter
-            solver sees at every scatter update; the reconstruction keeps them. None keeps every voxel. Defaults to
-            None.
+        mbir_weighting (str): the MBIR weight of a measurement before ``measurement_weights``: "uniform" gives every
+            measurement the same weight; "transmission" weights it by its transmission Y / I0, the inverse variance of
+            its line integral without scatter. Defaults to "uniform".
+        max_measurement_weight (float or None): cap on the transmission weights of ``mbir_weighting="transmission"``.
+            Defaults to None (no cap).
+        air_threshold (float or None): voxels below this attenuation in 1/cm are air (density 0) in the volume the
+            scatter solver sees at every scatter update; the reconstruction keeps them. None keeps every voxel.
+            Defaults to None.
         known_objects (array or None): [R, C, S] attenuation in 1/cm on the reconstruction grid of objects known in
             advance, such as the patient couch from its model. Where it is positive it replaces the volume in the
             scatter solver's scene and in the modelled primary, and its forward projection is removed from the
@@ -837,13 +837,13 @@ class CitrusConfig:
     primary_views_per_chunk: Optional[int] = None
     resume_error_sinogram: bool = True
     grouping_object_size: Union[Literal["auto"], float] = "auto"
-    metal_attenuation_threshold: Optional[float] = None
     extend_scatter_scene: bool = False
     beam_hardening_correction: bool = False
     hardening_materials: Sequence[str] = ()
     measurement_weights: Optional[Any] = None
+    mbir_weighting: Literal["uniform", "transmission"] = "uniform"
     max_measurement_weight: Optional[float] = None
-    air_threshold_hu: Optional[float] = None
+    air_threshold: Optional[float] = None
     known_objects: Optional[Any] = None
 
     def validate(self) -> None:
@@ -880,12 +880,9 @@ class CitrusConfig:
         if not (size == "auto" or (isinstance(size, (int, float, np.floating, np.integer))
                                    and not isinstance(size, bool) and float(size) > 0)):
             raise ValueError(f"grouping_object_size must be 'auto' or a positive number (cm), got {size!r}")
-        threshold = self.metal_attenuation_threshold
-        if threshold is not None and (isinstance(threshold, bool)
-                                      or not isinstance(threshold, (int, float, np.floating, np.integer))
-                                      or not float(threshold) > 0):
-            raise ValueError(f"metal_attenuation_threshold must be None or a positive number (1/cm), got {threshold!r}")
-        for name in ("max_measurement_weight", "air_threshold_hu"):
+        if self.mbir_weighting not in ("uniform", "transmission"):
+            raise ValueError(f'mbir_weighting must be "uniform" or "transmission", got {self.mbir_weighting!r}')
+        for name in ("max_measurement_weight", "air_threshold"):
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float, np.floating,
                                                                                           np.integer))
@@ -932,6 +929,10 @@ class Schedule:
         num_scatter_updates (int or None): number of outer iterations, from the first, that make a new scatter
             estimate; the later ones keep the last one (1 with ``"converged"`` is the sequential schedule, 0 no
             correction). None updates it in every outer iteration. Defaults to None.
+        stages (Sequence[Stage] or None): multigrid stages, coarse to fine (``multigrid.Stage``): each runs the loop
+            with its own outer iterations on its grid and binned data, from the previous stage's volume and scatter
+            state; the last stage is at full resolution and the other settings apply to every stage. None runs one
+            stage at full resolution. Defaults to None.
     """
 
     num_outer_iterations: int = 14
@@ -940,6 +941,7 @@ class Schedule:
     scatter_sweeps_per_outer_iteration: Union[int, Literal["converged"]] = 1
     scatter_change_threshold: Optional[float] = None
     num_scatter_updates: Optional[int] = None
+    stages: Optional[Sequence[Stage]] = None
 
     def updates_scatter(self, outer_iteration: int) -> bool:
         """Whether an outer iteration makes a new scatter estimate.
@@ -974,6 +976,13 @@ class Schedule:
             if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float, np.floating))
                                       or not float(value) > 0):
                 raise ValueError(f"{name} must be None or a positive number, got {value!r}")
+        if self.stages is not None:
+            if len(self.stages) == 0 or not all(isinstance(stage, Stage) for stage in self.stages):
+                raise ValueError("stages must be None or a non-empty sequence of Stage")
+            for stage in self.stages:
+                stage.validate()
+            if not self.stages[-1].full_resolution:
+                raise ValueError("the last stage must be at full resolution (every factor 1)")
 
 
 def _schedule_of(config: CitrusConfig, schedule: Optional[Schedule]) -> Schedule:
@@ -1437,9 +1446,12 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
     """
     config.validate()
     schedule.validate()
-    weights_of_counts = Y / I0
-    if config.max_measurement_weight is not None:
-        weights_of_counts = weights_of_counts.clamp_max(float(config.max_measurement_weight))
+    if config.mbir_weighting == "transmission":
+        weights_of_counts = Y / I0
+        if config.max_measurement_weight is not None:
+            weights_of_counts = weights_of_counts.clamp_max(float(config.max_measurement_weight))
+    else:
+        weights_of_counts = torch.ones_like(Y)
     if config.measurement_weights is not None:
         multipliers = torch.as_tensor(config.measurement_weights, device=Y.device, dtype=Y.dtype)
         try:
@@ -1485,23 +1497,17 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
     num_outer = int(schedule.num_outer_iterations)
     threshold = schedule.outer_change_threshold
     iteration = 0  # MBIR iterations so far: the seed and the schedule position of the next one
-    # the volume in which the metal was first found and its total attenuation of the metal (metal_fill)
-    metal_reference: Optional[tuple[Tensor, Tensor]] = None
     for k in range(num_outer):
         record: dict = {"outer_iteration": k + 1}
         _sync(device)
         t0 = time.perf_counter()
-        X_filled = X
-        if config.metal_attenuation_threshold is not None:
-            X_filled, metal_reference = metal_fill(X, float(config.metal_attenuation_threshold), metal_reference,
-                                                   record)
         if scatter_stage is not None:
-            spr = scatter_stage(k, X_filled, record)
+            spr = scatter_stage(k, X, record)
         corrected_counts = Y if spr is None else Y / (1.0 + spr)
         corrected_line_integrals = -torch.log(corrected_counts.clamp_min(config.min_counts) / I0)
         if line_integral_correction is not None:
             corrected_line_integrals = line_integral_correction(corrected_line_integrals)
-        weights, fit_mask = _metal_mask(model, X, weights_of_counts, config, record)
+        weights = weights_of_counts
         if regularization is None:  # estimated once on the first sinogram MBIR inverts, then frozen
             regularization = estimate_regularization(model, corrected_line_integrals, weights)
         # resume: e = y_c - A X from the kept -A X and the current corrected data (A X is unchanged by the scatter
@@ -1511,8 +1517,8 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
             error_sinogram, negative_projection = negative_projection.add_(corrected_line_integrals), None
         residual: Optional[float] = None
         if track_residual:
-            residual = (_relative_norm(error_sinogram, corrected_line_integrals, fit_mask) if error_sinogram is not None
-                        else _sinogram_nrmse(model, X, corrected_line_integrals, fit_mask))
+            residual = (_relative_norm(error_sinogram, corrected_line_integrals) if error_sinogram is not None
+                        else _sinogram_nrmse(model, X, corrected_line_integrals))
             record["sinogram_nrmse_start"] = residual
         if mbir_callback is not None and k == 0:  # the initial volume against the first corrected sinogram
             mbir_callback(0, X, {"outer_iteration": 0, "mbir_iteration": 0, "sinogram_nrmse": residual})
@@ -1528,11 +1534,10 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
                                                    error_sinogram=error_sinogram, return_checkpoint=True)
                 error_sinogram = checkpoint["error_sinogram"]  # y_c - A X of the new X
                 del checkpoint
-                residual = (_relative_norm(error_sinogram, corrected_line_integrals, fit_mask) if track_residual
-                            else None)
+                residual = _relative_norm(error_sinogram, corrected_line_integrals) if track_residual else None
             else:
                 X, _ = mbir_iterations(model, corrected_line_integrals, X, first_iteration=iteration, weights=weights)
-                residual = _sinogram_nrmse(model, X, corrected_line_integrals, fit_mask) if track_residual else None
+                residual = _sinogram_nrmse(model, X, corrected_line_integrals) if track_residual else None
             iteration += 1
             j += 1
             if mbir_callback is not None:
@@ -1560,8 +1565,7 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
             torch.cuda.reset_peak_memory_stats(device)
         info["records"].append(record)
         if callback is not None:
-            callback(k + 1, X if metal_reference is None else metal_fill(X, float(config.metal_attenuation_threshold),
-                                                                          metal_reference)[0], record)
+            callback(k + 1, X, record)
         if config.verbose:
             extra = (f" dPhi {record['accumulator_change_mean']:.2e}" if "accumulator_change_mean" in record
                      else "")
@@ -1575,109 +1579,34 @@ def _outer_loop(Y: Tensor, I0: Union[float, Tensor], angles: np.ndarray, grid: G
     info["outer_iterations_total"] = len(info["records"]) - 1
     info.update(seconds=time.perf_counter() - t_start, regularization=regularization, spr=spr,
                 scatter_counts=scatter_estimate)
-    if metal_reference is not None:
-        X = metal_fill(X, float(config.metal_attenuation_threshold), metal_reference)[0]
     return X, info
 
 
-def _sinogram_nrmse(model, X: Tensor, line_integrals: Tensor, mask: Optional[Tensor] = None) -> float:
+def _sinogram_nrmse(model, X: Tensor, line_integrals: Tensor) -> float:
     """Relative RMSE of the forward projection of a volume against a sinogram, ``|A X - y| / |y|``.
 
     Args:
         model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model.
         X (Tensor): [R, C, S] volume in 1/cm.
         line_integrals (Tensor): [V, Rd, Cd] sinogram y.
-        mask (Tensor or None, optional): [V, Rd, Cd] measurements to include; None includes all. Defaults to None.
 
     Returns:
         float: the relative RMSE.
     """
-    return _relative_norm(forward_project(model, X) - line_integrals, line_integrals, mask)
+    return _relative_norm(forward_project(model, X) - line_integrals, line_integrals)
 
 
-def _relative_norm(error: Tensor, reference: Tensor, mask: Optional[Tensor] = None) -> float:
-    """Norm of an error sinogram relative to that of a reference sinogram, over the masked measurements.
+def _relative_norm(error: Tensor, reference: Tensor) -> float:
+    """Norm of an error sinogram relative to that of a reference sinogram.
 
     Args:
         error (Tensor): [V, Rd, Cd] error sinogram.
         reference (Tensor): [V, Rd, Cd] reference sinogram.
-        mask (Tensor or None, optional): [V, Rd, Cd] measurements to include; None includes all. Defaults to None.
 
     Returns:
-        float: ``|error| / |reference|`` over the mask.
+        float: ``|error| / |reference|``.
     """
-    if mask is None:
-        return float(error.norm() / reference.norm())
-    return float(error[mask].norm() / reference[mask].norm())
-
-
-def metal_fill(X: Tensor, threshold: float, reference: Optional[tuple[Tensor, Tensor]] = None,
-               record: Optional[dict] = None) -> tuple[Tensor, Optional[tuple[Tensor, Tensor]]]:
-    """Fill the metal voxels of a volume from the volume in which the metal was first found.
-
-    The metal is the voxels of X above the threshold. Once the metal mask leaves their rays out of MBIR they have no
-    data and fade, while the set itself shrinks from the blurred metal of the initial volume to the metal's core. The
-    fill gives the current metal voxels the values of the reference volume, scaled so that their sum equals the
-    reference's total attenuation of its own metal voxels: blur spreads the attenuation of the metal but keeps its
-    sum.
-
-    Args:
-        X (Tensor): [R, C, S] volume in 1/cm.
-        threshold (float): attenuation in 1/cm above which a voxel is metal.
-        reference (tuple or None, optional): ``(volume, total)``, the volume in which the metal was first found and
-            the sum of its values over its own metal voxels; None makes X the reference when it has metal. Defaults
-            to None.
-        record (dict or None, optional): gets ``metal_voxels`` and ``metal_fill_scale``. Defaults to None.
-
-    Returns:
-        (Tensor, tuple or None): the filled volume (X itself when it has no metal or there is no reference) and the
-            reference.
-    """
-    metal = X > threshold
-    count = int(metal.sum())
-    if record is not None:
-        record["metal_voxels"] = count
-    if count == 0:
-        return X, reference
-    if reference is None:
-        reference = (X.clone(), X[metal].sum())
-    volume, total = reference
-    current = volume[metal].sum()
-    if not float(current) > 0.0:
-        return X, reference
-    scale = total / current
-    if record is not None:
-        record["metal_fill_scale"] = float(scale)
-    return torch.where(metal, volume * scale, X), reference
-
-
-def _metal_mask(model, X: Tensor, weights: Tensor, config: CitrusConfig,
-                record: dict) -> tuple[Tensor, Optional[Tensor]]:
-    """MBIR weights of an outer iteration with the measurements through metal set to 0, and the measurements kept.
-
-    With ``metal_attenuation_threshold`` the voxels of X above the threshold are metal; the measurements whose rays
-    cross a metal voxel (forward projection of the metal voxels above 0) get weight 0 and are left out of the fit.
-
-    Args:
-        model (ConeBeamModel or ParallelBeamModel): MBIRTORCH model.
-        X (Tensor): [R, C, S] current volume in 1/cm.
-        weights (Tensor): [V, Rd, Cd] weights of the measured counts, ``Y / I0``.
-        config (CitrusConfig): loop settings.
-        record (dict): record of the outer iteration; gets ``metal_measurement_fraction`` with a threshold.
-
-    Returns:
-        (Tensor, Tensor or None): weights [V, Rd, Cd] and the boolean mask [V, Rd, Cd] of the measurements kept in
-            the fit (None for all).
-    """
-    if config.metal_attenuation_threshold is None:
-        return weights, None
-    metal = (X > float(config.metal_attenuation_threshold)).to(torch.float32)
-    if not bool(metal.any()):
-        record["metal_measurement_fraction"] = 0.0
-        return weights, None
-    kept = forward_project(model, metal) <= 0.0
-    record["metal_measurement_fraction"] = 1.0 - float(kept.float().mean())
-    return torch.where(kept, weights, torch.zeros_like(weights)), kept
+    return float(error.norm() / reference.norm())
 
 
 def _counts_and_angles(sinogram_counts, angles, device) -> tuple[Tensor, np.ndarray]:
@@ -1803,20 +1732,21 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
     Args:
         sinogram_counts (Tensor or ndarray): [V, Rd, Cd] measured counts Y (primary plus scatter).
         I0 (float, Tensor or ndarray): flat-field counts per pixel: a number (uniform emission, the solver's source
-            unchanged), or the open field [Rd, Cd] for every view or [V, Rd, Cd] per view.
+            unchanged; also for projections already divided by a flood image), or the open field [Rd, Cd] for every
+            view or [V, Rd, Cd] per view.
         angles (Sequence[float] or ndarray): [V] view angles in rad.
         grid (Grid): reconstruction grid (MBIRTORCH conventions), also the fine grid of the solver.
         geometry (ConeGeometry or ParallelGeometry): geometry of the scan.
         solver (ScatterSolver): scatter solver of the scanner; its device is used for everything.
         config (CitrusConfig, optional): loop settings. Defaults to None (``CitrusConfig()``).
-        schedule (Schedule, optional): numbers of iterations and scatter updates; the counts of ``config`` overwrite
-            its own when set. Defaults to None (``Schedule()``, CITRUS).
+        schedule (Schedule, optional): numbers of iterations and scatter updates, and the multigrid ``stages``; the
+            counts of ``config`` overwrite its own when set. Defaults to None (``Schedule()``, CITRUS).
         regularization (dict, optional): frozen ``sigma_y``, ``sigma_x`` and ``sigma_prox``. Defaults to None
             (estimated once on the first corrected sinogram).
         init_recon (Tensor, optional): [R, C, S] initial volume in 1/cm. Defaults to None (FDK of the uncorrected data,
             or the filtered back projection of a parallel beam).
         model (ConeBeamModel or ParallelBeamModel, optional): prebuilt MBIRTORCH model
-            (``recon.mbir_bridge.make_model``). Defaults to None.
+            (``recon.mbir_bridge.make_model``), e.g. with MBIR settings or a region of reconstruction. Defaults to None.
         callback (callable, optional): ``callback(k, X_k, record)``, called for the initial volume (k = 0, the FDK)
             and after every outer iteration k = 1, ..., N. Defaults to None.
         mbir_callback (callable, optional): ``mbir_callback(i, X, record)``, called for the initial volume (i = 0)
@@ -1833,6 +1763,34 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
     """
     config = CitrusConfig() if config is None else config
     config.validate()
+    if schedule is not None and schedule.stages is not None:
+        schedule.validate()
+        return multigrid_recon(_citrus_single, sinogram_counts, I0, angles, grid, geometry, solver, config, schedule,
+                               regularization=regularization, init_recon=init_recon, model=model, callback=callback,
+                               mbir_callback=mbir_callback, detector_gain=detector_gain, make_model=make_model,
+                               close_store=StateStore.close)
+    return _citrus_single(sinogram_counts, I0, angles, grid, geometry, solver, config, schedule=schedule,
+                          regularization=regularization, init_recon=init_recon, model=model, callback=callback,
+                          mbir_callback=mbir_callback, detector_gain=detector_gain)
+
+
+def _citrus_single(sinogram_counts, I0, angles, grid: Grid, geometry, solver: ScatterSolver, config: CitrusConfig, *,
+                   schedule: Optional[Schedule], regularization: Optional[dict], init_recon, model, callback,
+                   mbir_callback, detector_gain, stage_carry: Optional[dict] = None,
+                   view_ids: Optional[np.ndarray] = None) -> tuple[Tensor, dict]:
+    """The single-resolution CITRUS loop of ``citrus_recon``; a multigrid stage hands over its scatter state.
+
+    Args:
+        sinogram_counts, I0, angles, grid, geometry, solver, config, schedule, regularization, init_recon, model,
+            callback, mbir_callback, detector_gain: as for ``citrus_recon``.
+        stage_carry (dict or None, optional): the previous stage's state store (``"store"``) and the full-resolution
+            views of its slots (``"view_ids"``), taken over when they match this stage's, and replaced by this stage's
+            store, which is then left open. Defaults to None (the store is closed on return).
+        view_ids (ndarray or None, optional): [V] full-resolution index of every view of this stage. Defaults to None.
+
+    Returns:
+        (Tensor, dict): as for ``citrus_recon``; ``info["state_carried"]`` with ``stage_carry``.
+    """
     schedule = _schedule_of(config, schedule)
     schedule.validate()
     sweeps = schedule.scatter_sweeps_per_outer_iteration
@@ -1878,6 +1836,20 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
     state_store = StateStore(len(computed), full_shape, device, gpu_budget_mib=config.gpu_state_budget_mib,
                              pinned_memory_limit_gib=config.pinned_memory_limit_gib)
     view_states = [CitrusState() for _ in computed]  # one per computed view (the age-ordered recursion)
+    carried = False
+    if stage_carry is not None:  # a multigrid stage: the previous stage's collided fluence of the same views
+        slot_views = (np.arange(V) if view_ids is None else np.asarray(view_ids))[computed]
+        previous = stage_carry.get("store")
+        if (previous is not None and previous.full_shape == state_store.full_shape
+                and np.array_equal(stage_carry.get("view_ids"), slot_views)):
+            for j in range(len(computed)):
+                moments = previous.get(j)
+                if moments is not None:
+                    state_store.put(j, moments)
+            carried = True
+        if previous is not None:
+            previous.close()
+        stage_carry.update(store=state_store, view_ids=slot_views)
     Rd, Cd = int(Y.shape[1]), int(Y.shape[2])
     tiny = torch.finfo(torch.float32).tiny
     # every view's last scatter estimate (interpolation order None keeps it on the skipped views)
@@ -1890,11 +1862,10 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
     def scene_volume(X: Tensor, density_model: DensityModel) -> Tensor:
         """The volume the scatter solver sees: X with the air set to 0, extended past the body along z
         (extend_scatter_scene) and with the known objects in place."""
-        water = _water_attenuation(density_model)
-        if config.air_threshold_hu is not None:
-            X = torch.where(X < _attenuation_of_hu(float(config.air_threshold_hu), water), torch.zeros_like(X), X)
-        if config.extend_scatter_scene:
-            X, scene_slices[0] = extend_scene_slices(X, _attenuation_of_hu(-500.0, water),
+        if config.air_threshold is not None:
+            X = torch.where(X < float(config.air_threshold), torch.zeros_like(X), X)
+        if config.extend_scatter_scene:  # the body: the voxels above half of water's attenuation
+            X, scene_slices[0] = extend_scene_slices(X, 0.5 * _water_attenuation(density_model),
                                                      grid.delta_voxel * grid.voxel_slice_aspect)
         return with_known_objects(X)
 
@@ -2014,8 +1985,11 @@ def citrus_recon(sinogram_counts: Union[Tensor, np.ndarray], I0: Union[float, Te
         info["computed_views"] = computed.copy()
         info["view_interpolated"] = view_interpolated
         info["emission_profile"] = emission_profile[0]
+        if stage_carry is not None:
+            info["state_carried"] = carried
     finally:
-        state_store.close()
+        if stage_carry is None:
+            state_store.close()
         solver.source = original_source
     return X, info
 

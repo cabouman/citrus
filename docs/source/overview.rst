@@ -10,8 +10,12 @@ Package layout
     :func:`~citrus.citrus.citrus_step` (one scatter step of one view; ``citrus_view_step`` from prebuilt fields) and its
     operators ``uncollided_operator``, ``first_collision_operator``, ``multiple_collision_operator``,
     ``accumulator_update_operator``, ``project_scatter``; the primaries of all views (``primary_signals``, MBIRTORCH
-    projections of the material maps); the density model (one material map at a time), the metal mask and fill
-    (``metal_fill``) and the compact per-view state storage.
+    projections of the material maps); the density model (one material map at a time), the line-integral corrections
+    of the loop (water linearization, hardening offset, known objects) and the compact per-view state storage.
+
+``citrus.multigrid``
+    ``Stage``: the multigrid stages of a ``Schedule``, coarse voxels on binned data first, each stage starting from
+    the previous one's volume and scatter state.
 
 ``citrus.scatter_solver``
     The LBTE source iteration solver. :class:`~citrus.scatter_solver.scatter_solver.ScatterSolver` assembles the
@@ -25,8 +29,9 @@ Package layout
     ``photon_data``               the photon data: NIST XCOM cross sections (downloaded on first use), xraylib
                                   angular distributions
     ``cross_section_library``     the library builder from those data, cached on disk
-    ``source``, ``detector``      point source or parallel beam with emission profile; detector and anti-scatter-grid
-                                  responses
+    ``source``                    point source or parallel beam: collimated field, off-focal emission, emission
+                                  profile, beam filter
+    ``detector``, ``grid_model``  detector responses, anti-scatter grids (analytic model of the septa)
     ``angular_quadrature``        direction sets, real spherical harmonics, the scattering-source operator
     ``linear_discontinuous_cell`` the linear-discontinuous cell equations and their closed-form solve
     ``wavefront``                 the diagonal-plane ordering of the sweep
@@ -61,10 +66,10 @@ Scope of the solver
 * Reference materials chosen from a catalogue of compounds, tissues and all elements, or defined by the user
   (``SolverConfig.materials``, :doc:`conventions`, "Materials"); every voxel is a mixture of at most two of them, the
   two whose nominal attenuations bracket its attenuation at the effective energy.
-* A point source collimated to a flat or curved panel, with circular or helical views, or a parallel beam; an
-  optional emission profile of the source (from the measured open field); detector and anti-scatter-grid responses
-  (grid septa along the channels, the rows or both) as lookup tables, built from the photon data for any catalogue
-  material or given as a table.
+* A point source collimated to a flat or curved panel, with circular or helical views, or a parallel beam; field
+  margins past the panel, off-focal emission, an emission profile (from the measured open field) and a beam filter
+  whose thickness varies per direction; detector and anti-scatter-grid responses (grid septa along the channels, the
+  rows or both) as lookup tables, built from the photon data for any catalogue material or given as a table.
 * Float32 on CUDA (production; fused Triton kernels) and float64 / CPU (reference and tests).
 
 Repository
@@ -80,6 +85,9 @@ Repository
     ``demo_advanced_3_custom_schedules.py`` (CITRUS against other scatter schedules, each built from a view
     function). The spectra, the cached data and the outputs are in ``demo/spectra/``, ``demo/input/`` and
     ``demo/output/``.
+``experiments/``
+    Reconstructions of measured scans. ``experiments/IGRT/`` holds the scripts of the COBRA2026 pelvis CBCT cases of
+    three scanners, each in a low-resolution and a full-resolution version (:doc:`experiments`).
 ``tests/``
     The test suite (``python -m pytest -q``), including oracle tests: a 1-D slab linear-discontinuous solution,
     particle balance, dense Galerkin assembly, Beer's law, brute-force point-to-point scatter integrals, and the

@@ -219,13 +219,13 @@ def test_smoke_dataset_2cm(real_library, tmp_path):
     assert out["meta"]["materials"] == list(MATERIALS) and out["mass_attenuation"].shape == (7,)
     assert out["meta"]["short_scan"] is False and out["meta"]["end_view_angle"] == pytest.approx(2 * np.pi)
     assert out["phi_air"].shape == (75, 100)
-    # noise-free: Y = P + S, P = I0 exp(-A X), S = SPR P
+    # noise-free: Y = P + S, the solver's primary and scatter signals with the same factor I0 / f per pixel
     assert np.array_equal(out["Y"], out["Y_mean"])
     assert np.allclose(out["Y"], out["P"] + out["S"], rtol=1e-6)
-    assert np.allclose(out["P"], 1.0e5 * np.exp(-out["line_integrals"]), rtol=1e-5)
-    assert np.allclose(out["S"], out["SPR"] * out["P"], rtol=1e-5)
+    scale = out["P"] / out["solver_primary"]  # the open field over the solver's open-field signal, per pixel
+    assert np.allclose(out["S"], scale * out["solver_scatter"], rtol=1e-5)
     assert np.allclose(out["SPR"], out["solver_scatter"] / out["solver_primary"], rtol=1e-5)
-    assert out["meta"]["primary_projector"] == "mbirtorch" and out["meta"]["data_format"] == 2
+    assert out["meta"]["primary_projector"] == "mbirtorch" and out["meta"]["data_format"] == 3
     # plausible WLAB scatter: SPR behind the phantom of order 1 (no grid)
     assert 0.3 < _shadow_median_spr(out) < 1.5
     assert (out["SPR"] > 0).all() and out["meta"]["si_iterations"]["all_converged"]
@@ -248,8 +248,9 @@ def test_smoke_dataset_2cm(real_library, tmp_path):
 
 @cuda
 def test_synthesize_cone_beam_data_generic():
-    """Any density volume (a water box with a bone rod, the synthetic library): shapes, Y = P + S, S = SPR P,
-    P = I0 exp(-A X), the scatter of the given solver; the solver must be built for the scan geometry."""
+    """Any density volume (a water box with a bone rod, the synthetic library): shapes, Y = P + S with P and S the
+    given solver's primary and scatter signals with the same factor per pixel, S = SPR P; the solver must be built for
+    the scan geometry."""
     pytest.importorskip("mbirtorch")
     from citrus.scatter_solver import ScatterSolver, ideal_counting_response, no_grid
 
@@ -269,15 +270,17 @@ def test_synthesize_cone_beam_data_generic():
     out = synthesize_cone_beam_data(rho, grid, geometry, angles, solver, I0=1.0e4, noise=False)
     assert out["Y"].shape == (3, 24, 24) and out["X_true"].shape == grid.shape and "rho_true" not in out
     assert np.allclose(out["Y"], out["P"] + out["S"], rtol=1e-6)
-    assert np.allclose(out["P"], 1.0e4 * np.exp(-out["line_integrals"]), rtol=1e-5)
+    scale = out["P"] / out["solver_primary"]  # the open field over the solver's open-field signal, per pixel
+    assert np.allclose(out["S"], scale * out["solver_scatter"], rtol=1e-5)
     assert np.allclose(out["S"], out["SPR"] * out["P"], rtol=1e-5)
+    assert float((out["P"] / 1.0e4).max()) <= 1.0 + 1e-5  # the polychromatic transmission
     assert float(out["SPR"].max()) > 0 and out["meta"]["si_iterations"]["all_converged"]
     other = ConeGeometry(100.0, 150.0, 20, 24, 1.6, 1.6)
     with pytest.raises(ValueError, match="geometry"):
         synthesize_cone_beam_data(rho, grid, other, angles, solver)
-    # the SPR's primary is the loop's MBIRTORCH per-material primary (meta unchanged since citrus 0.3.0); it agrees
-    # with the solver's Siddon primary of solve_view (one ray per pixel center) except at the edges of the object
-    assert out["meta"]["primary_projector"] == "mbirtorch" and out["meta"]["data_format"] == 2
+    # the primary is the loop's MBIRTORCH per-material primary; it agrees with the solver's Siddon primary of
+    # solve_view (one ray per pixel center) except at the edges of the object
+    assert out["meta"]["primary_projector"] == "mbirtorch" and out["meta"]["data_format"] == 3
     siddon = np.stack([solver.solve_view(rho, grid, a).primary["planar_fluence"].sum(0).cpu().numpy()
                        for a in angles])
     d = np.abs(out["solver_primary"] / siddon - 1)

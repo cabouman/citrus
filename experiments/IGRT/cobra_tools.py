@@ -1,4 +1,5 @@
-"""Shared code of the COBRA2026 IGRT experiments (COBRA_TrueBeam.py, COBRA_Halcyon.py, COBRA_Synergy.py).
+"""Shared code of the COBRA2026 IGRT experiments (the COBRA_TrueBeam, COBRA_Halcyon and COBRA_Synergy
+scripts, LowRes and FullRes).
 
 The scripts read as five sections: parameters, data, preprocessing, reconstruction and figure. This module holds what
 they share: the downloader of the COBRA2026 cases, the readers of the Varian files (Scan.xml, geometry.xml, .xim

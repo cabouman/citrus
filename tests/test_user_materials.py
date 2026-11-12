@@ -331,13 +331,13 @@ def test_synthetic_data_and_citrus_recon_with_a_user_material(tmp_path):
     solver = wlab_solver(2.0, config=truth.config, library=library, geometry=geometry, device="cuda")
     model = make_cone_model(grid, geometry, data["angles"], device="cuda")
     P = torch.as_tensor(data["P"], device="cuda")
-    regularization = estimate_regularization(model, -torch.log(P / 1.0e5), torch.as_tensor(data["Y"], device="cuda")
-                                             / 1.0e5)
-    citrus_config = CitrusConfig(mbir_iterations_per_outer_iteration=2, num_outer_iterations=3)
+    regularization = estimate_regularization(model, -torch.log(P / 1.0e5))  # uniform weights, as in the loop
+    citrus_config = CitrusConfig(mbir_iterations_per_outer_iteration=2, num_outer_iterations=3,
+                                 beam_hardening_correction=True)
     X, _ = citrus_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, solver, citrus_config,
                         regularization=regularization)
     X_none, _ = mbir_recon(data["Y"], 1.0e5, data["angles"], grid, geometry, citrus_config,
-                           regularization=regularization, device="cuda")
+                           regularization=regularization, device="cuda", solver=solver)
     X_true = torch.as_tensor(data["X_true"], device="cuda")
     error = {name: float((value - X_true).norm() / X_true.norm()) for name, value in (("citrus", X), ("none", X_none))}
     assert error["citrus"] < error["none"], error

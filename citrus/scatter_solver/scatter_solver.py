@@ -2,8 +2,11 @@
 
 :class:`ScatterSolver` turns the basis-material densities of a volume (or its attenuation and a density model) into
 the primary and scatter images and the scatter fraction of one view. :class:`MaterialFields` holds the density-only
-fields on the fine, transport and quadrature grids, and :class:`ViewResult` the images of one view. The steps are
-described in docs/source/method.rst, "The LBTE scatter solver", and the grids in docs/source/conventions.rst, "Grids".
+fields on the fine, transport and quadrature grids, and :class:`ViewResult` the images of one view. The module also
+derives the source's emission profile from an open field (:func:`emission_profile_from_open_field`), a beam filter's
+thickness from its measured transmission (:func:`filter_thickness_from_transmission`) and the per-pixel water table
+of the beam-hardening correction (:func:`water_linearization`). The steps are described in docs/source/method.rst,
+"The LBTE scatter solver", and the grids in docs/source/conventions.rst, "Grids".
 """
 
 from __future__ import annotations

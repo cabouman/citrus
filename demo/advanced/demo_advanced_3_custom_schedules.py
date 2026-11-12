@@ -60,7 +60,8 @@ else:
     save_dataset(data, path)
 X_true = torch.as_tensor(data["X_true"], device="cuda")
 relative_error = lambda X: float((X - X_true).norm() / X_true.norm())  # noqa: E731
-loop = CitrusConfig(scatter_view_stride=8)  # scatter on every 8th view; the iteration counts are the schedule's
+# scatter on every 8th view, the beam hardening of the spectrum linearized; the iteration counts are the schedule's
+loop = CitrusConfig(scatter_view_stride=8, beam_hardening_correction=True)
 shared = {}  # the FDK volume, the frozen regularization and the model, set by the first run and shared by the others
 
 

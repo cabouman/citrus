@@ -79,7 +79,8 @@ print(f"Scatter-to-primary ratio behind the grid: mean {data['SPR'].mean():.3f},
 
 # ---- CITRUS: the same geometry object for the solver and the reconstruction (its helix is keyed by the angles) ----
 X_citrus, info = citrus_recon(Y, I0, angles, grid, geometry, make_solver(),
-                              CitrusConfig(scatter_view_stride=scatter_view_stride, verbose=True))
+                              CitrusConfig(scatter_view_stride=scatter_view_stride, beam_hardening_correction=True,
+                                           verbose=True))
 
 # ---- Results ----------------------------------------------------------------------------------------------------
 X_citrus, X_initial = X_citrus.cpu().numpy(), info["init_recon"].cpu().numpy()

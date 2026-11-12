@@ -43,7 +43,7 @@ def parallel():
     model = make_model(grid, geometry, angles, device=DEVICE)
     Y = torch.as_tensor(data["Y"], device=DEVICE)
     P = torch.as_tensor(data["P"], device=DEVICE)
-    regularization = estimate_regularization(model, -torch.log(P / 1.0e5), Y / 1.0e5)
+    regularization = estimate_regularization(model, -torch.log(P / 1.0e5))  # uniform weights, as in the loop
     return data, grid, geometry, solver, regularization
 
 

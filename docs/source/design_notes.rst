@@ -101,7 +101,10 @@ so no (fine energy, ray) tensor is formed. A source's beam filter is one more te
 ray times its fine mass attenuation, added after the materials; the kernel has it as a compile-time constant
 (``FILTER``), so a source without a filter runs the kernel without it, and a filter of zero thickness adds an exact
 zero. The filter's fine mass attenuation is computed once per material and library from the photon data
-(``source._fine_attenuation``).
+(``source._fine_attenuation``). The PyTorch path evaluates the sum in blocks of at most :math:`2^{22}`
+(fine energy, ray) pairs: per block one optical-depth tensor (M fused multiply-adds), an in-place exponential and one
+matrix product with the fine-to-group weights, accumulated into the result. The float32 matrix product assumes that
+TF32 is off (``torch.backends.cuda.matmul.allow_tf32 = False``, the PyTorch default).
 
 **Source outside the panel.** The field margins, the off-focal emission and the filter are properties of the ray's
 point on the panel plane, so the source keeps one rule for every place it enters (uncollided fluence, primary, open
@@ -116,13 +119,11 @@ region, where the reconstruction changes from one outer iteration to the next, a
 fed those changes back into the scatter. The primary is that of the scatter solver's scene, so the
 scatter-to-primary ratio compares one volume with itself. The scene has no support of its own: an air threshold
 removes the noise that the density model's clamp at 0 turns into matter, and with the start set to 0 outside MBIR's
-region nothing else lies beside the object, so the scene needs no mask around it. The water linearization is tabulated per pixel with the solver's own primary: the filter and
-the incidence angle both change the spectrum a pixel sees, and the table is the exact polychromatic model of the
-loop's primary. A material's hardening beyond water uses the primary of the current volume twice, as it is and with
-the material made of water, which reuses the projections of the scatter update. The PyTorch path evaluates the sum in blocks of at most :math:`2^{22}`
-(fine energy, ray) pairs: per block one optical-depth tensor (M fused multiply-adds), an in-place exponential and one
-matrix product with the fine-to-group weights, accumulated into the result. The float32 matrix product assumes that
-TF32 is off (``torch.backends.cuda.matmul.allow_tf32 = False``, the PyTorch default).
+region nothing else lies beside the object, so the scene needs no mask around it. The water linearization is
+tabulated per pixel with the solver's own primary: the filter and the incidence angle both change the spectrum a
+pixel sees, and the table is the exact polychromatic model of the loop's primary. A material's hardening beyond water
+uses the primary of the current volume twice, as it is and with the material made of water, which reuses the
+projections of the scatter update.
 
 **Cache.** ``build_library`` caches the library as ``mglib_<hash>.pt`` in ``$CITRUS_CACHE_DIR`` (default
 ``~/.cache/citrus``); the key covers the configuration, the spectrum, the backend, the numerical parameters and the
@@ -460,20 +461,24 @@ geometry's table at the model's angles, so a sub-model over some views gets thei
 ``make_parallel_model`` builds MBIRTORCH's ``ParallelBeamModel`` of a ``ParallelGeometry``, which has no row pitch,
 row offset or slice offset of its own (row r is slice r): it checks that the geometry's rows are the grid's slices
 instead of copying them, and ``make_model`` chooses the model of the geometry. The
-region-of-reconstruction mask is off, because the WLAB grid tiles the prism and the mask would drop its corners.
+region-of-reconstruction mask is off by default, because the WLAB grid tiles the prism and the mask would drop its
+corners. A caller sets a region with ``model.set_params(use_ror_mask=...)``, as the experiments do for the field of
+view and the couch.
 
 **Units and devices.** MBIRTORCH projects in value times its arbitrary length unit; the bridge uses cm, so a volume
 in 1/cm projects to dimensionless line integrals. MBIRTORCH accepts torch tensors on any device and places them as
 float32 on the model device (no copy when they already are); the bridge pins every model to one device
 (``configure_devices``, which also switches off MBIRTORCH's automatic multi-GPU layout) and returns torch tensors on
-it (``output_sharded=True``), never numpy. ``torch.compile`` is used on CUDA only, since on the CPU it needs a C++
-toolchain.
+it (``output_sharded=True``), never numpy. MBIRTORCH's kernels run without ``torch.compile`` by default
+(``compile_mode="off"``): the compiled kernels are specialized to the image and subset sizes and recompile at every
+new size, which over the loop's iteration counts costs more than compiling saves per iteration. ``compile_mode="auto"``
+turns it back on for CUDA.
 
 **Projections in chunks of views.** An MBIRTORCH model projects onto all its views at once. To project onto a run
 of consecutive views (the per-material path lengths of the loop's primary must not grow to ``[M', V, rows,
 channels]``), ``ViewChunkProjector`` builds a sub-model over those angles with ``make_model`` and keeps the
-last few in a least-recently-used cache. A sub-model is cheap to build; its first projection compiles, later ones
-cost the same per view as the full model, and its projections equal the matching views of the full model to float
+last few in a least-recently-used cache. A sub-model is cheap to build; later projections cost the same per view
+as the full model, and its projections equal the matching views of the full model to float
 rounding.
 
 **One warm-started iteration.** ``model.recon(sino, weights=W, init_recon=X, max_iterations=k + 1,
@@ -510,8 +515,8 @@ or ``recon_fbp`` takes ``redundancy_weighting``, CITRUS leaves the weighting to 
 per-row helical weights gave a worse start near the ends of the helix than MBIRTORCH's coverage-scaled FDK.
 
 **Primary of the loop.** The loop's primary uses MBIRTORCH's projector, the reconstruction's own operator: it averages
-the line integral over the pixel like a detector pixel does, and the synthetic data define their scatter through the
-same primary, so the correction is consistent with the data also on the pixels whose rays graze an object face.
+the line integral over the pixel like a detector pixel does, and the synthetic data take their primary from the same
+model, so the correction is consistent with the data also on the pixels whose rays graze an object face.
 
 **MBIR resume.** MBIRTORCH's public ``recon`` recomputes the error sinogram with one forward projection per call;
 ``mbir_iterations(..., error_sinogram=, return_checkpoint=True)`` replicates ``recon``'s preparation and calls its
@@ -524,21 +529,27 @@ initial volume in place, so the loop passes a copy of the volume. The engine pat
 partition sequence as ``recon`` for the same random state and uses the same regularization, so a resumed call
 equals the plain one up to the float rounding of the carried error sinogram.
 
-Metal
------
+Multigrid stages
+----------------
 
-**Selected by attenuation.** Metal is the voxels of the current volume above an attenuation threshold, not the
-voxels of named materials: a user can define any material that contains metal, and the attenuation at the effective
-energy decides how badly a ray disagrees with the linear model, so a megavoltage beam, which passes through metal,
-needs no mask. A threshold on the primary counts would catch only the starved core of a thick piece; the rays that
-streak the tissue graze the metal with plenty of counts.
+**Coarse stages first.** Most of the change of the volume, and of its scatter, happens in the first outer
+iterations, where MBIR moves the image far from the scatter-corrupted start. A coarse stage takes that change on
+binned data, a subset of the views and large voxels, at a small part of the cost of a full-resolution outer iteration,
+so the full-resolution stage only sharpens the image. Every stage is a run of the same loop, so the stages need no
+code of their own beyond binning the data and building the stage's solver and model.
 
-**Left out, then filled.** The rays through metal get zero weight rather than a smaller one: their data are
-inconsistent, not merely noisy. Without data the masked metal fades under the regularization, which tightens the
-mask onto the metal's core but would hand the scatter solver a fading absorber. Blur spreads the attenuation of the
-metal but keeps its sum, so the fill gives the tightened set the first metal estimate rescaled to that sum. Scatter
-weights that discount high-scatter measurements, a polynomial beam-hardening fit (MBIRTORCH's
-``recon_plastic_metal``) and frozen values that also define the set were tried and gave worse reconstructions.
+**One scatter state across the stages.** The accumulators live on the transport grid and the computed views, which
+do not depend on the voxel size or the detector binning. Carrying them over keeps the recursion going: a fresh state
+at every stage would restart the multiple scatter from the first order and lag the volume again. The views and the
+transport grid therefore have to match, which is why ``scatter_view_stride`` counts full-resolution views and why a
+stage's grid is floor(n / ``voxel_factor``) voxels: it never reaches past the full grid, whose cells it then shares.
+A fractional voxel factor lets the stages use round voxel sizes, such as 5 mm, over a grid on the clinical image's
+voxels.
+
+**Binning the inputs.** The counts and the flat field are averaged, like a coarser panel would record them. A
+measurement of weight 0, such as a dead pixel, holds no valid count, so a block that contains one is left out rather
+than averaged with it. The known objects are averaged over the fine voxels of each coarse voxel, so that a thin shell
+keeps its line integrals, where sampling the fine grid at the coarse centres could miss it.
 
 Memory
 ------
